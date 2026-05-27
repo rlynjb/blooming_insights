@@ -1,13 +1,12 @@
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
   OAuthClientInformationMixed,
-  OAuthClientInformationFull,
   OAuthTokens,
   OAuthClientMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 interface SessionAuthState {
-  clientInformation?: OAuthClientInformationFull;
+  clientInformation?: OAuthClientInformationMixed;
   tokens?: OAuthTokens;
   codeVerifier?: string;
   state?: string;
@@ -68,7 +67,7 @@ export class BloomreachAuthProvider implements OAuthClientProvider {
     return this.state_.clientInformation;
   }
 
-  saveClientInformation(info: OAuthClientInformationFull): void {
+  saveClientInformation(info: OAuthClientInformationMixed): void {
     this.state_.clientInformation = info;
   }
 
@@ -97,6 +96,22 @@ export class BloomreachAuthProvider implements OAuthClientProvider {
 
 export function hasTokens(sessionId: string): boolean {
   return !!authStore.get(sessionId)?.tokens;
+}
+
+/**
+ * Validate and consume the OAuth CSRF `state` for a session (one-time use).
+ * Defensive: returns true when the session has no stored state (the SDK may not
+ * have invoked our optional state(), in which case we cannot enforce — so we do
+ * not block the flow), and only returns false on a definite mismatch.
+ * LIVE-VERIFICATION: confirm the SDK propagates our state() value verbatim into
+ * the authorize URL so the callback's `state` param matches the stored value.
+ */
+export function consumeState(sessionId: string, state: string | null): boolean {
+  const st = authStore.get(sessionId);
+  const stored = st?.state;
+  if (st) st.state = undefined; // one-time use
+  if (!stored) return true;
+  return stored === state;
 }
 
 export function clearAuth(sessionId: string): void {

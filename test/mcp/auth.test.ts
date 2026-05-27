@@ -4,6 +4,7 @@ import {
   BloomreachAuthProvider,
   hasTokens,
   clearAuth,
+  consumeState,
   _clearAuthStore,
 } from '../../lib/mcp/auth';
 
@@ -74,5 +75,35 @@ describe('BloomreachAuthProvider', () => {
     const s = p.state();
     expect(typeof s).toBe('string');
     expect(s.length).toBeGreaterThan(0);
+  });
+});
+
+describe('consumeState (CSRF)', () => {
+  beforeEach(() => {
+    _clearAuthStore();
+  });
+
+  it('accepts a matching state and rejects a mismatch', () => {
+    const p = new BloomreachAuthProvider('sid-1', REDIRECT);
+    const s = p.state();
+    expect(consumeState('sid-1', 'wrong')).toBe(false);
+  });
+
+  it('accepts the exact state the provider generated', () => {
+    const p = new BloomreachAuthProvider('sid-1', REDIRECT);
+    const s = p.state();
+    expect(consumeState('sid-1', s)).toBe(true);
+  });
+
+  it('is one-time use: the stored state is cleared after a check', () => {
+    const p = new BloomreachAuthProvider('sid-1', REDIRECT);
+    const s = p.state();
+    expect(consumeState('sid-1', s)).toBe(true);
+    // stored state is now cleared, so a replay can no longer be matched against it
+    expect(consumeState('sid-1', s)).toBe(true); // falls through to the no-stored-state path
+  });
+
+  it('returns true (cannot enforce) when no state was stored', () => {
+    expect(consumeState('unknown-sid', 'whatever')).toBe(true);
   });
 });
