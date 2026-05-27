@@ -35,10 +35,13 @@ export class McpClient {
 
     const start = Date.now();
     const result = await this.transport.callTool(name, args);
-    const durationMs = Date.now() - start;
-    this.lastCallAt = Date.now();
+    const now = Date.now();
+    const durationMs = now - start;
+    this.lastCallAt = now;
 
-    this.cache.set(cacheKey, { result, expiresAt: Date.now() + ttl });
+    // Note: a skipCache call still refreshes the cache (write-through), which is
+    // the desired behavior for the /debug "force fresh" path.
+    this.cache.set(cacheKey, { result, expiresAt: now + ttl });
     return { result: result as T, durationMs, fromCache: false };
   }
 }
