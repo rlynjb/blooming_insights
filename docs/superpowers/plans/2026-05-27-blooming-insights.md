@@ -10,6 +10,29 @@
 
 ---
 
+## Build status & corrections (updated 2026-05-27)
+
+Phase 1 has been implemented. A few things diverged from the original plan text below — **Phases 2–6 should use the corrected API surface here, not the older snippets further down.**
+
+**Stack deviations (deliberate, accepted):**
+- **Next.js 16.2.6** (not 15), **Tailwind v4** (CSS-first, no `tailwind.config.js`), **React 19**. All app-router patterns in this plan are compatible.
+- Fonts load via **`next/font/google`** (Syne, Inter, JetBrains Mono) — no `public/fonts/` dir.
+
+**Auth is SDK-driven OAuth (the plan's hand-rolled `buildAuthorizeUrl`/`exchangeCodeForToken`/`startAuthFlow`/`getSession(token)` model is OBSOLETE).** Verified against the official sample + live discovery probes: Bloomreach uses **OAuth 2.0 Authorization Code + PKCE with Dynamic Client Registration** (no pre-registered `client_id`, no `client_secret`; endpoints auto-discovered via RFC 8414). The MCP SDK drives the whole flow. Actual implemented surface:
+
+- `lib/mcp/auth.ts` — `BloomreachAuthProvider implements OAuthClientProvider`, persistence keyed by app session id in an in-memory `authStore`. Helpers: `hasTokens(sid)`, `clearAuth(sid)`, `consumeState(sid, state)`, `_clearAuthStore()`.
+- `lib/mcp/connect.ts` — **`connectMcp(sessionId): Promise<ConnectResult>`** where `ConnectResult = { ok: true; mcp: McpClient } | { ok: false; authUrl: string }`; and **`completeAuth(sessionId, code)`** (calls `transport.finishAuth`). MCP URL has its trailing slash stripped (avoids a 307). Uses `StreamableHTTPClientTransport` from `@modelcontextprotocol/sdk/client/streamableHttp.js` with `{ authProvider }`.
+- `lib/mcp/session.ts` — `getOrCreateSessionId()` / `readSessionId()` (cookie `bi_session`). **Phases 2+ must obtain `sessionId` from these and call `connectMcp(sessionId)`** — there is no `getSession(token)` and no bearer token threading.
+- Routes: `app/api/mcp/callback/route.ts` (handles `?error`, validates `state`), `app/api/mcp/call/route.ts` (generic tool caller used by `/debug`).
+
+**Tool listing resolved:** the `__list_tools__` placeholder used in Tasks 2.8 / 3.4 is really **`client.listTools()`** → `{ tools: [{ name, description, inputSchema }] }`. `McpClient` does not yet expose this — Phase 2 should add a `listTools()` passthrough (extend `McpTransport` + `SdkTransport`, or have `connectMcp` also return the raw `Client`). Tool calls return `{ isError, content: [{ type, text }] }`.
+
+**Env (`.env.example`, committed):** `ANTHROPIC_API_KEY`, `BLOOMREACH_MCP_URL`, `NEXT_PUBLIC_APP_NAME`, `APP_ORIGIN`. No `BLOOMREACH_CLIENT_ID`/`PROJECT_ID` (DCR + runtime discovery).
+
+**Outstanding for Phase 1 acceptance (needs live Bloomreach creds — not yet done):** run the real auth round-trip on `/debug`, confirm ≥4 tools return JSON, capture response fixtures (`test/fixtures/*.json`) for the Phase 2 schema parser, and deploy a Vercel preview. The OAuth flow is written to the documented SDK behavior but has **not** been exercised against live auth — see the `LIVE-VERIFICATION` block atop `connect.ts`. In-memory `authStore` works per-process (fine locally); a shared store (KV/Redis) is needed before multi-instance/serverless deploy.
+
+---
+
 ## Testing strategy (read first)
 
 This build straddles two worlds, and the plan tests each differently:
