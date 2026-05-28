@@ -104,6 +104,10 @@ export default function HomePage() {
     active: false,
     msg: '',
   });
+  // "how this briefing was gathered" pane open state — opened automatically for a
+  // live briefing so the status/log trace streams in view as the scan runs; the
+  // user can collapse it. Closed for demo (the snapshot loads instantly).
+  const [traceOpen, setTraceOpen] = useState(false);
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -259,6 +263,7 @@ export default function HomePage() {
     setStepStatus('');
     setQueryCount(0);
     setTraceItems([]);
+    setTraceOpen(!isDemo); // live → open the trace so the scan streams in view
 
     const url = `/api/briefing${search}`;
     let cancelled = false;
@@ -549,8 +554,12 @@ export default function HomePage() {
           pinned near the top (above the feed) so the fixed query box can't
           overlap it. shown in both modes; a demo snapshot without a captured
           trace shows a placeholder so the feature/label stays visible. */}
-      {(status === 'loaded' || status === 'empty') && (
+      {(status === 'loaded' ||
+        status === 'empty' ||
+        (status === 'loading' && traceItems.length > 0)) && (
         <details
+          open={traceOpen}
+          onToggle={(e) => setTraceOpen((e.currentTarget as HTMLDetailsElement).open)}
           style={{
             marginBottom: 24,
             border: '1px solid var(--border)',
@@ -572,6 +581,7 @@ export default function HomePage() {
             {traceItems.length > 0
               ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
               : '-- queries'}
+            {status === 'loading' && ' · scanning…'}
           </summary>
           <div style={{ padding: '8px 16px 18px' }}>
             {traceItems.length > 0 ? (
