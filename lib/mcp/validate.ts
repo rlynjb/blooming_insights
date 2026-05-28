@@ -1,4 +1,4 @@
-import type { Anomaly, Severity } from './types';
+import type { Anomaly, Severity, Diagnosis } from './types';
 
 export function parseAgentJson(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -24,4 +24,12 @@ export function isAnomalyArray(v: unknown): v is Anomaly[] {
     typeof (a as any).change.baseline === 'string' &&
     SEVERITIES.includes((a as any).severity)
   );
+}
+
+export function isDiagnosis(v: unknown): v is Diagnosis {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as any;
+  return typeof d.conclusion === 'string'
+    && Array.isArray(d.evidence)
+    && Array.isArray(d.hypothesesConsidered);
 }
