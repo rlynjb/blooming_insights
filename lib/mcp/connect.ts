@@ -14,7 +14,7 @@
 //       (KV/Redis) is the likely production fix.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { SdkTransport } from './transport';
+import { SdkTransport, makeCapturingFetch, type HttpErrorHolder } from './transport';
 import { McpClient } from './client';
 import { BloomreachAuthProvider, withAuthCookies } from './auth';
 
@@ -65,8 +65,12 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
 
 async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
   const provider = new BloomreachAuthProvider(sessionId, await redirectUri());
+  // Capture the raw body of any non-OK HTTP response so tool failures can report
+  // the real server error (e.g. the `invalid_token` JSON behind a 401).
+  const httpErrors: HttpErrorHolder = { last: null };
   const transport = new StreamableHTTPClientTransport(mcpUrl(), {
     authProvider: provider,
+    fetch: makeCapturingFetch(httpErrors),
   });
   const client = new Client(
     { name: 'blooming-insights', version: '0.1.0' },
@@ -84,7 +88,7 @@ async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
     // observed 10s window when no hint is parseable.
     return {
       ok: true,
-      mcp: new McpClient(new SdkTransport(client), {
+      mcp: new McpClient(new SdkTransport(client, httpErrors), {
         minIntervalMs: 1100,
         retryDelayMs: 10_000,
         retryCeilingMs: 20_000,
