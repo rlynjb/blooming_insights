@@ -54,7 +54,7 @@ export default function EvidencePanel({ diagnosis, loading }: EvidencePanelProps
   }
 
   return (
-    <div style={cardStyle}>
+    <div className="bi-fade-up" style={cardStyle}>
       <h2
         className="lowercase"
         style={{

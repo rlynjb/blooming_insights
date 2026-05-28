@@ -25,6 +25,7 @@ export default function RecommendationCard({ recommendation }: RecommendationCar
 
   return (
     <div
+      className="bi-fade-up"
       style={{
         background: 'var(--bg-surface)',
         border: '1px solid var(--border)',

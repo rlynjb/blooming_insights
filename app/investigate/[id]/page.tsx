@@ -8,6 +8,7 @@ import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import EvidencePanel from '@/components/investigation/EvidencePanel';
 import RecommendationCard from '@/components/investigation/RecommendationCard';
+import AgentPipeline from '@/components/shared/AgentPipeline';
 
 function BackLink() {
   return (
@@ -35,6 +36,9 @@ export default function InvestigatePage() {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [complete, setComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeAgent, setActiveAgent] = useState<
+    'monitoring' | 'diagnostic' | 'recommendation' | null
+  >(null);
   const startedRef = useRef(false);
 
   useEffect(() => {
@@ -45,10 +49,19 @@ export default function InvestigatePage() {
 
     let cancelled = false;
 
+    // advance the pipeline pill from an event's agent; only diagnostic /
+    // recommendation move it (monitoring already happened upstream, coordinator ignored)
+    const advancePipeline = (agent: string) => {
+      if (agent === 'diagnostic' || agent === 'recommendation') {
+        setActiveAgent(agent);
+      }
+    };
+
     const handleEvent = (e: AgentEvent) => {
       if (cancelled) return;
       switch (e.type) {
         case 'reasoning_step':
+          advancePipeline(e.step.agent);
           setItems((prev) => [
             ...prev,
             {
@@ -61,6 +74,7 @@ export default function InvestigatePage() {
           ]);
           break;
         case 'tool_call_start':
+          advancePipeline(e.agent);
           setItems((prev) => [
             ...prev,
             {
@@ -72,6 +86,7 @@ export default function InvestigatePage() {
           ]);
           break;
         case 'tool_call_end':
+          advancePipeline(e.agent);
           setItems((prev) => {
             const next = [...prev];
             for (let i = next.length - 1; i >= 0; i--) {
@@ -169,6 +184,85 @@ export default function InvestigatePage() {
       : 'var(--accent-amber)';
   const statusLabel = error ? 'error' : complete ? 'complete' : 'analyzing…';
 
+  const canExport = complete || diagnosis !== null;
+
+  const buildMarkdown = (): string => {
+    const lines: string[] = [];
+
+    lines.push(`# investigation: ${id ?? 'unknown'}`);
+    lines.push('');
+
+    // reasoning trace
+    lines.push('## reasoning trace');
+    if (items.length === 0) {
+      lines.push('- (no trace)');
+    } else {
+      for (const it of items) {
+        if (it.kind === 'step') {
+          lines.push(`- [${it.agent}/${it.stepKind}] ${it.content}`);
+        } else {
+          lines.push(`- tool: ${it.toolName} (${it.durationMs ?? 0}ms)`);
+        }
+      }
+    }
+    lines.push('');
+
+    // diagnosis
+    lines.push('## diagnosis');
+    if (diagnosis) {
+      lines.push(diagnosis.conclusion);
+      if (diagnosis.evidence.length > 0) {
+        lines.push('');
+        lines.push('**evidence**');
+        for (const e of diagnosis.evidence) lines.push(`- ${e}`);
+      }
+      if (diagnosis.hypothesesConsidered.length > 0) {
+        lines.push('');
+        lines.push('**hypotheses considered**');
+        for (const h of diagnosis.hypothesesConsidered) {
+          lines.push(
+            `- [${h.supported ? 'supported' : 'ruled out'}] ${h.hypothesis} — ${h.reasoning}`,
+          );
+        }
+      }
+    } else {
+      lines.push('(no diagnosis)');
+    }
+    lines.push('');
+
+    // recommendations
+    lines.push('## recommendations');
+    if (recommendations.length === 0) {
+      lines.push('(no recommendations)');
+    } else {
+      for (const r of recommendations) {
+        lines.push(`### ${r.title}  (${r.bloomreachFeature} · ${r.confidence})`);
+        lines.push(r.rationale);
+        if (r.steps.length > 0) {
+          lines.push('steps:');
+          r.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
+        }
+        lines.push(`impact: ${r.estimatedImpact}`);
+        lines.push('');
+      }
+    }
+
+    return lines.join('\n');
+  };
+
+  const handleExport = () => {
+    const md = buildMarkdown();
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `investigation-${id ?? 'unknown'}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <main
       className="min-h-screen px-6 py-10 mx-auto w-full max-w-5xl"
@@ -201,31 +295,56 @@ export default function InvestigatePage() {
             style={{
               display: 'inline-flex',
               alignItems: 'center',
-              gap: 6,
+              gap: 12,
               marginLeft: 'auto',
+              flexWrap: 'wrap',
             }}
           >
-            <span
-              className={streaming ? 'animate-pulse' : undefined}
-              aria-hidden
-              style={{
-                display: 'inline-block',
-                width: 8,
-                height: 8,
-                borderRadius: '50%',
-                background: statusColor,
-              }}
-            />
-            <span
-              className="lowercase"
-              style={{
-                color: statusColor,
-                fontFamily: 'var(--font-mono), monospace',
-                fontSize: '0.75rem',
-              }}
-            >
-              {statusLabel}
+            {!error && <AgentPipeline active={activeAgent} done={complete} />}
+
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <span
+                className={streaming ? 'animate-pulse' : undefined}
+                aria-hidden
+                style={{
+                  display: 'inline-block',
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  background: statusColor,
+                }}
+              />
+              <span
+                className="lowercase"
+                style={{
+                  color: statusColor,
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.75rem',
+                }}
+              >
+                {statusLabel}
+              </span>
             </span>
+
+            {canExport && !error && (
+              <button
+                type="button"
+                onClick={handleExport}
+                className="lowercase"
+                style={{
+                  background: 'transparent',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  color: 'var(--text-secondary)',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.75rem',
+                  padding: '3px 10px',
+                }}
+              >
+                export ↓
+              </button>
+            )}
           </span>
         </div>
       </div>

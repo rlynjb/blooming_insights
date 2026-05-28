@@ -21,6 +21,7 @@ export default function InsightCard({ insight }: InsightCardProps) {
       style={{ textDecoration: 'none', display: 'block' }}
     >
       <article
+        className="bi-fade-up"
         style={{
           background: 'var(--bg-surface)',
           border: '1px solid var(--border)',

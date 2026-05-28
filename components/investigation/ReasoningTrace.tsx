@@ -44,7 +44,7 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
     >
       {items.map((item) =>
         item.kind === 'step' ? (
-          <div key={item.id}>
+          <div key={item.id} className="bi-fade-up">
             <div
               style={{
                 display: 'flex',
@@ -79,14 +79,15 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
             </p>
           </div>
         ) : (
-          <ToolCallBlock
-            key={item.id}
-            toolName={item.toolName}
-            status={item.status}
-            durationMs={item.durationMs}
-            result={item.result}
-            error={item.error}
-          />
+          <div key={item.id} className="bi-fade-up">
+            <ToolCallBlock
+              toolName={item.toolName}
+              status={item.status}
+              durationMs={item.durationMs}
+              result={item.result}
+              error={item.error}
+            />
+          </div>
         ),
       )}
     </div>
