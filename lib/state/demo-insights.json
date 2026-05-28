@@ -21,7 +21,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A 58.3% revenue collapse in the USA wipes out roughly half your weekly income from your largest likely market — if unresolved, it signals a broken checkout, failed campaigns, or payment issues that will compound into serious cash-flow damage within days."
     },
     {
       "id": "fb0e830e-48f6-463a-a9e9-a3e120b11de7",
@@ -44,7 +45,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A 38.4% revenue collapse over seven days puts roughly $1 in every $2.60 of weekly income at risk; if unaddressed, monthly targets will be severely missed and customer lifetime value projections will need significant downward revision."
     },
     {
       "id": "a9f5f69b-e290-46b1-b343-890b43c9c3d6",
@@ -67,7 +69,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A doubling of US purchases in just seven days signals a major revenue surge—if driven by a campaign or promotion, scaling it quickly could sustain momentum, but if anomalous, urgent data validation is needed to avoid acting on inflated numbers."
     },
     {
       "id": "41c6546a-d3dc-46ad-8b71-65d9a817fca1",
@@ -90,7 +93,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A doubling of cart updates in the USA suggests significantly more customers are modifying rather than completing purchases, which could signal checkout friction or indecision — if conversion rates don't rise in parallel, this risks increased cart abandonment and lost revenue."
     },
     {
       "id": "152bce25-3e47-4d62-85ba-09073bbe857b",
@@ -113,7 +117,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A 2.7% rise in US checkouts this week translates to roughly 3–4 additional completed purchases per 100 sessions, incrementally lifting revenue and signaling healthy mid-funnel momentum worth monitoring to confirm it's sustained rather than a short-term spike."
     },
     {
       "id": "e1ab6e24-b70f-4ec1-b2cc-64e0116a5867",
@@ -136,7 +141,8 @@
           "tool": "execute_analytics_eql",
           "result": {}
         }
-      ]
+      ],
+      "impact": "A 5.7% drop in US sessions means roughly 1 in 18 American visitors is no longer engaging, directly reducing pipeline for conversions and revenue — if sustained, downstream purchase and retention metrics will follow this traffic decline."
     }
   ],
   "workspace": {
