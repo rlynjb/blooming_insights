@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAgentJson, isAnomalyArray, isDiagnosis } from '../../lib/mcp/validate';
+import { parseAgentJson, isAnomalyArray, isDiagnosis, isRecommendationArray } from '../../lib/mcp/validate';
 
 describe('parseAgentJson', () => {
   it('extracts a json array from a fenced ```json block', () => {
@@ -63,5 +63,42 @@ describe('isDiagnosis', () => {
 
   it('rejects an object where evidence is not an array', () => {
     expect(isDiagnosis({ conclusion: 'ok', evidence: 'not-an-array', hypothesesConsidered: [] })).toBe(false);
+  });
+});
+
+describe('isRecommendationArray', () => {
+  // The agent emits recommendations WITHOUT an `id` (the system assigns ids after validation).
+  const good = {
+    title: 'Send recovery email to abandoned mobile cart segment',
+    rationale: 'Mobile abandonment rose; a recovery scenario can recapture lost revenue.',
+    bloomreachFeature: 'scenario',
+    steps: ['Create a segment of mobile cart abandoners', 'Build a recovery scenario', 'Schedule the send'],
+    estimatedImpact: 'Likely recovers ~20% of mobile abandonments.',
+    confidence: 'medium',
+  };
+
+  it('accepts a well-formed (id-less) recommendation array', () => {
+    expect(isRecommendationArray([good])).toBe(true);
+  });
+
+  it('accepts an empty array', () => {
+    expect(isRecommendationArray([])).toBe(true);
+  });
+
+  it('rejects a non-array', () => {
+    expect(isRecommendationArray({})).toBe(false);
+  });
+
+  it('rejects a bad bloomreachFeature', () => {
+    expect(isRecommendationArray([{ ...good, bloomreachFeature: 'webhook' }])).toBe(false);
+  });
+
+  it('rejects a bad confidence', () => {
+    expect(isRecommendationArray([{ ...good, confidence: 'certain' }])).toBe(false);
+  });
+
+  it('rejects a missing steps field', () => {
+    const { steps: _s, ...rest } = good;
+    expect(isRecommendationArray([rest])).toBe(false);
   });
 });

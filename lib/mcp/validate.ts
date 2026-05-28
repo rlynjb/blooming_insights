@@ -1,4 +1,4 @@
-import type { Anomaly, Severity, Diagnosis } from './types';
+import type { Anomaly, Severity, Diagnosis, Recommendation } from './types';
 
 export function parseAgentJson(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -32,4 +32,22 @@ export function isDiagnosis(v: unknown): v is Diagnosis {
   return typeof d.conclusion === 'string'
     && Array.isArray(d.evidence)
     && Array.isArray(d.hypothesesConsidered);
+}
+
+const FEATURES = ['scenario', 'segment', 'campaign', 'voucher', 'experiment'];
+const CONFIDENCE = ['high', 'medium', 'low'];
+
+// The agent emits recommendations WITHOUT an `id` (the system assigns ids after
+// validation), so we validate the array of the id-less shape.
+export function isRecommendationArray(v: unknown): v is Omit<Recommendation, 'id'>[] {
+  return Array.isArray(v) && v.every((r) => {
+    const x = r as any;
+    return !!x && typeof x === 'object'
+      && typeof x.title === 'string'
+      && typeof x.rationale === 'string'
+      && FEATURES.includes(x.bloomreachFeature)
+      && Array.isArray(x.steps)
+      && typeof x.estimatedImpact === 'string'
+      && CONFIDENCE.includes(x.confidence);
+  });
 }
