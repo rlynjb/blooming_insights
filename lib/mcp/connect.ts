@@ -28,7 +28,26 @@ function mcpUrl(): URL {
   return new URL(raw.replace(/\/+$/, '')); // strip trailing slash(es) — avoids a 307
 }
 
-function redirectUri(): string {
+async function redirectUri(): Promise<string> {
+  // In production, derive the redirect from the ACTUAL request host so the OAuth
+  // callback returns to the same origin that set the session cookie — preview
+  // deployments and the production alias both work (DCR registers each host's
+  // redirect URI on the fly). Without this, opening a per-deploy URL while the
+  // callback goes to APP_ORIGIN drops the cookie → "no session". Locally we use
+  // APP_ORIGIN (http://localhost), since there's no forwarded host.
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      const { headers } = await import('next/headers');
+      const h = await headers();
+      const host = h.get('x-forwarded-host') ?? h.get('host');
+      if (host) {
+        const proto = h.get('x-forwarded-proto') ?? 'https';
+        return `${proto}://${host}/api/mcp/callback`;
+      }
+    } catch {
+      /* not in a request scope — fall through to APP_ORIGIN */
+    }
+  }
   return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
 }
 
@@ -45,7 +64,7 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
 }
 
 async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
-  const provider = new BloomreachAuthProvider(sessionId, redirectUri());
+  const provider = new BloomreachAuthProvider(sessionId, await redirectUri());
   const transport = new StreamableHTTPClientTransport(mcpUrl(), {
     authProvider: provider,
   });
@@ -90,7 +109,7 @@ async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
  */
 export async function completeAuth(sessionId: string, code: string): Promise<void> {
   await withAuthCookies(async () => {
-    const provider = new BloomreachAuthProvider(sessionId, redirectUri());
+    const provider = new BloomreachAuthProvider(sessionId, await redirectUri());
     const transport = new StreamableHTTPClientTransport(mcpUrl(), {
       authProvider: provider,
     });

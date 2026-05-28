@@ -27,7 +27,8 @@ export async function GET(req: NextRequest) {
 
   try {
     await completeAuth(sid, code);
-    return NextResponse.redirect(new URL('/debug', req.url));
+    // Land on the feed (same host as the callback, so the cookie matches).
+    return NextResponse.redirect(new URL('/', req.url));
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 401 });
   }
