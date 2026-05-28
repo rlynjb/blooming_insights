@@ -15,7 +15,13 @@
       "scope": [
         "USA"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     },
     {
       "id": "fb0e830e-48f6-463a-a9e9-a3e120b11de7",
@@ -32,7 +38,13 @@
       "scope": [
         "global"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     },
     {
       "id": "a9f5f69b-e290-46b1-b343-890b43c9c3d6",
@@ -49,7 +61,13 @@
       "scope": [
         "USA"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     },
     {
       "id": "41c6546a-d3dc-46ad-8b71-65d9a817fca1",
@@ -66,7 +84,13 @@
       "scope": [
         "USA"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     },
     {
       "id": "152bce25-3e47-4d62-85ba-09073bbe857b",
@@ -83,7 +107,13 @@
       "scope": [
         "USA"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     },
     {
       "id": "e1ab6e24-b70f-4ec1-b2cc-64e0116a5867",
@@ -100,7 +130,13 @@
       "scope": [
         "USA"
       ],
-      "source": "monitoring"
+      "source": "monitoring",
+      "evidence": [
+        {
+          "tool": "execute_analytics_eql",
+          "result": {}
+        }
+      ]
     }
   ],
   "workspace": {
