@@ -677,8 +677,10 @@ export default function HomePage() {
         </div>
       )}
 
-      {/* how the data was gathered — the monitoring agent's real tool calls */}
-      {(status === 'loaded' || status === 'empty') && traceItems.length > 0 && (
+      {/* how the data was gathered — the monitoring agent's real tool calls.
+          shown in both modes; a demo snapshot without a captured trace shows a
+          placeholder so the feature/label stays visible to judges. */}
+      {(status === 'loaded' || status === 'empty') && (
         <details
           style={{
             marginTop: 28,
@@ -697,10 +699,30 @@ export default function HomePage() {
               color: 'var(--text-secondary)',
             }}
           >
-            how this briefing was gathered · {queryCount} {queryCount === 1 ? 'query' : 'queries'}
+            how this briefing was gathered ·{' '}
+            {traceItems.length > 0
+              ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
+              : '-- queries'}
           </summary>
           <div style={{ padding: '8px 16px 18px' }}>
-            <ReasoningTrace items={traceItems} />
+            {traceItems.length > 0 ? (
+              <ReasoningTrace items={traceItems} />
+            ) : (
+              <p
+                className="lowercase"
+                style={{
+                  margin: 0,
+                  color: 'var(--text-tertiary)',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.72rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                -- the agent&apos;s query-by-query trace is recorded during a live briefing. switch
+                to live to watch the real eql it runs, or capture a live snapshot to bake it into
+                demo.
+              </p>
+            )}
           </div>
         </details>
       )}
@@ -734,7 +756,9 @@ export default function HomePage() {
         </button>
       )}
 
-      {!isDemo && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}
+      {/* shown in both modes so the "ask anything" feature is visible; inert in
+          demo (free-form Q&A runs the agents live against the workspace). */}
+      <QueryBox onSubmit={(q) => setActiveQuery(q)} disabled={isDemo} />
     </main>
   );
 }

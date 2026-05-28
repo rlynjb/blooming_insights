@@ -108,7 +108,9 @@ export default function InsightCard({ insight }: InsightCardProps) {
         { label: 'now', bar: prov.current as number, right: fmtNum(prov.current as number) },
       ]
     : [
-        { label: 'prior', bar: 100, right: '' },
+        // absolute prior/now numbers aren't in this snapshot — show "--" for the
+        // value but keep the row, so the comparison reads the same as live.
+        { label: 'prior', bar: 100, right: '--' },
         { label: 'now', bar: nowRel, right: `${arrow} ${abs}%` },
       ];
   const barMax = Math.max(...compareRows.map((r) => r.bar), 1);
@@ -243,7 +245,7 @@ export default function InsightCard({ insight }: InsightCardProps) {
             {insight.metric} · {arrow} {abs}% vs prior {humanizeBaseline(insight.change.baseline)}
             {!hasComparison && ' (relative)'}
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: prov.tools.length ? 8 : 0 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
             {compareRows.map((row) => (
               <div key={row.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span
@@ -291,18 +293,17 @@ export default function InsightCard({ insight }: InsightCardProps) {
               </div>
             ))}
           </div>
-          {prov.tools.length > 0 && (
-            <div
-              className="lowercase"
-              style={{
-                fontFamily: 'var(--font-mono), monospace',
-                fontSize: '0.68rem',
-                color: 'var(--text-tertiary)',
-              }}
-            >
-              via {prov.tools.join(', ')}
-            </div>
-          )}
+          {/* always shown so the "gathered via" label is visible in both modes */}
+          <div
+            className="lowercase"
+            style={{
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.68rem',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            via {prov.tools.length > 0 ? prov.tools.join(', ') : '--'}
+          </div>
         </div>
 
         {/* investigate affordance */}
