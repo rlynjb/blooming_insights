@@ -48,14 +48,22 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
   );
   try {
     await client.connect(transport);
-    // Bloomreach enforces ~1 request/second per user GLOBALLY (verified live:
-    // "rate limit reached ... (1 per 1 second)"). Space calls just over 1s to
-    // avoid "Too many requests". Combined with McpClient's 60s response cache,
-    // this keeps agents under the ceiling. (A retry/backoff on 429 is a Phase 2
-    // hardening follow-up.)
+    // Bloomreach rate-limits per user GLOBALLY and states the window in the
+    // error text — observed as both "(1 per 1 second)" and "(1 per 10 second)".
+    // Proactive spacing stays at ~1.1s on purpose: spacing at the full 10s
+    // window would cost ~60s for a 6-call investigation and blow the route's
+    // 60s budget (app/api/agent). Instead, McpClient parses the stated window
+    // from each 429 and waits it out on retry (see retryDelayMs/retryCeilingMs),
+    // and the 60s response cache absorbs repeats. retryDelayMs falls back to the
+    // observed 10s window when no hint is parseable.
     return {
       ok: true,
-      mcp: new McpClient(new SdkTransport(client), { minIntervalMs: 1100 }),
+      mcp: new McpClient(new SdkTransport(client), {
+        minIntervalMs: 1100,
+        retryDelayMs: 10_000,
+        retryCeilingMs: 20_000,
+        maxRetries: 3,
+      }),
     };
   } catch (err) {
     // The SDK throws (UnauthorizedError) after calling redirectToAuthorization when

@@ -47,6 +47,19 @@ Derive: purchase count & revenue change, the view→cart→checkout→purchase c
 - Multiple metrics in one query: `select count event view_item, count event cart_update in last 90 days`
 - One breakdown: `... by customer.country grouping top 5`
 
+## Common EQL errors to avoid (each one wastes a call)
+
+A syntax-error response still consumes one of your 6 tool calls, so use a known-good form on the **first** attempt.
+
+- **Always wrap a metric in `select <agg> event <name> ... in last <N> days`.** A bare metric reference fails with *"analysis type 'metric' cannot be executed directly"*.
+  - WRONG: `count event purchase in last 90 days` (no `select` wrapper)
+  - RIGHT: `select count event purchase in last 90 days`
+- **Never use a bare leading dot in a breakdown.**
+  - WRONG: `by .device` · `by .category_level_1` · `by .source` → *"Unexpected token ."*
+  - RIGHT: `by event session_start.device` (event property) or `by customer.country` (customer property)
+
+**Rule:** event properties → `event <event_name>.<property>`; customer properties → `customer.<property>`; never a bare leading dot.
+
 ## Output
 
 Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by severity (critical → warning → info → positive), wrapped in a ```json fenced block. Each item:

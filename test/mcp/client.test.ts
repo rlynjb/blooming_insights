@@ -100,11 +100,70 @@ describe('McpClient', () => {
 
   it('retries a rate-limited result then succeeds', async () => {
     let n = 0;
-    const t: McpTransport = { async callTool() { n++; return n < 3 ? { isError: true, content: [{ type: 'text', text: 'Too many requests: rate limit reached (1 per 1 second)' }] } : { isError: false, ok: true }; }, async listTools() { return { tools: [] }; } };
+    // No parseable window in the text → falls back to the (tiny) backoff base.
+    const t: McpTransport = { async callTool() { n++; return n < 3 ? { isError: true, content: [{ type: 'text', text: 'Too many requests: rate limit reached' }] } : { isError: false, ok: true }; }, async listTools() { return { tools: [] }; } };
     const c = new McpClient(t, { minIntervalMs: 0, retryDelayMs: 1 });
     const r = await c.callTool('x', {});
     expect((r.result as any).ok).toBe(true);
     expect(n).toBe(3);
+  });
+
+  it('waits the parsed retry-after window for "(1 per 10 second)", then succeeds and caches', async () => {
+    vi.useFakeTimers();
+    let n = 0;
+    let firstFailAt = 0;
+    let retryAt = 0;
+    const t: McpTransport = {
+      async callTool() {
+        n++;
+        if (n === 1) {
+          firstFailAt = Date.now();
+          return { isError: true, content: [{ type: 'text', text: 'Too many requests: rate limit reached (1 per 10 second)' }] };
+        }
+        retryAt = Date.now();
+        return { isError: false, ok: true };
+      },
+      async listTools() { return { tools: [] }; },
+    };
+    const c = new McpClient(t, { minIntervalMs: 0 }); // default retry tuning (10s window)
+    const p = c.callTool('x', {});
+    await vi.runAllTimersAsync();
+    const r = await p;
+    expect((r.result as any).ok).toBe(true);
+    expect(n).toBe(2);
+    // The retry waited at least the parsed 10s window (not the old 1.2s).
+    expect(retryAt - firstFailAt).toBeGreaterThanOrEqual(10_000);
+    // A rate-limited-then-successful call caches its success.
+    const r2 = await c.callTool('x', {});
+    expect(r2.fromCache).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('honors an explicit "Retry after ~N seconds" hint over the backoff base', async () => {
+    vi.useFakeTimers();
+    let n = 0;
+    let firstFailAt = 0;
+    let retryAt = 0;
+    const t: McpTransport = {
+      async callTool() {
+        n++;
+        if (n === 1) {
+          firstFailAt = Date.now();
+          return { isError: true, content: [{ type: 'text', text: 'rate limit reached. Retry after ~7 seconds' }] };
+        }
+        retryAt = Date.now();
+        return { isError: false, ok: true };
+      },
+      async listTools() { return { tools: [] }; },
+    };
+    const c = new McpClient(t, { minIntervalMs: 0, retryDelayMs: 60_000 });
+    const p = c.callTool('x', {});
+    await vi.runAllTimersAsync();
+    await p;
+    const waited = retryAt - firstFailAt;
+    expect(waited).toBeGreaterThanOrEqual(7_000);
+    expect(waited).toBeLessThan(8_000); // the 7s hint, not the 60s fallback base
+    vi.useRealTimers();
   });
 
   it('gives up after maxRetries and returns the error result', async () => {

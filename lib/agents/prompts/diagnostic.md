@@ -33,6 +33,19 @@ Investigate WHY a specific anomaly occurred. You are given one anomaly; your job
 - **Do NOT use a `customers matching ...` clause — it is NOT supported in this EQL flavor and wastes a call.** Segment with `by <attribute>` instead.
 - Funnels require a trailing `end`: `funnel view_item followed by purchase in last 7 days end`.
 
+## Common EQL errors to avoid (each one wastes a call)
+
+A syntax-error response still consumes one of your 6 tool calls, so use a known-good form on the **first** attempt.
+
+- **Always wrap a metric in `select <agg> event <name> ... in last <N> days`.** A bare metric reference fails with *"analysis type 'metric' cannot be executed directly"*.
+  - WRONG: `count event purchase in last 7 days` (no `select` wrapper)
+  - RIGHT: `select count event purchase in last 7 days`
+- **Never use a bare leading dot in a breakdown.** This is the most common failure when segmenting.
+  - WRONG: `by .device` · `by .category_level_1` · `by .source` → *"Unexpected token ."*
+  - RIGHT: `by event session_start.device` (event property) or `by customer.device_type` (customer property)
+
+**Rule:** event properties → `event <event_name>.<property>`; customer properties → `customer.<property>`; never a bare leading dot.
+
 ## CRITICAL: this workspace's data may be historical (not live)
 
 **If queries for recent windows (last 7 days, last 14 days) return 0 or empty results**, the data is historical and stops at some point in the past. In that case:

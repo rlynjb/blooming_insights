@@ -39,8 +39,16 @@ export const queryTools = [
   ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
 ] as const;
 
+// The exact tools the bootstrap path calls (see lib/mcp/schema.ts):
+//   resolveProject  → list_cloud_organizations, list_projects
+//   bootstrapSchema → get_event_schema, get_customer_property_schema,
+//                     list_catalogs, get_project_overview
+// `whoami`, `get_customer_schema`, and `get_mapping` were listed here
+// historically but are never called — removed to keep the list honest.
+// Cross-check every name against the live server with lib/mcp/tool-coverage.ts
+// (exposed at GET /api/mcp/tools/check).
 export const bootstrapTools = [
-  'whoami',
-  'list_projects', 'get_project_overview',
-  'get_event_schema', 'get_customer_schema', 'get_mapping',
+  'list_cloud_organizations', 'list_projects',
+  'get_event_schema', 'get_customer_property_schema',
+  'list_catalogs', 'get_project_overview',
 ] as const;
