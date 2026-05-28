@@ -49,6 +49,14 @@ export function schemaSummary(schema: WorkspaceSchema): string {
 
 const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
 
+/** Streaming hooks fired as the monitoring loop runs (used to stream live status
+ *  to the feed). All optional; mirror runAgentLoop's hook surface. */
+export interface MonitorHooks {
+  onToolCall?: (tc: ToolCall) => void;
+  onToolResult?: (tc: ToolCall) => void;
+  onText?: (t: string) => void;
+}
+
 export class MonitoringAgent {
   constructor(
     private anthropic: Anthropic,
@@ -57,7 +65,7 @@ export class MonitoringAgent {
     private allTools: McpToolDef[],
   ) {}
 
-  async scan(onToolCall?: (tc: ToolCall) => void): Promise<Anomaly[]> {
+  async scan(hooks?: MonitorHooks): Promise<Anomaly[]> {
     const system = PROMPT
       .replace('{schema}', schemaSummary(this.schema))
       .replace(/\{project_id\}/g, this.schema.projectId);
@@ -69,7 +77,9 @@ export class MonitoringAgent {
       system,
       userPrompt: 'Scan the workspace for significant recent changes and return the anomaly JSON array.',
       toolSchemas: filterToolSchemas(this.allTools, monitoringTools),
-      onToolCall,
+      onToolCall: hooks?.onToolCall,
+      onToolResult: hooks?.onToolResult,
+      onText: hooks?.onText,
       maxTurns: 8,
       maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
       synthesisInstruction:

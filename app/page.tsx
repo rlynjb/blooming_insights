@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import type { Insight } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
+import FeedStepper from '@/components/shared/FeedStepper';
 import QueryBox from '@/components/chat/QueryBox';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 
@@ -14,6 +15,16 @@ interface BriefingResponse {
     totalCustomers?: number;
   };
 }
+
+// The live briefing streams these NDJSON events (see app/api/briefing/route.ts).
+type BriefingEvent =
+  | { type: 'workspace'; workspace: BriefingResponse['workspace'] }
+  | { type: 'tool_call_start'; toolName: string; agent: string }
+  | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; error?: string }
+  | { type: 'reasoning_step'; step: { content?: string } }
+  | { type: 'insight'; insight: Insight }
+  | { type: 'done' }
+  | { type: 'error'; message?: string };
 
 /** Read a response body defensively: parse JSON when possible, otherwise return
  *  the raw text under __raw so a 500/empty/HTML body never throws on res.json(). */
@@ -39,6 +50,9 @@ export default function HomePage() {
   const [activeQuery, setActiveQuery] = useState<string | null>(null);
   // preserve the page's search params (e.g. ?demo=cached) on the query stream
   const [demoSuffix, setDemoSuffix] = useState('');
+  // live monitoring status for the top stepper (the real query the agent runs)
+  const [stepStatus, setStepStatus] = useState('');
+  const [queryCount, setQueryCount] = useState(0);
 
   // The query box runs LIVE (auth + Anthropic). On a static cached-demo deploy
   // those aren't available, so NEXT_PUBLIC_DEMO_ONLY=1 hides it. Unset locally.
@@ -61,17 +75,26 @@ export default function HomePage() {
     setDemoSuffix(carried ? `&${carried}` : '');
 
     const url = `/api/briefing${search}`;
+    let cancelled = false;
 
-    fetch(url)
-      .then(async (res) => {
-        const body = await readBody(res);
+    (async () => {
+      try {
+        const res = await fetch(url);
 
-        if (res.status === 401 && body?.needsAuth && body?.authUrl) {
-          window.location.href = body.authUrl as string;
+        // Auth + error cases come back as JSON (the route checks auth before it
+        // commits to a stream), so handle those first.
+        if (res.status === 401) {
+          const body = await readBody(res);
+          if (body?.needsAuth && body?.authUrl) {
+            window.location.href = body.authUrl as string;
+            return;
+          }
+          setErrorMessage('authentication required');
+          setStatus('error');
           return;
         }
-
         if (!res.ok) {
+          const body = await readBody(res);
           const msg =
             typeof body?.error === 'string'
               ? body.error
@@ -83,16 +106,87 @@ export default function HomePage() {
           return;
         }
 
-        const data = body as unknown as BriefingResponse;
-        const list: Insight[] = Array.isArray(data?.insights) ? data.insights : [];
-        setWorkspace(data?.workspace);
-        setInsights(list);
-        setStatus(list.length === 0 ? 'empty' : 'loaded');
-      })
-      .catch((e: unknown) => {
-        setErrorMessage(String(e));
-        setStatus('error');
-      });
+        const ct = res.headers.get('content-type') ?? '';
+
+        // Demo / snapshot path: plain JSON, no live stream.
+        if (!ct.includes('ndjson') || !res.body) {
+          const body = await readBody(res);
+          const data = body as unknown as BriefingResponse;
+          const list: Insight[] = Array.isArray(data?.insights) ? data.insights : [];
+          setWorkspace(data?.workspace);
+          setInsights(list);
+          setStatus(list.length === 0 ? 'empty' : 'loaded');
+          return;
+        }
+
+        // Live path: NDJSON stream — surface monitoring's real status as it runs.
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        const collected: Insight[] = [];
+        let buf = '';
+
+        const handle = (evt: BriefingEvent) => {
+          switch (evt.type) {
+            case 'workspace':
+              setWorkspace(evt.workspace);
+              break;
+            case 'tool_call_start':
+              setQueryCount((n) => n + 1);
+              break;
+            case 'reasoning_step':
+              if (evt.step?.content) setStepStatus(evt.step.content);
+              break;
+            case 'insight':
+              collected.push(evt.insight);
+              break;
+            case 'done':
+              setInsights(collected);
+              setStatus(collected.length === 0 ? 'empty' : 'loaded');
+              break;
+            case 'error':
+              setErrorMessage(evt.message ?? 'something went wrong');
+              setStatus('error');
+              break;
+          }
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (cancelled) {
+            await reader.cancel();
+            return;
+          }
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() ?? '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              handle(JSON.parse(line) as BriefingEvent);
+            } catch {
+              /* skip a partial/garbage line */
+            }
+          }
+        }
+        if (buf.trim()) {
+          try {
+            handle(JSON.parse(buf) as BriefingEvent);
+          } catch {
+            /* ignore trailing partial */
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setErrorMessage(String(e));
+          setStatus('error');
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
@@ -134,6 +228,14 @@ export default function HomePage() {
         )}
       </div>
 
+      {/* process stepper — monitoring runs here; the other two run on investigate */}
+      <FeedStepper
+        status={status}
+        statusText={stepStatus}
+        queryCount={queryCount}
+        insightCount={insights.length}
+      />
+
       {/* active query response — pinned above the feed */}
       {activeQuery && (
         <div style={{ marginBottom: 24 }}>
@@ -168,16 +270,6 @@ export default function HomePage() {
       {/* loading */}
       {status === 'loading' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <p
-            className="text-sm lowercase"
-            style={{
-              color: 'var(--text-tertiary)',
-              fontFamily: 'var(--font-mono), monospace',
-              marginBottom: 8,
-            }}
-          >
-            agents analyzing the workspace…
-          </p>
           <Skeleton height={96} />
           <Skeleton height={96} />
           <Skeleton height={96} />

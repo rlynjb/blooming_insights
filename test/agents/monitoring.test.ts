@@ -243,7 +243,7 @@ describe('MonitoringAgent.scan', () => {
       FAKE_TOOL_DEFS,
     );
 
-    const result = await agent.scan(onToolCall);
+    const result = await agent.scan({ onToolCall });
     expect(toolCallNames).toEqual(['execute_analytics_eql']);
     expect(onToolCall).toHaveBeenCalledTimes(1);
     expect(result[0].severity).toBe('critical');
