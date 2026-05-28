@@ -99,6 +99,11 @@ export default function HomePage() {
   const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
   // true briefly while auto-reconnecting after the alpha server revokes the token
   const [reconnecting, setReconnecting] = useState(false);
+  // dev-only single-click demo capture progress (briefing → investigations → bundle)
+  const [capturing, setCapturing] = useState<{ active: boolean; msg: string }>({
+    active: false,
+    msg: '',
+  });
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -132,6 +137,112 @@ export default function HomePage() {
     }
     setActiveQuery(null);
     setMode(next); // re-runs the briefing fetch below
+  }
+
+  // ── dev-only: capture the current LIVE briefing as the demo snapshot in ONE
+  //    click. The feed-level features (real current/prior + agent impact) come
+  //    from the briefing itself, so step 1 alone reaches feed parity; steps 2-3
+  //    run each investigation so demo card-clicks replay a real drill-down too.
+  async function postCapture(): Promise<{ ok: boolean; body: Record<string, unknown> }> {
+    const res = await fetch('/api/mcp/capture-demo', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ insights, workspace, trace: traceItems }),
+    });
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    return { ok: res.ok, body };
+  }
+
+  /** Run (or replay-from-cache) one insight's investigation to completion so it
+   *  lands in .investigation-cache.json. Drains the NDJSON stream, resolving on
+   *  the `done` event (ok) or an `error` event (with the message). */
+  async function runInvestigation(insight: Insight): Promise<{ ok: boolean; error?: string }> {
+    const url =
+      `/api/agent?insightId=${encodeURIComponent(insight.id)}` +
+      `&insight=${encodeURIComponent(JSON.stringify(insight))}`;
+    const res = await fetch(url);
+    if (!res.ok || !res.body) {
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      const err =
+        (body.error as string) ||
+        (body.needsAuth ? 'unauthorized (needs reconnect)' : `http ${res.status}`);
+      return { ok: false, error: err };
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let result: { ok: boolean; error?: string } = { ok: false, error: 'stream ended without done' };
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line) as { type?: string; message?: string };
+          if (evt.type === 'done') result = { ok: true };
+          else if (evt.type === 'error') result = { ok: false, error: String(evt.message ?? 'error') };
+        } catch {
+          /* partial line — ignore */
+        }
+      }
+    }
+    return result;
+  }
+
+  async function captureAll() {
+    if (capturing.active) return;
+    const AUTH_RE = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
+    try {
+      // 1) capture the briefing now — this alone gives feed parity (real
+      //    current/prior in evidence + the agent's business impact + the trace).
+      setCapturing({ active: true, msg: 'capturing the briefing (impact + comparison)…' });
+      const first = await postCapture();
+      if (!first.ok) {
+        window.alert(`capture failed: ${first.body.error ?? 'unknown'}`);
+        return;
+      }
+
+      // 2) run each investigation so demo card-clicks replay a real drill-down.
+      //    sequential — the MCP server is ~1 req/s; cached ones replay fast.
+      let stoppedFor = '';
+      for (let n = 0; n < insights.length; n++) {
+        const ins = insights[n];
+        setCapturing({
+          active: true,
+          msg: `investigating ${n + 1}/${insights.length} · ${ins.metric}…`,
+        });
+        const r = await runInvestigation(ins);
+        if (!r.ok && r.error && AUTH_RE.test(r.error)) {
+          stoppedFor = r.error;
+          break; // token revoked mid-run — keep what's cached, let the user resume
+        }
+        // non-auth failures: skip that one, keep going
+      }
+
+      // 3) re-capture to bundle the now-cached investigations.
+      setCapturing({ active: true, msg: 'bundling investigations…' });
+      const final = await postCapture();
+      const b = final.body;
+      const lines = [
+        final.ok
+          ? `captured ${b.insights} insights · ${b.traceItems} trace items · ${b.investigations} investigations`
+          : `capture failed: ${b.error ?? 'unknown'}`,
+        b.note ? String(b.note) : '',
+        stoppedFor
+          ? `stopped early — auth expired (${stoppedFor}). reconnect, then click capture again to finish the rest (cached ones are kept).`
+          : '',
+        final.ok ? `commit: ${((b.files as string[]) ?? []).join(', ')}` : '',
+      ].filter(Boolean);
+      window.alert(lines.join('\n'));
+    } catch (e) {
+      window.alert(`capture failed: ${String(e)}`);
+    } finally {
+      setCapturing({ active: false, msg: '' });
+    }
   }
 
   useEffect(() => {
@@ -594,42 +705,32 @@ export default function HomePage() {
         </details>
       )}
 
-      {/* dev-only: snapshot the current LIVE briefing (with provenance) as the
-          demo data — writes lib/state/demo-insights.json, then commit it. */}
+      {/* dev-only: snapshot the current LIVE briefing as the demo data in ONE
+          click — captures the briefing (impact + comparison), runs each
+          investigation, then bundles them. Writes lib/state/demo-insights.json
+          (+ demo-investigations.json); commit those. */}
       {process.env.NODE_ENV !== 'production' && !isDemo && status === 'loaded' && (
         <button
           type="button"
-          onClick={async () => {
-            try {
-              const res = await fetch('/api/mcp/capture-demo', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ insights, workspace, trace: traceItems }),
-              });
-              const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-              window.alert(
-                res.ok
-                  ? `captured ${body.insights} insights · ${body.traceItems} trace items · ${body.investigations} investigations\n${body.note ?? ''}\ncommit: ${((body.files as string[]) ?? []).join(', ')}`
-                  : `capture failed: ${body.error ?? res.status}`,
-              );
-            } catch (e) {
-              window.alert(`capture failed: ${String(e)}`);
-            }
-          }}
+          disabled={capturing.active}
+          onClick={captureAll}
           className="lowercase"
           style={{
             marginTop: 20,
             background: 'transparent',
             border: '1px dashed var(--border)',
             borderRadius: 4,
-            cursor: 'pointer',
+            cursor: capturing.active ? 'progress' : 'pointer',
             color: 'var(--text-tertiary)',
             fontFamily: 'var(--font-mono), monospace',
             fontSize: '0.72rem',
             padding: '6px 12px',
+            opacity: capturing.active ? 0.7 : 1,
           }}
         >
-          ⓘ dev · capture this as the demo snapshot
+          {capturing.active
+            ? `⏳ ${capturing.msg}`
+            : 'ⓘ dev · capture this as the demo snapshot (one click)'}
         </button>
       )}
 
