@@ -107,6 +107,27 @@ export default function DebugPage() {
     }
   }
 
+  async function resetAuth() {
+    setError('');
+    setOutput('');
+    setDurationMs(null);
+    setLoading(true);
+    try {
+      const res = await fetch('/api/mcp/reset', { method: 'POST' });
+      const body = await readBody(res);
+      if (!res.ok) {
+        setError(typeof body?.error === 'string' ? body.error : `http ${res.status}`);
+        return;
+      }
+      // auth cleared — go to the feed, which re-runs the OAuth flow on its next call
+      window.location.href = '/';
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main
       className="min-h-screen px-6 py-8 mx-auto w-full max-w-3xl"
@@ -196,6 +217,20 @@ export default function DebugPage() {
           }}
         >
           list tools
+        </button>
+        <button
+          type="button"
+          onClick={resetAuth}
+          disabled={loading}
+          className="px-4 py-2 text-sm"
+          style={{
+            background: 'var(--bg-elevated)',
+            color: 'var(--accent-coral)',
+            border: '1px solid var(--border)',
+            opacity: loading ? 0.6 : 1,
+          }}
+        >
+          reset auth
         </button>
       </div>
 

@@ -20,7 +20,9 @@ function summarizeTrace(trace: ToolCall[]) {
   }));
 }
 
-export const maxDuration = 60; // agents + ~1 req/s MCP can take a while
+// 300s = Vercel Pro's max. The monitoring agent + ~1 req/s MCP spacing can run
+// well past Hobby's 60s ceiling, so the live briefing needs the higher budget.
+export const maxDuration = 300;
 
 const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 

@@ -15,7 +15,9 @@ import { getCachedInvestigation, saveInvestigation } from '@/lib/state/investiga
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
 import type { AgentName, Anomaly, Insight } from '@/lib/mcp/types';
 
-export const maxDuration = 60;
+// 300s = Vercel Pro's max. A live investigation (diagnostic → recommendation)
+// runs ~100-115s under the ~1 req/s MCP limit; 60s (Hobby) cannot fit it.
+export const maxDuration = 300;
 
 const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 

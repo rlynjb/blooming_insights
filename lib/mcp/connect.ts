@@ -16,7 +16,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SdkTransport } from './transport';
 import { McpClient } from './client';
-import { BloomreachAuthProvider } from './auth';
+import { BloomreachAuthProvider, withAuthCookies } from './auth';
 
 export type ConnectResult =
   | { ok: true; mcp: McpClient }
@@ -38,6 +38,13 @@ function redirectUri(): string {
  * return so the caller can redirect the browser.
  */
 export async function connectMcp(sessionId: string): Promise<ConnectResult> {
+  // In production the auth store is the encrypted cookie; withAuthCookies seeds
+  // it from the request once and flushes it once (see lib/mcp/auth.ts). In
+  // dev/test it's a passthrough.
+  return withAuthCookies(() => connectMcpInner(sessionId));
+}
+
+async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
   const provider = new BloomreachAuthProvider(sessionId, redirectUri());
   const transport = new StreamableHTTPClientTransport(mcpUrl(), {
     authProvider: provider,
@@ -82,9 +89,11 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
  * then finishes auth, which persists tokens via the provider's saveTokens.
  */
 export async function completeAuth(sessionId: string, code: string): Promise<void> {
-  const provider = new BloomreachAuthProvider(sessionId, redirectUri());
-  const transport = new StreamableHTTPClientTransport(mcpUrl(), {
-    authProvider: provider,
+  await withAuthCookies(async () => {
+    const provider = new BloomreachAuthProvider(sessionId, redirectUri());
+    const transport = new StreamableHTTPClientTransport(mcpUrl(), {
+      authProvider: provider,
+    });
+    await transport.finishAuth(code);
   });
-  await transport.finishAuth(code);
 }

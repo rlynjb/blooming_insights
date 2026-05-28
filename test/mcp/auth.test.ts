@@ -6,6 +6,7 @@ import {
   clearAuth,
   consumeState,
   _clearAuthStore,
+  _authCookieCrypto,
 } from '../../lib/mcp/auth';
 
 const REDIRECT = 'http://localhost:3000/api/mcp/callback';
@@ -105,5 +106,21 @@ describe('consumeState (CSRF)', () => {
 
   it('returns true (cannot enforce) when no state was stored', () => {
     expect(consumeState('unknown-sid', 'whatever')).toBe(true);
+  });
+});
+
+describe('auth cookie crypto (production backend)', () => {
+  it('round-trips an encrypted store under AUTH_SECRET', () => {
+    process.env.AUTH_SECRET = 'test-secret-please-ignore';
+    const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
+    const token = _authCookieCrypto.encrypt(store);
+    expect(typeof token).toBe('string');
+    expect(token).not.toContain('tok'); // ciphertext, not plaintext tokens
+    expect(_authCookieCrypto.decrypt(token)).toEqual(store);
+  });
+
+  it('returns an empty store for a tampered/garbage cookie', () => {
+    process.env.AUTH_SECRET = 'test-secret-please-ignore';
+    expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
   });
 });
