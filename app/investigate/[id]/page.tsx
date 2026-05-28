@@ -353,11 +353,13 @@ export default function InvestigatePage() {
           }}
         >
           <p
-            className="text-sm lowercase"
             style={{
               color: 'var(--accent-coral)',
               fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.8rem',
               margin: '0 0 12px',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
             }}
           >
             {error}

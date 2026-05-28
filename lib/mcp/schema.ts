@@ -1,4 +1,5 @@
 import type { McpClient } from './client';
+import { McpToolError } from './client';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -129,17 +130,34 @@ export function parseWorkspaceSchema(input: {
 
 let cached: WorkspaceSchema | null = null;
 
+/** Call a bootstrap tool and surface an error envelope (`isError`) as a tagged
+ *  McpToolError carrying the server's text — otherwise `unwrap` fails later with
+ *  a cryptic JSON parse error that hides which tool returned what. */
+async function callOrThrow(
+  mcp: McpClient,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const { result } = await mcp.callTool(name, args);
+  const r = result as { isError?: boolean; content?: Array<{ text?: string }> } | null;
+  if (r && r.isError === true) {
+    const text =
+      (r.content ?? []).map((c) => c?.text).filter(Boolean).join(' ') || 'tool returned an error';
+    throw new McpToolError(name, text);
+  }
+  return result;
+}
+
 export async function resolveProject(
   mcp: McpClient,
 ): Promise<{ projectId: string; projectName: string }> {
   const orgs = unwrap<{ data: { id: string; name: string }[] }>(
-    (await mcp.callTool('list_cloud_organizations', {})).result,
+    await callOrThrow(mcp, 'list_cloud_organizations', {}),
   ).data;
   if (!orgs?.length) throw new Error('no cloud organizations for this user');
 
   const projects = unwrap<{ data: { id: string; name: string }[] }>(
-    (await mcp.callTool('list_projects', { cloud_organization_id: orgs[0].id }))
-      .result,
+    await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }),
   ).data;
   if (!projects?.length) throw new Error('no projects in organization');
 
@@ -157,12 +175,10 @@ export async function bootstrapSchema(
   const args = { project_id: projectId };
 
   // Sequential — the server allows ~1 req/s; McpClient already spaces calls.
-  const eventSchema = (await mcp.callTool('get_event_schema', args)).result;
-  const customerProps = (
-    await mcp.callTool('get_customer_property_schema', args)
-  ).result;
-  const catalogs = (await mcp.callTool('list_catalogs', args)).result;
-  const overview = (await mcp.callTool('get_project_overview', args)).result;
+  const eventSchema = await callOrThrow(mcp, 'get_event_schema', args);
+  const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
+  const catalogs = await callOrThrow(mcp, 'list_catalogs', args);
+  const overview = await callOrThrow(mcp, 'get_project_overview', args);
 
   cached = parseWorkspaceSchema({
     projectId,

@@ -179,7 +179,11 @@ export async function GET(req: NextRequest) {
         send({ type: 'done' });
         saveInvestigation(insightId!, collected);
       } catch (e) {
-        send({ type: 'error', message: e instanceof Error ? e.message : String(e) });
+        console.error('[agent] error:', e); // full stack/cause in Vercel logs
+        send({
+          type: 'error',
+          message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,
+        });
       } finally {
         controller.close();
       }

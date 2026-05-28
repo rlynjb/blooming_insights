@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { McpClient } from '../../lib/mcp/client';
+import { McpClient, McpToolError } from '../../lib/mcp/client';
 import type { McpTransport } from '../../lib/mcp/transport';
 
 function fakeTransport(impl: (name: string) => unknown): McpTransport & { calls: number } {
@@ -173,5 +173,26 @@ describe('McpClient', () => {
     const r = await c.callTool('x', {});
     expect((r.result as any).isError).toBe(true);
     expect(n).toBe(3); // 1 initial + 2 retries
+  });
+
+  it('wraps a transport throw as McpToolError tagged with the tool name + detail', async () => {
+    const t: McpTransport = {
+      async callTool() { throw new Error('Unauthorized'); },
+      async listTools() { return { tools: [] }; },
+    };
+    const c = new McpClient(t, { minIntervalMs: 0 });
+    await expect(c.callTool('list_cloud_organizations', {})).rejects.toBeInstanceOf(McpToolError);
+    await expect(c.callTool('list_cloud_organizations', {})).rejects.toThrow(
+      'list_cloud_organizations → Unauthorized',
+    );
+  });
+
+  it('includes a thrown error.cause in the detail', async () => {
+    const t: McpTransport = {
+      async callTool() { throw new Error('fetch failed', { cause: new Error('ECONNREFUSED') }); },
+      async listTools() { return { tools: [] }; },
+    };
+    const c = new McpClient(t, { minIntervalMs: 0 });
+    await expect(c.callTool('get_event_schema', {})).rejects.toThrow(/ECONNREFUSED/);
   });
 });

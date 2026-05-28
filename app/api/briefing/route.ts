@@ -113,7 +113,11 @@ export async function GET(req: NextRequest) {
 
         send({ type: 'done' });
       } catch (e) {
-        send({ type: 'error', message: e instanceof Error ? e.message : String(e) });
+        console.error('[briefing] error:', e); // full stack/cause in Vercel logs
+        send({
+          type: 'error',
+          message: `/api/briefing · ${e instanceof Error ? e.message : String(e)}`,
+        });
       } finally {
         controller.close();
       }

@@ -41,6 +41,41 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === 'string' ? v : JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/** Pull the most useful detail out of a thrown transport error (message + any
+ *  nested cause / response body), so the UI shows the real server error rather
+ *  than a flat "Unauthorized". */
+function errorDetail(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as { cause?: unknown }).cause;
+    const causeStr = cause instanceof Error ? cause.message : cause ? safeStringify(cause) : '';
+    return causeStr && causeStr !== err.message ? `${err.message} — ${causeStr}` : err.message;
+  }
+  return safeStringify(err);
+}
+
+/** A tool call that failed, tagged with the tool name + the underlying server
+ *  detail. Thrown for transport-level failures (e.g. HTTP 401 Unauthorized) and
+ *  for tool results that come back as `isError`, so callers can report exactly
+ *  which tool failed and why. */
+export class McpToolError extends Error {
+  constructor(
+    public readonly toolName: string,
+    public readonly detail: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`${toolName} → ${detail}`, options);
+    this.name = 'McpToolError';
+  }
+}
+
 export class McpClient {
   private cache = new Map<string, { result: unknown; expiresAt: number }>();
   private lastCallAt = 0;
@@ -115,9 +150,16 @@ export class McpClient {
     if (elapsed < this.minIntervalMs) {
       await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
     }
-    const result = await this.transport.callTool(name, args);
-    this.lastCallAt = Date.now();
-    return result;
+    try {
+      const result = await this.transport.callTool(name, args);
+      this.lastCallAt = Date.now();
+      return result;
+    } catch (err) {
+      this.lastCallAt = Date.now();
+      // Tag transport-level failures (e.g. a 401) with the tool name so the UI
+      // can show which call failed, not just a generic message.
+      throw new McpToolError(name, errorDetail(err), { cause: err });
+    }
   }
 
   /** List the tools the connected MCP server exposes (name, description,
