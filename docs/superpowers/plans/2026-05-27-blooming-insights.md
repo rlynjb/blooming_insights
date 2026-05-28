@@ -25,7 +25,20 @@ Phase 1 has been implemented. A few things diverged from the original plan text 
 - `lib/mcp/session.ts` — `getOrCreateSessionId()` / `readSessionId()` (cookie `bi_session`). **Phases 2+ must obtain `sessionId` from these and call `connectMcp(sessionId)`** — there is no `getSession(token)` and no bearer token threading.
 - Routes: `app/api/mcp/callback/route.ts` (handles `?error`, validates `state`), `app/api/mcp/call/route.ts` (generic tool caller used by `/debug`).
 
-**Tool listing resolved:** the `__list_tools__` placeholder used in Tasks 2.8 / 3.4 is really **`client.listTools()`** → `{ tools: [{ name, description, inputSchema }] }`. `McpClient` does not yet expose this — Phase 2 should add a `listTools()` passthrough (extend `McpTransport` + `SdkTransport`, or have `connectMcp` also return the raw `Client`). Tool calls return `{ isError, content: [{ type, text }] }`.
+**Tool listing resolved & implemented:** the `__list_tools__` placeholder is really **`client.listTools()`** → `{ tools: [{ name, title, description, inputSchema, outputSchema }] }`. This is now wired: `McpClient.listTools()` (passthrough via `McpTransport`/`SdkTransport`) + a `GET /api/mcp/tools` route + a "list tools" button on `/debug`.
+
+**MCP tool reality (verified live via listTools, 2026-05-27) — this rewrites the Phase 2 schema bootstrap:**
+- **Navigation/bootstrap chain (the spec's `bootstrapTools` was incomplete):**
+  ```
+  list_cloud_organizations   {}                         -> { data: [{ id, name }] }      (NO args; this is the real entry point)
+  list_projects              { cloud_organization_id }  -> { data: [{ id, name, category, workspace_id, workspace_name }] }
+  <all other Engagement tools> { project_id, ... }
+  ```
+  `whoami` returns only `{ client_id, scopes, email, access_token }` — it does NOT contain `cloud_organization_id`. Optional middle step: `list_workspaces({cloud_organization_id})`. Shortcut for the feed: `list_projects_with_overview({cloud_organization_id})` returns projects + KPI snapshots in one call.
+- **EVERY Engagement data tool requires `project_id` as a required input field.** So `bootstrapSchema` must resolve and cache `cloud_organization_id` + `project_id`, and **every agent must pass `project_id` on every tool call.** Put the resolved `project_id` in `WorkspaceSchema` and inject it into each agent's system prompt with an explicit instruction to pass it to every tool. (`BLOOMREACH_PROJECT_ID` env can seed/override the project selection.)
+- **Tool-name corrections for `bootstrapSchema`:** use `get_event_schema({project_id})` → `{ events: [{ type, name, source, used, properties: { default_group: { properties: [...] }}}] }`; use **`get_customer_property_schema({project_id})`** (NOT `get_customer_schema`) for customer properties → `{ properties: [{ property, type, source, used }] }`. `get_customer_schema` is the *identifier* schema (registered/cookie, hard/soft). Catalogs: `list_catalogs({project_id})` → `{ data: [{ _id, name, display_name, type }] }`.
+- **Result envelope:** tools return `{ isError, content: [{ type:'text', text }], structuredContent }`. Read **`structuredContent`** — shape `{ success: bool, data | events | properties | policies | campaigns, error: string|null }`. Phase 2 parsers should consume `structuredContent`, falling back to `JSON.parse(content[0].text)`.
+- Monitoring/diagnostic/recommendation tool subsets in `lib/mcp/tools.ts` are all valid (every listed tool exists). The analytical workhorse is `execute_analytics_eql({project_id, query})` (EQL). All tools are `readOnlyHint: true`.
 
 **Env (`.env.example`, committed):** `ANTHROPIC_API_KEY`, `BLOOMREACH_MCP_URL`, `NEXT_PUBLIC_APP_NAME`, `APP_ORIGIN`. No `BLOOMREACH_CLIENT_ID`/`PROJECT_ID` (DCR + runtime discovery).
 
