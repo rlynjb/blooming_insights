@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import type { Insight } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
+import QueryBox from '@/components/chat/QueryBox';
+import StreamingResponse from '@/components/chat/StreamingResponse';
 
 interface BriefingResponse {
   insights: Insight[];
@@ -34,9 +36,20 @@ export default function HomePage() {
   const [insights, setInsights] = useState<Insight[]>([]);
   const [workspace, setWorkspace] = useState<BriefingResponse['workspace']>(undefined);
   const [errorMessage, setErrorMessage] = useState('');
+  const [activeQuery, setActiveQuery] = useState<string | null>(null);
+  // preserve the page's search params (e.g. ?demo=cached) on the query stream
+  const [demoSuffix, setDemoSuffix] = useState('');
 
   useEffect(() => {
     const search = typeof window !== 'undefined' ? window.location.search : '';
+
+    // carry existing params (e.g. ?demo=cached) onto the query stream as an
+    // &-prefixed suffix, since the agent endpoint already takes ?q first.
+    const params = new URLSearchParams(search);
+    params.delete('q');
+    const carried = params.toString();
+    setDemoSuffix(carried ? `&${carried}` : '');
+
     const url = `/api/briefing${search}`;
 
     fetch(url)
@@ -74,7 +87,7 @@ export default function HomePage() {
 
   return (
     <main
-      className="min-h-screen px-6 py-10 mx-auto w-full max-w-2xl"
+      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-2xl"
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -110,6 +123,37 @@ export default function HomePage() {
           </p>
         )}
       </div>
+
+      {/* active query response — pinned above the feed */}
+      {activeQuery && (
+        <div style={{ marginBottom: 24 }}>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'flex-end',
+              marginBottom: 8,
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setActiveQuery(null)}
+              className="lowercase"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                padding: 0,
+                cursor: 'pointer',
+                color: 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.75rem',
+              }}
+            >
+              × clear
+            </button>
+          </div>
+          <StreamingResponse key={activeQuery} query={activeQuery} demoSuffix={demoSuffix} />
+        </div>
+      )}
 
       {/* loading */}
       {status === 'loading' && (
@@ -162,6 +206,8 @@ export default function HomePage() {
           ))}
         </div>
       )}
+
+      <QueryBox onSubmit={(q) => setActiveQuery(q)} />
     </main>
   );
 }
