@@ -322,15 +322,47 @@ export default function HomePage() {
 
       {/* error */}
       {status === 'error' && (
-        <p
-          className="text-sm lowercase"
-          style={{
-            color: 'var(--accent-coral)',
-            fontFamily: 'var(--font-mono), monospace',
-          }}
-        >
-          {errorMessage || 'something went wrong'}
-        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-start' }}>
+          <p
+            className="text-sm lowercase"
+            style={{
+              color: 'var(--accent-coral)',
+              fontFamily: 'var(--font-mono), monospace',
+              margin: 0,
+            }}
+          >
+            {/unauthor|forbidden|401|session expired/i.test(errorMessage)
+              ? 'your workspace session expired — reconnect to continue'
+              : errorMessage || 'something went wrong'}
+          </p>
+          {/unauthor|forbidden|401|session expired/i.test(errorMessage) && (
+            <button
+              type="button"
+              onClick={async () => {
+                // clear the revoked token, then reload → re-runs OAuth cleanly
+                try {
+                  await fetch('/api/mcp/reset', { method: 'POST' });
+                } catch {
+                  /* ignore — reload still triggers the auth check */
+                }
+                window.location.href = '/';
+              }}
+              className="lowercase"
+              style={{
+                background: 'var(--bg-elevated)',
+                color: 'var(--text-primary)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.8rem',
+                padding: '6px 14px',
+              }}
+            >
+              reconnect
+            </button>
+          )}
+        </div>
       )}
 
       {/* empty */}
