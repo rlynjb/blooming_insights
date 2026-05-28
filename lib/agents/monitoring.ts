@@ -73,8 +73,16 @@ export class MonitoringAgent {
       maxTurns: 10,
     });
 
-    const parsed = parseAgentJson(finalText);
-    if (!isAnomalyArray(parsed)) throw new Error('monitoring agent returned invalid anomalies');
+    let parsed: unknown;
+    try {
+      parsed = parseAgentJson(finalText);
+    } catch {
+      // Surface what the agent actually produced so failures are diagnosable.
+      const preview = finalText.trim().slice(0, 600) || '(empty — agent likely exhausted its turns without answering)';
+      throw new Error(`monitoring agent produced no parseable JSON. finalText: ${preview}`);
+    }
+    if (!isAnomalyArray(parsed))
+      throw new Error(`monitoring agent returned invalid anomalies: ${JSON.stringify(parsed).slice(0, 600)}`);
     return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
   }
 }

@@ -75,13 +75,18 @@ export async function runAgentLoop(opts: {
   const toolCalls: ToolCall[] = [];
 
   for (let turn = 0; turn < maxTurns; turn++) {
-    const res = await anthropic.messages.create({
+    // On the final allowed turn, omit tools so the model MUST return a text
+    // answer instead of another tool call — guarantees a final response rather
+    // than an empty one when the agent would otherwise keep exploring.
+    const isLastTurn = turn === maxTurns - 1;
+    const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: AGENT_MODEL,
       max_tokens: maxTokens,
       system,
-      tools: toolSchemas,
       messages,
-    } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+    };
+    if (!isLastTurn) params.tools = toolSchemas;
+    const res = await anthropic.messages.create(params);
 
     // Append assistant turn to message history
     messages.push({ role: 'assistant', content: res.content });
