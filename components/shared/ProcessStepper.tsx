@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+import Link from 'next/link';
 
 export type StepState = 'pending' | 'active' | 'complete' | 'error';
 
@@ -6,6 +7,8 @@ export interface StepInput {
   state: StepState;
   /** short status line under the label */
   sub?: string;
+  /** when set, the step becomes a link (used to jump between investigation steps) */
+  href?: string;
 }
 
 interface ProcessStepperProps {
@@ -80,7 +83,7 @@ export default function ProcessStepper({
       }}
     >
       {STEPS.map((step, i) => {
-        const { state, sub } = inputs[i];
+        const { state, sub, href } = inputs[i];
         const labelColor =
           state === 'pending'
             ? 'var(--text-tertiary)'
@@ -88,19 +91,19 @@ export default function ProcessStepper({
               ? 'var(--accent-coral)'
               : 'var(--text-primary)';
         const subColor = state === 'active' ? 'var(--text-secondary)' : 'var(--text-tertiary)';
-        return (
-          <div
-            key={step.key}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              padding: '12px 14px',
-              display: 'flex',
-              gap: 10,
-              alignItems: 'flex-start',
-              borderLeft: i > 0 ? '1px solid var(--border)' : undefined,
-            }}
-          >
+        const wrapStyle: CSSProperties = {
+          flex: 1,
+          minWidth: 0,
+          padding: '12px 14px',
+          display: 'flex',
+          gap: 10,
+          alignItems: 'flex-start',
+          borderLeft: i > 0 ? '1px solid var(--border)' : undefined,
+          textDecoration: 'none',
+          cursor: href ? 'pointer' : 'default',
+        };
+        const inner = (
+          <>
             <span
               aria-hidden
               className={state === 'active' ? 'animate-pulse' : undefined}
@@ -118,6 +121,15 @@ export default function ProcessStepper({
                 </div>
               )}
             </div>
+          </>
+        );
+        return href ? (
+          <Link key={step.key} href={href} style={wrapStyle}>
+            {inner}
+          </Link>
+        ) : (
+          <div key={step.key} style={wrapStyle}>
+            {inner}
           </div>
         );
       })}

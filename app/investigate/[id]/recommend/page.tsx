@@ -3,12 +3,12 @@
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
-import EvidencePanel from '@/components/investigation/EvidencePanel';
+import RecommendationCard from '@/components/investigation/RecommendationCard';
 import StatusLog from '@/components/shared/StatusLog';
 import { useInvestigation } from '@/lib/hooks/useInvestigation';
 import { investigationToMarkdown, downloadMarkdown } from '@/lib/export/investigationMarkdown';
 
-function BackLink({ href = '/', label = '← feed' }: { href?: string; label?: string }) {
+function BackLink({ href, label }: { href: string; label: string }) {
   return (
     <Link
       href={href}
@@ -25,32 +25,27 @@ function BackLink({ href = '/', label = '← feed' }: { href?: string; label?: s
   );
 }
 
-// STEP 2 — "investigating the issue": the diagnosis, with the agent's live
-// status/log trace in the sidebar. Recommendations live on step 3
-// (/investigate/[id]/recommend); the full diagnostic → recommendation run
-// happens here once and is stashed, so step 3 hydrates instantly.
-export default function InvestigatePage() {
+// STEP 3 — "decision & recommendation": the proposed actions, with the agent's
+// status/log trace in the sidebar. Hydrates from the stash written on step 2
+// (instant); falls back to a fetch (demo replay / live) if opened directly.
+export default function RecommendPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
   const { items, diagnosis, recommendations, complete, error } = useInvestigation(id);
 
   const streaming = !complete && !error;
-  const recsReady = complete && !error; // recs are produced during this run
-  const recommendHref = `/investigate/${id}/recommend`;
-
-  const diagState: StepState = error && !diagnosis ? 'error' : diagnosis ? 'complete' : 'active';
-  const diagSub = diagState === 'error' ? 'failed' : diagState === 'complete' ? 'cause identified' : 'testing hypotheses…';
-  const recState: StepState = error && diagnosis && !complete ? 'error' : complete ? 'complete' : diagnosis ? 'active' : 'pending';
+  const diagnosisHref = `/investigate/${id}`;
+  const recState: StepState = error ? 'error' : recommendations.length > 0 ? 'complete' : 'active';
   const recSub =
     recState === 'error'
       ? 'failed'
       : recState === 'complete'
-        ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'} ready`
-        : recState === 'active'
-          ? 'preparing…'
-          : 'awaiting diagnosis';
+        ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'}`
+        : diagnosis
+          ? 'proposing actions…'
+          : 'awaiting diagnosis…';
 
-  const canExport = (complete || diagnosis !== null) && !error;
+  const canExport = (complete || recommendations.length > 0) && !error;
 
   return (
     <main
@@ -68,7 +63,7 @@ export default function InvestigatePage() {
             marginBottom: 12,
           }}
         >
-          <BackLink />
+          <BackLink href={diagnosisHref} label="← diagnosis" />
           {canExport && (
             <button
               type="button"
@@ -111,8 +106,8 @@ export default function InvestigatePage() {
 
       <ProcessStepper
         monitoring={{ state: 'complete', sub: 'change detected', href: '/' }}
-        diagnostic={{ state: diagState, sub: diagSub }}
-        recommendation={{ state: recState, sub: recSub, href: recsReady ? recommendHref : undefined }}
+        diagnostic={{ state: 'complete', sub: 'cause identified', href: diagnosisHref }}
+        recommendation={{ state: recState, sub: recSub }}
       />
 
       {error ? (
@@ -136,56 +131,48 @@ export default function InvestigatePage() {
           >
             {error}
           </p>
-          <BackLink />
+          <BackLink href={diagnosisHref} label="← diagnosis" />
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
-          {/* ── col 1 — the diagnosis (step 2) ─────────────────────────────── */}
-          <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <EvidencePanel diagnosis={diagnosis} loading={streaming} />
+          {/* ── col 1 — the recommendations (step 3) ───────────────────────── */}
+          <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <h2
+              className="lowercase"
+              style={{
+                color: 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.7rem',
+                letterSpacing: '0.06em',
+                margin: 0,
+              }}
+            >
+              recommendations
+            </h2>
 
-            {recsReady ? (
-              <Link
-                href={recommendHref}
-                className="lowercase"
-                style={{
-                  alignSelf: 'flex-start',
-                  background: 'var(--accent-teal)',
-                  color: 'var(--bg-base)',
-                  border: 'none',
-                  borderRadius: 4,
-                  cursor: 'pointer',
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.8rem',
-                  padding: '8px 16px',
-                  textDecoration: 'none',
-                }}
+            {recommendations.length > 0 ? (
+              recommendations.map((r) => <RecommendationCard key={r.id} recommendation={r} />)
+            ) : streaming ? (
+              <p
+                className="text-sm lowercase"
+                style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: 0 }}
               >
-                see recommendations ({recommendations.length}) →
-              </Link>
+                {diagnosis ? 'proposing actions…' : 'awaiting diagnosis…'}
+              </p>
             ) : (
-              <span
-                className="lowercase"
-                style={{
-                  alignSelf: 'flex-start',
-                  background: 'var(--bg-elevated)',
-                  color: 'var(--text-tertiary)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 4,
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.8rem',
-                  padding: '8px 16px',
-                }}
+              <p
+                className="text-sm lowercase"
+                style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: 0 }}
               >
-                {diagnosis ? 'preparing recommendations…' : 'awaiting diagnosis…'}
-              </span>
+                no recommendations
+              </p>
             )}
           </div>
 
           {/* ── col 2 — live statuses / logs ───────────────────────────────── */}
           <StatusLog
             items={items}
-            title="how this was figured out"
+            title="how these were chosen"
             countLabel={items.length > 0 ? `${items.length} steps` : undefined}
             scanning={streaming}
             emptyMessage="connecting to the agent…"
