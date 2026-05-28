@@ -17,6 +17,10 @@ export interface Insight {
   // how this insight was found: the tool(s) the monitoring agent used and their
   // result (e.g. { current, prior }). Optional — older snapshots lack it.
   evidence?: { tool: string; result: unknown }[];
+  // one-sentence business impact, written by the monitoring agent (why this
+  // change matters for the business). Optional — older snapshots lack it, so
+  // the UI falls back to a derived explanation.
+  impact?: string;
 }
 
 export interface ToolCall {
@@ -44,6 +48,7 @@ export interface Anomaly {
   change: { value: number; direction: 'up' | 'down'; baseline: string };
   severity: Severity;
   evidence: { tool: string; result: unknown }[];
+  impact?: string;                          // one-sentence business impact (agent-written)
 }
 
 // Diagnostic agent output (from spec "diagnostic agent" section)

@@ -70,6 +70,7 @@ Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by severit
     "scope": ["global"],
     "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
     "severity": "critical",
+    "impact": "Revenue is the workspace's top line, so an 18% drop over the quarter is roughly $9.5k of lost sales — if the trend holds it compounds into the next period and squeezes margin.",
     "evidence": [
       { "tool": "execute_analytics_eql", "result": { "current": 42000, "prior": 51500 } }
     ]
@@ -81,6 +82,7 @@ Field rules:
 - `scope` — `["global"]` unless you located the change in a specific segment/country.
 - `change.value` — magnitude as a positive percentage; `change.direction` — `"up"` or `"down"`; `change.baseline` — e.g. `"90d"`.
 - `severity` — `"critical"` (>20% on revenue/conversion), `"warning"` (10–20% on a key metric), `"info"` (smaller but notable), `"positive"` (a genuine improvement).
+- `impact` — ONE plain-language sentence on the **business impact**: what this change means for the business and why the user should care. Be specific to this metric and magnitude (translate to revenue/customers/funnel consequences using the `current`/`prior` values where useful), and where it matters note the downstream effect if the trend continues. Do NOT just restate the percentage. ≤ ~40 words.
 - `evidence` — cite the tool calls with the `current` and `prior` values you computed.
 
 If nothing meaningful is found, return `[]`.

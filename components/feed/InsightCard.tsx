@@ -157,7 +157,9 @@ export default function InsightCard({ insight }: InsightCardProps) {
         {/* the so-what: why this matters, and why it's scoped the way it is */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '0 0 12px' }}>
           {[
-            { label: 'why it matters', text: whyItMatters(insight) },
+            // prefer the agent's business-impact sentence; fall back to the
+            // derived explanation for demo / older snapshots that lack it.
+            { label: 'why it matters', text: insight.impact?.trim() || whyItMatters(insight) },
             { label: 'scope', text: scopeExplain(insight) },
           ].map((d) => (
             <div key={d.label} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
