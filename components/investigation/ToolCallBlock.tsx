@@ -66,7 +66,8 @@ export default function ToolCallBlock({
           style={{
             color: 'var(--text-primary)',
             fontFamily: 'var(--font-mono), monospace',
-            fontSize: '0.8rem',
+            fontSize: '0.72rem',
+            wordBreak: 'break-all',
           }}
         >
           {toolName}
@@ -76,7 +77,8 @@ export default function ToolCallBlock({
             marginLeft: 'auto',
             color: error ? 'var(--accent-coral)' : 'var(--text-tertiary)',
             fontFamily: 'var(--font-mono), monospace',
-            fontSize: '0.75rem',
+            fontSize: '0.68rem',
+            flexShrink: 0,
           }}
         >
           {running ? 'running…' : error ? 'error' : `${durationMs ?? 0}ms`}

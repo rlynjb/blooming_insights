@@ -9,6 +9,7 @@ export type TraceItem =
       agent: AgentName;
       stepKind: 'thought' | 'hypothesis' | 'conclusion';
       content: string;
+      ts?: number; // when this line was recorded (epoch ms), shown as a log timestamp
     }
   | {
       kind: 'tool';
@@ -18,6 +19,7 @@ export type TraceItem =
       durationMs?: number;
       result?: unknown;
       error?: string;
+      ts?: number;
     };
 
 const stepKindColor: Record<'thought' | 'hypothesis' | 'conclusion', string> = {
@@ -25,6 +27,22 @@ const stepKindColor: Record<'thought' | 'hypothesis' | 'conclusion', string> = {
   hypothesis: 'var(--accent-amber)',
   conclusion: 'var(--accent-teal)',
 };
+
+const tsStyle = {
+  color: 'var(--text-tertiary)',
+  fontFamily: 'var(--font-mono), monospace',
+  fontSize: '0.6rem',
+  opacity: 0.65,
+} as const;
+
+function fmtTs(ts?: number): string {
+  if (!ts) return '';
+  try {
+    return new Date(ts).toLocaleTimeString([], { hour12: false });
+  } catch {
+    return '';
+  }
+}
 
 interface ReasoningTraceProps {
   items: TraceItem[];
@@ -35,11 +53,11 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
     <div
       style={{
         position: 'relative',
-        paddingLeft: 20,
+        paddingLeft: 16,
         borderLeft: '1px solid var(--border)',
         display: 'flex',
         flexDirection: 'column',
-        gap: 24,
+        gap: 14,
       }}
     >
       {items.map((item) =>
@@ -50,7 +68,7 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
-                marginBottom: 6,
+                marginBottom: 4,
                 flexWrap: 'wrap',
               }}
             >
@@ -59,18 +77,21 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
                 style={{
                   color: stepKindColor[item.stepKind],
                   fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.7rem',
+                  fontSize: '0.62rem',
                   letterSpacing: '0.04em',
                 }}
               >
                 {item.stepKind}
               </span>
+              {item.ts && (
+                <span style={{ ...tsStyle, marginLeft: 'auto' }}>{fmtTs(item.ts)}</span>
+              )}
             </div>
             <p
               style={{
                 color: 'var(--text-secondary)',
-                fontSize: '0.875rem',
-                lineHeight: 1.55,
+                fontSize: '0.75rem',
+                lineHeight: 1.5,
                 margin: 0,
                 whiteSpace: 'pre-wrap',
               }}
@@ -80,6 +101,7 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
           </div>
         ) : (
           <div key={item.id} className="bi-fade-up">
+            {item.ts && <div style={{ ...tsStyle, marginBottom: 3 }}>{fmtTs(item.ts)}</div>}
             <ToolCallBlock
               toolName={item.toolName}
               status={item.status}

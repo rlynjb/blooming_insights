@@ -75,13 +75,14 @@ export function useInvestigation(id: string | undefined): InvestigationState {
             agent: e.step.agent,
             stepKind: e.step.kind as 'thought' | 'hypothesis' | 'conclusion',
             content: e.step.content,
+            ts: Date.now(),
           };
           cItems.push(it);
           setItems((p) => [...p, it]);
           break;
         }
         case 'tool_call_start': {
-          const it: TraceItem = { kind: 'tool', id: crypto.randomUUID(), toolName: e.toolName, status: 'running' };
+          const it: TraceItem = { kind: 'tool', id: crypto.randomUUID(), toolName: e.toolName, status: 'running', ts: Date.now() };
           cItems.push(it);
           setItems((p) => [...p, it]);
           break;

@@ -161,14 +161,14 @@ export default function InsightCard({ insight }: InsightCardProps) {
           {[
             // prefer the agent's business-impact sentence; fall back to the
             // derived explanation for demo / older snapshots that lack it.
-            { label: 'why it matters', text: insight.impact?.trim() || whyItMatters(insight) },
+            { label: 'business impact', text: insight.impact?.trim() || whyItMatters(insight) },
             { label: 'scope', text: scopeExplain(insight) },
           ].map((d) => (
             <div key={d.label} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
               <span
                 style={{
                   flexShrink: 0,
-                  width: 86,
+                  width: 100,
                   fontFamily: 'var(--font-mono), monospace',
                   fontSize: '0.62rem',
                   letterSpacing: '0.04em',

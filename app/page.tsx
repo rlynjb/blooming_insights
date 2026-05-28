@@ -322,7 +322,7 @@ export default function HomePage() {
               setQueryCount((n) => n + 1);
               setTraceItems((prev) => [
                 ...prev,
-                { kind: 'tool', id: crypto.randomUUID(), toolName: evt.toolName, status: 'running' },
+                { kind: 'tool', id: crypto.randomUUID(), toolName: evt.toolName, status: 'running', ts: Date.now() },
               ]);
               break;
             case 'reasoning_step': {
@@ -338,6 +338,7 @@ export default function HomePage() {
                     agent: 'monitoring',
                     stepKind: (step.kind as 'thought' | 'hypothesis' | 'conclusion') ?? 'thought',
                     content,
+                    ts: Date.now(),
                   },
                 ]);
               }
