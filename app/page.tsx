@@ -97,6 +97,8 @@ export default function HomePage() {
   const [queryCount, setQueryCount] = useState(0);
   // the monitoring agent's gathering trace (tool calls + thoughts) for provenance
   const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
+  // true briefly while auto-reconnecting after the alpha server revokes the token
+  const [reconnecting, setReconnecting] = useState(false);
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -255,12 +257,49 @@ export default function HomePage() {
             case 'done':
               setInsights(collected);
               stashInsights(collected);
+              try {
+                sessionStorage.removeItem('bi:reconnecting');
+              } catch {
+                /* ignore */
+              }
               setStatus(collected.length === 0 ? 'empty' : 'loaded');
               break;
-            case 'error':
-              setErrorMessage(evt.message ?? 'something went wrong');
+            case 'error': {
+              const msg = evt.message ?? 'something went wrong';
+              // The alpha server revokes tokens after a few minutes; its own 401
+              // says to clear tokens and reconnect ("the client should
+              // automatically re-register and obtain new tokens"). Do that ONCE
+              // automatically — guarded so it can't loop if the fresh token is
+              // also immediately revoked.
+              if (/invalid_token|unauthor|forbidden|401|session expired|reconnect/i.test(msg)) {
+                let alreadyTried = false;
+                try {
+                  alreadyTried = sessionStorage.getItem('bi:reconnecting') === '1';
+                } catch {
+                  /* ignore */
+                }
+                if (!alreadyTried) {
+                  try {
+                    sessionStorage.setItem('bi:reconnecting', '1');
+                  } catch {
+                    /* ignore */
+                  }
+                  setReconnecting(true);
+                  fetch('/api/mcp/reset', { method: 'POST' }).finally(() => {
+                    window.location.href = '/';
+                  });
+                  return;
+                }
+                try {
+                  sessionStorage.removeItem('bi:reconnecting');
+                } catch {
+                  /* ignore */
+                }
+              }
+              setErrorMessage(msg);
               setStatus('error');
               break;
+            }
           }
         };
 
@@ -426,8 +465,22 @@ export default function HomePage() {
         </div>
       )}
 
+      {/* auto-reconnecting after a revoked token (brief, before the redirect) */}
+      {reconnecting && (
+        <p
+          className="lowercase"
+          style={{
+            color: 'var(--accent-amber)',
+            fontFamily: 'var(--font-mono), monospace',
+            fontSize: '0.8rem',
+          }}
+        >
+          session expired — reconnecting to bloomreach…
+        </p>
+      )}
+
       {/* loading */}
-      {status === 'loading' && (
+      {status === 'loading' && !reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <Skeleton height={96} />
           <Skeleton height={96} />
