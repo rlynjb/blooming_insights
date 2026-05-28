@@ -455,7 +455,7 @@ export default function HomePage() {
 
   return (
     <main
-      className={`min-h-screen px-6 py-10 ${isDemo ? 'pb-10' : 'pb-28'} mx-auto w-full max-w-2xl`}
+      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-2xl"
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -544,6 +544,57 @@ export default function HomePage() {
         diagnostic={{ state: 'pending', sub: 'opens when you investigate' }}
         recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
       />
+
+      {/* how the data was gathered — the monitoring agent's real tool calls.
+          pinned near the top (above the feed) so the fixed query box can't
+          overlap it. shown in both modes; a demo snapshot without a captured
+          trace shows a placeholder so the feature/label stays visible. */}
+      {(status === 'loaded' || status === 'empty') && (
+        <details
+          style={{
+            marginBottom: 24,
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--bg-elevated)',
+          }}
+        >
+          <summary
+            className="lowercase"
+            style={{
+              cursor: 'pointer',
+              padding: '12px 16px',
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.72rem',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            how this briefing was gathered ·{' '}
+            {traceItems.length > 0
+              ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
+              : '-- queries'}
+          </summary>
+          <div style={{ padding: '8px 16px 18px' }}>
+            {traceItems.length > 0 ? (
+              <ReasoningTrace items={traceItems} />
+            ) : (
+              <p
+                className="lowercase"
+                style={{
+                  margin: 0,
+                  color: 'var(--text-tertiary)',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.72rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                -- the agent&apos;s query-by-query trace is recorded during a live briefing. switch
+                to live to watch the real eql it runs, or capture a live snapshot to bake it into
+                demo.
+              </p>
+            )}
+          </div>
+        </details>
+      )}
 
       {/* active query response — pinned above the feed */}
       {activeQuery && (
@@ -675,56 +726,6 @@ export default function HomePage() {
             <InsightCard key={insight.id} insight={insight} />
           ))}
         </div>
-      )}
-
-      {/* how the data was gathered — the monitoring agent's real tool calls.
-          shown in both modes; a demo snapshot without a captured trace shows a
-          placeholder so the feature/label stays visible to judges. */}
-      {(status === 'loaded' || status === 'empty') && (
-        <details
-          style={{
-            marginTop: 28,
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-            background: 'var(--bg-elevated)',
-          }}
-        >
-          <summary
-            className="lowercase"
-            style={{
-              cursor: 'pointer',
-              padding: '12px 16px',
-              fontFamily: 'var(--font-mono), monospace',
-              fontSize: '0.72rem',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            how this briefing was gathered ·{' '}
-            {traceItems.length > 0
-              ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
-              : '-- queries'}
-          </summary>
-          <div style={{ padding: '8px 16px 18px' }}>
-            {traceItems.length > 0 ? (
-              <ReasoningTrace items={traceItems} />
-            ) : (
-              <p
-                className="lowercase"
-                style={{
-                  margin: 0,
-                  color: 'var(--text-tertiary)',
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.72rem',
-                  lineHeight: 1.5,
-                }}
-              >
-                -- the agent&apos;s query-by-query trace is recorded during a live briefing. switch
-                to live to watch the real eql it runs, or capture a live snapshot to bake it into
-                demo.
-              </p>
-            )}
-          </div>
-        </details>
       )}
 
       {/* dev-only: snapshot the current LIVE briefing as the demo data in ONE
