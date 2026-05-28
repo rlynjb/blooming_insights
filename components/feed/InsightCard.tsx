@@ -18,6 +18,12 @@ function fmtNum(n: number): string {
   return n.toLocaleString();
 }
 
+/** "90d" → "90 days", "7d" → "7 days", else the raw baseline. */
+function humanizeBaseline(b: string): string {
+  const m = b.match(/^(\d+)\s*d$/i);
+  return m ? `${m[1]} days` : b;
+}
+
 /** Pull the provenance the monitoring agent recorded for this insight: which
  *  tool(s) ran, and the current vs prior values behind the change (when the
  *  evidence carries them). */
@@ -40,9 +46,26 @@ function readEvidence(insight: Insight): { tools: string[]; current?: number; pr
 export default function InsightCard({ insight }: InsightCardProps) {
   const prov = readEvidence(insight);
   const hasComparison = prov.current !== undefined && prov.prior !== undefined;
-  const cmax = Math.max(prov.current ?? 0, prov.prior ?? 0, 1);
   const dirColor =
     insight.change.direction === 'down' ? 'var(--accent-coral)' : 'var(--accent-teal)';
+  const abs = Math.abs(insight.change.value);
+  const arrow = insight.change.direction === 'down' ? '▼' : '▲';
+
+  // Two rows for a prior → now comparison. Real absolute values when the
+  // evidence carries them (live / captured); otherwise index prior to 100 and
+  // derive `now` from the real % change, so demo still shows a before/after
+  // rather than a lone progress bar.
+  const nowRel = Math.max(100 + (insight.change.direction === 'up' ? abs : -abs), 0);
+  const compareRows = hasComparison
+    ? [
+        { label: 'prior', bar: prov.prior as number, right: fmtNum(prov.prior as number) },
+        { label: 'now', bar: prov.current as number, right: fmtNum(prov.current as number) },
+      ]
+    : [
+        { label: 'prior', bar: 100, right: '' },
+        { label: 'now', bar: nowRel, right: `${arrow} ${abs}%` },
+      ];
+  const barMax = Math.max(...compareRows.map((r) => r.bar), 1);
 
   return (
     <Link
@@ -123,122 +146,71 @@ export default function InsightCard({ insight }: InsightCardProps) {
           </span>
         </div>
 
-        {/* provenance: how this item came about — comparison + tool(s) used.
-            current vs prior when the evidence carries it (live / captured),
-            else the real % change (demo snapshot). */}
+        {/* provenance: how this item came about — a prior → now comparison and
+            the tool(s) used. Absolute values when the evidence carries them
+            (live / captured); otherwise indexed from the real % change (demo). */}
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
-          {hasComparison ? (
-            <div
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 6,
-                marginBottom: prov.tools.length ? 8 : 0,
-              }}
-            >
-              {[
-                { label: 'prior', value: prov.prior as number, color: 'var(--text-tertiary)' },
-                { label: 'now', value: prov.current as number, color: dirColor },
-              ].map((row) => (
-                <div key={row.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span
-                    className="lowercase"
-                    style={{
-                      width: 38,
-                      flexShrink: 0,
-                      fontFamily: 'var(--font-mono), monospace',
-                      fontSize: '0.68rem',
-                      color: 'var(--text-tertiary)',
-                    }}
-                  >
-                    {row.label}
-                  </span>
-                  <div
-                    style={{
-                      flex: 1,
-                      height: 10,
-                      background: 'var(--bg-elevated)',
-                      borderRadius: 2,
-                      overflow: 'hidden',
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: `${Math.max((row.value / cmax) * 100, 2)}%`,
-                        height: '100%',
-                        background: row.color,
-                        borderRadius: 2,
-                      }}
-                    />
-                  </div>
-                  <span
-                    style={{
-                      width: 92,
-                      flexShrink: 0,
-                      textAlign: 'right',
-                      fontFamily: 'var(--font-mono), monospace',
-                      fontSize: '0.7rem',
-                      color: 'var(--text-secondary)',
-                    }}
-                  >
-                    {fmtNum(row.value)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                marginBottom: prov.tools.length ? 8 : 0,
-              }}
-            >
-              <span
-                className="lowercase"
-                style={{
-                  width: 38,
-                  flexShrink: 0,
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.68rem',
-                  color: 'var(--text-tertiary)',
-                }}
-              >
-                change
-              </span>
-              <div
-                style={{
-                  flex: 1,
-                  height: 10,
-                  background: 'var(--bg-elevated)',
-                  borderRadius: 2,
-                  overflow: 'hidden',
-                }}
-              >
+          <div
+            className="lowercase"
+            style={{
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.65rem',
+              letterSpacing: '0.04em',
+              color: 'var(--text-tertiary)',
+              marginBottom: 8,
+            }}
+          >
+            {insight.metric} · {arrow} {abs}% vs prior {humanizeBaseline(insight.change.baseline)}
+            {!hasComparison && ' (relative)'}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: prov.tools.length ? 8 : 0 }}>
+            {compareRows.map((row) => (
+              <div key={row.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span
+                  className="lowercase"
+                  style={{
+                    width: 38,
+                    flexShrink: 0,
+                    fontFamily: 'var(--font-mono), monospace',
+                    fontSize: '0.68rem',
+                    color: 'var(--text-tertiary)',
+                  }}
+                >
+                  {row.label}
+                </span>
                 <div
                   style={{
-                    width: `${Math.min(Math.abs(insight.change.value), 100)}%`,
-                    height: '100%',
-                    background: dirColor,
+                    flex: 1,
+                    height: 10,
+                    background: 'var(--bg-elevated)',
                     borderRadius: 2,
+                    overflow: 'hidden',
                   }}
-                />
+                >
+                  <div
+                    style={{
+                      width: `${Math.max((row.bar / barMax) * 100, 2)}%`,
+                      height: '100%',
+                      background: row.label === 'now' ? dirColor : 'var(--text-tertiary)',
+                      borderRadius: 2,
+                    }}
+                  />
+                </div>
+                <span
+                  style={{
+                    width: 92,
+                    flexShrink: 0,
+                    textAlign: 'right',
+                    fontFamily: 'var(--font-mono), monospace',
+                    fontSize: '0.7rem',
+                    color: row.label === 'now' ? dirColor : 'var(--text-secondary)',
+                  }}
+                >
+                  {row.right}
+                </span>
               </div>
-              <span
-                style={{
-                  width: 92,
-                  flexShrink: 0,
-                  textAlign: 'right',
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.7rem',
-                  color: dirColor,
-                }}
-              >
-                {insight.change.direction === 'down' ? '▼' : '▲'} {Math.abs(insight.change.value)}%
-              </span>
-            </div>
-          )}
+            ))}
+          </div>
           {prov.tools.length > 0 && (
             <div
               className="lowercase"
