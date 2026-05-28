@@ -32,6 +32,12 @@ function describeToolCall(tc: ToolCall): string {
   return text.length > 120 ? `${text.slice(0, 117)}…` : text;
 }
 
+const TRUNC = 4000;
+function trunc(v: unknown): unknown {
+  const s = JSON.stringify(v);
+  return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
+}
+
 export async function GET(req: NextRequest) {
   const demo = req.nextUrl.searchParams.get('demo') === 'cached';
 
@@ -100,6 +106,7 @@ export async function GET(req: NextRequest) {
               toolName: tc.toolName,
               agent: 'monitoring',
               durationMs: tc.durationMs ?? 0,
+              result: trunc(tc.result), // surfaced in the feed's "how it was gathered" trace
               error: tc.error,
             }),
           onText: (t) => {

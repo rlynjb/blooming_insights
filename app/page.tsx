@@ -5,6 +5,8 @@ import type { Insight } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
+import ChangeChart from '@/components/feed/ChangeChart';
+import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import QueryBox from '@/components/chat/QueryBox';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 
@@ -14,14 +16,16 @@ interface BriefingResponse {
     projectName?: string;
     totalCustomers?: number;
   };
+  // present when a cached snapshot bundles the gathering trace (forward-compat)
+  trace?: TraceItem[];
 }
 
 // The live briefing streams these NDJSON events (see app/api/briefing/route.ts).
 type BriefingEvent =
   | { type: 'workspace'; workspace: BriefingResponse['workspace'] }
   | { type: 'tool_call_start'; toolName: string; agent: string }
-  | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; error?: string }
-  | { type: 'reasoning_step'; step: { content?: string } }
+  | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; result?: unknown; error?: string }
+  | { type: 'reasoning_step'; step: { id?: string; kind?: string; content?: string } }
   | { type: 'insight'; insight: Insight }
   | { type: 'done' }
   | { type: 'error'; message?: string };
@@ -92,6 +96,8 @@ export default function HomePage() {
   // live monitoring status for the top stepper (the real query the agent runs)
   const [stepStatus, setStepStatus] = useState('');
   const [queryCount, setQueryCount] = useState(0);
+  // the monitoring agent's gathering trace (tool calls + thoughts) for provenance
+  const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -140,6 +146,7 @@ export default function HomePage() {
     setInsights([]);
     setStepStatus('');
     setQueryCount(0);
+    setTraceItems([]);
 
     const url = `/api/briefing${search}`;
     let cancelled = false;
@@ -183,6 +190,7 @@ export default function HomePage() {
           setWorkspace(data?.workspace);
           setInsights(list);
           stashInsights(list);
+          if (Array.isArray(data?.trace)) setTraceItems(data.trace);
           setStatus(list.length === 0 ? 'empty' : 'loaded');
           return;
         }
@@ -200,9 +208,47 @@ export default function HomePage() {
               break;
             case 'tool_call_start':
               setQueryCount((n) => n + 1);
+              setTraceItems((prev) => [
+                ...prev,
+                { kind: 'tool', id: crypto.randomUUID(), toolName: evt.toolName, status: 'running' },
+              ]);
               break;
-            case 'reasoning_step':
-              if (evt.step?.content) setStepStatus(evt.step.content);
+            case 'reasoning_step': {
+              const step = evt.step;
+              const content = step?.content;
+              if (content) {
+                setStepStatus(content);
+                setTraceItems((prev) => [
+                  ...prev,
+                  {
+                    kind: 'step',
+                    id: step.id ?? crypto.randomUUID(),
+                    agent: 'monitoring',
+                    stepKind: (step.kind as 'thought' | 'hypothesis' | 'conclusion') ?? 'thought',
+                    content,
+                  },
+                ]);
+              }
+              break;
+            }
+            case 'tool_call_end':
+              setTraceItems((prev) => {
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  const it = next[i];
+                  if (it.kind === 'tool' && it.toolName === evt.toolName && it.status === 'running') {
+                    next[i] = {
+                      ...it,
+                      status: 'done',
+                      durationMs: evt.durationMs,
+                      result: evt.result,
+                      error: evt.error,
+                    };
+                    break;
+                  }
+                }
+                return next;
+              });
               break;
             case 'insight':
               collected.push(evt.insight);
@@ -459,13 +505,44 @@ export default function HomePage() {
         </p>
       )}
 
-      {/* loaded */}
+      {/* loaded — comparison chart + the insight cards */}
       {status === 'loaded' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-          {insights.map((insight) => (
-            <InsightCard key={insight.id} insight={insight} />
-          ))}
-        </div>
+        <>
+          <ChangeChart insights={insights} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {insights.map((insight) => (
+              <InsightCard key={insight.id} insight={insight} />
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* how the data was gathered — the monitoring agent's real tool calls */}
+      {(status === 'loaded' || status === 'empty') && traceItems.length > 0 && (
+        <details
+          style={{
+            marginTop: 28,
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--bg-elevated)',
+          }}
+        >
+          <summary
+            className="lowercase"
+            style={{
+              cursor: 'pointer',
+              padding: '12px 16px',
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.72rem',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            how this briefing was gathered · {queryCount} {queryCount === 1 ? 'query' : 'queries'}
+          </summary>
+          <div style={{ padding: '8px 16px 18px' }}>
+            <ReasoningTrace items={traceItems} />
+          </div>
+        </details>
       )}
 
       {!isDemo && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}
