@@ -6,6 +6,7 @@ import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
 import { bootstrapSchema } from '@/lib/mcp/schema';
 import { DiagnosticAgent } from '@/lib/agents/diagnostic';
+import { RecommendationAgent } from '@/lib/agents/recommendation';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { getAnomaly, getInsight } from '@/lib/state/insights';
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
@@ -64,35 +65,47 @@ export async function GET(req: NextRequest) {
     ? ((rawTools as { tools: McpToolDef[] }).tools)
     : [];
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const agent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (e: AgentEvent) => controller.enqueue(encoder.encode(encodeEvent(e)));
-      const step = (kind: 'thought' | 'hypothesis' | 'conclusion', content: string) =>
-        send({ type: 'reasoning_step', step: { id: crypto.randomUUID(), agent: 'diagnostic', kind, content } });
+      const stepFor = (
+        agent: 'diagnostic' | 'recommendation',
+        kind: 'thought' | 'hypothesis' | 'conclusion',
+        content: string,
+      ) => send({ type: 'reasoning_step', step: { id: crypto.randomUUID(), agent, kind, content } });
+      const hooksFor = (agent: 'diagnostic' | 'recommendation') => ({
+        onText: (t: string) => {
+          if (t.trim()) stepFor(agent, 'thought', t);
+        },
+        onToolCall: (tc: import('@/lib/mcp/types').ToolCall) =>
+          send({ type: 'tool_call_start', toolName: tc.toolName, agent }),
+        onToolResult: (tc: import('@/lib/mcp/types').ToolCall) =>
+          send({
+            type: 'tool_call_end',
+            toolName: tc.toolName,
+            agent,
+            durationMs: tc.durationMs ?? 0,
+            result: trunc(tc.result),
+            error: tc.error,
+          }),
+      });
       try {
-        step(
+        stepFor(
+          'diagnostic',
           'thought',
           `investigating "${anomaly.metric}" (${anomaly.change.direction} ${anomaly.change.value}% vs ${anomaly.change.baseline})…`,
         );
-        const diagnosis = await agent.investigate(anomaly, {
-          onText: (t) => {
-            if (t.trim()) step('thought', t);
-          },
-          onToolCall: (tc) => send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'diagnostic' }),
-          onToolResult: (tc) =>
-            send({
-              type: 'tool_call_end',
-              toolName: tc.toolName,
-              agent: 'diagnostic',
-              durationMs: tc.durationMs ?? 0,
-              result: trunc(tc.result),
-              error: tc.error,
-            }),
-        });
+        const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+        const diagnosis = await diagAgent.investigate(anomaly, hooksFor('diagnostic'));
         send({ type: 'diagnosis', diagnosis });
+
+        stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
+        const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+        const recommendations = await recAgent.propose(anomaly, diagnosis, hooksFor('recommendation'));
+        for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+
         send({ type: 'done' });
       } catch (e) {
         send({ type: 'error', message: e instanceof Error ? e.message : String(e) });

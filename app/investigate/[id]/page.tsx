@@ -4,9 +4,10 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { AgentEvent } from '@/lib/mcp/events';
-import type { Diagnosis } from '@/lib/mcp/types';
+import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import EvidencePanel from '@/components/investigation/EvidencePanel';
+import RecommendationCard from '@/components/investigation/RecommendationCard';
 
 function BackLink() {
   return (
@@ -31,6 +32,7 @@ export default function InvestigatePage() {
 
   const [items, setItems] = useState<TraceItem[]>([]);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
+  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [complete, setComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const startedRef = useRef(false);
@@ -90,6 +92,9 @@ export default function InvestigatePage() {
           break;
         case 'diagnosis':
           setDiagnosis(e.diagnosis);
+          break;
+        case 'recommendation':
+          setRecommendations((prev) => [...prev, e.recommendation]);
           break;
         case 'done':
           setComplete(true);
@@ -265,28 +270,50 @@ export default function InvestigatePage() {
             )}
           </div>
 
-          {/* right: evidence + recommendations placeholder */}
+          {/* right: evidence + recommendations */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <EvidencePanel diagnosis={diagnosis} loading={streaming} />
-            <div
-              style={{
-                background: 'var(--bg-surface)',
-                border: '1px dashed var(--border)',
-                borderRadius: 4,
-                padding: '16px 20px',
-              }}
-            >
-              <p
-                className="text-sm lowercase"
+
+            <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <h2
+                className="lowercase"
                 style={{
                   color: 'var(--text-tertiary)',
                   fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.7rem',
+                  letterSpacing: '0.06em',
                   margin: 0,
                 }}
               >
-                recommendations — coming in phase 4
-              </p>
-            </div>
+                recommendations
+              </h2>
+
+              {recommendations.length > 0 ? (
+                recommendations.map((r) => <RecommendationCard key={r.id} recommendation={r} />)
+              ) : streaming ? (
+                <p
+                  className="text-sm lowercase"
+                  style={{
+                    color: 'var(--text-tertiary)',
+                    fontFamily: 'var(--font-mono), monospace',
+                    margin: 0,
+                  }}
+                >
+                  {diagnosis ? 'proposing actions…' : 'awaiting diagnosis…'}
+                </p>
+              ) : (
+                <p
+                  className="text-sm lowercase"
+                  style={{
+                    color: 'var(--text-tertiary)',
+                    fontFamily: 'var(--font-mono), monospace',
+                    margin: 0,
+                  }}
+                >
+                  no recommendations
+                </p>
+              )}
+            </section>
           </div>
         </div>
       )}
