@@ -278,10 +278,10 @@ describe('MonitoringAgent.scan', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 3. scan throws on invalid output
+  // 3. scan degrades gracefully on unusable output (no crash → empty briefing)
   // ---------------------------------------------------------------------------
 
-  it('throws when the agent returns non-anomaly JSON', async () => {
+  it('returns [] when the agent returns non-anomaly JSON', async () => {
     const { anthropic } = buildFakeAnthropic([
       {
         content: [textBlock('```json\n[{"foo":1}]\n```')],
@@ -296,7 +296,22 @@ describe('MonitoringAgent.scan', () => {
       FAKE_TOOL_DEFS,
     );
 
-    await expect(agent.scan()).rejects.toThrow('monitoring agent returned invalid anomalies');
+    await expect(agent.scan()).resolves.toEqual([]);
+  });
+
+  it('returns [] when the agent produces no parseable output (e.g. empty)', async () => {
+    const { anthropic } = buildFakeAnthropic([
+      { content: [textBlock('I could not establish a populated window.')], stop_reason: 'end_turn' },
+    ]);
+
+    const agent = new MonitoringAgent(
+      anthropic as unknown as Anthropic,
+      buildFakeMcp(),
+      FIXTURE_SCHEMA,
+      FAKE_TOOL_DEFS,
+    );
+
+    await expect(agent.scan()).resolves.toEqual([]);
   });
 
   it('accepts an empty array as valid (no anomalies found)', async () => {

@@ -249,4 +249,34 @@ describe('runAgentLoop', () => {
     expect(result.finalText).toBe('');
     expect(callCount()).toBe(2);
   });
+
+  // -------------------------------------------------------------------------
+  // 5. Forces a final answer once maxToolCalls is reached
+  // -------------------------------------------------------------------------
+  it('omits tools and forces a final answer once maxToolCalls is reached', async () => {
+    const { anthropic, callCount } = buildFakeAnthropic([
+      { content: [toolUseBlock('tu5', 'get_project_overview', { project_id: 'z' })], stop_reason: 'tool_use' },
+      { content: [textBlock('final after budget')], stop_reason: 'end_turn' },
+    ]);
+    const mcp = buildFakeMcp(async () => ({ ok: true }));
+
+    const result = await runAgentLoop({
+      anthropic: anthropic as unknown as Anthropic,
+      mcp,
+      agent: 'monitoring',
+      system: 's',
+      userPrompt: 'go',
+      toolSchemas: fakeToolSchemas,
+      maxToolCalls: 1,
+      maxTurns: 8,
+    });
+
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.finalText).toContain('final after budget');
+    expect(callCount()).toBe(2);
+    // turn 1 offered tools; turn 2 (budget spent) must omit them
+    const calls = (anthropic as { messages: { create: { mock: { calls: { 0: { tools?: unknown } }[] } } } }).messages.create.mock.calls;
+    expect(calls[0][0].tools).toBeDefined();
+    expect(calls[1][0].tools).toBeUndefined();
+  });
 });

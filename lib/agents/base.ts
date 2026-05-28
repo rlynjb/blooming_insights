@@ -55,6 +55,7 @@ export async function runAgentLoop(opts: {
   onToolCall?: (tc: ToolCall) => void;
   maxTurns?: number;
   maxTokens?: number;
+  maxToolCalls?: number; // hard cap on total tool calls; once hit, the model is forced to synthesize
 }): Promise<AgentRunResult> {
   const {
     anthropic,
@@ -66,6 +67,7 @@ export async function runAgentLoop(opts: {
     onToolCall,
     maxTurns = 8,
     maxTokens = 4096,
+    maxToolCalls,
   } = opts;
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -75,17 +77,19 @@ export async function runAgentLoop(opts: {
   const toolCalls: ToolCall[] = [];
 
   for (let turn = 0; turn < maxTurns; turn++) {
-    // On the final allowed turn, omit tools so the model MUST return a text
-    // answer instead of another tool call — guarantees a final response rather
-    // than an empty one when the agent would otherwise keep exploring.
-    const isLastTurn = turn === maxTurns - 1;
+    // Omit tools when the model must now produce a final answer instead of
+    // another tool call — guarantees a non-empty response and bounds latency:
+    //   - on the final allowed turn, or
+    //   - once the hard tool-call budget (maxToolCalls) is reached.
+    const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+    const forceFinal = turn === maxTurns - 1 || budgetSpent;
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: AGENT_MODEL,
       max_tokens: maxTokens,
       system,
       messages,
     };
-    if (!isLastTurn) params.tools = toolSchemas;
+    if (!forceFinal) params.tools = toolSchemas;
     const res = await anthropic.messages.create(params);
 
     // Append assistant turn to message history

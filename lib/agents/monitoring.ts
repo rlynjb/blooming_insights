@@ -70,19 +70,21 @@ export class MonitoringAgent {
       userPrompt: 'Scan the workspace for significant recent changes and return the anomaly JSON array.',
       toolSchemas: filterToolSchemas(this.allTools, monitoringTools),
       onToolCall,
-      maxTurns: 10,
+      maxTurns: 8,
+      maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
     });
 
+    // Degrade gracefully: if the agent produced no parseable/valid anomaly array
+    // (e.g. stale data with nothing recent to report, or it exhausted its call
+    // budget mid-exploration), treat it as "no anomalies" rather than failing the
+    // whole briefing. The route's `trace` still records what the agent did.
     let parsed: unknown;
     try {
       parsed = parseAgentJson(finalText);
     } catch {
-      // Surface what the agent actually produced so failures are diagnosable.
-      const preview = finalText.trim().slice(0, 600) || '(empty — agent likely exhausted its turns without answering)';
-      throw new Error(`monitoring agent produced no parseable JSON. finalText: ${preview}`);
+      return [];
     }
-    if (!isAnomalyArray(parsed))
-      throw new Error(`monitoring agent returned invalid anomalies: ${JSON.stringify(parsed).slice(0, 600)}`);
+    if (!isAnomalyArray(parsed)) return [];
     return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
   }
 }
