@@ -1,0 +1,111 @@
+{
+  "insights": [
+    {
+      "id": "c38e9e2a-52ca-41c7-b3d2-24e792e574cf",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "critical",
+      "headline": "usa purchase_revenue · -58.3%",
+      "summary": "purchase_revenue down 58.3% vs 7d",
+      "metric": "purchase_revenue",
+      "change": {
+        "value": 58.3,
+        "direction": "down",
+        "baseline": "7d"
+      },
+      "scope": [
+        "USA"
+      ],
+      "source": "monitoring"
+    },
+    {
+      "id": "fb0e830e-48f6-463a-a9e9-a3e120b11de7",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "critical",
+      "headline": "global purchase_revenue · -38.4%",
+      "summary": "purchase_revenue down 38.4% vs 7d",
+      "metric": "purchase_revenue",
+      "change": {
+        "value": 38.4,
+        "direction": "down",
+        "baseline": "7d"
+      },
+      "scope": [
+        "global"
+      ],
+      "source": "monitoring"
+    },
+    {
+      "id": "a9f5f69b-e290-46b1-b343-890b43c9c3d6",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "critical",
+      "headline": "usa purchase_count · +100%",
+      "summary": "purchase_count up 100% vs 7d",
+      "metric": "purchase_count",
+      "change": {
+        "value": 100,
+        "direction": "up",
+        "baseline": "7d"
+      },
+      "scope": [
+        "USA"
+      ],
+      "source": "monitoring"
+    },
+    {
+      "id": "41c6546a-d3dc-46ad-8b71-65d9a817fca1",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "warning",
+      "headline": "usa cart_update_count · +100%",
+      "summary": "cart_update_count up 100% vs 7d",
+      "metric": "cart_update_count",
+      "change": {
+        "value": 100,
+        "direction": "up",
+        "baseline": "7d"
+      },
+      "scope": [
+        "USA"
+      ],
+      "source": "monitoring"
+    },
+    {
+      "id": "152bce25-3e47-4d62-85ba-09073bbe857b",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "info",
+      "headline": "usa checkout_count · +2.7%",
+      "summary": "checkout_count up 2.7% vs 7d",
+      "metric": "checkout_count",
+      "change": {
+        "value": 2.7,
+        "direction": "up",
+        "baseline": "7d"
+      },
+      "scope": [
+        "USA"
+      ],
+      "source": "monitoring"
+    },
+    {
+      "id": "e1ab6e24-b70f-4ec1-b2cc-64e0116a5867",
+      "timestamp": "2026-05-28T01:31:07.105Z",
+      "severity": "info",
+      "headline": "usa session_count · -5.7%",
+      "summary": "session_count down 5.7% vs 7d",
+      "metric": "session_count",
+      "change": {
+        "value": 5.7,
+        "direction": "down",
+        "baseline": "7d"
+      },
+      "scope": [
+        "USA"
+      ],
+      "source": "monitoring"
+    }
+  ],
+  "workspace": {
+    "projectName": "wobbly-ukulele",
+    "totalCustomers": 123162,
+    "totalEvents": 1173252
+  }
+}
