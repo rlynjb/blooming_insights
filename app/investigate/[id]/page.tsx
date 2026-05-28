@@ -110,15 +110,19 @@ export default function InvestigatePage() {
 
     (async () => {
       try {
-        // Hand the agent the insight the feed stashed (sessionStorage), so the
-        // anomaly survives Vercel's per-instance memory across function boundaries.
+        // Match the feed's mode: demo → cache-replay (default); live → run the
+        // agents, handing over the insight the feed stashed (sessionStorage) so
+        // the anomaly survives Vercel's per-instance memory across function calls.
         let url = `/api/agent?insightId=${id}`;
         try {
-          const stashed =
-            typeof window !== 'undefined' ? sessionStorage.getItem(`bi:insight:${id}`) : null;
-          if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
+          const live = typeof window !== 'undefined' && localStorage.getItem('bi:mode') === 'live';
+          if (live) {
+            url += '&live=1';
+            const stashed = sessionStorage.getItem(`bi:insight:${id}`);
+            if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
+          }
         } catch {
-          /* sessionStorage blocked — fall back to server-side lookup */
+          /* storage blocked — fall back to server-side lookup / cache */
         }
 
         const res = await fetch(url);

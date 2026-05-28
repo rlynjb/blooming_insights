@@ -87,31 +87,59 @@ export default function HomePage() {
   const [workspace, setWorkspace] = useState<BriefingResponse['workspace']>(undefined);
   const [errorMessage, setErrorMessage] = useState('');
   const [activeQuery, setActiveQuery] = useState<string | null>(null);
-  // preserve the page's search params (e.g. ?demo=cached) on the query stream
+  // carried onto the query stream; the query box is live-only, so this stays empty
   const [demoSuffix, setDemoSuffix] = useState('');
   // live monitoring status for the top stepper (the real query the agent runs)
   const [stepStatus, setStepStatus] = useState('');
   const [queryCount, setQueryCount] = useState(0);
 
-  // The query box runs LIVE (auth + Anthropic). On a static cached-demo deploy
-  // those aren't available, so NEXT_PUBLIC_DEMO_ONLY=1 hides it. Unset locally.
-  const demoOnly = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
+  // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
+  // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
+  // agents against Bloomreach (real data, but the alpha server may need a
+  // reconnect). NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle.
+  const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
+  const [mode, setMode] = useState<'demo' | 'live'>('demo');
+  const [ready, setReady] = useState(false);
+  const isDemo = mode === 'demo';
+
+  // Resolve the persisted mode before the first fetch (so we don't waste a demo
+  // fetch when the user previously chose live).
+  useEffect(() => {
+    if (!forcedDemo) {
+      try {
+        const saved = localStorage.getItem('bi:mode');
+        if (saved === 'live' || saved === 'demo') setMode(saved);
+      } catch {
+        /* localStorage blocked — default to demo */
+      }
+    }
+    setReady(true);
+  }, [forcedDemo]);
+
+  function switchMode(next: 'demo' | 'live') {
+    if (next === mode) return;
+    try {
+      localStorage.setItem('bi:mode', next);
+    } catch {
+      /* ignore */
+    }
+    setActiveQuery(null);
+    setMode(next); // re-runs the briefing fetch below
+  }
 
   useEffect(() => {
-    // On a cached-demo deploy, always use the cached briefing so the bare root URL
-    // works with no auth. Locally (flag unset), honor the URL's params.
-    const search = demoOnly
-      ? '?demo=cached'
-      : typeof window !== 'undefined'
-        ? window.location.search
-        : '';
+    if (!ready) return; // wait until the persisted mode is resolved
 
-    // carry existing params (e.g. ?demo=cached) onto the query stream as an
-    // &-prefixed suffix, since the agent endpoint already takes ?q first.
-    const params = new URLSearchParams(search);
-    params.delete('q');
-    const carried = params.toString();
-    setDemoSuffix(carried ? `&${carried}` : '');
+    // demo → cached snapshot (instant, no auth); live → run the agents.
+    const search = isDemo ? '?demo=cached' : '';
+    setDemoSuffix(isDemo ? '&demo=cached' : '');
+
+    // reset the feed for this (re)load — important when toggling demo/live
+    setStatus('loading');
+    setErrorMessage('');
+    setInsights([]);
+    setStepStatus('');
+    setQueryCount(0);
 
     const url = `/api/briefing${search}`;
     let cancelled = false;
@@ -228,11 +256,11 @@ export default function HomePage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [mode, ready]);
 
   return (
     <main
-      className={`min-h-screen px-6 py-10 ${demoOnly ? 'pb-10' : 'pb-28'} mx-auto w-full max-w-2xl`}
+      className={`min-h-screen px-6 py-10 ${isDemo ? 'pb-10' : 'pb-28'} mx-auto w-full max-w-2xl`}
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -266,6 +294,49 @@ export default function HomePage() {
               ? ` · ${formatCustomerCount(workspace.totalCustomers)} customers`
               : ''}
           </p>
+        )}
+
+        {!forcedDemo && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+            <div
+              style={{
+                display: 'inline-flex',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                overflow: 'hidden',
+              }}
+            >
+              {(['demo', 'live'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => switchMode(m)}
+                  className="lowercase"
+                  style={{
+                    background: mode === m ? 'var(--accent-teal)' : 'transparent',
+                    color: mode === m ? 'var(--bg-base)' : 'var(--text-secondary)',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontFamily: 'var(--font-mono), monospace',
+                    fontSize: '0.72rem',
+                    padding: '4px 12px',
+                  }}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+            <span
+              className="lowercase"
+              style={{
+                color: 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.68rem',
+              }}
+            >
+              {isDemo ? 'cached snapshot · instant' : 'live · real workspace data'}
+            </span>
+          </div>
         )}
       </div>
 
@@ -384,7 +455,7 @@ export default function HomePage() {
         </div>
       )}
 
-      {!demoOnly && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}
+      {!isDemo && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}
     </main>
   );
 }
