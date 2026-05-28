@@ -53,6 +53,8 @@ export async function runAgentLoop(opts: {
   userPrompt: string;
   toolSchemas: Anthropic.Messages.Tool[];
   onToolCall?: (tc: ToolCall) => void;
+  onText?: (text: string) => void;
+  onToolResult?: (tc: ToolCall) => void;
   maxTurns?: number;
   maxTokens?: number;
   maxToolCalls?: number; // hard cap on total tool calls; once hit, the model is forced to synthesize
@@ -65,6 +67,8 @@ export async function runAgentLoop(opts: {
     userPrompt,
     toolSchemas,
     onToolCall,
+    onText,
+    onToolResult,
     maxTurns = 8,
     maxTokens = 4096,
     maxToolCalls,
@@ -95,6 +99,14 @@ export async function runAgentLoop(opts: {
     // Append assistant turn to message history
     messages.push({ role: 'assistant', content: res.content });
 
+    // Extract text blocks from this turn and surface them to caller
+    const textBlocks = res.content.filter(
+      (b): b is Anthropic.Messages.TextBlock => b.type === 'text',
+    );
+    if (textBlocks.length > 0 && onText) {
+      onText(textBlocks.map((b) => b.text).join(''));
+    }
+
     // Collect tool_use blocks
     const toolUses = res.content.filter(
       (b): b is Anthropic.Messages.ToolUseBlock => b.type === 'tool_use',
@@ -102,10 +114,7 @@ export async function runAgentLoop(opts: {
 
     // No tools → we're done; collect text and return
     if (toolUses.length === 0) {
-      const finalText = res.content
-        .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
-        .map<string>((b) => b.text)
-        .join('');
+      const finalText = textBlocks.map((b) => b.text).join('');
       return { finalText, toolCalls };
     }
 
@@ -142,6 +151,7 @@ export async function runAgentLoop(opts: {
       }
 
       toolCalls.push(tc);
+      onToolResult?.(tc);
 
       const toolResult: Anthropic.Messages.ToolResultBlockParam = {
         type: 'tool_result',

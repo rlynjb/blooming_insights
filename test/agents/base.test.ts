@@ -279,4 +279,79 @@ describe('runAgentLoop', () => {
     expect(calls[0][0].tools).toBeDefined();
     expect(calls[1][0].tools).toBeUndefined();
   });
+
+  // -------------------------------------------------------------------------
+  // 6. onText fires with reasoning text from each turn that has text blocks
+  // -------------------------------------------------------------------------
+  it('calls onText with reasoning text for each turn that has text', async () => {
+    const { anthropic } = buildFakeAnthropic([
+      // Turn 1: text reasoning + tool use
+      {
+        content: [
+          textBlock('thinking about it'),
+          toolUseBlock('tu6', 'get_project_overview', { project_id: 'r' }),
+        ],
+        stop_reason: 'tool_use',
+      },
+      // Turn 2: final text only
+      {
+        content: [textBlock('final')],
+        stop_reason: 'end_turn',
+      },
+    ]);
+
+    const mcp = buildFakeMcp(async () => ({ ok: true }));
+    const onTextCalls: string[] = [];
+    const onText = (text: string) => { onTextCalls.push(text); };
+
+    await runAgentLoop({
+      anthropic: anthropic as unknown as Anthropic,
+      mcp,
+      agent: 'monitoring',
+      system: 'You are a monitoring agent.',
+      userPrompt: 'Check things.',
+      toolSchemas: fakeToolSchemas,
+      onText,
+    });
+
+    expect(onTextCalls).toHaveLength(2);
+    expect(onTextCalls[0]).toContain('thinking about it');
+    expect(onTextCalls[1]).toContain('final');
+  });
+
+  // -------------------------------------------------------------------------
+  // 7. onToolResult fires after execution with a fully populated ToolCall
+  // -------------------------------------------------------------------------
+  it('calls onToolResult after tool execution with result populated', async () => {
+    const { anthropic } = buildFakeAnthropic([
+      // Turn 1: tool use
+      {
+        content: [toolUseBlock('tu7', 'get_project_overview', { project_id: 's' })],
+        stop_reason: 'tool_use',
+      },
+      // Turn 2: final text
+      {
+        content: [textBlock('done')],
+        stop_reason: 'end_turn',
+      },
+    ]);
+
+    const mcp = buildFakeMcp(async () => ({ total: 42 }));
+    const onToolResultCalls: import('../../lib/mcp/types').ToolCall[] = [];
+    const onToolResult = (tc: import('../../lib/mcp/types').ToolCall) => { onToolResultCalls.push(tc); };
+
+    await runAgentLoop({
+      anthropic: anthropic as unknown as Anthropic,
+      mcp,
+      agent: 'monitoring',
+      system: 'You are a monitoring agent.',
+      userPrompt: 'Check.',
+      toolSchemas: fakeToolSchemas,
+      onToolResult,
+    });
+
+    expect(onToolResultCalls).toHaveLength(1);
+    expect(onToolResultCalls[0].toolName).toBe('get_project_overview');
+    expect(onToolResultCalls[0].result).toBeDefined();
+  });
 });
