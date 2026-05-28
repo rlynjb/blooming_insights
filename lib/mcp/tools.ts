@@ -33,6 +33,12 @@ export const recommendationTools = [
   'get_frequency_policies',
 ] as const;
 
+// Broad, de-duplicated union granted to the free-form query agent so it can
+// answer anything (monitoring + diagnostic + recommendation surfaces combined).
+export const queryTools = [
+  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
+] as const;
+
 export const bootstrapTools = [
   'whoami',
   'list_projects', 'get_project_overview',
