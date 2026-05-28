@@ -1,0 +1,440 @@
+# Structured outputs (prompt-instructed JSON, and surviving it)
+
+**Industry name(s):** structured outputs, JSON-from-prompt, fenced-JSON extraction, schema-in-prose, output contracts
+**Type:** Industry standard · Language-agnostic
+
+> blooming insights does the thing every blog tells you not to — it instructs the model to "Return ONLY a JSON array … wrapped in a ```json fenced block" in plain prose — and survives it because `parseAgentJson` strips the fence first, three type guards prove the shape, and `synthesize()` retries on clean context. The fence-regex-first ordering is not arbitrary: it is a direct fix for courteous models wrapping JSON in markdown.
+
+**See also:** → 01-anatomy.md · → 03-prompts-as-code.md · → 07-output-mode-mismatch.md · → 09-chain-of-thought.md
+
+---
+
+## Why care
+
+You have a form that posts to an endpoint expecting a typed body. You do not trust the client — you parse the body, validate every field, and have a defined response for when it's malformed, because the boundary between "bytes from outside" and "typed object inside" is where reliability is won or lost. An LLM that should return structured data is that boundary with one extra hazard: the producer is a probabilistic text model that sometimes wraps your JSON in "Here's the analysis:" prose and a markdown fence it added to be helpful.
+
+The question this file answers: blooming insights instructs JSON *in the prompt text* — `monitoring.md` L50–73, `diagnostic.md` L44–81, `recommendation.md` L44–71 — which is exactly the approach the internet warns against. Does it work, and what does it cost?
+
+**The pivot: prompt-instructed JSON is fine in production as long as you treat the model's output like an untrusted body — parse leniently, validate strictly, repair on failure — and you accept the cost of doing all three in your own code instead of buying validity from the provider.** Asking for JSON in prose is the cheap, portable request. The contract that turns "usually JSON-ish" into "always a valid typed object or a known default" is the part that matters, and it lives in `lib/mcp/validate.ts`, not in the prompt.
+
+The internet's advice, stated fairly:
+- "Never instruct JSON in the prompt — use native tool/JSON mode so invalid output is structurally impossible."
+
+What blooming insights does instead, and survives:
+- `monitoring.md` L52: "Return ONLY a JSON array … wrapped in a ```json fenced block"
+- `parseAgentJson` (`validate.ts` L3–13) extracts it; `isAnomalyArray` (`validate.ts` L17–27) proves it; `synthesize()` retries when the loop fails to emit it.
+
+It is the untrusted-body discipline, applied to a producer that occasionally adds a markdown fence as a courtesy.
+
+---
+
+## How it works
+
+**Mental model.** The model's final text is an untrusted body you must defensively turn into a typed value through a three-stage funnel: *extract* the JSON out of whatever prose surrounds it, *validate* its shape field-by-field, *repair* via a clean-context retry when extract-or-validate fails. The prompt's job is to *ask* for the shape; the funnel's job is to *guarantee* it.
+
+```
+finalText: "Here's the anomalies:\n```json\n[ … ]\n```\nLet me know!"
+      │
+  (1) EXTRACT    parseAgentJson   validate.ts L3–13
+      │  fence regex FIRST → bare JSON.parse → first-bracket-to-last scan
+      ▼
+  parsed: unknown
+      │
+  (2) VALIDATE   isAnomalyArray / isDiagnosis / isRecommendationArray
+      │  validate.ts L17–53   every required field present & correct type?
+      ▼
+  typed value ✓     ─── or ───▶  null / []
+                                   │
+  (3) REPAIR     synthesize()   diagnostic.ts L82–121  (clean-context retry)
+                                   │  ?? FALLBACK / []
+                                   ▼
+                              always a valid typed value
+```
+
+The model tries to emit JSON; the funnel guarantees a typed result regardless of how well it tried.
+
+---
+
+### The choice the codebase made: instruct JSON in prose
+
+Open any of the three structured prompts and you'll see the format demanded in English, with a concrete example block:
+
+```
+monitoring.md L50–73
+  ## Output
+  Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by
+  severity …, wrapped in a ```json fenced block. Each item:
+  [ { "metric": …, "change": { "value": …, "direction": …, "baseline": … }, … } ]
+  Field rules:
+  - metric — short snake_case name …
+  - severity — "critical" (>20% …), "warning" (10–20% …), …
+```
+
+```
+diagnostic.md L44–81     ## Output → a ```json {object} of exactly this shape + field rules
+recommendation.md L44–71 ## Output → a ```json [array] of at most 3 objects + field rules
+```
+
+This is the pattern blog folklore warns against: "don't describe JSON in words, the model will drift; use the provider's native mode." And the folklore is not wrong about the *failure modes* — prose-instructed JSON does drift, does get wrapped in fences, does occasionally arrive with a chatty preamble. The disagreement is about whether those failure modes are *handled* or *fatal*. blooming insights treats them as handled.
+
+---
+
+### Schema-shaping in prose: telling the model what NOT to emit
+
+The prompts don't just describe the shape — they sculpt it, including fields the model must *omit*:
+
+```
+recommendation.md L64
+  - Do NOT include an `id` field — the system assigns it after validation.
+```
+
+This is schema-shaping done in English. The model emits id-less recommendations; the type guard validates the id-less shape (`isRecommendationArray`, `validate.ts` L42 — `Omit<Recommendation,'id'>[]`); the code assigns the id after validation (`recommendation.ts` L76, `crypto.randomUUID()`):
+
+```
+prompt says (L64):           "Do NOT include an id"
+model emits:                 { title, rationale, bloomreachFeature, steps, … }  ← no id
+isRecommendationArray (L42): validates THIS id-less shape
+code assigns (rec.ts L76):   { id: crypto.randomUUID(), ...r }
+```
+
+The split is deliberate: the prompt and validator agree on what the *model* controls; the system owns *identity*. Letting the model invent `id`s risks collisions and non-UUID strings. The "Do NOT include an id" line is a prose instruction doing a job a native schema would do with `additionalProperties: false` — and it has to be repeated in the synthesis instruction too (`recommendation.ts` L62: "Do NOT include an id field"), because the synthesis path bypasses the main prompt.
+
+---
+
+### The fence-strip-first bug, and why the regex runs first
+
+Here is the production scar. `parseAgentJson` tries the markdown-fence regex *before* a bare `JSON.parse`:
+
+```
+validate.ts L3–13
+  export function parseAgentJson(text: string): unknown {
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);   // ← FENCE FIRST
+    const candidate = (fence ? fence[1] : text).trim();
+    try { return JSON.parse(candidate); } catch { /* fall through */ }
+    const start = candidate.search(/[[{]/);                      // substring scan
+    const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+    if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1));
+    throw new Error('no parseable json in agent output');
+  }
+```
+
+Why fence-first? Because the prompts *ask* for a ```json fence (`monitoring.md` L52, `diagnostic.md` L46, `recommendation.md` L46) — and the model complies. If you ran a bare `JSON.parse` first, it would throw on the leading ```` ```json ```` and the trailing ```` ``` ````, and you'd be relying on the substring scan to recover — which is the *least* precise strategy. Fence-first means the common case (model did exactly what you asked) is also the most precise extraction.
+
+```
+the bug class this defends against:
+  ─────────────────────────────────────────────────────────
+  prompt:  "be concise" + "return JSON"
+  model:   politely wraps the JSON in ```json … ``` as code
+  naive:   JSON.parse("```json\n[…]\n```")  → SyntaxError → 500
+  here:    fence regex captures group 1 → JSON.parse([…]) → ✓
+```
+
+I have shipped a feature where a teammate added "be concise and well-formatted" to a prompt that relied on schema mode, and overnight the model started fencing its JSON as a courtesy — well-formatted, to a model, means a code block. The parser that did bare-parse-first broke for every call. The fix was the exact ordering you see here: strip the fence before you trust the body. This is not theoretical; it is the literal reason line 4 comes before line 6.
+
+---
+
+### Validate: shape proofs, not casts
+
+`parseAgentJson` returns `unknown` — it has parsed *syntax*, not *shape*. Three `v is T` guards prove the shape field-by-field:
+
+```
+validate.ts L17–27  isAnomalyArray       walks every item: metric:string, scope[],
+                                          change.value:number, change.direction∈{up,down},
+                                          change.baseline:string, severity∈SEVERITIES
+validate.ts L29–35  isDiagnosis          conclusion:string, evidence[], hypothesesConsidered[]
+validate.ts L42–53  isRecommendationArray every item: title, rationale,
+                                          bloomreachFeature∈FEATURES, steps[],
+                                          estimatedImpact, confidence∈CONFIDENCE  (id NOT checked)
+```
+
+A guard returning `false` is not an error — it routes to the repair or the floor. `monitoring.ts` L91: `if (!isAnomalyArray(parsed)) return []`. The guard is the gate that decides whether the model's output is trustworthy enough to ship.
+
+---
+
+### Repair: the clean-context `synthesize()` retry
+
+When the loop's final text doesn't parse-and-validate, the diagnostic and recommendation agents don't give up — they re-prompt on clean context:
+
+```
+diagnostic.ts L73–77   return tryParseDiagnosis(finalText)
+                          ?? (await this.synthesize(anomaly, toolCalls))
+                          ?? FALLBACK;
+```
+
+`synthesize()` (`diagnostic.ts` L82–121) is a *separate* `anthropic.messages.create` (L92) with **no tools and no loop history** — it formats the gathered evidence as text and asks for ONLY the JSON. Why a fresh call instead of one more loop turn: the loop history is full of `tool_use`/`tool_result` pairs and the model has momentum toward "I should query more." A clean single-turn call breaks that momentum. Recommendation has the identical structure (`recommendation.ts` L82–127, call at L96). Monitoring has no `synthesize()` — it degrades straight to `[]` (`monitoring.ts` L88–91), because an empty anomaly list is a safe, honest answer; a missing diagnosis is not.
+
+---
+
+### The principle
+
+Prompt-instructed JSON is a defensible production choice when — and only when — you pair it with extract + validate + repair in your own code. The prompt makes the *request*; `parseAgentJson` + the guards + `synthesize()` make the *guarantee*. The cost is real (you own the parser, you pay for repair retries, you get shape-not-correctness), and the benefit is real (portable across any text model, fully unit-testable with fakes, no provider coupling on the output side). The fence-first ordering is the one detail that earns its place by experience, not by theory.
+
+---
+
+## Structured outputs — diagram
+
+This diagram spans the producer and the contract. The model emits prose-with-fenced-JSON because the prompt asked for it; the funnel extracts, validates, and repairs into a typed value with a guaranteed floor. A reader who sees only this should grasp that the prompt requests the shape and the code guarantees it.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  PRODUCER — the prompt requests JSON in PROSE                         │
+│   monitoring.md L50–73 · diagnostic.md L44–81 · recommendation.md L44–71 │
+│   "Return ONLY a JSON … wrapped in a ```json fenced block"           │
+│   recommendation.md L64: "Do NOT include an id" (schema-shaping)     │
+│           │                                                          │
+│           ▼  finalText = "Here's …:\n```json\n[…]\n```\nLet me know" │
+└───────────────────────────┬───────────────────────────────────────────┘
+                            │  untrusted string
+┌───────────────────────────▼───────────────────────────────────────────┐
+│  CONTRACT — extract + validate + repair  (lib/mcp/validate.ts)        │
+│                                                                       │
+│  (1) EXTRACT  parseAgentJson  L3–13                                  │
+│       FENCE REGEX FIRST → bare parse → first-[/{-to-last-]/}-scan    │
+│       (fence-first = fix for courteous markdown-wrapping)            │
+│           │ unknown                                                  │
+│  (2) VALIDATE isAnomalyArray / isDiagnosis / isRecommendationArray   │
+│       L17–53   field-by-field; id intentionally NOT validated        │
+│           │ valid              │ false / threw                       │
+│           ▼                    ▼                                     │
+│      typed value         (3) REPAIR  synthesize()  diagnostic L82–121│
+│                              fresh create, NO tools, NO history      │
+│                                   │ valid        │ null              │
+│                                   ▼              ▼                   │
+│                              typed value   FALLBACK / []  (diag L15) │
+│                                                                       │
+│  monitoring: NO synthesize → parse?validate? else [] (mon.ts L88–91) │
+└────────────────────────────────────────────────────────────────────────┘
+
+  prompt = the REQUEST (statistical).  contract = the GUARANTEE (enforced).
+```
+
+The fence is asked for in prose, stripped first in code; the typed value is manufactured by extract → validate → repair, with a model-independent floor.
+
+---
+
+## In this codebase
+
+**Case A — implemented.**
+
+### The prompt-side JSON instruction
+
+- **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md`
+- **Function / class:** the `## Output` section of each prompt
+- **Line range:** `monitoring.md` L50–73 (array, fenced, severity-sorted, field rules); `diagnostic.md` L44–81 (object of exact shape + the empty-case shape L74–81); `recommendation.md` L44–71 (≤3 objects + field rules, including the id-omission at L64).
+- **Role:** requests fenced JSON in prose and sculpts the shape (including which fields to omit).
+
+### Extract
+
+- **File:** `lib/mcp/validate.ts`
+- **Function / class:** `parseAgentJson(text)`
+- **Line range:** L3–13 — fence regex (L4) first, bare `JSON.parse` (L6), first-bracket-to-last-bracket substring scan (L7–10), throw (L12).
+- **Role:** pulls the JSON out of fenced/bare/prose-wrapped output; fence-first by design.
+
+### Validate
+
+- **File:** `lib/mcp/validate.ts`
+- **Function / class:** `isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`
+- **Line range:** L17–27, L29–35, L42–53; enum sets `SEVERITIES` (L15), `FEATURES`/`CONFIDENCE` (L37–38). The recommendation guard validates `Omit<Recommendation,'id'>[]` (L42).
+- **Role:** proves shape field-by-field; the recommendation guard skips `id` because the system assigns it.
+
+### Repair + floor
+
+- **File:** `lib/agents/{diagnostic,recommendation,monitoring}.ts`
+- **Function / class:** `synthesize()` and the fallback chain
+- **Line range:** diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L73–77), `synthesize` (L82–121), `FALLBACK` (L15–19); recommendation `tryParseRecommendations ?? synthesize` then `[]`, ids assigned (L69–76), `synthesize` (L82–127); monitoring parse-or-`[]` (L85–92, no synthesize).
+- **Role:** clean-context retry then a model-independent floor; monitoring's floor is `[]` directly.
+
+### Why this is a codebase strength
+
+The output contract works against any text model and is fully exercisable in the test suite with injected fakes — no live structured-output API needed. The id-assignment-after-validation detail shows the boundary was thought through precisely. And the fence-first ordering encodes a real lesson rather than a guessed one.
+
+---
+
+## Elaborate
+
+### Where this comes from
+
+Extracting JSON from generated prose predates native JSON modes. LangChain's `OutputParser`s, the `instructor` library's validate-and-retry loop, and Pydantic-backed extraction all converged on the same shape — prompt for a format, parse leniently, validate against a schema, retry on failure. The ```json fence convention emerged because models trained on developer text reach for code fences when asked for code-shaped output, which makes the fence a high-signal extraction anchor — exactly what `parseAgentJson` exploits. Native structured outputs (OpenAI `response_format` / structured outputs, Anthropic tool-use JSON, constrained decoding via Outlines/SGLang) are the newer answer: constrain the *decoding* so invalid JSON is impossible.
+
+### The deeper principle
+
+```
+request                               guarantee
+─────────────────────────────────    ─────────────────────────────────
+"return JSON in a ```json fence"      parse + validate + repair (code)
+honored statistically                 honored always
+breaks silently on prose/fence        surfaces as null → repair → floor
+provider-agnostic                     provider-agnostic
+```
+
+The model's adherence to a format request is probabilistic; the contract's adherence to its return type is absolute. The funnel exists to move the guarantee from the model (statistical) into code (enforced).
+
+### Where this breaks down
+
+1. **The substring scan can mis-recover.** Stage (c) grabs first-bracket-to-last-bracket. Prose with stray brackets, or two JSON blocks, can yield a wrong-but-parseable object that then *passes* the guard. Pragmatic recovery, not a correctness guarantee.
+2. **Shape is not correctness.** `isDiagnosis` proves `conclusion` is a string — not that it is true. A hallucinated diagnosis with the right shape passes the entire contract. Catching wrong-but-well-formed output is the job of evals (→ 03-prompts-as-code.md notes the missing observability), not validation.
+3. **Repair doubles cost on the unlucky path.** When `tryParse` returns null, `synthesize()` is a second full call (`max_tokens: 2048`, `diagnostic.ts` L94). Free on the happy path, real money if the parse-failure rate climbs.
+4. **Prose-instructed JSON drifts on model upgrades.** A new model can change how it formats by default (more prose, different fence style). Native mode is immune to that; prose-instruction must be re-checked when the model changes — and nothing in the code logs which model produced which output (→ 03-prompts-as-code.md).
+
+### What to explore next
+
+- **Native tool-use for the final artifact:** define `submit_diagnosis` as a tool the model must call to finish, so the SDK enforces valid arguments — eliminating extract+validate for the output at the cost of provider coupling. The codebase *already* uses native tool-use for the input side (every MCP call), so the runner-up is proven acceptable; it's held back on output deliberately.
+- **Zod schemas:** one schema per shape, generating both the validator and the static type, with field-level error messages the hand-written guards lack.
+- **Constrained decoding (Outlines, SGLang):** force valid JSON at the token level — the strongest form of the parse guarantee.
+
+---
+
+## Tradeoffs
+
+### Prompt-instructed JSON (this codebase) vs. native tool/JSON mode
+
+| Dimension | This codebase (prompt-instructed + funnel) | Native tool / JSON mode |
+|---|---|---|
+| Validity guarantee | Manufactured in code; repair + floor | Token-level; malformed impossible |
+| Provider coupling | None — any text model | High — per-provider feature surface |
+| Testability with fakes | Full — pure functions, injected anthropic | Lower — needs the live structured mode |
+| Cost on failure | Extra `synthesize()` call (2048 tokens) | None (cannot fail to parse) |
+| Drift on model upgrade | Must re-check default formatting | Immune (decode is constrained) |
+| Correctness guarantee | Shape only | Shape only |
+
+**What we gave up.** A token-level validity guarantee. Some fraction of calls fail extract-or-validate and pay the repair cost; a native mode makes malformed output structurally impossible. The codebase accepts that cost to keep the output contract portable and unit-testable.
+
+**What the alternative would have cost.** Coupling the output contract to one provider's structured-output feature — different shapes and limits per vendor, harder to exercise in the test suite without the live API. The id-omission instruction (`recommendation.md` L64) would become an `additionalProperties: false` schema constraint, which is cleaner, but the whole funnel would need the live API to test. Native tool-use is already accepted for *input*; the output side is held back on purpose.
+
+**The breakpoint.** Prompt-instructed JSON is right while the parse-failure rate stays low enough that `synthesize()` retries are rare. The moment a *measured* failure rate climbs past a few percent — making the doubled-cost repair a real line item — or a model upgrade changes default formatting often enough to need re-checking, moving the final artifact onto native tool-use JSON becomes worth the provider coupling. The retrieval side already proves native tool-use works here; the output side is a deliberate hold, not an inability.
+
+---
+
+## Tech reference (industry pairing)
+
+### Prompt-instructed fenced JSON (`## Output` + `parseAgentJson`)
+
+- **Codebase uses:** the prompts request a ```json fence in prose (`monitoring.md` L52); `parseAgentJson` (`validate.ts` L3–13) strips the fence first, then bare-parses, then substring-scans.
+- **Why it's here:** portability and testability — works against any text model and is exercisable with fakes; the fence-first ordering handles the courteous-markdown-wrapping failure mode.
+- **Leading today (2026):** native structured outputs (OpenAI `response_format`, Anthropic tool-use JSON) lead for *new* projects; fence-extraction is the portable baseline.
+- **Why it leads:** constrained decoding eliminates the parse failure mode where the provider supports it.
+- **Runner-up:** LangChain `JsonOutputParser` / `instructor` — same parse-validate-retry shape, more framework.
+
+### Anthropic tool-use JSON mode (the road not taken for output)
+
+- **Codebase uses:** native tool-use is used for **input** (every MCP call is a schema'd `tool_use`, `base.ts` L101), but **not** for the final artifact.
+- **Why it's here (as the runner-up):** it would make the final JSON structurally valid by forcing the model to terminate via a typed tool call — `additionalProperties: false` would enforce the id-omission that `recommendation.md` L64 does in prose.
+- **Leading today (2026):** Anthropic tool-use and OpenAI function-calling/structured-outputs lead adoption for typed output.
+- **Why it leads:** the typed contract is enforced at the API boundary, not in app code.
+- **Runner-up to *it*:** OpenAI `response_format: { type: 'json_schema', strict: true }` — same guarantee, different vendor.
+
+### Hand-written `v is T` type guards
+
+- **Codebase uses:** `validate.ts` L17–53 — one predicate per shape; the recommendation guard validates the id-less shape.
+- **Why it's here:** converts `parseAgentJson`'s `unknown` into a typed value with a runtime shape proof, no dependency.
+- **Leading today (2026):** Zod leads runtime validation in TypeScript — one schema generates validator and type.
+- **Why it leads:** single source of truth, composable, structured error reporting the guards lack.
+- **Runner-up:** Valibot (smaller bundle), io-ts (functional).
+
+---
+
+## Project exercises
+
+### Promote the final artifact to native tool-use JSON
+
+- **Exercise ID:** C1.7 (adapted) — structured outputs via the provider's contract.
+- **What to build:** define the `Diagnosis` shape as a `submit_diagnosis` tool and require the diagnostic agent to terminate by calling it, so the SDK enforces valid arguments; keep `parseAgentJson` + `synthesize()` as the fallback for portability. Encode the id-omission as `additionalProperties: false` for the recommendation tool.
+- **Why it earns its place:** demonstrates you know the difference between *requesting* JSON and *guaranteeing* it at decode level, and that the codebase already uses native tool-use for input but not output.
+- **Files to touch:** `lib/agents/diagnostic.ts` (terminate via tool call), `lib/agents/base.ts` (surface tool input), `lib/mcp/validate.ts` (reuse `isDiagnosis` on the tool args), `test/agents/diagnostic.test.ts`.
+- **Done when:** a normal run produces a `Diagnosis` from tool-call arguments (no `parseAgentJson`), and a forced tool-call failure still degrades through `synthesize() ?? FALLBACK`.
+- **Estimated effort:** 1–2 days
+
+### Add a fence-courtesy regression test
+
+- **Exercise ID:** C1.7 (adapted) — pin the fence-first behavior.
+- **What to build:** a Vitest case that feeds `parseAgentJson` a string where the JSON is wrapped in a ```json fence *with* a chatty preamble and trailer ("Here's the analysis:\n```json\n[…]\n```\nHope this helps!"), and asserts the array is extracted correctly — locking in the courteous-markdown defense so a future "simplification" of the parser can't silently break it.
+- **Why it earns its place:** turns the production scar (the reason the fence regex runs first) into an executable invariant.
+- **Files to touch:** `test/mcp/validate.test.ts` (extend `parseAgentJson` cases).
+- **Done when:** the test passes against the current parser and fails if the fence regex is removed or reordered after the bare parse.
+- **Estimated effort:** <1hr
+
+---
+
+## Summary
+
+blooming insights instructs JSON in the prompt text — `monitoring.md` L50–73, `diagnostic.md` L44–81, `recommendation.md` L44–71 — the approach blog folklore warns against, including schema-shaping in prose ("Do NOT include an id field", `recommendation.md` L64). It survives by treating the model's output as an untrusted body: `parseAgentJson` (`validate.ts` L3–13) strips the markdown fence *first* (the literal fix for courteous models wrapping JSON in code blocks), the three `v is T` guards (`validate.ts` L17–53) prove shape field-by-field, and `synthesize()` (`diagnostic.ts` L82–121) retries on clean context before a model-independent floor. The cost is owning the parser, paying for repair retries, and getting shape-not-correctness; the benefit is portability and full testability with fakes — a defensible, reversible choice the codebase makes deliberately while reserving native tool-use for input.
+
+**Key points:**
+- The prompts request fenced JSON in prose; the contract (extract + validate + repair) is what guarantees a typed result.
+- `parseAgentJson` tries the fence regex *first* — a direct fix for models that wrap JSON in markdown as a courtesy.
+- `recommendation.md` L64 ("Do NOT include an id") is schema-shaping in prose; the guard validates the id-less shape and the code assigns the UUID after.
+- `synthesize()` is a clean-context, tool-less retry that breaks the loop's "keep querying" momentum; monitoring skips it and floors to `[]`.
+- Native tool/JSON mode is the runner-up — already used for *input* — held back on *output* for portability and testability, flippable when measured failure rate justifies the coupling.
+
+---
+
+## Interview defense
+
+### What an interviewer is really asking
+
+"How do you get structured output from an LLM?" tests whether you stop at "I prompt for JSON" or go to "I prompt, extract, validate, repair — and I know the cost of each." The senior signal is defending prompt-instructed JSON honestly: naming why the blogs warn against it, then showing the funnel that makes it safe, and knowing exactly where native mode would win.
+
+### Likely questions
+
+**[mid] "The model returns `Here's the result:\n```json\n[…]\n````. How do you get a typed array out?"**
+
+`parseAgentJson` (`validate.ts` L3–13) runs the fence regex first, capturing the body inside ```json``` — the common case because the prompt asked for that fence. Then `isAnomalyArray` (L17–27) proves the shape. Both succeed → typed `Anomaly[]`; otherwise → `[]` (`monitoring.ts` L91).
+
+```
+prose + ```json fence → fence regex (L4) → JSON.parse → isAnomalyArray → Anomaly[] ✓
+```
+
+**[senior] "The internet says never instruct JSON in the prompt. You do. Defend it."**
+
+The blogs are right about the failure modes — drift, fences, preambles — and wrong to call them fatal. We treat the output as an untrusted body: `parseAgentJson` extracts (fence-first), the guards validate field-by-field, `synthesize()` repairs on clean context, and there's a model-independent floor. That buys portability (any text model) and full testability with fakes. The cost is owning the parser and paying for repair retries. Native mode would remove the parse failure entirely but couple the output to one provider — we already accept native tool-use for input and hold it back on output deliberately.
+
+```
+blog warns:   drift / fence / preamble  → "use native mode"
+we answer:    extract(fence-first) + validate + repair + floor
+trade:        portability+testability  vs  token-level validity
+```
+
+**[arch] "Why does `parseAgentJson` try the fence regex before a bare `JSON.parse`?"**
+
+Because the prompts ask for a ```json fence and the model complies, so the fence is the *common* case — and a bare parse would throw on the fence delimiters, dropping you to the least-precise substring scan. Fence-first means the happy path is also the most precise extraction. Concretely: a teammate once added "be concise and well-formatted" to a schema-mode prompt and the model started fencing its JSON as a courtesy overnight; the bare-parse-first parser broke for every call. Fence-first is the fix.
+
+```
+bare-first:  JSON.parse("```json…```") → SyntaxError → rely on fuzzy scan
+fence-first: regex captures [...] → JSON.parse → precise ✓
+```
+
+### The question candidates always dodge
+
+**"What does your validation actually guarantee?"** Shape, not truth. `isDiagnosis` proves `conclusion` is a string — not that the conclusion is correct. A hallucinated-but-well-shaped diagnosis passes the entire contract. Candidates dodge this because it concedes the contract doesn't catch wrong answers. The honest answer: shape is the validator's job; correctness is the evals' job, which this codebase does not yet have (→ 03-prompts-as-code.md).
+
+### One-line anchors
+
+- `lib/mcp/validate.ts` L3–13 — `parseAgentJson`: fence regex FIRST, then bare parse, then substring scan.
+- `lib/mcp/validate.ts` L17–53 — the three guards; recommendation validates the id-less shape.
+- `lib/agents/prompts/recommendation.md` L64 — "Do NOT include an id" — schema-shaping in prose.
+- `lib/agents/diagnostic.ts` L82–121 — `synthesize()`: clean-context, tool-less repair.
+- `lib/agents/monitoring.ts` L88–91 — parse-or-`[]`, no synthesize (empty list is a safe answer).
+
+---
+
+## Validate
+
+### Level 1 — Reconstruct
+
+From memory, draw the three-stage funnel (extract → validate → repair) and name the function at each stage. State the order of `parseAgentJson`'s three extraction strategies and which one matches what the prompt asked for.
+
+### Level 2 — Explain
+
+Out loud: why does `isRecommendationArray` validate a shape *without* `id` (`validate.ts` L42), where does the `id` come from (`recommendation.ts` L76), and why is the "Do NOT include an id" instruction repeated in the synthesis text (`recommendation.ts` L62)?
+
+### Level 3 — Apply
+
+Scenario: you add a new agent that must return `{ summary: string; tags: string[] }`. Using `validate.ts` L29–35 as the template, write the `isSummary` guard; decide which `parseAgentJson` strategy hits for fence-wrapped output; and decide whether this agent needs a `synthesize()` repair or can floor to a default like monitoring does — justify the choice with what a safe default would be.
+
+### Level 4 — Defend
+
+A reviewer says: "Switch the final diagnosis to Anthropic tool-use JSON mode and delete `parseAgentJson`." State what that buys (token-level validity), what it costs (provider coupling, harder fakes-in-tests, re-encoding `recommendation.md` L64 as a schema constraint), why the codebase already accepts native tool-use for *input* but not output, and the measured condition under which you'd flip the output side.
+
+### Quick check — code reference test
+
+In `parseAgentJson`, what are the three extraction strategies in order, and what happens if all three fail? (Answer: (1) fenced-code regex `/```(?:json)?\s*([\s\S]*?)```/i`, (2) bare `JSON.parse`, (3) first-bracket-to-last-bracket substring scan; if none yields valid JSON it throws `'no parseable json in agent output'` — `lib/mcp/validate.ts` L3–13.)
