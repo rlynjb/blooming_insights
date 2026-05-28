@@ -265,4 +265,28 @@ describe('DiagnosticAgent.investigate', () => {
     expect(result.evidence).toEqual([]);
     expect(result.hypothesesConsidered).toEqual([]);
   });
+
+  // ---------------------------------------------------------------------------
+  // 5. Dedicated synthesis salvages a diagnosis when the loop didn't emit valid JSON
+  // ---------------------------------------------------------------------------
+
+  it('synthesizes a diagnosis from gathered evidence when the loop output is unusable', async () => {
+    const { anthropic } = buildFakeAnthropic([
+      // Investigation loop ends with rambling prose (no valid diagnosis JSON)
+      { content: [textBlock('Let me keep investigating — I should run more queries first.')], stop_reason: 'end_turn' },
+      // The dedicated tool-less synthesis call then returns a valid diagnosis
+      { content: [textBlock('```json\n' + VALID_DIAGNOSIS_JSON + '\n```')], stop_reason: 'end_turn' },
+    ]);
+
+    const agent = new DiagnosticAgent(
+      anthropic as unknown as Anthropic,
+      buildFakeMcp(),
+      FIXTURE_SCHEMA,
+      FAKE_TOOL_DEFS,
+    );
+
+    const result = await agent.investigate(SAMPLE_ANOMALY);
+    expect(result.conclusion).toContain('payment UI regression');
+    expect(result.hypothesesConsidered).toHaveLength(2);
+  });
 });

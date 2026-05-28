@@ -58,6 +58,7 @@ export async function runAgentLoop(opts: {
   maxTurns?: number;
   maxTokens?: number;
   maxToolCalls?: number; // hard cap on total tool calls; once hit, the model is forced to synthesize
+  synthesisInstruction?: string; // appended to system on the forced-final turn to compel a structured answer
 }): Promise<AgentRunResult> {
   const {
     anthropic,
@@ -72,6 +73,7 @@ export async function runAgentLoop(opts: {
     maxTurns = 8,
     maxTokens = 4096,
     maxToolCalls,
+    synthesisInstruction,
   } = opts;
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -90,7 +92,10 @@ export async function runAgentLoop(opts: {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: AGENT_MODEL,
       max_tokens: maxTokens,
-      system,
+      // On the forced-final turn, append the synthesis instruction so the model
+      // stops exploring and emits its structured answer (it otherwise tends to
+      // keep "thinking" and never produce the JSON).
+      system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
       messages,
     };
     if (!forceFinal) params.tools = toolSchemas;

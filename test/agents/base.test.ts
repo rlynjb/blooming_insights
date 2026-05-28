@@ -354,4 +354,31 @@ describe('runAgentLoop', () => {
     expect(onToolResultCalls[0].toolName).toBe('get_project_overview');
     expect(onToolResultCalls[0].result).toBeDefined();
   });
+
+  // -------------------------------------------------------------------------
+  // 8. synthesisInstruction is appended to system only on the forced-final turn
+  // -------------------------------------------------------------------------
+  it('appends synthesisInstruction to the system prompt only on the forced-final turn', async () => {
+    const { anthropic } = buildFakeAnthropic([
+      { content: [toolUseBlock('tu8', 'get_project_overview', { project_id: 'z' })], stop_reason: 'tool_use' },
+      { content: [textBlock('final')], stop_reason: 'end_turn' },
+    ]);
+    const mcp = buildFakeMcp(async () => ({ ok: true }));
+
+    await runAgentLoop({
+      anthropic: anthropic as unknown as Anthropic,
+      mcp,
+      agent: 'diagnostic',
+      system: 'BASE SYSTEM',
+      userPrompt: 'go',
+      toolSchemas: fakeToolSchemas,
+      maxToolCalls: 1,
+      maxTurns: 8,
+      synthesisInstruction: 'OUTPUT JSON NOW',
+    });
+
+    const calls = (anthropic as { messages: { create: { mock: { calls: { 0: { system: string } }[] } } } }).messages.create.mock.calls;
+    expect(calls[0][0].system).toBe('BASE SYSTEM'); // turn 1: tools offered, plain system
+    expect(calls[1][0].system).toContain('OUTPUT JSON NOW'); // forced turn: augmented
+  });
 });

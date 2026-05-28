@@ -30,6 +30,8 @@ Investigate WHY a specific anomaly occurred. You are given one anomaly; your job
 - Segment by dimension: `select count event purchase by customer.country grouping top 5 in last 7 days`
 - Segment by device: `select count event purchase by customer.device_type grouping top 5 in last 7 days`
 - Multiple metrics: `select count event view_item, count event cart_update, count event purchase in last 7 days`
+- **Do NOT use a `customers matching ...` clause — it is NOT supported in this EQL flavor and wastes a call.** Segment with `by <attribute>` instead.
+- Funnels require a trailing `end`: `funnel view_item followed by purchase in last 7 days end`.
 
 ## CRITICAL: this workspace's data may be historical (not live)
 
