@@ -50,6 +50,7 @@ export default function StatusLog({
         style={{
           position: 'sticky',
           top: 0,
+          zIndex: 1, // keep the header above the trace that scrolls under it
           padding: '12px 16px',
           borderBottom: '1px solid var(--border)',
           background: 'var(--bg-elevated)',
