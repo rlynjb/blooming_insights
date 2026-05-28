@@ -8,7 +8,7 @@ import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import EvidencePanel from '@/components/investigation/EvidencePanel';
 import RecommendationCard from '@/components/investigation/RecommendationCard';
-import AgentPipeline from '@/components/shared/AgentPipeline';
+import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 
 function BackLink() {
   return (
@@ -36,9 +36,6 @@ export default function InvestigatePage() {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [complete, setComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeAgent, setActiveAgent] = useState<
-    'monitoring' | 'diagnostic' | 'recommendation' | null
-  >(null);
   const startedRef = useRef(false);
 
   useEffect(() => {
@@ -49,19 +46,10 @@ export default function InvestigatePage() {
 
     let cancelled = false;
 
-    // advance the pipeline pill from an event's agent; only diagnostic /
-    // recommendation move it (monitoring already happened upstream, coordinator ignored)
-    const advancePipeline = (agent: string) => {
-      if (agent === 'diagnostic' || agent === 'recommendation') {
-        setActiveAgent(agent);
-      }
-    };
-
     const handleEvent = (e: AgentEvent) => {
       if (cancelled) return;
       switch (e.type) {
         case 'reasoning_step':
-          advancePipeline(e.step.agent);
           setItems((prev) => [
             ...prev,
             {
@@ -74,7 +62,6 @@ export default function InvestigatePage() {
           ]);
           break;
         case 'tool_call_start':
-          advancePipeline(e.agent);
           setItems((prev) => [
             ...prev,
             {
@@ -86,7 +73,6 @@ export default function InvestigatePage() {
           ]);
           break;
         case 'tool_call_end':
-          advancePipeline(e.agent);
           setItems((prev) => {
             const next = [...prev];
             for (let i = next.length - 1; i >= 0; i--) {
@@ -124,7 +110,18 @@ export default function InvestigatePage() {
 
     (async () => {
       try {
-        const res = await fetch(`/api/agent?insightId=${id}`);
+        // Hand the agent the insight the feed stashed (sessionStorage), so the
+        // anomaly survives Vercel's per-instance memory across function boundaries.
+        let url = `/api/agent?insightId=${id}`;
+        try {
+          const stashed =
+            typeof window !== 'undefined' ? sessionStorage.getItem(`bi:insight:${id}`) : null;
+          if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
+        } catch {
+          /* sessionStorage blocked — fall back to server-side lookup */
+        }
+
+        const res = await fetch(url);
 
         if (res.status === 401) {
           const b = await res.json().catch(() => ({}));
@@ -177,14 +174,33 @@ export default function InvestigatePage() {
   }, [id]);
 
   const streaming = !complete && !error;
-  const statusColor = error
-    ? 'var(--accent-coral)'
-    : complete
-      ? 'var(--accent-teal)'
-      : 'var(--accent-amber)';
-  const statusLabel = error ? 'error' : complete ? 'complete' : 'analyzing…';
-
   const canExport = complete || diagnosis !== null;
+
+  // Stepper stages: monitoring already produced this insight upstream;
+  // diagnostic + recommendation run live on this page.
+  const diagState: StepState = error && !diagnosis ? 'error' : diagnosis ? 'complete' : 'active';
+  const recState: StepState =
+    error && diagnosis && !complete
+      ? 'error'
+      : complete
+        ? 'complete'
+        : diagnosis
+          ? 'active'
+          : 'pending';
+  const diagSub =
+    diagState === 'error'
+      ? 'failed'
+      : diagState === 'complete'
+        ? 'cause identified'
+        : 'testing hypotheses…';
+  const recSub =
+    recState === 'error'
+      ? 'failed'
+      : recState === 'complete'
+        ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'}`
+        : recState === 'active'
+          ? 'proposing actions…'
+          : 'awaiting diagnosis';
 
   const buildMarkdown = (): string => {
     const lines: string[] = [];
@@ -268,86 +284,60 @@ export default function InvestigatePage() {
       className="min-h-screen px-6 py-10 mx-auto w-full max-w-5xl"
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
-      {/* header */}
-      <div style={{ marginBottom: 28 }}>
-        <div style={{ marginBottom: 12 }}>
-          <BackLink />
-        </div>
+      {/* header — consistent with the feed: branding + the shared stepper */}
+      <div style={{ marginBottom: 32 }}>
+        {/* utility row: back + export */}
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
+            justifyContent: 'space-between',
             gap: 12,
-            flexWrap: 'wrap',
+            marginBottom: 12,
           }}
         >
-          <h1
-            className="text-2xl lowercase"
-            style={{
-              fontFamily: 'var(--font-display), system-ui, sans-serif',
-              color: 'var(--text-primary)',
-              margin: 0,
-            }}
-          >
-            investigation
-          </h1>
-          <span
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 12,
-              marginLeft: 'auto',
-              flexWrap: 'wrap',
-            }}
-          >
-            {!error && <AgentPipeline active={activeAgent} done={complete} />}
-
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              <span
-                className={streaming ? 'animate-pulse' : undefined}
-                aria-hidden
-                style={{
-                  display: 'inline-block',
-                  width: 8,
-                  height: 8,
-                  borderRadius: '50%',
-                  background: statusColor,
-                }}
-              />
-              <span
-                className="lowercase"
-                style={{
-                  color: statusColor,
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.75rem',
-                }}
-              >
-                {statusLabel}
-              </span>
-            </span>
-
-            {canExport && !error && (
-              <button
-                type="button"
-                onClick={handleExport}
-                className="lowercase"
-                style={{
-                  background: 'transparent',
-                  border: '1px solid var(--border)',
-                  borderRadius: 4,
-                  cursor: 'pointer',
-                  color: 'var(--text-secondary)',
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.75rem',
-                  padding: '3px 10px',
-                }}
-              >
-                export ↓
-              </button>
-            )}
-          </span>
+          <BackLink />
+          {canExport && !error && (
+            <button
+              type="button"
+              onClick={handleExport}
+              className="lowercase"
+              style={{
+                background: 'transparent',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                cursor: 'pointer',
+                color: 'var(--text-secondary)',
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.75rem',
+                padding: '3px 10px',
+              }}
+            >
+              export ↓
+            </button>
+          )}
         </div>
+        <h1
+          className="text-3xl lowercase"
+          style={{
+            fontFamily: 'var(--font-display), system-ui, sans-serif',
+            color: 'var(--text-primary)',
+            marginBottom: 6,
+          }}
+        >
+          blooming insights
+        </h1>
+        <p className="text-sm lowercase" style={{ color: 'var(--text-secondary)' }}>
+          your workspace, in bloom
+        </p>
       </div>
+
+      {/* same stepper as the feed — monitoring is done; the other two run here */}
+      <ProcessStepper
+        monitoring={{ state: 'complete', sub: 'change detected' }}
+        diagnostic={{ state: diagState, sub: diagSub }}
+        recommendation={{ state: recState, sub: recSub }}
+      />
 
       {error ? (
         <div

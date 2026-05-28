@@ -25,8 +25,23 @@ function insightToAnomaly(i: Insight): Anomaly {
   return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
 }
 
-/** Resolve the anomaly to investigate: in-memory state first, then the demo snapshot. */
-function resolveAnomaly(insightId: string): Anomaly | null {
+/** Resolve the anomaly to investigate. Prefers the client-provided insight
+ *  (handed from the feed via sessionStorage → `?insight=`), which is the only
+ *  source that survives Vercel's per-instance memory: the feed request and this
+ *  request can land on different function instances, so the in-memory store is
+ *  unreliable in production. Falls back to in-memory (same-instance / dev) then
+ *  the demo snapshot. */
+function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
+  if (insightParam) {
+    try {
+      const i = JSON.parse(insightParam) as Insight;
+      if (i && typeof i.metric === 'string' && i.change && Array.isArray(i.scope) && i.severity) {
+        return insightToAnomaly(i);
+      }
+    } catch {
+      /* malformed param — fall through to the server-side lookup */
+    }
+  }
   const a = getAnomaly(insightId);
   if (a) return a;
   const i = getInsight(insightId);
@@ -53,6 +68,7 @@ const REPLAY_DELAY_MS = 180;
 
 export async function GET(req: NextRequest) {
   const insightId = req.nextUrl.searchParams.get('insightId');
+  const insightParam = req.nextUrl.searchParams.get('insight');
   const q = req.nextUrl.searchParams.get('q')?.trim() || null;
   if (!insightId && !q) {
     return NextResponse.json({ error: 'insightId or q required' }, { status: 400 });
@@ -83,7 +99,7 @@ export async function GET(req: NextRequest) {
   }
 
   // For the investigation flow we need a resolvable anomaly; the query flow does not.
-  const anomaly = insightId ? resolveAnomaly(insightId) : null;
+  const anomaly = insightId ? resolveAnomaly(insightId, insightParam) : null;
   if (insightId && !anomaly) {
     return NextResponse.json({ error: 'insight not found' }, { status: 404 });
   }

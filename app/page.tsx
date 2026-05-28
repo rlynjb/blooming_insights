@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import type { Insight } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
-import FeedStepper from '@/components/shared/FeedStepper';
+import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 import QueryBox from '@/components/chat/QueryBox';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 
@@ -25,6 +25,45 @@ type BriefingEvent =
   | { type: 'insight'; insight: Insight }
   | { type: 'done' }
   | { type: 'error'; message?: string };
+
+type FeedStatus = 'loading' | 'error' | 'empty' | 'loaded';
+
+// Monitoring is the only stage that runs on the feed; derive its stepper state
+// and live status line from the feed's fetch status.
+function monitoringState(status: FeedStatus): StepState {
+  if (status === 'loading') return 'active';
+  if (status === 'error') return 'error';
+  return 'complete'; // loaded | empty
+}
+
+function monitoringSub(
+  status: FeedStatus,
+  statusText: string,
+  queryCount: number,
+  insightCount: number,
+): string {
+  if (status === 'loading') {
+    const q = statusText.trim();
+    if (q) return queryCount > 0 ? `query ${queryCount} · ${q}` : q;
+    return 'scanning your workspace…';
+  }
+  if (status === 'empty') return 'no notable changes';
+  if (status === 'error') return 'scan failed';
+  return `${insightCount} change${insightCount === 1 ? '' : 's'} found`;
+}
+
+/** Stash each insight so the investigation page can hand its anomaly to the
+ *  agent route (?insight=…). On Vercel the feed and the investigation request
+ *  can hit different instances, so server-side in-memory lookup is unreliable;
+ *  the browser carries the data across instead. */
+function stashInsights(list: Insight[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    for (const i of list) sessionStorage.setItem(`bi:insight:${i.id}`, JSON.stringify(i));
+  } catch {
+    /* sessionStorage full/blocked — investigation falls back to server lookup */
+  }
+}
 
 /** Read a response body defensively: parse JSON when possible, otherwise return
  *  the raw text under __raw so a 500/empty/HTML body never throws on res.json(). */
@@ -115,6 +154,7 @@ export default function HomePage() {
           const list: Insight[] = Array.isArray(data?.insights) ? data.insights : [];
           setWorkspace(data?.workspace);
           setInsights(list);
+          stashInsights(list);
           setStatus(list.length === 0 ? 'empty' : 'loaded');
           return;
         }
@@ -141,6 +181,7 @@ export default function HomePage() {
               break;
             case 'done':
               setInsights(collected);
+              stashInsights(collected);
               setStatus(collected.length === 0 ? 'empty' : 'loaded');
               break;
             case 'error':
@@ -229,11 +270,13 @@ export default function HomePage() {
       </div>
 
       {/* process stepper — monitoring runs here; the other two run on investigate */}
-      <FeedStepper
-        status={status}
-        statusText={stepStatus}
-        queryCount={queryCount}
-        insightCount={insights.length}
+      <ProcessStepper
+        monitoring={{
+          state: monitoringState(status),
+          sub: monitoringSub(status, stepStatus, queryCount, insights.length),
+        }}
+        diagnostic={{ state: 'pending', sub: 'opens when you investigate' }}
+        recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
       />
 
       {/* active query response — pinned above the feed */}

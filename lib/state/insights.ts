@@ -22,6 +22,13 @@ export function anomalyToInsight(a: Anomaly): Insight {
 }
 
 export function putInsights(items: Insight[], rawAnomalies?: Anomaly[]): void {
+  // Replace the previous briefing — each run IS the current feed, not an
+  // addition. Without clearing, a warm serverless instance (or a long-running
+  // dev server) accumulates stale insights from earlier runs, so the feed shows
+  // yesterday's anomalies alongside today's. Investigations are keyed separately
+  // and untouched here.
+  insights.clear();
+  anomalies.clear();
   items.forEach((i, idx) => {
     insights.set(i.id, i);
     if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);

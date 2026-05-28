@@ -1,35 +1,29 @@
 import type { CSSProperties } from 'react';
 
-// The three-stage process blooming insights runs. Only `monitoring` executes on
-// the feed (via /api/briefing); `diagnostic` and `recommendation` run when an
-// insight is opened (app/investigate/[id]). The stepper is honest about that —
-// it shows monitoring's REAL live status while the briefing streams, and frames
-// the other two as the phases that activate on investigate.
+export type StepState = 'pending' | 'active' | 'complete' | 'error';
 
-type FeedStatus = 'loading' | 'error' | 'empty' | 'loaded';
-type StepState = 'active' | 'complete' | 'pending' | 'error';
-
-interface FeedStepperProps {
-  status: FeedStatus;
-  /** Live monitoring status (the actual query the agent is running). */
-  statusText?: string;
-  /** Number of monitoring tool calls made so far (live). */
-  queryCount?: number;
-  /** Insights found, once monitoring completes. */
-  insightCount?: number;
+export interface StepInput {
+  state: StepState;
+  /** short status line under the label */
+  sub?: string;
 }
 
+interface ProcessStepperProps {
+  monitoring: StepInput;
+  diagnostic: StepInput;
+  recommendation: StepInput;
+}
+
+// The three stages blooming insights runs, with fixed wording shared across the
+// feed and the investigation view so the process reads identically on both.
+// Each page drives the per-step state + status: on the feed, monitoring is the
+// live one; on an investigation, monitoring is already complete and the other
+// two run live.
 const STEPS = [
   { key: 'monitoring', label: 'monitoring anomalies' },
   { key: 'diagnostic', label: 'investigating the issue' },
   { key: 'recommendation', label: 'decision & recommendation' },
 ] as const;
-
-function monitoringState(status: FeedStatus): StepState {
-  if (status === 'loading') return 'active';
-  if (status === 'error') return 'error';
-  return 'complete'; // loaded | empty
-}
 
 const labelStyle: CSSProperties = {
   fontFamily: 'var(--font-mono), monospace',
@@ -66,30 +60,12 @@ function badgeStyle(state: StepState): CSSProperties {
   return { ...base, border: '1px solid var(--border)', color: 'var(--text-tertiary)' };
 }
 
-function monitoringSub(p: FeedStepperProps): string {
-  switch (p.status) {
-    case 'loading': {
-      const q = p.statusText?.trim();
-      const n = p.queryCount ?? 0;
-      if (q) return n > 0 ? `query ${n} · ${q}` : q;
-      return 'scanning your workspace…';
-    }
-    case 'empty':
-      return 'no notable changes';
-    case 'error':
-      return 'scan failed';
-    case 'loaded':
-    default: {
-      const c = p.insightCount ?? 0;
-      return `${c} change${c === 1 ? '' : 's'} found`;
-    }
-  }
-}
-
-export default function FeedStepper(props: FeedStepperProps) {
-  const subFor = (i: number): string =>
-    i === 0 ? monitoringSub(props) : 'opens when you investigate';
-
+export default function ProcessStepper({
+  monitoring,
+  diagnostic,
+  recommendation,
+}: ProcessStepperProps) {
+  const inputs: StepInput[] = [monitoring, diagnostic, recommendation];
   return (
     <div
       role="group"
@@ -104,7 +80,7 @@ export default function FeedStepper(props: FeedStepperProps) {
       }}
     >
       {STEPS.map((step, i) => {
-        const state: StepState = i === 0 ? monitoringState(props.status) : 'pending';
+        const { state, sub } = inputs[i];
         const labelColor =
           state === 'pending'
             ? 'var(--text-tertiary)'
@@ -136,9 +112,11 @@ export default function FeedStepper(props: FeedStepperProps) {
               <div className="lowercase" style={{ ...labelStyle, color: labelColor }}>
                 {step.label}
               </div>
-              <div className="lowercase" style={{ ...subStyle, color: subColor }} title={subFor(i)}>
-                {subFor(i)}
-              </div>
+              {sub && (
+                <div className="lowercase" style={{ ...subStyle, color: subColor }} title={sub}>
+                  {sub}
+                </div>
+              )}
             </div>
           </div>
         );
