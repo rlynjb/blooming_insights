@@ -1,0 +1,503 @@
+# NDJSON line-buffering + event reconciliation
+
+**Industry name(s):** stream framing / delimiter-based buffering, incremental parsing; reconciliation by reverse scan
+**Type:** Industry standard · Language-agnostic
+
+> Read a chunked byte stream where JSON objects may arrive split across network boundaries, reassemble complete newline-delimited records in a string buffer, parse each, and keep state consistent by reconciling paired start/end events in place.
+
+**See also:** → ../01-system-design/05-streaming-ndjson.md
+
+---
+
+## Why care
+
+You call `fetch('/api/agent?insightId=…')`, get a `ReadableStream` back, call `getReader()`, and loop over `reader.read()` chunks. Each chunk is a `Uint8Array`. You decode it and call `JSON.parse`. On the first real run, one chunk arrives decoded as:
+
+```
+{"type":"tool_call_start","toolName":"fetch_metrics","agent":"diagn
+```
+
+`JSON.parse` throws `SyntaxError: Unexpected end of JSON input`. The object was cut in half mid-flight. Nothing in `fetch` or `ReadableStream` guarantees that chunk boundaries fall on newlines — they fall wherever TCP and the HTTP layer decide to flush.
+
+**The question:** how do you reassemble complete records when network chunks can arrive with an object split across two of them?
+
+**Without buffering, valid events are silently dropped or throw.** The reasoning trace misses tool calls. The pipeline pill never advances. The UI freezes at "connecting to agent…" because `tool_call_end` never fires to resolve the `running` item. You have no error to act on — the `catch` block just swallows the parse failure and moves on.
+
+The one-line reduction: split on the newline delimiter, but always carry the last incomplete piece forward into the next iteration.
+
+---
+
+## How it works
+
+**Mental model — the buffer as a sliding window over the byte stream.**
+
+A string variable `buf` accumulates decoded text across iterations. On each chunk, you append to `buf`, then split on `\n`. The split result is an array where every element except the last is a complete record (it ended before a `\n`). The last element may be empty (the chunk ended exactly on `\n`) or a partial record still in flight. You keep that last element in `buf` and parse everything else.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  buf (string, persists across reader.read() iterations)         │
+│                                                                 │
+│  iteration N:  buf = prev_partial + decoded_chunk_N             │
+│                                                                 │
+│  after split('\n'):                                             │
+│  ┌──────────────┬──────────────┬──────────────────────────┐    │
+│  │ complete[0]  │ complete[1]  │ partial (last element)   │    │
+│  └──────────────┴──────────────┴──────────────────────────┘    │
+│         ↓              ↓                  ↓                     │
+│    JSON.parse     JSON.parse        buf = partial               │
+│    handleEvent    handleEvent       (held for next iter)        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The invariant: after every iteration, `buf` holds at most one incomplete JSON object. That object will be completed — or the stream ends and you flush it.
+
+### decode with `{stream: true}`
+
+`TextDecoder.decode(value, { stream: true })` tells the decoder that more bytes are coming. Without that flag, the decoder finalises its internal state on each call and may replace a trailing multi-byte UTF-8 sequence (e.g., a 3-byte emoji split across chunk boundaries) with the Unicode replacement character `U+FFFD`. With `{ stream: true }`, the decoder holds the incomplete byte sequence internally and emits it correctly when the remaining bytes arrive in the next chunk. For ASCII-only JSON this is invisible; for any non-ASCII content in strings (user-facing text, tool results, diagnosis copy) it is load-bearing.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Chunk N ends with:  0xE2 0x80  (first 2 bytes of "…" U+2026) │
+│                                                                │
+│  stream: false → decoder emits  U+FFFD  (corrupt)             │
+│  stream: true  → decoder buffers 0xE2 0x80, waits for 0xA6    │
+│                                                                │
+│  Chunk N+1 starts with: 0xA6 …                                │
+│  stream: true  → decoder emits  "…"  (correct)                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### split + `lines.pop()`
+
+`buf.split('\n')` returns an array. `Array.prototype.pop()` removes and returns the last element. That last element is either an empty string (chunk ended with `\n`) or the start of the next object. Assigning it back to `buf` is the entire buffering mechanism — one line, no data structures, no library.
+
+Buffer state across two chunks where an event is split:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  CHUNK 1 (decoded)                                             │
+│  {"type":"reasoning_step","step":{…}}\n{"type":"tool_call_sta  │
+│                                                                │
+│  buf before:  ""                                               │
+│  buf after decode append:                                      │
+│    {"type":"reasoning_step","step":{…}}\n{"type":"tool_call_sta│
+│                                                                │
+│  lines = buf.split('\n')                                       │
+│  ┌─────────────────────────────────────┬──────────────────┐   │
+│  │ lines[0]: {"type":"reasoning_step"… │ lines[1]: partial│   │
+│  └─────────────────────────────────────┴──────────────────┘   │
+│                                                                │
+│  buf = lines.pop()  →  {"type":"tool_call_sta                  │
+│  lines = [{"type":"reasoning_step",…}]  → parsed + dispatched  │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  CHUNK 2 (decoded)                                             │
+│  rt","toolName":"fetch_metrics","agent":"diagnostic"}\n        │
+│                                                                │
+│  buf before:  {"type":"tool_call_sta                           │
+│  buf after decode append:                                      │
+│    {"type":"tool_call_start","toolName":"fetch_metrics",…}\n   │
+│                                                                │
+│  lines = buf.split('\n')                                       │
+│  ┌──────────────────────────────────────────────────┬──────┐  │
+│  │ lines[0]: {"type":"tool_call_start",…}           │  ""  │  │
+│  └──────────────────────────────────────────────────┴──────┘  │
+│                                                                │
+│  buf = lines.pop()  →  ""   (empty — chunk ended on \n)       │
+│  lines = [{"type":"tool_call_start",…}]  → parsed + dispatched │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### parse + dispatch
+
+Each element in `lines` (after `pop()`) that is not blank is passed to `JSON.parse`. The result is cast to `AgentEvent` and handed to `handleEvent`. If `JSON.parse` throws, the catch block continues — malformed lines are skipped rather than crashing the loop.
+
+After the `for (;;)` loop exits (`done === true`), any remaining content in `buf` is flushed with a final `JSON.parse` + `handleEvent`. This handles the edge case where the server closes the connection without a trailing newline.
+
+### tool-call reconciliation
+
+`handleEvent` maintains a `TraceItem[]` array in React state. The reconciliation problem: `tool_call_start` and `tool_call_end` are separate events, potentially separated by many other events (reasoning steps, other tool calls). When `tool_call_end` arrives, you need to find the matching `running` item without a shared identifier — only `toolName` links them.
+
+The algorithm is a reverse scan — iterate backward through the current items array, find the last item where `kind === 'tool'` and `toolName === e.toolName` and `status === 'running'`, then mutate a shallow copy of the array at that index.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  items array at time of tool_call_end for "fetch_metrics"      │
+│                                                                │
+│  index  0: {kind:'step',   id:'s1', …}                        │
+│  index  1: {kind:'tool',   toolName:'fetch_metrics',           │
+│                            status:'running'}   ← target        │
+│  index  2: {kind:'step',   id:'s2', …}                        │
+│  index  3: {kind:'tool',   toolName:'analyze_trends',          │
+│                            status:'running'}                   │
+│                                                                │
+│  reverse scan: i=3 → toolName mismatch                        │
+│                i=2 → kind:'step' skip                         │
+│                i=1 → match → next[1] = {...it, status:'done'}  │
+│                       break                                    │
+│                                                                │
+│  result: index 1 updated, index 3 untouched (still running)   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Step-by-step execution trace — split-across-chunks + reconciliation.**
+
+Setup: `buf = ""`, `items = []`.
+
+**Step 1: reader.read() → chunk 1**
+
+`value` (decoded with `{ stream: true }`):
+```
+{"type":"tool_call_start","toolName":"fetch_metrics","agent":"diagnostic"}\n{"type":"reasoning_step","step":{"id":"s1","agent":"diagn
+```
+
+`buf` before: `""`
+`buf` after `buf += decode(value, { stream: true })`: the full decoded string above.
+
+`lines = buf.split('\n')`:
+- `lines[0]`: `{"type":"tool_call_start","toolName":"fetch_metrics","agent":"diagnostic"}`
+- `lines[1]`: `{"type":"reasoning_step","step":{"id":"s1","agent":"diagn`
+
+`buf = lines.pop()`: `buf` = `{"type":"reasoning_step","step":{"id":"s1","agent":"diagn`
+
+`lines` now = `[lines[0]]`.
+
+Loop over `lines`:
+- Line 0 is non-blank → `JSON.parse` succeeds → `handleEvent({type:'tool_call_start', toolName:'fetch_metrics', …})`
+- `handleEvent` hits `case 'tool_call_start'` → `setItems(prev => [...prev, {kind:'tool', id: uuid, toolName:'fetch_metrics', status:'running'}])`
+
+`items` (after React schedules the update): `[{kind:'tool', toolName:'fetch_metrics', status:'running'}]`
+
+**Step 2: reader.read() → chunk 2**
+
+`value` (decoded):
+```
+ostic","kind":"thought","content":"checking metric gaps"}}\n{"type":"tool_call_end","toolName":"fetch_metrics","agent":"diagnostic","durationMs":320}\n
+```
+
+`buf` before: `{"type":"reasoning_step","step":{"id":"s1","agent":"diagn`
+`buf` after append: `{"type":"reasoning_step","step":{"id":"s1","agent":"diagnostic","kind":"thought","content":"checking metric gaps"}}\n{"type":"tool_call_end","toolName":"fetch_metrics","agent":"diagnostic","durationMs":320}\n`
+
+`lines = buf.split('\n')`:
+- `lines[0]`: `{"type":"reasoning_step","step":{"id":"s1","agent":"diagnostic","kind":"thought","content":"checking metric gaps"}}`
+- `lines[1]`: `{"type":"tool_call_end","toolName":"fetch_metrics","agent":"diagnostic","durationMs":320}`
+- `lines[2]`: `""` (trailing newline)
+
+`buf = lines.pop()`: `buf` = `""`.
+
+`lines` now = `[lines[0], lines[1]]`.
+
+Loop:
+- Line 0: `JSON.parse` → `handleEvent({type:'reasoning_step', …})` → appends step item to `items`.
+- Line 1: `JSON.parse` → `handleEvent({type:'tool_call_end', toolName:'fetch_metrics', durationMs:320})`
+  - `setItems(prev => …)` functional update:
+    - `next = [...prev]` (copy)
+    - `i = next.length - 1` → scan backward
+    - finds `{kind:'tool', toolName:'fetch_metrics', status:'running'}` at its index
+    - replaces with `{…, status:'done', durationMs:320}`
+    - returns `next`
+
+`items` final: `[{kind:'tool', toolName:'fetch_metrics', status:'done', durationMs:320}, {kind:'step', id:'s1', …}]`
+
+**The principle:** you can only frame records from a delimiter-based stream by buffering the boundary. The delimiter (`\n`) is not guaranteed to align with chunk boundaries. The buffer is the mechanism that holds the boundary region across iterations until the delimiter arrives.
+
+---
+
+## NDJSON line-buffering + event reconciliation — diagram
+
+The primary data flow from byte stream to UI state.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  fetch('/api/agent?insightId=…')                                     │
+│       │                                                              │
+│       ▼                                                              │
+│  res.body  ──  ReadableStream<Uint8Array>                            │
+│       │                                                              │
+│       ▼                                                              │
+│  reader = res.body.getReader()          ← Web Streams API            │
+│       │                                                              │
+│  ┌────┴──────────────────────────────────────────────────────────┐   │
+│  │  for (;;) loop                                                │   │
+│  │                                                               │   │
+│  │  { done, value } = await reader.read()                        │   │
+│  │         │                                                      │   │
+│  │         ▼                                                      │   │
+│  │  dec.decode(value, { stream: true })   ← TextDecoder          │   │
+│  │         │  (holds partial multi-byte seqs across chunks)      │   │
+│  │         ▼                                                      │   │
+│  │  buf += decoded_string                 ← string accumulator   │   │
+│  │         │                                                      │   │
+│  │         ▼                                                      │   │
+│  │  lines = buf.split('\n')              ← delimiter framing     │   │
+│  │         │                                                      │   │
+│  │         ├─── buf = lines.pop()        ← keep trailing partial │   │
+│  │         │         (may be "" or partial JSON)                  │   │
+│  │         │                                                      │   │
+│  │         ▼                                                      │   │
+│  │  for each non-blank line in lines:                            │   │
+│  │    JSON.parse(line)  ──→  AgentEvent                          │   │
+│  │         │                                                      │   │
+│  │         ▼                                                      │   │
+│  │    handleEvent(e)                                             │   │
+│  │         │                                                      │   │
+│  │         ├── tool_call_start → setItems([...prev, {status:'running'}]) │
+│  │         │                                                      │   │
+│  │         ├── tool_call_end   → setItems(prev => {              │   │
+│  │         │       next = [...prev]                              │   │
+│  │         │       reverse scan for last running+toolName match  │   │
+│  │         │       next[i] = {...it, status:'done'}              │   │
+│  │         │       return next })                                │   │
+│  │         │                                                      │   │
+│  │         ├── reasoning_step  → setItems([...prev, step])       │   │
+│  │         ├── diagnosis       → setDiagnosis(e.diagnosis)       │   │
+│  │         ├── recommendation  → setRecommendations([...prev,…]) │   │
+│  │         └── done            → setComplete(true)               │   │
+│  └───────────────────────────────────────────────────────────────┘   │
+│       │                                                              │
+│       ▼  (after loop exits)                                          │
+│  flush: if (buf.trim()) handleEvent(JSON.parse(buf))                 │
+│       │                                                              │
+│       ▼                                                              │
+│  React state: items[], diagnosis, recommendations, complete          │
+│       │                                                              │
+│       ▼                                                              │
+│  <ReasoningTrace items={items} />  ←  live-updating UI              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The diagram stands alone: a chunk arrives as bytes, gets decoded as text with `{ stream: true }` to handle multi-byte boundaries, appended to `buf`, split on `\n`, the trailing partial is popped back into `buf`, every complete line is parsed and dispatched to `handleEvent`, which appends or reconciles items in React state.
+
+---
+
+## In this codebase
+
+**File:** `app/investigate/[id]/page.tsx`
+**Function / class:** `InvestigatePage` — the `useEffect` reader loop (L143–L168) and `handleEvent` (L60–L123)
+**Line range:** L60–L168
+
+The reader loop:
+
+```ts
+// app/investigate/[id]/page.tsx  L143–L160
+const reader = res.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });
+  const lines = buf.split('\n');
+  buf = lines.pop() ?? '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      handleEvent(JSON.parse(line) as AgentEvent);
+    } catch {
+      /* ignore malformed line */
+    }
+  }
+}
+```
+
+The tool-call reconciliation reverse scan inside `handleEvent`:
+
+```ts
+// app/investigate/[id]/page.tsx  L88–L106
+case 'tool_call_end':
+  advancePipeline(e.agent);
+  setItems((prev) => {
+    const next = [...prev];
+    for (let i = next.length - 1; i >= 0; i--) {
+      const it = next[i];
+      if (it.kind === 'tool' && it.toolName === e.toolName && it.status === 'running') {
+        next[i] = {
+          ...it,
+          status: 'done',
+          durationMs: e.durationMs,
+          result: e.result,
+          error: e.error,
+        };
+        break;
+      }
+    }
+    return next;
+  });
+  break;
+```
+
+**Also:** `components/chat/StreamingResponse.tsx` — identical reader loop at L107–L132, identical reconciliation at L59–L76. `StreamingResponse` is used in the query box flow; `app/investigate/[id]/page.tsx` is used for full investigation runs. Both duplicate the same buffer+reconciliation pattern.
+
+**GitHub links:**
+- `app/investigate/[id]/page.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/page.tsx#L143-L168
+- `components/chat/StreamingResponse.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/components/chat/StreamingResponse.tsx#L107-L132
+
+---
+
+## Elaborate
+
+**Where it comes from.** Stream framing is the fundamental problem of any message-oriented protocol running over a byte-stream transport. TCP delivers bytes in order but not in message-sized units. Every protocol that carries structured messages over TCP — HTTP chunked transfer, WebSocket, gRPC, Redis RESP, PostgreSQL wire protocol — solves framing. NDJSON solves it with the simplest possible delimiter: `\n`. Each complete JSON object ends with a newline; the reader buffers until it sees one. The alternative framing strategies are length-prefix (write a 4-byte integer before each record so the reader knows exactly how many bytes to wait for) and sentinel (use a unique byte sequence that cannot appear inside a record). NDJSON's newline delimiter is human-readable and trivial to implement but requires that `\n` cannot appear unescaped inside a JSON string value — which is true by the JSON spec.
+
+**The deeper principle.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Framing strategies over a byte stream                          │
+│                                                                 │
+│  Strategy          │ Delimiter        │ Reader action           │
+│  ──────────────────┼──────────────────┼─────────────────────── │
+│  NDJSON (here)     │ \n               │ split + buffer partial  │
+│  Length-prefix     │ 4-byte header    │ read N, then payload    │
+│  SSE               │ \n\n             │ browser built-in        │
+│  WebSocket frames  │ frame header     │ browser built-in        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Where it breaks down.**
+
+1. **No max-buffer guard.** If the server never writes a `\n` — due to a bug, or because it starts streaming raw prose — `buf` grows without bound for the lifetime of the request. The browser tab's memory is the only limit. A real production implementation adds `if (buf.length > MAX_BUF) { reader.cancel(); setError('stream framing error'); return; }` after the append.
+
+2. **Reconciliation LIFO mis-pairs on concurrent tools.** The reverse scan finds the *last* `running` item with a matching `toolName`. If two calls to the same tool ran concurrently, `tool_call_end` would pair with the second one regardless of which started first. In this codebase, tools run sequentially (the agent awaits each tool before starting the next), so the LIFO scan is always correct. If the orchestration model changed to parallel tool dispatch, this would silently mis-pair results.
+
+3. **`lines.pop() ?? ''` returns `''` on an empty array.** If `buf` were empty and the decoded chunk were also empty (a keep-alive byte with no content), `buf.split('\n')` returns `['']`, `pop()` returns `''`, and `buf` stays `''`. Harmless, but worth knowing the degenerate path.
+
+**What to explore next.**
+- `ndjson` npm package — wraps this exact loop as a `Transform` stream; useful if the pattern recurs in server-side Node code.
+- `eventsource-parser` — parses the Server-Sent Events wire format, which adds `event:`, `data:`, `id:`, and `retry:` fields on top of the `\n\n` delimiter; the parsing algorithm is structurally identical to what is here.
+- Backpressure via `ReadableStream.cancel()` — if `handleEvent` cannot keep up with the rate of incoming events, the browser buffers them in the network layer; a real backpressure mechanism would pause `reader.read()` until the UI catches up.
+
+---
+
+## Tradeoffs
+
+| Dimension | This implementation | Alternative: SSE + `EventSource` | Alternative: streaming NDJSON parser lib |
+|-----------|--------------------|------------------------------------|------------------------------------------|
+| Framing complexity | Manual: `split('\n')` + `pop()` — ~3 lines | Browser-native: `EventSource` handles framing | Library handles framing, exposes object events |
+| Multi-byte safety | `TextDecoder({ stream: true })` — correct but must remember the flag | Built into the browser SSE implementation | Built into the library |
+| Reconnect on drop | None — stream closes, UI stops | `EventSource` reconnects automatically with `Last-Event-ID` | Depends on fetch wrapper used |
+| Backpressure | None — `buf` grows unbounded if server is faster than consumer | None — `EventSource` buffers in the browser | Depends on library |
+| Dependency count | Zero — Web Streams API + `String.prototype.split` | Zero — `EventSource` is a browser built-in | One npm dependency |
+| Auth headers | `fetch` accepts `Authorization` header | `EventSource` cannot send custom headers in the browser (requires a wrapper or query-param token) | Same as fetch — full header control |
+
+**What was given up.** The hand-rolled loop has no backpressure, no max-buffer guard, and no reconnect. If the server drops the connection mid-stream, the investigation stops and the user sees a stale "analyzing…" indicator. Two files (`page.tsx` and `StreamingResponse.tsx`) duplicate the same 25-line pattern rather than sharing a hook.
+
+**What the alternative costs.** SSE (`EventSource`) would remove the manual framing code entirely, but `EventSource` in the browser cannot send `Authorization` headers — the server-side OAuth token that `/api/agent` needs would have to move to a query parameter or cookie, which changes the auth surface. Using `eventsource-parser` as a library adds a dependency and still requires the `fetch`+`getReader()` shell around it; it replaces the `split`/`pop` lines, not the loop structure.
+
+**The breakpoint.** The current approach is correct and sufficient for this workload: events are small (tens of bytes to a few kilobytes), the stream is short-lived (one investigation run), and tools run sequentially so reconciliation is unambiguous. If the agent were to stream large tool results (tens of kilobytes per event), emit events at high frequency, or run tools concurrently, the lack of backpressure and the LIFO reconciliation assumption would both need revisiting.
+
+---
+
+## Tech reference (industry pairing)
+
+### Web Streams reader + TextDecoder
+
+- **`ReadableStream.getReader()`** — acquires an exclusive lock on the stream and returns a `ReadableStreamDefaultReader`. Only one reader can be active at a time. `reader.read()` returns `Promise<{done: boolean, value: Uint8Array}>`. When `done` is `true`, `value` is `undefined` and the stream is closed.
+- **`TextDecoder`** — decodes a `Uint8Array` to a string using a specified encoding (default UTF-8). The `stream: true` option in `decode()` tells the decoder to preserve its internal state (incomplete multi-byte character buffers) between calls, producing correct output when a multi-byte sequence straddles a chunk boundary.
+- **`String.prototype.split(separator)`** — splits a string on every occurrence of `separator` and returns an array. `"a\nb\n".split('\n')` returns `["a", "b", ""]` — the trailing newline produces an empty string as the last element. This is why `lines.pop()` works: the last element is always either empty (safe to discard) or a partial record (must be buffered).
+- **`Array.prototype.pop()`** — removes and returns the last element of an array, mutating the array in place. Used here to extract the trailing partial in one expression rather than slicing.
+- **Runner-up: `eventsource-parser`** — an npm library (by Sanity) that accepts SSE-formatted text and emits parsed events; structurally identical to this pattern but handles the SSE envelope (`data:`, `event:`, `id:` fields) rather than raw NDJSON.
+
+### NDJSON framing
+
+- **NDJSON (Newline-Delimited JSON)** — an informal specification (ndjson.org) where each line of a text stream is a complete, valid JSON value. The newline character `\n` (U+000A) is the record separator. JSON strings cannot contain a literal unescaped `\n`, so the delimiter is unambiguous within a well-formed stream.
+- **Chunked Transfer Encoding (HTTP/1.1)** — the mechanism by which the server sends `Transfer-Encoding: chunked` and writes the response body in variable-size pieces without knowing the total content length in advance. Each chunk is prefixed with its byte count in hex. The browser's `ReadableStream` exposes these chunks as individual `read()` values, but chunk boundaries are not guaranteed to align with NDJSON record boundaries.
+- **Delimiter-based framing** — the general strategy of using a known byte value (or sequence) as the boundary between records in a stream. The receiver buffers bytes until it sees the delimiter, then processes the accumulated bytes as a record. Contrast with *length-prefix framing*, where the sender writes the record length before the record so the receiver knows exactly how many bytes to accumulate.
+- **Reverse scan for reconciliation** — iterating backward through an array to find the most-recently-added matching element. O(n) in the number of items, but n is bounded by the total number of events in one investigation run (tens to low hundreds). The backward direction ensures LIFO semantics: if the same tool appeared multiple times, the most recent `running` entry is paired with the `end` event.
+- **Runner-up: `ndjson` npm package** — wraps NDJSON parsing as a Node.js `Transform` stream; useful server-side. On the browser side, `eventsource-parser` covers the SSE variant of this pattern.
+
+---
+
+## Summary
+
+**Part 1 — what and why.** Chunked HTTP streams deliver bytes at arbitrary boundaries. NDJSON uses `\n` as the record delimiter, but a record can arrive split across two network chunks. A string buffer accumulates decoded text across `reader.read()` iterations; `split('\n')` + `pop()` extracts complete records and retains the trailing partial. `TextDecoder({ stream: true })` prevents corruption of multi-byte UTF-8 sequences that straddle chunk boundaries. When a complete line is available, `JSON.parse` recovers the `AgentEvent` object and `handleEvent` dispatches it to React state. `tool_call_start` and `tool_call_end` are paired by a backward scan through the items array that finds the most recent `running` entry with a matching `toolName`.
+
+**Part 2 — key properties.**
+
+- `buf = lines.pop() ?? ''` is the entire buffer mechanism — one assignment, no data structures.
+- `{ stream: true }` on `TextDecoder.decode` is required for correctness on non-ASCII content; omitting it produces silent data corruption.
+- The reverse scan for reconciliation is correct under sequential tool dispatch; it mis-pairs if the same tool runs concurrently.
+- No max-buffer guard means a server that never writes `\n` will grow `buf` unbounded.
+- The pattern is duplicated in two files (`app/investigate/[id]/page.tsx` L143–L160 and `components/chat/StreamingResponse.tsx` L107–L124) — a shared hook would be the straightforward consolidation.
+- Zero runtime dependencies: `ReadableStream`, `TextDecoder`, and `String.prototype.split` are all Web Platform APIs available in every modern browser.
+
+---
+
+## Interview defense
+
+**What they are really asking:** can you reason about byte-stream boundaries, explain why a naive `JSON.parse(chunk)` fails, and articulate the invariant that makes the buffer-and-split approach correct? At senior level: can you name the failure modes (no max-buffer guard, LIFO mis-pair on concurrent tools)?
+
+**[mid] Q: Why does `JSON.parse(chunk)` fail on a streaming fetch response?**
+A: `reader.read()` delivers whatever bytes the network layer happens to have buffered — there is no alignment to JSON or newline boundaries. A chunk can end mid-string, mid-number, or mid-key. `JSON.parse` requires a complete, valid JSON value; a partial object is a syntax error. The fix is to accumulate chunks in a string buffer and only call `JSON.parse` after you have seen the `\n` that marks the end of the NDJSON record.
+
+**[senior] Q: Walk through what happens to `buf` when a `tool_call_start` event is split across two chunks.**
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  chunk 1 decoded:  {"type":"tool_call_start","toolName":"fetch  │
+│                                                                │
+│  buf += chunk1  →  {"type":"tool_call_start","toolName":"fetch  │
+│  lines = split('\n')  →  [ {"type":"tool_call_start",…partial ] │
+│  buf = lines.pop()    →  {"type":"tool_call_start","toolName":… │
+│  lines = []           →  nothing parsed this iteration         │
+│                                                                │
+│  chunk 2 decoded:  _metrics","agent":"diagnostic"}\n           │
+│                                                                │
+│  buf += chunk2  →  {"type":"tool_call_start",…,"agent":"diag…}│
+│  lines = split('\n')  →  [ complete_object, "" ]               │
+│  buf = lines.pop()    →  ""                                    │
+│  JSON.parse(complete_object) → handleEvent → items += running  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+The event is recovered on the second iteration. No data is lost.
+
+**[arch] Q: What breaks if two instances of the same tool run concurrently and both emit `tool_call_end`?**
+A: The reverse scan is LIFO — it always pairs `tool_call_end` with the *last* `running` entry that matches `toolName`. If `fetch_metrics` started twice before either finished, both `tool_call_end` events would match the second (later) `running` entry. The first entry would never transition to `done`. The UI would show a permanently-spinning tool call. The fix is to add a unique `id` field to both `tool_call_start` and `tool_call_end` and scan by `id` rather than `toolName`. The current design is safe because tools are dispatched sequentially in this codebase.
+
+**The dodge — "why hand-roll buffering instead of SSE or a parser library?"**
+Honest answer: `EventSource` (browser SSE) cannot send custom request headers — `Authorization`, `x-api-key`, etc. The agent route requires an OAuth token. Moving auth to a query parameter or cookie changes the attack surface. Using `fetch` with the `Authorization` header keeps auth in the standard place. The NDJSON framing code is 6 lines; the cost of the hand-roll is low compared to the auth complexity tradeoff. If auth were cookie-based, SSE would be worth revisiting.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  SSE (EventSource)                 │  fetch + NDJSON (this code)    │
+│  ─────────────────────────────────   ─────────────────────────────  │
+│  Auth: cookies only (no headers)   │  Auth: any header              │
+│  Reconnect: automatic              │  Reconnect: none               │
+│  Framing: browser-native           │  Framing: 6 lines of code      │
+│  Format: SSE envelope required     │  Format: raw NDJSON            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Anchors — cite these in your answer.**
+- `app/investigate/[id]/page.tsx` L149: `buf += dec.decode(value, { stream: true })` — the append.
+- `app/investigate/[id]/page.tsx` L150–L151: `const lines = buf.split('\n'); buf = lines.pop() ?? ''` — the invariant.
+- `app/investigate/[id]/page.tsx` L92–L103: the reverse scan in `tool_call_end`.
+- `components/chat/StreamingResponse.tsx` L113–L115: the same three lines in the query-box flow, confirming the pattern is shared across both streaming surfaces.
+- `TextDecoder` MDN: the `stream` option is documented under `TextDecodeOptions`.
+
+---
+
+## Validate your understanding
+
+**Level 1 — reconstruct.** Without looking at the file, write the 6-line buffer loop: declare `buf`, call `reader.read()` in a `for (;;)`, decode with the correct option, split, pop, and loop over the remaining lines calling `JSON.parse`. Then check your version against `app/investigate/[id]/page.tsx` L143–L160.
+
+**Level 2 — explain.** At L151, `buf = lines.pop() ?? ''`. What does `lines.pop()` return when the chunk ends with exactly one `\n`? What does it return when the chunk ends with no `\n`? Why is the `?? ''` fallback needed, and when would `pop()` return `undefined`? (Answer: if `buf` were `""` and the decoded chunk were `""`, `"".split('\n')` returns `[""]` and `pop()` returns `""` — not `undefined`. The `?? ''` fallback triggers only if `split` somehow returned an empty array, which cannot happen for a string, so it is a defensive `null`-coalescion for TypeScript's type narrowing.)
+
+**Level 3 — apply.** Scenario: users report that one out of every thirty-or-so investigation runs shows a missing tool call in the reasoning trace — a `tool_call_start` with no matching `done` state. A colleague suspects a chunk boundary is landing mid-object. Trace the buffer for this sequence:
+
+```
+chunk A: {"type":"tool_call_start","toolName":"query_segments","agent":
+chunk B: "diagnostic"}\n{"type":"tool_call_end","toolName":"query_segm
+chunk C: ents","agent":"diagnostic","durationMs":88}\n
+```
+
+Show every variable at every step: `buf` before and after each chunk, `lines`, `buf = lines.pop()`, which lines get parsed, and what `handleEvent` does. Then identify whether the missing-tool-call bug would appear in this trace or somewhere else. Cite `app/investigate/[id]/page.tsx` L143–L160 and L88–L106.
+
+**Level 4 — defend.** A reviewer says: "this is reinventing SSE; just use `EventSource`." Walk through the auth constraint, the three lines of framing code that would be saved, and the reconnect behavior difference. State your conclusion without hedging.
+
+**Quick check.**
+- What is the value of `buf` after `"abc\ndef".split('\n').pop()`? (`"def"`)
+- If `{ stream: true }` is omitted from `TextDecoder.decode`, what breaks and when? (multi-byte sequences split across chunk boundaries produce `U+FFFD` — only visible in non-ASCII content)
+- What is the time complexity of the reverse scan in `tool_call_end`? (O(n) where n = number of items in the trace so far)
+- Name the two files in this codebase that implement the identical buffer loop. (`app/investigate/[id]/page.tsx` and `components/chat/StreamingResponse.tsx`)

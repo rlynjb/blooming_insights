@@ -1,0 +1,32 @@
+# 02 — data structures & algorithms
+
+The concrete operations this codebase performs, one file per operation. Each file includes a step-by-step execution trace (every variable at every step), not just before/after.
+
+## Operations
+
+- **[01-ttl-cache.md](01-ttl-cache.md)** — cache-aside with time-to-live: a `Map` keyed on `name:JSON.stringify(args)`, an `expiresAt` check, and write-on-success-only (never cache an error).
+- **[02-rate-limit-and-retry.md](02-rate-limit-and-retry.md)** — fixed-interval inter-call spacing (`liveCall`'s `elapsed < minIntervalMs` wait) plus a bounded retry loop on rate-limit results.
+- **[03-ndjson-line-buffering.md](03-ndjson-line-buffering.md)** — reassembling complete JSON records from arbitrary network chunks: `split('\n')` + keep the trailing partial line; plus reverse-scan reconciliation of `tool_call_start`/`tool_call_end`.
+- **[04-json-from-prose.md](04-json-from-prose.md)** — lenient extraction of JSON from LLM prose (fenced block → bare parse → substring scan) followed by structural type-guard validation.
+- **[05-severity-sort.md](05-severity-sort.md)** — a rank-table comparator sort (`SEV_RANK[b] - SEV_RANK[a]`) + top-N truncation, and a `new Set([...a,...b,...c])` union that dedups overlapping tool subsets.
+
+## Complexity cheat sheet
+
+`n` is the input size for that operation (cache entries, stream bytes, text length, list length). These run at tiny `n` in practice — the table is the shape, not a bottleneck.
+
+| Operation | File | Time | Space |
+|---|---|---|---|
+| TTL cache get / set | 01 | O(1) average (hash map) | O(distinct `name+args` keys) — **unbounded, no eviction** |
+| Inter-call spacing | 02 | O(1) per call (+ up to `minIntervalMs` wait) | O(1) (`lastCallAt`) |
+| Bounded rate-limit retry | 02 | O(maxRetries) worst case (+ `retryDelayMs` waits) | O(1) |
+| NDJSON line-buffering | 03 | O(n) over stream bytes | O(longest unterminated line) |
+| tool-call reconciliation | 03 | O(k) per `tool_call_end` (reverse scan of k trace items) | O(1) |
+| JSON-from-prose extract | 04 | O(n) over text length (regex + index scan) | O(n) (the sliced candidate) |
+| Anomaly rank sort | 05 | O(n log n) (`Array.sort`) | O(n) |
+| Set-union dedup | 05 | O(m) over total tool names | O(u) unique tools |
+
+## Flagged: an O(n) win left on the table
+
+- **TTL cache has no eviction** (`01-ttl-cache.md`). The `Map` grows with every distinct `(name, args)` pair and is never bounded. At session scale this is harmless (a handful of distinct calls), but it is O(distinct-keys) memory with no cap — an LRU bound is the obvious fix the moment distinct keys grow large or the process is long-lived. This is called out plainly in the file's Tradeoffs.
+
+No operation here is accidentally O(n²) where O(n) is easy — the sort is the only super-linear step, and `O(n log n)` on ≤10 items is irrelevant.

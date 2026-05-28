@@ -1,0 +1,605 @@
+# Multi-agent orchestration
+
+**Industry name(s):** agentic tool-use loop (ReAct-style), orchestrator + specialist agents, structured-output synthesis pass
+**Type:** Industry standard · Language-agnostic
+
+> One shared `runAgentLoop` function drives a multi-turn Claude conversation for each specialist agent, executing MCP tool calls between turns and forcing a final tool-less synthesis turn to guarantee parseable JSON output.
+
+**See also:** → 05-streaming-ndjson.md · → 03-provider-abstraction.md · → ../02-dsa/04-json-from-prose.md
+
+---
+
+## Why care
+
+You have called an API in a `while` loop before: fetch a paginated list, check if there is a next-page token, if yes call again with the token, if no break and return the accumulated data. The agent loop is the same shape — but instead of deciding "do I have the next-page token?" you hand that decision to a language model. The model reads the accumulated data, decides what query to run next, and you execute that query and feed the result back. The question is: how do you STOP, and how do you guarantee the final iteration produces a parseable JSON result rather than prose?
+
+The question this file answers is: how does an LLM agent run a bounded tool-use loop and reliably end with structured JSON a downstream function can parse?
+
+**The stakes are concrete.** Without a turn budget the agent runs until the `maxDuration = 60` route limit kills the request mid-stream; the client receives a truncated NDJSON stream and the UI never gets a `done` event. Without a forced synthesis turn the loop exhausts its budget and returns `finalText: ''` — `tryParseDiagnosis('')` returns `null`, `synthesize()` is the last line of defense, but if the tool calls themselves contained nothing useful, the investigation ends with `FALLBACK: { conclusion: 'Insufficient data…', evidence: [] }` and the recommendation step has nothing actionable to build on.
+
+Before the budget + synthesis pass:
+- `finalText` is empty or mid-thought prose when the budget ran out
+- `parseAgentJson(finalText)` throws, `tryParseDiagnosis` returns `null`
+- `synthesize()` also has no gathered evidence to work from
+- the route emits a `diagnosis` event with the `FALLBACK` conclusion and zero evidence
+- `RecommendationAgent.propose` receives a hollow diagnosis and returns `[]`
+
+After the budget + dedicated synthesis call:
+- the loop forces a tool-less turn at budget exhaustion; the model emits its JSON
+- if the loop's final turn still produces prose, `synthesize()` hands the model the actual tool results (formatted as `Query N: toolName args\nResult: ...`) and requests ONLY the structured JSON
+- the diagnostic agent produced a 7-evidence diagnosis in the run where the loop final turn failed
+- `RecommendationAgent.propose` received a concrete diagnosis and returned 3 ranked recommendations
+
+It is a `while` loop with a hard turn budget and a guaranteed-final-render step.
+
+---
+
+## How it works
+
+**Mental model.** Think of `runAgentLoop` as the `while` loop in your paginator, except the "next-page token" is replaced by tool-use blocks in the model's response. Each iteration: ask the model → if the response contains tool-use blocks, execute them and push their results back as the next user message → if no tool-use blocks, the loop is done and you return whatever text the model produced.
+
+The loop iterates until one of three conditions:
+- the model returns a response with no `tool_use` blocks (natural end)
+- the hard tool-call budget `maxToolCalls` is spent
+- the turn counter reaches `maxTurns`
+
+The diagram below shows one full traversal from the caller's perspective.
+
+```
+ caller
+   │
+   └── runAgentLoop(opts)
+         │
+         │  turn 0
+         ├─────────────────────────────────────────────────────────┐
+         │  send messages + toolSchemas to Claude                   │
+         │  ◀── response with tool_use blocks                       │
+         │  execute each tool via mcp.callTool()                    │
+         │  push tool_result messages back                          │
+         │  ↓ next turn                                             │
+         │  turn 1 … turn N                                         │
+         │  (same: send → tool_use → execute → feed back)           │
+         │                                                          │
+         │  forceFinal turn (budget spent OR turn === maxTurns-1)   │
+         │  send messages WITHOUT toolSchemas                       │
+         │  ◀── response with text only (no tool_use possible)      │
+         └── return { finalText, toolCalls }
+```
+
+The caller receives `{ finalText, toolCalls }` and then decides whether `finalText` parses as valid structured output. The `toolCalls` array is the complete log of every query the agent ran — it is the raw material for the dedicated synthesis call.
+
+---
+
+### The shared loop (`runAgentLoop`)
+
+`runAgentLoop` in `lib/agents/base.ts` (L48–L176) is the only place where Claude API calls happen inside the agent system. Every specialist agent calls it; none of them drive the Anthropic client directly.
+
+The message accumulation pattern mirrors what you do when managing form state in a reducer: each action produces a new entry appended to the array, and the full array is always passed to the next render. Here the array is `messages: Anthropic.Messages.MessageParam[]`, starting with the initial user prompt (L79–L81) and growing with each assistant turn (L105) and each batch of tool results (L171).
+
+```
+messages array grows across turns
+─────────────────────────────────────────────────────────────
+[0] { role: 'user',      content: userPrompt }          ← initial
+[1] { role: 'assistant', content: [tool_use, ...] }     ← turn 0
+[2] { role: 'user',      content: [tool_result, ...] }  ← turn 0 results
+[3] { role: 'assistant', content: [tool_use, ...] }     ← turn 1
+[4] { role: 'user',      content: [tool_result, ...] }  ← turn 1 results
+[5] { role: 'assistant', content: [text] }              ← forceFinal turn
+─────────────────────────────────────────────────────────────
+```
+
+The model sees the full conversation on every call — it reads its own previous queries and their results before deciding what to do next. This is why it can build a diagnosis over multiple tool calls rather than needing to re-query on every turn.
+
+---
+
+### The tool-call budget + forced-final turn
+
+`maxToolCalls` (L60) is a hard cap on the total number of tool calls across all turns. `budgetSpent` (L90) is `true` as soon as `toolCalls.length >= maxToolCalls`. `forceFinal` (L91) is `true` when either the budget is spent or the turn counter is at `maxTurns - 1`.
+
+On a `forceFinal` turn, `params.tools` is not set (L101: `if (!forceFinal) params.tools = toolSchemas`). The model receives a request with no tool definitions, so it cannot emit `tool_use` blocks — it must produce text. This is the "omit the next-page token and the loop must stop" equivalent.
+
+The turn timeline for the diagnostic agent (`maxTurns: 8, maxToolCalls: 6`) looks like this:
+
+```
+turn  toolCalls  budgetSpent  forceFinal  tools sent?
+────  ─────────  ───────────  ──────────  ───────────
+  0       0         false       false        yes   ← query 1, 2
+  1       2         false       false        yes   ← query 3, 4
+  2       4         false       false        yes   ← query 5, 6
+  3       6          true        true         NO   ← must emit text
+  ↑
+  budget hit at turn 3; forceFinal forces a text-only response
+```
+
+Even if the natural loop would have continued, `forceFinal` stops further exploration at turn 3 and forces a synthesis response. This bounds latency to `maxToolCalls` round-trips plus one final API call.
+
+---
+
+### The `synthesisInstruction` nudge
+
+`synthesisInstruction` (L61) is a string that is appended to the `system` prompt on the `forceFinal` turn only (L98: `system: forceFinal && synthesisInstruction ? \`${system}\n\n${synthesisInstruction}\` : system`).
+
+It is the equivalent of appending a final instruction to a prompt mid-conversation: "you have what you need now, stop asking for more, give me the answer". For the diagnostic agent (L62–L66 of `diagnostic.ts`) the instruction text is:
+
+```
+You have NO more tool calls available. Stop investigating now and output
+your final answer. Respond with ONLY a single JSON object in a ```json
+fence matching the diagnosis shape (conclusion, evidence,
+hypothesesConsidered). Base it on the evidence you have already gathered
+— state your best-supported explanation, even if partial. Do not say you
+need more queries.
+```
+
+This nudge is why `forceFinal` usually produces valid JSON: the system prompt explicitly tells the model what shape to emit and prohibits further exploration. When it works, `tryParseDiagnosis(finalText)` returns a valid `Diagnosis` and the `synthesize()` call is never reached.
+
+---
+
+### The dedicated synthesis call
+
+The model sometimes emits partial JSON, reasoning prose, or a hybrid on the `forceFinal` turn even with `synthesisInstruction`. When `tryParseDiagnosis(finalText)` returns `null`, a fresh, tool-less call is made.
+
+`DiagnosticAgent.synthesize()` (L82–L121 of `diagnostic.ts`) is a completely separate `anthropic.messages.create` call — not part of `runAgentLoop`. It takes the `toolCalls` array (the complete log), formats each as `Query N: toolName args\nResult: payload`, and sends a single-turn prompt to the model with the instruction to emit ONLY the structured JSON. There is no conversation history from the loop — no tool definitions, no accumulated messages. The model sees the gathered evidence as plain text and is asked for exactly one thing.
+
+The fallback chain in `DiagnosticAgent.investigate` (L73–L77) is:
+
+```
+tryParseDiagnosis(finalText)   ← loop produced valid JSON?
+  ?? (await this.synthesize(anomaly, toolCalls))  ← dedicated call
+  ?? FALLBACK                  ← { conclusion: 'Insufficient data…', evidence: [] }
+```
+
+`RecommendationAgent.propose` (L69–L71 of `recommendation.ts`) uses the same chain:
+
+```
+tryParseRecommendations(finalText)
+  ?? (await this.synthesize(anomaly, diagnosis, toolCalls))
+```
+
+with `[]` as the final fallback (L73). This is a three-tier reliability guarantee: the loop's nudged final turn, the dedicated synthesis call, and the safe empty-array fallback.
+
+The reason for a dedicated call rather than extending the loop is that the loop's message history contains partial reasoning and tool_use/tool_result pairs. The model "knows" it was in investigation mode and tends to continue that mode. A fresh single-turn call with no prior context and no tool definitions breaks the mode — the model sees only evidence + instruction and reliably produces JSON.
+
+---
+
+### Four agents, one loop
+
+Each specialist agent is a class that builds a system prompt, selects a subset of MCP tool schemas via `filterToolSchemas`, and delegates to `runAgentLoop`. The only differences between agents are the prompt, the tool subset, the validator (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`), and the budget numbers.
+
+```
+MonitoringAgent.scan()
+  system = monitoring.md + schema summary
+  tools  = monitoringTools subset
+  budget = maxTurns:8, maxToolCalls:6
+  valid  = isAnomalyArray → sort by severity → slice(0,10)
+  fallback = []
+
+DiagnosticAgent.investigate()
+  system = diagnostic.md + schema + anomaly JSON
+  tools  = diagnosticTools subset
+  budget = maxTurns:8, maxToolCalls:6
+  valid  = isDiagnosis → return
+  fallback chain: tryParse ?? synthesize() ?? FALLBACK
+
+RecommendationAgent.propose()
+  system = recommendation.md + schema + diagnosis JSON
+  tools  = recommendationTools subset
+  budget = maxTurns:6, maxToolCalls:4
+  valid  = isRecommendationArray → assign ids → slice(0,3)
+  fallback chain: tryParse ?? synthesize() ?? []
+
+QueryAgent.answer()
+  system = query.md + schema
+  tools  = all or intent-filtered
+  budget = varies
+  valid  = plain text (no JSON validator needed)
+```
+
+All four share the same `runAgentLoop` with no special-casing inside the loop itself. The loop is "dumb" — it executes tool calls and accumulates messages. The agents are where the domain logic lives.
+
+---
+
+### The route orchestration
+
+`app/api/agent/route.ts` (L52–L177) is the controller that runs the diagnostic→recommendation sequence and streams each agent's reasoning as NDJSON events.
+
+The orchestration sequence (L133–L162):
+
+```
+if (q && !insightId)
+  └── QueryAgent.answer()           ← free-form query, single agent
+      send({ type:'done' })
+
+if (insightId)
+  └── DiagnosticAgent.investigate() ← runs runAgentLoop internally
+      send({ type:'diagnosis', diagnosis })
+      └── RecommendationAgent.propose(inv, diagnosis)
+          for each r: send({ type:'recommendation', recommendation:r })
+          send({ type:'done' })
+```
+
+The diagnosis result is passed directly into `propose()` — the route is the only place that sequences agents, and it does so with plain sequential `await` calls, not a framework or graph. The `hooksFor(agent)` factory (L117–L132) wires each agent's `onText`, `onToolCall`, and `onToolResult` callbacks to `send()` calls that push NDJSON events to the client with the agent name attached — so the UI knows whether a `reasoning_step` came from the diagnostic or recommendation agent.
+
+---
+
+### The principle
+
+Separate exploration from synthesis. The loop's job is to gather evidence (tool calls + results). The synthesis step's job is to produce a typed output from that evidence. Keeping them separate means you can bound the loop (prevent runaway exploration) and give the synthesis step a clean context (no tool_use scaffolding, no partial reasoning chains). The `forceFinal` mechanism is the handoff between the two modes.
+
+---
+
+## Multi-agent orchestration — diagram
+
+The diagram below shows the full service layer. `runAgentLoop` sits at the center, receiving a prompt and tool subset from each agent and handing tool calls to the MCP/Provider boundary. The synthesis/validation step sits outside the loop.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Route layer   app/api/agent/route.ts                               │
+│                                                                     │
+│  GET /api/agent                                                     │
+│  ├── free-form q: QueryAgent.answer()                               │
+│  └── insightId : DiagnosticAgent.investigate()                      │
+│                   └── RecommendationAgent.propose(diagnosis)        │
+│  hooksFor(agent) → NDJSON stream to client                          │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ await (sequential)
+┌──────────────────────────▼──────────────────────────────────────────┐
+│  Agent layer   lib/agents/                                          │
+│                                                                     │
+│  MonitoringAgent    DiagnosticAgent    RecommendationAgent          │
+│  .scan()            .investigate()     .propose()                   │
+│  prompt: monitoring prompt: diagnostic prompt: recommendation       │
+│  tools: monitoring  tools: diagnostic  tools: recommendation        │
+│  subset             subset             subset                       │
+│         │                  │                   │                    │
+│         └──────────────────┼───────────────────┘                   │
+│                            │ all call                               │
+│                ┌───────────▼────────────┐                           │
+│                │   runAgentLoop()       │  lib/agents/base.ts       │
+│                │                        │                           │
+│                │  for turn in maxTurns  │                           │
+│                │   forceFinal?          │                           │
+│                │    send w/o tools ─────┼──→ finalText              │
+│                │   else                 │                           │
+│                │    send w/ tools ──────┼──→ tool_use blocks        │
+│                │    execute via MCP ────┼──← tool results           │
+│                │    feed back           │                           │
+│                │  return finalText,     │                           │
+│                │         toolCalls      │                           │
+│                └───────────────────────┘                           │
+│                            │                                        │
+│  Synthesis/validation step (per agent):                             │
+│  tryParse(finalText) ──── valid? ──→ return typed output            │
+│       │ null                                                        │
+│       ▼                                                             │
+│  synthesize(toolCalls) ── valid? ──→ return typed output            │
+│       │ null                                                        │
+│       ▼                                                             │
+│  FALLBACK / []                                                      │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ callTool()
+┌──────────────────────────▼──────────────────────────────────────────┐
+│  MCP / Provider boundary   lib/mcp/                                 │
+│                                                                     │
+│  McpCaller interface  ←  McpClient (prod)  /  buildFakeMcp (tests)  │
+│  Anthropic SDK client ←  real API key      /  injected fake         │
+│                                                                     │
+│  callTool(name, args) → { result, durationMs, fromCache }           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation mechanics. The synthesis/validation step owns the contract: a typed output or a safe default.
+
+---
+
+## In this codebase
+
+| File | Function | Lines | Role |
+|------|----------|-------|------|
+| `lib/agents/base.ts` | `runAgentLoop` | L48–L176 | The shared loop: turn iteration, forceFinal logic, tool execution, message accumulation |
+| `lib/agents/base.ts` | `AGENT_MODEL` | L9 | `'claude-sonnet-4-6'` — single constant used by all agents and the synthesize calls |
+| `lib/agents/diagnostic.ts` | `DiagnosticAgent.investigate` | L44–L78 | Calls `runAgentLoop`, then the fallback chain |
+| `lib/agents/diagnostic.ts` | `DiagnosticAgent.synthesize` | L82–L121 | Dedicated tool-less synthesis call; formats `toolCalls` as evidence text |
+| `lib/agents/diagnostic.ts` | `FALLBACK` | L15–L19 | Last-resort `Diagnosis` with empty evidence |
+| `lib/agents/recommendation.ts` | `RecommendationAgent.propose` | L36–L77 | Same loop + fallback chain pattern; assigns `id`s after validation |
+| `lib/agents/recommendation.ts` | `RecommendationAgent.synthesize` | L82–L127 | Same as diagnostic synthesize, includes diagnosis in prompt |
+| `lib/agents/monitoring.ts` | `MonitoringAgent.scan` | L60–L93 | Calls `runAgentLoop`; degrades to `[]` on any parse failure |
+| `app/api/agent/route.ts` | `GET` | L52–L177 | Route orchestration: diagnostic → recommendation, NDJSON streaming |
+| `app/api/agent/route.ts` | `hooksFor` | L117–L132 | Wires `onText`/`onToolCall`/`onToolResult` to `send()` per agent |
+
+**Pseudocode: the loop core** (`lib/agents/base.ts` L85–L175):
+
+```typescript
+for (let turn = 0; turn < maxTurns; turn++) {
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+  const forceFinal  = turn === maxTurns - 1 || budgetSpent;          // L91
+
+  const params = { model, max_tokens, system, messages };
+  if (!forceFinal) params.tools = toolSchemas;                        // L101
+  if (forceFinal && synthesisInstruction)
+    params.system = `${system}\n\n${synthesisInstruction}`;           // L98
+
+  const res = await anthropic.messages.create(params);
+  messages.push({ role: 'assistant', content: res.content });         // L105
+
+  const toolUses = res.content.filter(b => b.type === 'tool_use');
+  if (toolUses.length === 0) return { finalText, toolCalls };         // L121-124
+
+  for (const tu of toolUses) {
+    const result = await mcp.callTool(tu.name, tu.input);             // L144
+    toolCalls.push(tc);
+    toolResults.push({ type:'tool_result', tool_use_id: tu.id, ... });
+  }
+  messages.push({ role: 'user', content: toolResults });              // L171
+}
+return { finalText: '', toolCalls };  // maxTurns exhausted            // L175
+```
+
+**Pseudocode: the fallback chain** (`lib/agents/diagnostic.ts` L73–L77):
+
+```typescript
+return (
+  tryParseDiagnosis(finalText)              // L74
+  ?? (await this.synthesize(anomaly, toolCalls))  // L75
+  ?? FALLBACK                               // L76
+);
+```
+
+**GitHub links:**
+- `lib/agents/base.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/base.ts
+- `lib/agents/diagnostic.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/diagnostic.ts
+- `lib/agents/recommendation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/recommendation.ts
+- `lib/agents/monitoring.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts
+- `app/api/agent/route.ts`: https://github.com/rlynjb/blooming_insights/blob/main/app/api/agent/route.ts
+
+---
+
+## Elaborate
+
+### Where it comes from
+
+The loop pattern has a formal name: **ReAct** (Reason + Act), introduced by Yao et al. 2022. The idea is that a model alternates reasoning steps with action steps (tool calls), updating its belief state (the message history) after each action. The Anthropic tool-use API implements the action step as `tool_use` blocks in the assistant message and `tool_result` blocks in the subsequent user message.
+
+The "forced final turn" trick is a production-grade addition not in the original ReAct paper. Papers assume the model stops cleanly; production models often want to keep querying. The budget + synthesis pass is the engineering solution.
+
+### The deeper principle
+
+Exploration and synthesis are different cognitive modes and they benefit from different prompt contexts. Exploration needs tool definitions and conversation history so the model can build on prior queries. Synthesis needs a clean slate — just the evidence and a precise output schema — so the model is not distracted by the "I could run one more query" pattern.
+
+```
+Exploration mode                   Synthesis mode
+────────────────────────────────   ────────────────────────────────
+tools available                    no tools
+full conversation history          no history (or evidence-only)
+prompt: "investigate X"            prompt: "given this evidence, output JSON"
+model output: tool_use blocks      model output: structured text
+terminates on: budget hit          terminates on: always (one turn)
+```
+
+The loop runs in exploration mode. `synthesize()` runs in synthesis mode. Keeping them separate prevents the model from "re-entering" exploration reasoning during the synthesis call.
+
+### Where it breaks down
+
+**Deep multi-step chains.** A 2-step diagnose→recommend chain works well with sequential `await`. A 5-step chain with branching (e.g., diagnose → split on hypothesis → two parallel sub-investigations → merge → recommend) breaks this pattern. Sequential `await` cannot express branching, and the combined latency compounds per step.
+
+**Cost and latency compound.** Each agent runs up to `maxToolCalls` round-trips plus one `synthesize()` call. With 3 agents in sequence at `maxToolCalls: 6` each, plus the route's own overhead, you approach the `maxDuration: 60` ceiling on a slow connection. Adding a fourth agent in sequence is risky without reducing per-agent budgets.
+
+**No inter-agent memory beyond the route.** Agents share data only through the route's `await` chain (`diagnosis` is passed to `propose()`). There is no shared context store, no vector memory, no cross-agent message history. If two agents need to discuss a finding, the route has to explicitly pass that finding as a constructor argument or prompt variable.
+
+### What to explore next
+
+- **LangGraph** — a graph-based agent orchestration library where nodes are agents or functions, edges are conditional transitions, and state flows through a typed schema. Adds branching, cycles, and checkpointing that the sequential `await` chain here cannot express.
+- **Anthropic Agent SDK** — Anthropic's higher-level agent SDK adds built-in tool-use loops, memory primitives, and observability hooks. The `runAgentLoop` in this codebase is a hand-rolled version of what the SDK provides.
+- **Structured outputs / function-calling JSON modes** — OpenAI and some other providers support constrained decoding that forces the model to emit valid JSON at the token level, eliminating the need for `tryParse ?? synthesize ?? FALLBACK`. Claude's `tool_use` JSON mode is a partial equivalent.
+
+---
+
+## Tradeoffs
+
+### Comparison
+
+| Dimension | This codebase | One mega-agent | No budget | Trust loop's final turn |
+|-----------|--------------|----------------|-----------|------------------------|
+| Specialist focus | Each agent sees only its tool subset + prompt | All tools always visible; prompt bloat | Same as this codebase | Same as this codebase |
+| Latency ceiling | Bounded by `maxToolCalls` + 1 synthesis call | Bounded by same budget (same tools available) | Unbounded; hits route timeout | Same as budget path, but synthesis unreliable |
+| Structured output reliability | 3-tier: loop final turn → synthesize() → FALLBACK | Same 3-tier applicable | Loop never forces final text; returns `finalText: ''` | `finalText` often prose or partial JSON; `tryParse` fails; no safety net |
+| Testability | Each agent tested independently with fake MCP | Single surface to test but larger | Same | Same |
+| Token cost per investigation | 3 agents × up to 6 tool calls + 3 synthesis calls | 1 agent × same total calls (no savings) | Runs until timeout; wastes tokens | 1 extra call per agent (synthesis) avoided but unreliable |
+
+**What this approach gave up.** Each diagnostic or recommendation agent that fails `tryParse` pays an extra synthesis call: one additional `anthropic.messages.create` with up to 2048 tokens. In a run where the loop's `forceFinal` turn produces valid JSON, `synthesize()` is never called and the cost is zero. In the worst case (loop fails, synthesize succeeds) you pay ~2× tokens for that agent. That is the price of reliability.
+
+**What the alternatives cost.** Without a budget, the loop runs until the 60-second `maxDuration` kills the request. The client receives a partial NDJSON stream — some tool-call events but no `diagnosis` or `done` event — and the UI hangs. Without `synthesize()`, any run where the `forceFinal` turn produces prose instead of JSON silently degrades to `FALLBACK`, which means the recommendation step receives a hollow diagnosis and returns `[]`. The user sees "Insufficient data" even though the agent ran 6 successful queries and has evidence.
+
+**The breakpoint.** The sequential `await` orchestration in the route is fine for a 2-step diagnose→recommend chain. It becomes a liability when chains get deep (>3 steps) or need to branch — for example, running two diagnostic hypotheses in parallel or conditionally skipping the recommendation step if the diagnosis confidence is `low`. At that point the route's `if/await/if/await` structure becomes a hand-rolled state machine and should be replaced with a proper agent graph (LangGraph or equivalent).
+
+---
+
+## Tech reference (industry pairing)
+
+### @anthropic-ai/sdk tool use (claude-sonnet-4-6)
+
+The Anthropic Messages API supports tool use via the `tools` parameter (an array of JSON Schema tool definitions) and `tool_use`/`tool_result` block types in the message content. `claude-sonnet-4-6` is the model used in this codebase (`AGENT_MODEL` in `lib/agents/base.ts` L9).
+
+- **Tool definitions:** passed as `toolSchemas` in `runAgentLoop`; omitted on `forceFinal` turns to prevent further tool calls
+- **`tool_use` blocks:** the model's request to call a tool — `{ type: 'tool_use', id, name, input }`
+- **`tool_result` blocks:** the response fed back — `{ type: 'tool_result', tool_use_id, content, is_error? }`
+- **`stop_reason: 'tool_use'`:** indicates the model is waiting for tool results; `stop_reason: 'end_turn'` indicates a natural end — the loop checks for `tool_use` blocks in `res.content` instead of `stop_reason` directly
+- **`max_tokens`:** capped at 4096 for agent turns, 2048 for synthesis calls; controls cost per turn
+
+### The agentic loop pattern
+
+The ReAct pattern (Reason + Act) alternates reasoning steps with tool-call steps until a stopping condition. Industry implementations include LangChain's `AgentExecutor`, LangGraph's graph-based runner, the Anthropic Agent SDK, and hand-rolled loops like `runAgentLoop` here.
+
+- **LangGraph** is the current leader for production multi-agent graphs with branching, checkpointing, and human-in-the-loop nodes; replaces the sequential `await` chain when the graph gets complex
+- **Anthropic Agent SDK** provides a higher-level loop with built-in observability and tool execution; `runAgentLoop` is a hand-rolled equivalent
+- **LangChain `AgentExecutor`** is the original Python reference implementation; similar mechanics but less typed than the Anthropic SDK approach
+- **`maxIterations` / `maxToolCalls`** budget: every serious production implementation enforces a hard cap; the default behavior without one is to run to the token or time limit
+- **Structured output via tool_use:** using a "done" tool that accepts a typed JSON argument is an alternative to the `synthesisInstruction` approach — the model must call the done-tool to terminate, passing its result as the tool argument; guarantees valid JSON without a separate synthesis call at the cost of one extra hop
+
+### Structured-output synthesis pass
+
+The `synthesize()` method is an instance of the "extract from evidence" pattern used in production RAG and agentic pipelines: gather raw evidence in one pass, then format/extract in a second, clean-context pass.
+
+- **Two-pass extraction** is a standard RAG pattern: retrieve in pass 1, synthesize in pass 2; the synthesis call here is the same shape applied to tool-call results instead of retrieved documents
+- **JSON repair / retry loops** are an alternative — attempt to parse, repair malformed JSON with a second call, retry; more fragile than a clean-context synthesis pass and harder to test
+- **Constrained decoding (Outlines, SGLang, OpenAI structured outputs):** forces valid JSON at the token level; eliminates the need for `tryParse ?? synthesize ?? FALLBACK` entirely; not yet available in the Anthropic API at the time of this codebase
+- **Tool-as-output schema:** wrapping the desired JSON shape as a tool definition forces the model to emit valid arguments when it calls the tool; a common pattern in OpenAI function-calling workflows
+- **Pydantic + instructor library:** a Python-side approach that wraps the model call in a validation loop, retrying with the validation error message if the model's output does not parse; runner-up to constrained decoding
+
+---
+
+## Summary
+
+`runAgentLoop` is a shared `while` loop that drives a multi-turn Claude conversation: ask the model, execute any tool calls, feed results back, repeat until no more tool calls or budget exhausted. On the forced-final turn, tools are withheld and a `synthesisInstruction` is appended to the system prompt, compelling the model to emit its structured answer. If the loop's final text still does not parse, a dedicated tool-less `synthesize()` call receives the gathered evidence and requests only the JSON. Four specialist agents (monitoring, diagnostic, recommendation, query) each call `runAgentLoop` with their own prompt and tool subset; the route sequences diagnostic → recommendation and streams each agent's reasoning as NDJSON.
+
+Key takeaways:
+- `forceFinal` (L91 of `base.ts`) is the mechanism that converts an exploration loop into a synthesis step — it is the equivalent of removing the "next page" parameter so the loop must stop (`2. Request-response flow`)
+- without `maxToolCalls`, the loop runs to the `maxDuration: 60` route limit; the client receives a truncated stream and no `done` event (`5. Failure handling`)
+- the fallback chain `tryParse ?? synthesize() ?? FALLBACK` is a three-tier reliability guarantee; each tier handles a different failure mode; the `FALLBACK` ensures the route always emits a valid `diagnosis` event (`5. Failure handling`)
+- cost and latency compound per agent in the sequential chain; the 60-second route budget is the hard ceiling (`6. Scale concerns`)
+- the `synthesize()` call is justified by the failure mode it prevents — a hollow `FALLBACK` diagnosis that produces zero recommendations — not by speculative quality improvements (`6. Scale concerns`)
+- four agents share one loop because the loop is domain-agnostic; domain logic lives in the prompts, tool subsets, and validators, not in the loop itself (`2. Request-response flow`)
+
+---
+
+## Interview defense
+
+### What the interviewer is really asking
+
+When an interviewer asks "how does your agent avoid running forever?" they want to know if you understand the gap between "the model will naturally stop" (hope) and "the loop enforces a budget and forces a text-only final turn" (production). When they ask "how do you guarantee structured output from an agent?" they want `tryParse ?? synthesize ?? FALLBACK`, not "I prompt it to return JSON."
+
+---
+
+### Q+A
+
+**[mid] "Walk me through what happens when `maxToolCalls` is hit mid-turn."**
+
+`budgetSpent` becomes `true` at the top of the next iteration (L90 of `base.ts`). `forceFinal` is set to `true` (L91). `params.tools` is not populated (L101). If `synthesisInstruction` is set, it is appended to `params.system` (L98). The Anthropic API call goes out with no tool definitions — the model cannot emit `tool_use` blocks and must produce text. The loop's next check at L121 (`if toolUses.length === 0`) is always `true` on a forced-final turn, so the function returns `{ finalText, toolCalls }`.
+
+```
+turn N   toolCalls.length >= maxToolCalls
+  │
+  └── budgetSpent = true
+      forceFinal  = true
+      params.tools NOT set
+      params.system += synthesisInstruction
+         │
+         ▼
+      anthropic.messages.create()   ← no tool_use possible
+         │
+         ▼
+      toolUses.length === 0  ──true──→  return { finalText, toolCalls }
+```
+
+**[senior] "Why do you need a dedicated `synthesize()` call? Can't you just improve the `synthesisInstruction`?"**
+
+Yes, you can improve the `synthesisInstruction` — and that is the first thing to try. But the `synthesisInstruction` runs inside the loop's conversation context, which contains `tool_use`/`tool_result` block pairs, partial reasoning, and potentially mid-sentence thoughts from earlier turns. The model has "momentum" toward the exploration pattern. A fresh single-turn call with no prior context and no tool definitions breaks that momentum. The model sees only: "here is the evidence, here is the schema, output JSON." Empirically, the clean-context call is more reliable. The cost is one extra API call per agent that fails the first parse — zero cost when the loop's final turn succeeds.
+
+```
+Loop context (exploration mode)       Synthesize context (synthesis mode)
+─────────────────────────────────     ─────────────────────────────────
+[user] investigate anomaly            [user] evidence + schema + "output JSON"
+[asst] tool_use: query_events              ↓
+[user] tool_result: {...}             [asst] {"conclusion": ..., "evidence": [...]}
+[asst] tool_use: query_funnels             (reliable)
+[user] tool_result: {...}
+[asst] synthesisInstruction in system
+       "stop, output JSON now"
+       → sometimes prose, sometimes JSON
+         (unreliable without clean context)
+```
+
+**[arch] "This is a 2-agent sequential chain. How would you extend it to a branching graph?"**
+
+With sequential `await`, branching requires `if/else` in the route. For a 3-way branch (e.g., low-confidence diagnosis → re-investigate with a different tool subset, medium → skip recommendation, high → proceed) the route becomes a hand-rolled state machine. At that point, replace the route's control flow with LangGraph: define nodes for each agent and conditional edges based on typed state (e.g., `diagnosis.confidence`). LangGraph handles the branching, provides checkpoints for debugging mid-graph failures, and can parallelize independent branches. The agents themselves (`runAgentLoop` calls) do not change — only the orchestration layer changes.
+
+```
+Current (sequential await):           LangGraph equivalent:
+────────────────────────────────       ────────────────────────────────────
+investigate()                          diagnose_node
+  ↓ await                                    │
+propose(diagnosis)                     ┌─────┴────────────────┐
+  ↓ await                              ▼                       ▼
+done                              high/med confidence     low confidence
+                                  │                       │
+                                  ▼                       ▼
+                              recommend_node         reinvestigate_node
+                                  │                       │
+                                  └───────────┬───────────┘
+                                              ▼
+                                           done_node
+```
+
+---
+
+### The dodge
+
+**"Why a second synthesis call instead of just prompting the loop to return JSON?"**
+
+The honest answer is: prompting is the first line of defense and the `synthesisInstruction` is exactly that prompt. The second synthesis call is a safety net for the cases where the first-line prompt does not work. If the `synthesisInstruction` were 100% reliable, `synthesize()` would never be invoked and its cost would be zero. In practice, the model has a tendency to emit partial JSON or reasoning prose wrapped around JSON on the forced-final turn, especially when the conversation history is long (6 tool-call pairs = 12 messages). The clean-context call breaks that tendency. The tradeoff is explicit: accept up to 2× token cost for an agent that fails the first parse in exchange for a non-empty, valid diagnosis that produces actionable recommendations.
+
+```
+First line:  synthesisInstruction appended to system on forceFinal turn
+             ├── success (most runs): tryParse(finalText) = Diagnosis
+             │   synthesize() not called; no extra cost
+             └── failure (some runs): finalText = prose or partial JSON
+                 tryParse returns null
+                 │
+                 ▼
+Second line: synthesize(anomaly, toolCalls)
+             ├── success: returns Diagnosis from clean-context call
+             └── failure: returns null
+                          └── FALLBACK (safe empty result)
+```
+
+---
+
+### Anchors
+
+- `lib/agents/base.ts` L91 — `forceFinal = turn === maxTurns - 1 || budgetSpent`; the single line that converts an exploration loop into a synthesis step
+- `lib/agents/base.ts` L101 — `if (!forceFinal) params.tools = toolSchemas`; omitting tools is what forces the model to produce text
+- `lib/agents/diagnostic.ts` L73–L77 — the three-tier fallback chain; cite this when asked "what happens when the model fails to produce JSON?"
+- `lib/agents/diagnostic.ts` L82–L121 — `synthesize()`: a completely separate API call with no loop history; cite this when asked about the dedicated synthesis call
+- `app/api/agent/route.ts` L152–L162 — the sequential `await` orchestration; cite this when asked how agents are sequenced
+
+---
+
+## Validate your understanding
+
+### Level 1 — Reconstruct
+
+Without looking at the code, write down: (a) the condition that sets `forceFinal` to `true`; (b) what changes in the API call parameters when `forceFinal` is `true`; (c) what the loop returns when it exits the `for` loop having exhausted all `maxTurns` without a clean break.
+
+Check against `lib/agents/base.ts` L90–L101 and L175.
+
+### Level 2 — Explain
+
+`runAgentLoop` accumulates `messages` across turns. Explain why the model needs to see all previous turns on every API call, not just the most recent tool results. Cite `lib/agents/base.ts` L79–L105 in your answer.
+
+The follow-up question: what would break if you sent only the latest tool results instead of the full message history?
+
+### Level 3 — Apply
+
+Scenario: an investigation returns the `FALLBACK` `{ conclusion: 'Insufficient data…', evidence: [] }` even though the tool calls all succeeded and returned data. Where do you look and what is the fix?
+
+Start at `lib/agents/diagnostic.ts` L73–L77: `tryParseDiagnosis(finalText)` returned `null` AND `synthesize()` returned `null`. Work backwards:
+
+1. Was `finalText` non-empty prose? If yes, `synthesisInstruction` did not produce JSON on the forced-final turn. Look at `lib/agents/base.ts` L98: did `synthesisInstruction` get appended? Check that `synthesisInstruction` is set in the `runAgentLoop` call at `lib/agents/diagnostic.ts` L62–L67.
+
+2. Was `finalText` empty (`''`)? If yes, the loop exhausted `maxTurns` without a clean break (`lib/agents/base.ts` L175). Either `maxTurns` is too low for the number of tool calls, or `forceFinal` was hit but the model still emitted `tool_use` blocks (impossible after L101 — if tools are not sent, `tool_use` blocks cannot appear). Check that `maxToolCalls` is set correctly.
+
+3. Did `synthesize()` receive populated `toolCalls`? If `toolCalls` is empty or all entries have `tc.error` set, the evidence string sent to `synthesize()` is `'(no successful queries were completed)'`. The model has nothing to synthesize from. Look at `lib/agents/base.ts` L140–L156: did `mcp.callTool` throw for every tool call? Check the MCP connection and tool names.
+
+Fix path: verify `synthesisInstruction` is non-empty → verify `maxToolCalls` is high enough to allow meaningful exploration → verify at least one tool call succeeded by checking the `toolCalls` array in the `onToolResult` hook.
+
+### Level 4 — Defend
+
+A reviewer says: "You should use a single large agent with all tools instead of three specialist agents. It reduces code and the model has full context." Respond with the concrete tradeoffs in terms of this codebase: prompt size, tool count, budget, and the fallback chain.
+
+### Quick check
+
+- What is the value of `AGENT_MODEL`? (Answer: `'claude-sonnet-4-6'`, `lib/agents/base.ts` L9)
+- What does `runAgentLoop` return when `maxTurns` is exhausted? (Answer: `{ finalText: '', toolCalls }`, L175)
+- What is the `maxToolCalls` budget for `DiagnosticAgent`? (Answer: `6`, `lib/agents/diagnostic.ts` L61)
+- What is the `maxToolCalls` budget for `RecommendationAgent`? (Answer: `4`, `lib/agents/recommendation.ts` L57)
+- In the fallback chain at `diagnostic.ts` L73–L77, what does `synthesize()` receive as its second argument? (Answer: `toolCalls` — the full array of every tool call the loop made)
+- Which line in `base.ts` feeds tool results back to the model as the next user turn? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`)

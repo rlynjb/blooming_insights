@@ -1,0 +1,556 @@
+# Extracting JSON from prose
+
+**Industry name(s):** lenient/forgiving JSON extraction, fenced-block parsing, structural validation (type guards)
+**Type:** Industry standard · Language-agnostic
+
+> When an LLM returns a JSON object wrapped in free-form text, you need a fallback ladder — fenced-block regex, bare parse, substring scan — followed by a type guard that confirms shape before you trust the value.
+
+**See also:** → ../01-system-design/06-multi-agent-orchestration.md · → 05-severity-sort.md
+
+---
+
+## Why care
+
+An endpoint that returns text like `Here you go:\n\`\`\`json\n{"status":"ok"}\n\`\`\`` will throw the moment you call `JSON.parse(body)`. The response is *almost* JSON — a structured value is in there — but a strict parse fails because the content type is prose, not JSON.
+
+The question becomes: how do you reliably extract a structured object from text a model wrote, when the model was told to emit JSON but chose to wrap it in a sentence?
+
+**The stakes are concrete.** The monitoring agent, diagnosis agent, and recommendation agent in this codebase all emit JSON inside prose. A strict `JSON.parse` on the full text throws and the briefing/investigation call chain fails entirely. Even after a successful parse, the extracted value is `unknown` — TypeScript cannot guarantee the shape at runtime. A malformed anomaly that passes into the downstream briefing pipeline without a guard check corrupts the report silently.
+
+Before: `JSON.parse(agentOutput)` throws → agent pipeline crashes.
+After: `parseAgentJson(agentOutput)` extracts the JSON → `isAnomalyArray(parsed)` narrows the type → downstream code works on a typed, validated value.
+
+It reduces to: `JSON.parse` in a try/catch with a fenced-block fast-path and a substring-scan fallback, then a type guard to confirm shape.
+
+---
+
+## How it works
+
+The extraction is a three-attempt fallback ladder. Each attempt either returns a parsed value or falls through to the next. Once a value is parsed — by any path — it passes to a structural validator before being used.
+
+```
+text input
+    │
+    ▼
+┌───────────────────────────┐
+│  fenced-block regex?      │  match /```(?:json)?\s*([\s\S]*?)```/i
+│  yes → candidate = fence  │
+│  no  → candidate = text   │
+└───────────┬───────────────┘
+            │
+            ▼
+┌───────────────────────────┐
+│  JSON.parse(candidate)    │  try/catch
+│  ok  → return value       │
+│  throw → fall through     │
+└───────────┬───────────────┘
+            │
+            ▼
+┌───────────────────────────┐
+│  substring scan           │  first [/{ to last ]/}
+│  ok  → return value       │
+│  fail → throw             │
+└───────────┬───────────────┘
+            │
+            ▼
+        parsed: unknown
+            │
+            ▼
+┌───────────────────────────┐
+│  type guard               │  isAnomalyArray / isDiagnosis / isRecommendationArray
+│  true  → trusted value    │
+│  false → reject / throw   │
+└───────────────────────────┘
+```
+
+The ladder is short-circuit: the moment any step succeeds, the later steps never run.
+
+### The fenced-block regex
+
+```ts
+const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+```
+
+The regex matches an opening triple-backtick, an optional `json` label, optional whitespace, then captures everything up to the closing triple-backtick. The capture group `([\s\S]*)` uses `[\s\S]` — not `.` — because `.` does not match newlines by default in JavaScript without the `s` flag. The `?` after `*` makes it non-greedy so it stops at the first closing fence rather than consuming multiple blocks.
+
+If the match exists, `fence[1]` is the captured content (the JSON text only, without backticks). If no match, the full `text` is the candidate. Either way the candidate is trimmed before any parse attempt.
+
+### Bare parse
+
+```ts
+try { return JSON.parse(candidate); } catch { /* fall through */ }
+```
+
+This is a standard `JSON.parse` in a try/catch. If the candidate is already well-formed JSON (e.g. the fenced block contained only JSON, no prose), this succeeds and returns immediately. The catch block does nothing — it intentionally falls through to the substring scan.
+
+### The substring scan
+
+```ts
+const start = candidate.search(/[[{]/);
+const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+if (start >= 0 && end > start) {
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+throw new Error('no parseable json in agent output');
+```
+
+`String.prototype.search` returns the index of the first match of the regex `[[{]` — either `[` or `{`, whichever appears first. `lastIndexOf` finds the last occurrence of the closing bracket or brace. Slicing `[start, end + 1)` pulls out the substring that starts at the outermost bracket and ends at the outermost closing bracket.
+
+Sample string to make the indices concrete:
+
+```
+"Here is the data: [{\"metric\":\"views\",\"scope\":[\"homepage\"]}] — done."
+ 0         1         2         3         4         5         6
+ 0123456789012345678901234567890123456789012345678901234567890123456789
+
+start = 18   (index of '[')
+end   = 52   (index of ']' from lastIndexOf)
+slice(18, 53) = '[{"metric":"views","scope":["homepage"]}]'
+```
+
+`JSON.parse` on that slice succeeds.
+
+### Structural validation
+
+Parsing succeeds → value is `unknown`. TypeScript accepts `unknown` in no typed context without narrowing. The three type guards narrow by walking the actual fields at runtime.
+
+`isAnomalyArray` is an `is` predicate — it returns `v is Anomaly[]`, which tells TypeScript the value is that type inside the `if` branch:
+
+```ts
+export function isAnomalyArray(v: unknown): v is Anomaly[] {
+  return Array.isArray(v) && v.every((a) =>
+    !!a && typeof a === 'object' &&
+    typeof (a as any).metric === 'string' &&
+    Array.isArray((a as any).scope) &&
+    !!(a as any).change && typeof (a as any).change.value === 'number' &&
+    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+    typeof (a as any).change.baseline === 'string' &&
+    SEVERITIES.includes((a as any).severity)
+  );
+}
+```
+
+The guard is a chain of `&&` predicates. The moment any predicate is false, JavaScript short-circuits and returns `false` without evaluating the rest — no try/catch needed.
+
+`isDiagnosis` checks three fields: `conclusion` is a string, `evidence` is an array, `hypothesesConsidered` is an array. `isRecommendationArray` checks six fields per element including enum membership via `Array.includes`.
+
+### Step-by-step execution trace
+
+**Input A: prose wrapping a fenced JSON block**
+
+```
+text = "Here are the anomalies:\n```json\n[{\"metric\":\"orders\",\"scope\":[\"checkout\"],\"change\":{\"value\":0.12,\"direction\":\"down\",\"baseline\":\"last 7 days\"},\"severity\":\"warning\"}]\n```\nLet me know if you have questions."
+```
+
+Step 1 — fenced regex:
+```
+fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+fence[0] = "```json\n[{...}]\n```"
+fence[1] = "[{\"metric\":\"orders\",\"scope\":[\"checkout\"],\"change\":{\"value\":0.12,\"direction\":\"down\",\"baseline\":\"last 7 days\"},\"severity\":\"warning\"}]"
+```
+
+Step 2 — candidate:
+```
+candidate = fence[1].trim()
+           = "[{\"metric\":\"orders\",\"scope\":[\"checkout\"],\"change\":{\"value\":0.12,\"direction\":\"down\",\"baseline\":\"last 7 days\"},\"severity\":\"warning\"}]"
+```
+
+Step 3 — bare parse:
+```
+JSON.parse(candidate)  →  succeeds
+return value = [{metric:"orders", scope:["checkout"], change:{value:0.12,direction:"down",baseline:"last 7 days"}, severity:"warning"}]
+```
+
+Substring scan: never reached.
+
+Step 4 — type guard (caller calls `isAnomalyArray`):
+```
+v = [{metric:"orders", scope:["checkout"], change:{...}, severity:"warning"}]
+
+Array.isArray(v)                       → true
+v[0] != null                           → true
+typeof v[0] === 'object'               → true
+typeof v[0].metric === 'string'        → true  ("orders")
+Array.isArray(v[0].scope)              → true
+v[0].change != null                    → true
+typeof v[0].change.value === 'number'  → true  (0.12)
+v[0].change.direction === 'down'       → true
+typeof v[0].change.baseline === 'string' → true
+SEVERITIES.includes(v[0].severity)    → true  ("warning" ∈ SEVERITIES)
+
+isAnomalyArray(v) = true  →  v is now Anomaly[] inside caller's if-branch
+```
+
+---
+
+**Input B: bare array embedded in prose (no fence)**
+
+```
+text = "The anomalies are [{\"metric\":\"clicks\",\"scope\":[\"homepage\"],\"change\":{\"value\":0.05,\"direction\":\"up\",\"baseline\":\"30d avg\"},\"severity\":\"info\"}] — that's everything."
+```
+
+Step 1 — fenced regex:
+```
+fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+fence = null   (no backticks in text)
+```
+
+Step 2 — candidate:
+```
+candidate = text.trim()
+           = "The anomalies are [{...}] — that's everything."
+```
+
+Step 3 — bare parse:
+```
+JSON.parse(candidate)  →  throws SyntaxError  (leading prose before '[')
+// catch block: fall through
+```
+
+Step 4 — substring scan:
+```
+start = candidate.search(/[[{]/)
+      = 18   (index of '[' in "The anomalies are [")
+
+end = Math.max(
+        candidate.lastIndexOf(']'),   // index 89 (the ']' after the object)
+        candidate.lastIndexOf('}')    // index 88
+      )
+    = 89
+
+start >= 0 && end > start → true
+
+candidate.slice(18, 90)
+  = "[{\"metric\":\"clicks\",\"scope\":[\"homepage\"],\"change\":{\"value\":0.05,\"direction\":\"up\",\"baseline\":\"30d avg\"},\"severity\":\"info\"}]"
+
+JSON.parse(slice)  →  succeeds
+return value = [{metric:"clicks", scope:["homepage"], change:{value:0.05,direction:"up",baseline:"30d avg"}, severity:"info"}]
+```
+
+Step 5 — type guard:
+```
+isAnomalyArray(v):
+Array.isArray(v)                         → true
+v[0].metric === 'string'                 → true  ("clicks")
+Array.isArray(v[0].scope)                → true
+v[0].change.value is number              → true  (0.05)
+v[0].change.direction === 'up'           → true
+v[0].change.baseline is string           → true
+SEVERITIES.includes("info")             → true
+
+isAnomalyArray(v) = true
+```
+
+### The principle
+
+Be liberal in what you accept from a model; be strict in what you trust. The extraction ladder handles realistic model output — formatted code fences, bare JSON, JSON buried in a sentence — without demanding a contract the model can't always keep. The type guard is where strictness kicks in: only a structurally correct value is admitted to typed downstream code.
+
+The diagram in the next section is the primary recap.
+
+---
+
+## Extracting JSON from prose — diagram
+
+```
+ text: string
+      │
+      ▼
+ ┌─────────────────────────────────────────┐
+ │  fenced-block regex                     │
+ │  /```(?:json)?\s*([\s\S]*?)```/i        │
+ │                                         │
+ │  match?  yes ──► candidate = fence[1]   │
+ │          no  ──► candidate = text       │
+ └──────────────────────┬──────────────────┘
+                        │
+                        ▼ candidate.trim()
+ ┌─────────────────────────────────────────┐
+ │  JSON.parse(candidate)                  │
+ │                                         │
+ │  ok  ──────────────────────────────────►│
+ │  throw ──► fall through                 │
+ └──────────────────────┬──────────────────┘
+                        │ (only on throw)
+                        ▼
+ ┌─────────────────────────────────────────┐
+ │  substring scan                         │
+ │                                         │
+ │  start = first index of [ or {          │
+ │  end   = max(lastIndexOf(]), lastIndex(})│
+ │                                         │
+ │  ok  ──────────────────────────────────►│
+ │  fail ──► throw Error                   │
+ └──────────────────────┬──────────────────┘
+                        │
+                        ▼
+                  parsed: unknown
+                        │
+                        ▼
+ ┌─────────────────────────────────────────┐
+ │  type guard (caller's responsibility)   │
+ │                                         │
+ │  isAnomalyArray(parsed)       → Anomaly[]            │
+ │  isDiagnosis(parsed)          → Diagnosis             │
+ │  isRecommendationArray(parsed)→ Omit<Recommendation,'id'>[] │
+ │                                         │
+ │  true  ──► trusted typed value          │
+ │  false ──► reject / throw in caller     │
+ └─────────────────────────────────────────┘
+```
+
+---
+
+## In this codebase
+
+**File:** `lib/mcp/validate.ts`
+**Function / class:** `parseAgentJson` + `isAnomalyArray` + `isDiagnosis` + `isRecommendationArray`
+**Line range:** L2–L53
+
+```ts
+// lib/mcp/validate.ts  L2–L13
+export function parseAgentJson(text: string): unknown {
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fence ? fence[1] : text).trim();
+  try { return JSON.parse(candidate); } catch { /* fall through to substring scan */ }
+  const start = candidate.search(/[[{]/);
+  const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+  if (start >= 0 && end > start) {
+    return JSON.parse(candidate.slice(start, end + 1));
+  }
+  throw new Error('no parseable json in agent output');
+}
+
+// lib/mcp/validate.ts  L17–L27
+export function isAnomalyArray(v: unknown): v is Anomaly[] {
+  return Array.isArray(v) && v.every((a) =>
+    !!a && typeof a === 'object' &&
+    typeof (a as any).metric === 'string' &&
+    Array.isArray((a as any).scope) &&
+    !!(a as any).change && typeof (a as any).change.value === 'number' &&
+    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+    typeof (a as any).change.baseline === 'string' &&
+    SEVERITIES.includes((a as any).severity)
+  );
+}
+```
+
+GitHub: `https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/validate.ts`
+
+---
+
+## Elaborate
+
+### Where it comes from
+
+This pattern has a name: **Postel's law** (the robustness principle) — "be conservative in what you send, be liberal in what you accept." Applied to LLM output: you can't force a hosted model to return machine-readable JSON on every call (especially with streaming or older prompt-only APIs), so you accept whatever it writes and extract the structure yourself. The technique is also called **structured-output extraction** in the LLM tooling literature — distinct from constrained decoding, which prevents the problem at generation time.
+
+The `is` predicate pattern (`function isAnomalyArray(v: unknown): v is Anomaly[]`) is standard TypeScript for runtime type narrowing — identical to what you'd write to validate data from `fetch()` before rendering it.
+
+### The deeper principle
+
+```
+ model output (text)
+         │
+         ▼
+ ┌───────────────────┐         liberal
+ │  extraction ladder│  ◄──── accept any
+ │  (forgiving)      │         plausible
+ └────────┬──────────┘         encoding
+          │
+          ▼
+   parsed: unknown
+          │
+          ▼
+ ┌───────────────────┐         strict
+ │  type guard       │  ◄──── trust only
+ │  (exact fields)   │         exact shape
+ └───────────────────┘
+```
+
+Liberal at the boundary, strict at the gate.
+
+### Where it breaks down
+
+The substring scan uses the **outermost** brackets. If the prose before the real JSON contains a stray `{` — for example: `"Use {curly braces}. Here is the data: [{...}]"` — `start` points to the stray `{`, not the opening bracket of the array. `JSON.parse` on that slice fails, and the function throws even though a valid JSON array was present.
+
+The guards are hand-written. Each new field on `Anomaly`, `Diagnosis`, or `Recommendation` requires a matching check inside the guard — there is no schema that keeps itself in sync. A field rename in the type definition does not break the guard at compile time.
+
+### What to explore next
+
+- **Tool/function-calling JSON mode** — Anthropic's tool-use API and OpenAI's function-calling API both let you declare a JSON schema; the model is constrained to emit conforming JSON. No extraction ladder needed.
+- **Zod** — a TypeScript-first schema validation library. Define the schema once; get parsing, coercion, and a type-narrowed result. Replaces the hand-written guards and adds coercion (e.g. string → number).
+- **Constrained decoding** — grammar-guided sampling (e.g. Outlines, llama.cpp GBNF grammars) forces the model's token choices to produce valid JSON at generation time, eliminating the problem entirely for self-hosted models.
+
+---
+
+## Tradeoffs
+
+| Dimension | This implementation (regex + scan + hand guards) | Alternative: Zod + SDK structured output |
+|---|---|---|
+| Complexity | Three code paths; each guard hand-maintained per type | One Zod schema per type; SDK handles extraction |
+| Reliability | Substring scan fails on stray `{}`; guards lag type changes | Zod parses or throws cleanly; schema is the single source of truth |
+| Dependency footprint | Zero new dependencies | Zod (tiny) or SDK structured-output feature (already a dep) |
+| Model freedom | Works with any prompt style, any model, streaming text | Requires function/tool-call mode; older models or non-Anthropic providers may not support it |
+
+**Gave up:** The scan is fragile when prose contains stray brackets. Guards are hand-maintained — a field added to the TypeScript type is invisible to the guard until a developer also updates it. There is no compile-time enforcement of guard completeness.
+
+**Alternative cost:** Zod adds a dependency (though it's small and widely used). The Anthropic tool-use mode requires restructuring the agent prompt and call site — you declare a tool schema, call the model differently, and parse a tool-call response rather than text. That's a larger refactor than dropping in a parse function.
+
+**Breakpoint:** This implementation is fine when the shapes are small, stable, and few (three types: `Anomaly`, `Diagnosis`, `Recommendation`). When shapes grow, nest deeply, or change frequently, hand-written guards become a maintenance liability and Zod or structured output is the right call.
+
+---
+
+## Tech reference (industry pairing)
+
+### JSON.parse + regex extraction
+
+- **Leader — Anthropic tool-use mode:** The SDK's tool-use API returns structured JSON in a typed `tool_use` content block. No regex needed. Declared via a `tools` array with an input schema.
+- **Runner-up — OpenAI function calling / `response_format: { type: "json_object" }`:** Same idea; the model is constrained to emit JSON. Works across GPT-3.5+.
+- **Standard library — `JSON.parse` in a try/catch:** Language-native. Works in every JavaScript/TypeScript environment. The fallback when you cannot constrain the model.
+- **Regex fenced-block extraction:** A common pattern in LLM output parsers (LangChain's `JsonOutputParser`, LlamaIndex's `PydanticOutputParser`) — they all implement some variant of the fenced-block → bare-parse → substring-scan ladder.
+- **Constrained decoding — Outlines / llama.cpp GBNF:** For self-hosted models, you can compile a JSON grammar into the sampler so the model physically cannot produce invalid JSON. Eliminates extraction entirely.
+
+### Structural type guards
+
+- **Leader — Zod:** Schema-first validation. `z.array(AnomalySchema).parse(v)` returns a typed value or throws a `ZodError` with field-level detail. The schema is the TypeScript type's single source of truth.
+- **Runner-up — io-ts / Effect Schema:** Functional, composable schemas. Stronger than Zod for algebraic types but more verbose.
+- **Standard pattern — `is` predicates:** Language-native TypeScript. Zero dependency. No field-level error messages. Suitable for stable, small shapes.
+- **`instanceof` checks:** Work only for class instances, not plain objects. Not applicable here — agent output is always a plain object deserialized from JSON.
+- **JSON Schema + Ajv:** JSON Schema is language-agnostic and widely supported. `Ajv` compiles a schema to a validator function. Useful when the schema needs to be shared across languages or stored externally.
+
+---
+
+## Summary
+
+`parseAgentJson` extracts a JSON value from text a language model wrote. It uses a three-step fallback ladder: (1) pull the content of a fenced code block with a regex, (2) `JSON.parse` the candidate, (3) scan for the outermost bracket pair and slice. After extraction, the value is `unknown` — three `is` type guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) confirm shape before the caller uses the value in a typed context.
+
+- The fenced-block regex handles the most common agent output format: a markdown code block.
+- The bare-parse handles well-formed JSON emitted without a fence.
+- The substring scan handles JSON buried mid-sentence, without fence markers.
+- All three extraction paths return `unknown`; narrowing to a typed value requires an `is` predicate.
+- The design is liberal at the boundary (accept any parseable encoding) and strict at the gate (admit only exact shapes).
+- The main weakness is the substring scan's fragility when prose contains stray brackets and the hand-maintenance burden on the type guards.
+
+---
+
+## Interview defense
+
+### What they're really asking
+
+When an interviewer asks about extracting JSON from LLM output, they are testing: do you know how `JSON.parse` fails, what a type guard is, and why "the model returned JSON" is not the same as "you have a trusted typed value"? Senior questions layer in: what does Postel's law cost you, and when would you replace the extraction ladder with a schema library or constrained output mode?
+
+### Q&A
+
+**[mid] "Walk me through what happens when `JSON.parse(text)` throws on agent output."**
+
+The raw text from the agent contains markdown, punctuation, and English around the JSON. `JSON.parse` is a strict parser — it fails on any non-JSON prefix. You catch the exception, then attempt a recovery strategy: locate the outermost bracket pair and parse only that slice. If the slice parses, you have your value. If not, you surface a clear error.
+
+```
+text: "The data is [{...}] — let me know!"
+           │
+           JSON.parse(text)  →  SyntaxError (leading 'T')
+           │
+           search for first [ or {  →  index 12
+           lastIndexOf(])           →  index 18
+           slice(12, 19)            →  "[{...}]"
+           JSON.parse(slice)        →  [{...}]  ✓
+```
+
+**[senior] "The parsed value is `unknown`. Why does that matter, and how do you handle it?"**
+
+`JSON.parse` returns `any` in TypeScript's standard lib, which means the compiler will not catch field access on a non-existent key. If you type the result as `unknown` (or treat it as such), the compiler forces you to narrow the type before using it. An `is` predicate is the idiomatic way to do that narrowing at runtime. Without it, a malformed value from the model flows into typed code with no error.
+
+```
+function isAnomalyArray(v: unknown): v is Anomaly[] {
+  // walks every required field at runtime
+  return Array.isArray(v) && v.every((a) => typeof a.metric === 'string' && ...)
+}
+
+if (isAnomalyArray(parsed)) {
+  // TypeScript narrows parsed to Anomaly[] here
+  // downstream code is typed
+}
+```
+
+**[arch] "This extraction ladder is fragile — stray braces in prose break the scan. What would you replace it with, and what does the replacement cost?"**
+
+Two options, each eliminating the problem at a different layer:
+
+```
+ Option A: Zod schema                    Option B: structured output / tool-call mode
+ ┌──────────────────────┐                ┌──────────────────────────────────┐
+ │ model still returns  │                │ declare tool schema in API call  │
+ │ text prose           │                │ model emits tool_use block        │
+ │                      │                │ no extraction needed              │
+ │ extraction ladder    │                │                                  │
+ │  → still needed      │                │ model must support tool-call mode │
+ │                      │                │ prompt + call site changes        │
+ │ Zod replaces guards  │                │                                  │
+ │  → schema = source   │                │ zero extraction code              │
+ │    of truth          │                │ Zod optional but natural          │
+ └──────────────────────┘                └──────────────────────────────────┘
+```
+
+Option A (Zod) removes guard maintenance but not extraction fragility. Option B (structured output) removes both — the model's token space is constrained to valid JSON conforming to the schema. The cost of B is coupling to the tool-call API, restructuring the prompt, and losing the ability to use non-conformant models or streaming text mode without a rework.
+
+### The dodge
+
+**"Why not force the model to return clean JSON with a tool/JSON mode instead of scraping prose?"**
+
+Honest answer: you can, and for greenfield work it is the better default. Anthropic's tool-use API constrains the model to emit a `tool_use` content block with a structured input — no regex needed. This codebase uses text prompts that ask for JSON rather than declaring a tool schema, which gives the implementation flexibility (works with any model, any streaming mode) but pushes the extraction burden onto the client.
+
+```
+ Tool/JSON mode (ideal)          Text + extraction (current)
+ ┌──────────────────┐            ┌──────────────────────────┐
+ │ declare schema   │            │ prompt: "respond in JSON" │
+ │ in API call      │            │                          │
+ │                  │            │ extraction ladder        │
+ │ model: tool_use  │            │  → regex                 │
+ │ block (JSON)     │            │  → bare parse            │
+ │                  │            │  → substring scan        │
+ │ no extraction    │            │                          │
+ │ type guard still │            │ type guard               │
+ │ advisable        │            │                          │
+ └──────────────────┘            └──────────────────────────┘
+```
+
+The extraction approach works and has zero migration cost. It becomes a liability when shapes grow or the team inherits it without context.
+
+### Code anchors
+
+- `lib/mcp/validate.ts` L4 — fenced-block regex
+- `lib/mcp/validate.ts` L5 — candidate selection
+- `lib/mcp/validate.ts` L6 — bare parse try/catch
+- `lib/mcp/validate.ts` L7–L12 — substring scan + throw
+- `lib/mcp/validate.ts` L17–L27 — `isAnomalyArray` is-predicate
+
+---
+
+## Validate your understanding
+
+**Level 1 — Reconstruct**
+
+Without looking at the file, describe the three extraction attempts in `parseAgentJson` in order. For each: what it tries, what input makes it succeed, and what it does on failure.
+
+**Level 2 — Explain**
+
+`isAnomalyArray` in `lib/mcp/validate.ts` (L17–L27) checks `SEVERITIES.includes((a as any).severity)`. Explain why this check is necessary even after `JSON.parse` succeeds. What is the return type annotation `v is Anomaly[]`, and what does it enable in the caller's code? What would happen if you removed the guard and cast the result directly to `Anomaly[]`?
+
+**Level 3 — Apply**
+
+The model returns: `"I found two issues. {\"type\":\"summary\"} Here is the real list: [{\"metric\":\"sessions\",\"scope\":[\"landing\"],\"change\":{\"value\":0.08,\"direction\":\"down\",\"baseline\":\"7d avg\"},\"severity\":\"warning\"}] Done."` — no fence markers, and there is a stray `{}` before the array.
+
+Trace `parseAgentJson` on this input step by step. What does `candidate.search(/[[{]/)` return? What does `lastIndexOf(']')` return? What does `slice(start, end + 1)` contain? Does `JSON.parse` on that slice succeed? Cite `lib/mcp/validate.ts` L7–L10 in your answer.
+
+After `parseAgentJson` returns, what does `isAnomalyArray(result)` return, and why? Walk `lib/mcp/validate.ts` L18–L26 for the single array element.
+
+**Level 4 — Defend**
+
+A teammate argues: "We should replace `parseAgentJson` with Zod's `z.array(AnomalySchema).parse(result)` after JSON.parse." Evaluate this. What does Zod solve that the current guards do not? What does it not solve? Under what conditions would you recommend the change?
+
+**Quick check**
+
+- The regex `/```(?:json)?\s*([\s\S]*?)```/i` — why `[\s\S]` instead of `.`? What does the `?` after `*` do?
+- If `fence` is non-null, what is `fence[1]`? What is `fence[0]`?
+- `candidate.search(/[[{]/)` returns `-1` if there is no bracket. What does the guard `start >= 0 && end > start` prevent?
+- An `is` predicate returns `boolean`. What does the `: v is Anomaly[]` annotation add over just returning `boolean`?
