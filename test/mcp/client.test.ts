@@ -85,4 +85,34 @@ describe('McpClient', () => {
     const c = new McpClient(t);
     expect(await c.listTools()).toEqual({ tools: [{ name: 'list_projects' }] });
   });
+
+  it('does not cache an error result', async () => {
+    let n = 0;
+    const t: McpTransport = { async callTool() { n++; return n === 1 ? { isError: true, content: [{ type: 'text', text: 'boom' }] } : { ok: 1 }; }, async listTools() { return { tools: [] }; } };
+    const c = new McpClient(t, { minIntervalMs: 0 });
+    const r1 = await c.callTool('x', {});
+    expect((r1.result as any).isError).toBe(true);
+    const r2 = await c.callTool('x', {}); // same key — must NOT be served from cache
+    expect(r2.fromCache).toBe(false);
+    expect((r2.result as any).ok).toBe(1);
+    expect(n).toBe(2);
+  });
+
+  it('retries a rate-limited result then succeeds', async () => {
+    let n = 0;
+    const t: McpTransport = { async callTool() { n++; return n < 3 ? { isError: true, content: [{ type: 'text', text: 'Too many requests: rate limit reached (1 per 1 second)' }] } : { isError: false, ok: true }; }, async listTools() { return { tools: [] }; } };
+    const c = new McpClient(t, { minIntervalMs: 0, retryDelayMs: 1 });
+    const r = await c.callTool('x', {});
+    expect((r.result as any).ok).toBe(true);
+    expect(n).toBe(3);
+  });
+
+  it('gives up after maxRetries and returns the error result', async () => {
+    let n = 0;
+    const t: McpTransport = { async callTool() { n++; return { isError: true, content: [{ type: 'text', text: 'rate limit reached' }] }; }, async listTools() { return { tools: [] }; } };
+    const c = new McpClient(t, { minIntervalMs: 0, retryDelayMs: 1, maxRetries: 2 });
+    const r = await c.callTool('x', {});
+    expect((r.result as any).isError).toBe(true);
+    expect(n).toBe(3); // 1 initial + 2 retries
+  });
 });
