@@ -24,6 +24,52 @@ function humanizeBaseline(b: string): string {
   return m ? `${m[1]} days` : b;
 }
 
+/** Why this change matters — the metric's business role (inferred from its
+ *  name) plus the urgency its severity implies. Explains the real data the
+ *  agent recorded; invents nothing. */
+function whyItMatters(insight: Insight): string {
+  const m = insight.metric.toLowerCase();
+  let role: string;
+  if (/revenue|purchase|sales|order|spend|aov|ltv|gmv/.test(m))
+    role = 'a top-line revenue metric — a move here flows straight to income';
+  else if (/conversion|checkout|cart|funnel|abandon/.test(m))
+    role = 'a funnel metric — it tracks how efficiently visits turn into orders';
+  else if (/session|traffic|visit|view|reach|impression|open|click|ctr/.test(m))
+    role = 'a top-of-funnel volume metric — it shapes how many people enter the funnel';
+  else if (/retention|churn|repeat|return|reactivat|loyal/.test(m))
+    role = 'a retention metric — it reflects whether customers come back';
+  else if (/email|campaign|message|push|notif/.test(m))
+    role = 'an engagement metric — it tracks how customers respond to your messaging';
+  else role = 'a tracked workspace metric';
+
+  let urgency: string;
+  switch (insight.severity) {
+    case 'critical':
+      urgency = 'flagged critical — the most significant change in this briefing, so look here first';
+      break;
+    case 'warning':
+      urgency = 'flagged a warning — notable and worth a look before it compounds';
+      break;
+    case 'positive':
+      urgency = 'a positive move — worth understanding what drove it so you can repeat it';
+      break;
+    default:
+      urgency = 'smaller, but notable enough to surface';
+  }
+  return `this is ${role}. it's ${urgency}.`;
+}
+
+/** Why the card carries the scope it does. The monitor measures globally first
+ *  and only breaks a change down by segment when it's large enough to localize,
+ *  so a country tag means the shift is concentrated there. */
+function scopeExplain(insight: Insight): string {
+  const segs = insight.scope.filter((s) => s.toLowerCase() !== 'global');
+  if (segs.length === 0) {
+    return 'measured across your entire workspace — no single country or segment stood out, so this is a workspace-wide move.';
+  }
+  return `localized to ${segs.join(' / ')} — the change is concentrated there, not workspace-wide. the monitor breaks a metric down by segment only when the shift is large enough to pin to one.`;
+}
+
 /** Pull the provenance the monitoring agent recorded for this insight: which
  *  tool(s) ran, and the current vs prior values behind the change (when the
  *  evidence carries them). */
@@ -96,17 +142,44 @@ export default function InsightCard({ insight }: InsightCardProps) {
           </span>
         </div>
 
-        {/* summary */}
+        {/* summary — the agent's one-line statement of what changed */}
         <p
           style={{
             color: 'var(--text-secondary)',
             fontSize: '0.875rem',
             lineHeight: 1.5,
-            margin: '0 0 12px',
+            margin: '0 0 10px',
           }}
         >
           {insight.summary.toLowerCase()}
         </p>
+
+        {/* the so-what: why this matters, and why it's scoped the way it is */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '0 0 12px' }}>
+          {[
+            { label: 'why it matters', text: whyItMatters(insight) },
+            { label: 'scope', text: scopeExplain(insight) },
+          ].map((d) => (
+            <div key={d.label} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+              <span
+                style={{
+                  flexShrink: 0,
+                  width: 86,
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.62rem',
+                  letterSpacing: '0.04em',
+                  color: 'var(--text-tertiary)',
+                  paddingTop: 1,
+                }}
+              >
+                {d.label}
+              </span>
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', lineHeight: 1.45 }}>
+                {d.text}
+              </span>
+            </div>
+          ))}
+        </div>
 
         {/* meta row */}
         <div
@@ -120,6 +193,11 @@ export default function InsightCard({ insight }: InsightCardProps) {
           {insight.scope.map((tag) => (
             <span
               key={tag}
+              title={
+                tag.toLowerCase() === 'global'
+                  ? 'measured across the whole workspace'
+                  : `change localized to the ${tag.toLowerCase()} segment`
+              }
               style={{
                 background: 'var(--bg-elevated)',
                 color: 'var(--text-tertiary)',
