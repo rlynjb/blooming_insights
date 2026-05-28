@@ -37,6 +37,9 @@ yarn-error.log*
 # dev-only oauth token cache (plaintext tokens — never commit)
 .auth-cache.json
 
+# dev-only investigation cache (generated run data — never commit)
+.investigation-cache.json
+
 # vercel
 .vercel
 

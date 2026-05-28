@@ -9,6 +9,7 @@ import { DiagnosticAgent } from '@/lib/agents/diagnostic';
 import { RecommendationAgent } from '@/lib/agents/recommendation';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { getAnomaly, getInsight } from '@/lib/state/insights';
+import { getCachedInvestigation, saveInvestigation } from '@/lib/state/investigations';
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
 import type { Anomaly, Insight } from '@/lib/mcp/types';
 
@@ -44,9 +45,34 @@ const trunc = (v: unknown): unknown => {
   return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
 };
 
+const REPLAY_DELAY_MS = 180;
+
 export async function GET(req: NextRequest) {
   const insightId = req.nextUrl.searchParams.get('insightId');
   if (!insightId) return NextResponse.json({ error: 'insightId required' }, { status: 400 });
+
+  const live = req.nextUrl.searchParams.get('live') === '1';
+
+  // Cache-first: replay a precomputed investigation (no auth/key needed).
+  const cached = live ? null : getCachedInvestigation(insightId);
+  if (cached) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const e of cached) {
+          controller.enqueue(encoder.encode(encodeEvent(e)));
+          await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+      },
+    });
+  }
 
   const anomaly = resolveAnomaly(insightId);
   if (!anomaly) return NextResponse.json({ error: 'insight not found' }, { status: 404 });
@@ -69,7 +95,11 @@ export async function GET(req: NextRequest) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (e: AgentEvent) => controller.enqueue(encoder.encode(encodeEvent(e)));
+      const collected: AgentEvent[] = [];
+      const send = (e: AgentEvent) => {
+        collected.push(e);
+        controller.enqueue(encoder.encode(encodeEvent(e)));
+      };
       const stepFor = (
         agent: 'diagnostic' | 'recommendation',
         kind: 'thought' | 'hypothesis' | 'conclusion',
@@ -107,6 +137,7 @@ export async function GET(req: NextRequest) {
         for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
 
         send({ type: 'done' });
+        saveInvestigation(insightId, collected);
       } catch (e) {
         send({ type: 'error', message: e instanceof Error ? e.message : String(e) });
       } finally {
