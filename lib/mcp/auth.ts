@@ -93,7 +93,9 @@ export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
     (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
       httpOnly: true,
       secure: true,
-      sameSite: 'lax',
+      // SameSite=None so the PKCE verifier + client info survive the cross-site
+      // OAuth return from the IdP to /api/mcp/callback (matches bi_session).
+      sameSite: 'none',
       path: '/',
       maxAge: AUTH_COOKIE_MAX_AGE,
     });
