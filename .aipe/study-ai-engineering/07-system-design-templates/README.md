@@ -1,0 +1,12 @@
+# 07 — System design templates
+
+A **system design template** is an interview reframe of the codebase: the verbatim IK-style whiteboard prompt ("design an X"), answered first with the canonical generic architecture and then mapped honestly onto what blooming insights actually does. These files use a different shape from the per-concept study files — nine labelled bullets (the prompt, standard architecture, data model, key components, scale concerns, eval framing, common failure modes, applies-to-this-codebase, how-to-make-it-apply) instead of the Why-care / How-it-works template. The first seven bullets are generic and reusable; only the last two are blooming-insights-specific, and they are answered against the real code.
+
+## Files
+
+- **[01-search-ranking.md](01-search-ranking.md)** — C5.10. "Design a search ranking system that takes a user query and returns the top-k most relevant items from a corpus." Canonical two-stage retrieve-then-rank: query understanding → dense+sparse candidate retrieval → learned/cross-encoder ranking → serving + click logging. **Applies: no.** Blooming insights has no query→corpus search — its one ranking surface is `MonitoringAgent` sorting anomalies by `SEV_RANK` and slicing top-10 (`lib/agents/monitoring.ts:50`/`:92`), and its "retrieval" is live MCP tool calls, not a searchable index.
+- **[02-tech-support-chatbot.md](02-tech-support-chatbot.md)** — C5.14. "Design a tech support chatbot that answers customer questions, escalates when it can't, and learns from agent corrections." Canonical classify → RAG over KB → constrained generation → confident-respond/unsure-escalate → feedback loop. **Applies: partially.** The ask-anything `QueryAgent` (`lib/agents/query.ts`) + heuristic+LLM intent routing (`lib/agents/intent.ts`) + tool-grounded NDJSON streaming is structurally a chatbot over the Bloomreach workspace, but it is missing KB-RAG, an escalation gate, a feedback/correction loop, and multi-turn memory.
+
+## How to read these
+
+Read the prompt and the standard architecture as if you were at the whiteboard — they are the answer you would give in any interview, codebase or not. Then read the last two bullets as the honest follow-up an interviewer drills into: *"your repo has this; does it actually implement what you just described?"* The value of these files is the gap between the canonical design and the real code — and being able to defend why blooming insights chose live tool-call retrieval over a search index, and a one-shot grounded answerer over a full RAG-plus-escalation support stack.
