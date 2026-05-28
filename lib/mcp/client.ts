@@ -44,4 +44,12 @@ export class McpClient {
     this.cache.set(cacheKey, { result, expiresAt: now + ttl });
     return { result: result as T, durationMs, fromCache: false };
   }
+
+  /** List the tools the connected MCP server exposes (name, description,
+   *  inputSchema). Used by /debug for introspection and by agents to build the
+   *  tool schemas they hand to Claude. Not cached — the tool set is stable per
+   *  connection and listed rarely. */
+  async listTools(): Promise<unknown> {
+    return this.transport.listTools();
+  }
 }

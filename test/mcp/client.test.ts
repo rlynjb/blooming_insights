@@ -6,6 +6,7 @@ function fakeTransport(impl: (name: string) => unknown): McpTransport & { calls:
   const t = {
     calls: 0,
     async callTool(name: string) { t.calls++; return impl(name); },
+    async listTools() { return { tools: [] }; },
   };
   return t;
 }
@@ -74,5 +75,14 @@ describe('McpClient', () => {
     await p2;
     expect(Date.now() - start).toBeGreaterThanOrEqual(200);
     vi.useRealTimers();
+  });
+
+  it('listTools delegates to the transport', async () => {
+    const t: McpTransport = {
+      async callTool() { return {}; },
+      async listTools() { return { tools: [{ name: 'list_projects' }] }; },
+    };
+    const c = new McpClient(t);
+    expect(await c.listTools()).toEqual({ tools: [{ name: 'list_projects' }] });
   });
 });

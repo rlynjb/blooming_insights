@@ -59,6 +59,35 @@ export default function DebugPage() {
     }
   }
 
+  async function listTools() {
+    setError('');
+    setOutput('');
+    setDurationMs(null);
+    setLoading(true);
+    try {
+      const res = await fetch('/api/mcp/tools');
+      if (res.status === 401) {
+        const body = await res.json();
+        if (body?.needsAuth && body?.authUrl) {
+          window.location.href = body.authUrl;
+          return;
+        }
+        setError(JSON.stringify(body));
+        return;
+      }
+      const body = await res.json();
+      if (!res.ok) {
+        setError(typeof body?.error === 'string' ? body.error : JSON.stringify(body));
+        return;
+      }
+      setOutput(JSON.stringify(body.tools, null, 2));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main
       className="min-h-screen px-6 py-8 mx-auto w-full max-w-3xl"
@@ -121,19 +150,35 @@ export default function DebugPage() {
         }}
       />
 
-      <button
-        type="button"
-        onClick={call}
-        disabled={loading}
-        className="px-4 py-2 text-sm"
-        style={{
-          background: 'var(--accent-teal)',
-          color: 'var(--bg-base)',
-          opacity: loading ? 0.6 : 1,
-        }}
-      >
-        {loading ? 'calling…' : 'call'}
-      </button>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={call}
+          disabled={loading}
+          className="px-4 py-2 text-sm"
+          style={{
+            background: 'var(--accent-teal)',
+            color: 'var(--bg-base)',
+            opacity: loading ? 0.6 : 1,
+          }}
+        >
+          {loading ? 'calling…' : 'call'}
+        </button>
+        <button
+          type="button"
+          onClick={listTools}
+          disabled={loading}
+          className="px-4 py-2 text-sm"
+          style={{
+            background: 'var(--bg-elevated)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border)',
+            opacity: loading ? 0.6 : 1,
+          }}
+        >
+          list tools
+        </button>
+      </div>
 
       {error && (
         <pre

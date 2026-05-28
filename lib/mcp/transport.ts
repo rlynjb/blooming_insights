@@ -5,6 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
  *  tests provide a fake. */
 export interface McpTransport {
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
+  listTools(): Promise<unknown>;
 }
 
 /** Wraps a connected MCP SDK Client. Connection/auth handled in auth.ts/connect.ts. */
@@ -13,5 +14,8 @@ export class SdkTransport implements McpTransport {
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     const res = await this.client.callTool({ name, arguments: args });
     return res;
+  }
+  async listTools(): Promise<unknown> {
+    return this.client.listTools();
   }
 }
