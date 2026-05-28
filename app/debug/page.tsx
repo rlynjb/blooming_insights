@@ -2,7 +2,25 @@
 
 import { useState } from 'react';
 
-const PRESETS = ['whoami', 'list_projects', 'get_project_overview', 'list_dashboards'];
+const PRESETS = [
+  'whoami',
+  'list_cloud_organizations',
+  'list_projects',
+  'get_project_overview',
+  'list_dashboards',
+];
+
+/** Read a response body defensively: parse JSON when possible, otherwise return
+ *  the raw text under __raw so a 500/empty/HTML body never throws on res.json(). */
+async function readBody(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { __raw: text };
+  }
+}
 
 export default function DebugPage() {
   const [name, setName] = useState('whoami');
@@ -33,21 +51,21 @@ export default function DebugPage() {
         body: JSON.stringify({ name, args }),
       });
 
-      if (res.status === 401) {
-        const body = await res.json();
-        if (body?.needsAuth && body?.authUrl) {
-          // full-page redirect so the cookie + callback round-trip works; after the
-          // callback redirects back to /debug the user clicks the tool again.
-          window.location.href = body.authUrl;
-          return;
-        }
-        setError(JSON.stringify(body));
+      const body = await readBody(res);
+      if (res.status === 401 && body?.needsAuth && body?.authUrl) {
+        // full-page redirect so the cookie + callback round-trip works; after the
+        // callback redirects back to /debug the user clicks the tool again.
+        window.location.href = body.authUrl as string;
         return;
       }
-
-      const body = await res.json();
       if (!res.ok) {
-        setError(typeof body?.error === 'string' ? body.error : JSON.stringify(body));
+        setError(
+          typeof body?.error === 'string'
+            ? body.error
+            : typeof body?.__raw === 'string'
+              ? body.__raw
+              : `http ${res.status}`,
+        );
         return;
       }
       setOutput(JSON.stringify(body.result, null, 2));
@@ -66,18 +84,19 @@ export default function DebugPage() {
     setLoading(true);
     try {
       const res = await fetch('/api/mcp/tools');
-      if (res.status === 401) {
-        const body = await res.json();
-        if (body?.needsAuth && body?.authUrl) {
-          window.location.href = body.authUrl;
-          return;
-        }
-        setError(JSON.stringify(body));
+      const body = await readBody(res);
+      if (res.status === 401 && body?.needsAuth && body?.authUrl) {
+        window.location.href = body.authUrl as string;
         return;
       }
-      const body = await res.json();
       if (!res.ok) {
-        setError(typeof body?.error === 'string' ? body.error : JSON.stringify(body));
+        setError(
+          typeof body?.error === 'string'
+            ? body.error
+            : typeof body?.__raw === 'string'
+              ? body.__raw
+              : `http ${res.status}`,
+        );
         return;
       }
       setOutput(JSON.stringify(body.tools, null, 2));
