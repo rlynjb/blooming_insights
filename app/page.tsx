@@ -104,10 +104,6 @@ export default function HomePage() {
     active: false,
     msg: '',
   });
-  // "how this briefing was gathered" pane open state — opened automatically for a
-  // live briefing so the status/log trace streams in view as the scan runs; the
-  // user can collapse it. Closed for demo (the snapshot loads instantly).
-  const [traceOpen, setTraceOpen] = useState(false);
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -263,7 +259,6 @@ export default function HomePage() {
     setStepStatus('');
     setQueryCount(0);
     setTraceItems([]);
-    setTraceOpen(!isDemo); // live → open the trace so the scan streams in view
 
     const url = `/api/briefing${search}`;
     let cancelled = false;
@@ -460,7 +455,7 @@ export default function HomePage() {
 
   return (
     <main
-      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-2xl"
+      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-5xl"
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -550,62 +545,6 @@ export default function HomePage() {
         recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
       />
 
-      {/* how the data was gathered — the monitoring agent's real tool calls.
-          pinned near the top (above the feed) so the fixed query box can't
-          overlap it. shown in both modes; a demo snapshot without a captured
-          trace shows a placeholder so the feature/label stays visible. */}
-      {(status === 'loaded' ||
-        status === 'empty' ||
-        (status === 'loading' && traceItems.length > 0)) && (
-        <details
-          open={traceOpen}
-          onToggle={(e) => setTraceOpen((e.currentTarget as HTMLDetailsElement).open)}
-          style={{
-            marginBottom: 24,
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-            background: 'var(--bg-elevated)',
-          }}
-        >
-          <summary
-            className="lowercase"
-            style={{
-              cursor: 'pointer',
-              padding: '12px 16px',
-              fontFamily: 'var(--font-mono), monospace',
-              fontSize: '0.72rem',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            how this briefing was gathered ·{' '}
-            {traceItems.length > 0
-              ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
-              : '-- queries'}
-            {status === 'loading' && ' · scanning…'}
-          </summary>
-          <div style={{ padding: '8px 16px 18px' }}>
-            {traceItems.length > 0 ? (
-              <ReasoningTrace items={traceItems} />
-            ) : (
-              <p
-                className="lowercase"
-                style={{
-                  margin: 0,
-                  color: 'var(--text-tertiary)',
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.72rem',
-                  lineHeight: 1.5,
-                }}
-              >
-                -- the agent&apos;s query-by-query trace is recorded during a live briefing. switch
-                to live to watch the real eql it runs, or capture a live snapshot to bake it into
-                demo.
-              </p>
-            )}
-          </div>
-        </details>
-      )}
-
       {/* active query response — pinned above the feed */}
       {activeQuery && (
         <div style={{ marginBottom: 24 }}>
@@ -651,6 +590,12 @@ export default function HomePage() {
         </p>
       )}
 
+      {/* feed (col 1) + live statuses & logs (col 2), side by side — matches the
+          investigate page width, and keeps the live trace visible so the user
+          can see work happening in the background. */}
+      <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
+        {/* ── col 1 — the feed (anomaly items) ───────────────────────────── */}
+        <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       {/* loading */}
       {status === 'loading' && !reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -766,6 +711,75 @@ export default function HomePage() {
             : 'ⓘ dev · capture this as the demo snapshot (one click)'}
         </button>
       )}
+        </div>
+
+        {/* ── col 2 — live statuses / logs, so the user sees background work ── */}
+        <aside
+          style={{
+            position: 'sticky',
+            top: 16,
+            alignSelf: 'start',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--bg-elevated)',
+            maxHeight: 'calc(100vh - 96px)',
+            overflowY: 'auto',
+          }}
+        >
+          <div
+            className="lowercase"
+            style={{
+              position: 'sticky',
+              top: 0,
+              padding: '12px 16px',
+              borderBottom: '1px solid var(--border)',
+              background: 'var(--bg-elevated)',
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.72rem',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            how this briefing was gathered ·{' '}
+            {traceItems.length > 0
+              ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
+              : '-- queries'}
+            {status === 'loading' && ' · scanning…'}
+          </div>
+          <div style={{ padding: '10px 16px 16px' }}>
+            {traceItems.length > 0 ? (
+              <ReasoningTrace items={traceItems} />
+            ) : status === 'loading' ? (
+              <p
+                className="lowercase"
+                style={{
+                  margin: 0,
+                  color: 'var(--text-tertiary)',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.72rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                connecting to the agent…
+              </p>
+            ) : (
+              <p
+                className="lowercase"
+                style={{
+                  margin: 0,
+                  color: 'var(--text-tertiary)',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.72rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                -- the agent&apos;s query-by-query trace is recorded during a live briefing. switch
+                to live to watch the real eql it runs, or capture a live snapshot to bake it into
+                demo.
+              </p>
+            )}
+          </div>
+        </aside>
+      </div>
 
       {/* shown in both modes so the "ask anything" feature is visible; inert in
           demo (free-form Q&A runs the agents live against the workspace). */}

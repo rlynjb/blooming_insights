@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   getCachedInvestigation,
   saveInvestigation,
@@ -6,7 +8,12 @@ import {
 } from '../../lib/state/investigations';
 import type { AgentEvent } from '../../lib/mcp/events';
 
-const DEMO_ID = 'c38e9e2a-52ca-41c7-b3d2-24e792e574cf';
+// Derive a real id from the committed demo seed rather than hard-coding one —
+// the ids change every time the demo snapshot is re-captured.
+const DEMO_SEED = JSON.parse(
+  readFileSync(join(process.cwd(), 'lib/state/demo-investigations.json'), 'utf8'),
+) as Record<string, AgentEvent[]>;
+const DEMO_ID = Object.keys(DEMO_SEED)[0];
 
 const sample: AgentEvent[] = [
   { type: 'reasoning_step', step: { id: 's', agent: 'diagnostic', kind: 'thought', content: 'hi' } },
