@@ -1,0 +1,108 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"success\":true,\"data\":{\"archived_events\":0,\"event_types_overview\":{\"banner\":{\"event_count\":80509},\"campaign\":{\"event_count\":204917},\"cart_update\":{\"event_count\":38205},\"checkout\":{\"event_count\":30109},\"consent\":{\"event_count\":185702},\"experiment\":{\"event_count\":15988},\"first_session\":{\"event_count\":16164},\"inbound_call\":{\"event_count\":7612},\"installation\":{\"event_count\":15874},\"loyalty_update\":{\"event_count\":27046},\"menu\":{\"event_count\":1},\"merge\":{\"event_count\":968},\"outbound_call\":{\"event_count\":7612},\"page_visit\":{\"event_count\":55492},\"paper_catalogue\":{\"event_count\":22536},\"purchase\":{\"event_count\":27046},\"purchase_item\":{\"event_count\":29369},\"registration\":{\"event_count\":2470},\"retargeting\":{\"event_count\":7017},\"return\":{\"event_count\":3931},\"session_end\":{\"event_count\":114533},\"session_start\":{\"event_count\":34965},\"store_visit\":{\"event_count\":15907},\"support_ticket\":{\"event_count\":22536},\"survey\":{\"event_count\":14822},\"user_active\":{\"event_count\":3},\"view_category\":{\"event_count\":102201},\"view_item\":{\"event_count\":89717}},\"events\":1173252,\"identified_customers\":123162,\"merged_customers\":968,\"oldest_timestamp\":1704073839,\"total_customers\":123162,\"user_accounts\":1},\"error\":null}"
+    }
+  ],
+  "structuredContent": {
+    "success": true,
+    "data": {
+      "archived_events": 0,
+      "event_types_overview": {
+        "banner": {
+          "event_count": 80509
+        },
+        "campaign": {
+          "event_count": 204917
+        },
+        "cart_update": {
+          "event_count": 38205
+        },
+        "checkout": {
+          "event_count": 30109
+        },
+        "consent": {
+          "event_count": 185702
+        },
+        "experiment": {
+          "event_count": 15988
+        },
+        "first_session": {
+          "event_count": 16164
+        },
+        "inbound_call": {
+          "event_count": 7612
+        },
+        "installation": {
+          "event_count": 15874
+        },
+        "loyalty_update": {
+          "event_count": 27046
+        },
+        "menu": {
+          "event_count": 1
+        },
+        "merge": {
+          "event_count": 968
+        },
+        "outbound_call": {
+          "event_count": 7612
+        },
+        "page_visit": {
+          "event_count": 55492
+        },
+        "paper_catalogue": {
+          "event_count": 22536
+        },
+        "purchase": {
+          "event_count": 27046
+        },
+        "purchase_item": {
+          "event_count": 29369
+        },
+        "registration": {
+          "event_count": 2470
+        },
+        "retargeting": {
+          "event_count": 7017
+        },
+        "return": {
+          "event_count": 3931
+        },
+        "session_end": {
+          "event_count": 114533
+        },
+        "session_start": {
+          "event_count": 34965
+        },
+        "store_visit": {
+          "event_count": 15907
+        },
+        "support_ticket": {
+          "event_count": 22536
+        },
+        "survey": {
+          "event_count": 14822
+        },
+        "user_active": {
+          "event_count": 3
+        },
+        "view_category": {
+          "event_count": 102201
+        },
+        "view_item": {
+          "event_count": 89717
+        }
+      },
+      "events": 1173252,
+      "identified_customers": 123162,
+      "merged_customers": 968,
+      "oldest_timestamp": 1704073839,
+      "total_customers": 123162,
+      "user_accounts": 1
+    },
+    "error": null
+  },
+  "isError": false
+}

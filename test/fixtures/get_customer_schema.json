@@ -1,0 +1,33 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"success\":true,\"data\":[{\"name\":\"registered\",\"type\":\"hard\",\"transform_lowercase\":false,\"transform_trim\":true},{\"name\":\"cookie\",\"type\":\"soft\",\"transform_lowercase\":false,\"transform_trim\":true},{\"name\":\"google_analytics\",\"type\":\"soft\",\"transform_lowercase\":false,\"transform_trim\":true}],\"error\":null}"
+    }
+  ],
+  "structuredContent": {
+    "success": true,
+    "data": [
+      {
+        "name": "registered",
+        "type": "hard",
+        "transform_lowercase": false,
+        "transform_trim": true
+      },
+      {
+        "name": "cookie",
+        "type": "soft",
+        "transform_lowercase": false,
+        "transform_trim": true
+      },
+      {
+        "name": "google_analytics",
+        "type": "soft",
+        "transform_lowercase": false,
+        "transform_trim": true
+      }
+    ],
+    "error": null
+  },
+  "isError": false
+}

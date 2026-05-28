@@ -1,0 +1,14 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"success\":true,\"data\":[],\"error\":null}"
+    }
+  ],
+  "structuredContent": {
+    "success": true,
+    "data": [],
+    "error": null
+  },
+  "isError": false
+}

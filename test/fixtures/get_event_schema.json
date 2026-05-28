@@ -1,0 +1,2460 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"success\":true,\"events\":[{\"type\":\"consent\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"source\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"valid_until\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"identification_type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"identification\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"imported_timestamp\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"campaign\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"action_type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"campaign_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"campaign_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sent_timestamp\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"url\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"platform\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"session_end\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"ip\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"country\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"state\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"city\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"latitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"longitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"activity\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"cookie\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"path\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"referrer\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"created\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"last_update\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"duration\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"experiment\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"experiment_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"variant_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"view_item\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"brand\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_1\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_2\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_3\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"stock_level\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"title\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"page_visit\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"referrer\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"url\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"path\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"session_start\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"country\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"gclid\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"referrer\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"source\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_campaign\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_medium\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_source\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"ip\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"state\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"city\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"latitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"longitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"app_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sdk\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sdk_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"activity\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"cookie\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"path\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"first_session\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"country\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"gclid\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"referrer\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"source\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_campaign\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_medium\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"utm_source\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"ip\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"state\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"city\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"latitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"longitude\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"app_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sdk\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sdk_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"activity\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"cookie\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"path\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"banner\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"banner_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"variant_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"view_category\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"category_level_1\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_2\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_3\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"cart_update\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"brand\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_ids\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_list\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"size\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"title\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"total_price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"total_quantity\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"checkout\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"product_ids\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_list\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"total_price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"purchase\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"currency\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"payment_method\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_ids\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_list\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_source_type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"total_price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"purchase_item\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"brand\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_1\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_2\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"category_level_3\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"is_new\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_source_type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"quantity\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"size\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"title\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"loyalty_update\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"final_points\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"points_change\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"paper_catalogue\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"num_pages\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"support_ticket\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"body\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"subject\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"support_suite\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"store_visit\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"city\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"country\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"store\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"survey\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"answer\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"question\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"installation\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"app_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device_type\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"sdk_version\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"inbound_call\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"agent\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"call_reason\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"feedback\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"length\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"outbound_call\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"agent\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"call_reason\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"feedback\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"length\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"registration\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[]}}},{\"type\":\"retargeting\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"audience\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"platform\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"return\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"price\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"product_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"purchase_status\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"return_reason\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"title\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"merge\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"requested_ids\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"source_internal_ids\",\"type\":\"list\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"destination_internal_id\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"final_external_ids\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"original_external_ids\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"user_active\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"duration\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"end_client_timestamp\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"now_client_timestamp\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"start_client_timestamp\",\"type\":\"number\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}},{\"type\":\"menu\",\"name\":null,\"description\":null,\"source\":\"data\",\"used\":true,\"private\":null,\"forbidden\":false,\"deleting\":false,\"real_time_analytics\":true,\"properties\":{\"are_all_used\":true,\"default_group\":{\"properties\":[{\"property\":\"action\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"browser\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"device\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"item_level_1\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"location\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"os\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"path\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"position\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}]}}}],\"default_forbidden\":false,\"default_private\":false,\"error\":null}"
+    }
+  ],
+  "structuredContent": {
+    "success": true,
+    "events": [
+      {
+        "type": "consent",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "source",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "valid_until",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "identification_type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "identification",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "imported_timestamp",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "campaign",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "action_type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "campaign_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "campaign_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sent_timestamp",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "url",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "platform",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "session_end",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "ip",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "country",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "state",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "city",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "latitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "longitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "activity",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "cookie",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "path",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "referrer",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "created",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "last_update",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "duration",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "experiment",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "experiment_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "variant_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "view_item",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "brand",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_1",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_2",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_3",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "stock_level",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "title",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "page_visit",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "referrer",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "url",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "path",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "session_start",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "country",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "gclid",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "referrer",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "source",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_campaign",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_medium",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_source",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "ip",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "state",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "city",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "latitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "longitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "app_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sdk",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sdk_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "activity",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "cookie",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "path",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "first_session",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "country",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "gclid",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "referrer",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "source",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_campaign",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_medium",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "utm_source",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "ip",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "state",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "city",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "latitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "longitude",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "app_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sdk",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sdk_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "activity",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "cookie",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "path",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "banner",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "banner_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "variant_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "view_category",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "category_level_1",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_2",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_3",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "cart_update",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "brand",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_ids",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_list",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "size",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "title",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "total_price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "total_quantity",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "checkout",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "product_ids",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_list",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "total_price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "purchase",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "currency",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "payment_method",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_ids",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_list",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_source_type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "total_price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "purchase_item",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "brand",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_1",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_2",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "category_level_3",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "is_new",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_source_type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "quantity",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "size",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "title",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "loyalty_update",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "final_points",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "points_change",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "paper_catalogue",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "num_pages",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "support_ticket",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "body",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "subject",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "support_suite",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "store_visit",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "city",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "country",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "store",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "survey",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "answer",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "question",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "installation",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "app_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device_type",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os_name",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "sdk_version",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "inbound_call",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "agent",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "call_reason",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "feedback",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "length",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "outbound_call",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "agent",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "call_reason",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "feedback",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "length",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "registration",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": []
+          }
+        }
+      },
+      {
+        "type": "retargeting",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "audience",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "platform",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "return",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "price",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "product_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "purchase_status",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "return_reason",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "title",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "merge",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "requested_ids",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "source_internal_ids",
+                "type": "list",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "destination_internal_id",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "final_external_ids",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "original_external_ids",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "user_active",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "duration",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "end_client_timestamp",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "now_client_timestamp",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "start_client_timestamp",
+                "type": "number",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "menu",
+        "name": null,
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": null,
+        "forbidden": false,
+        "deleting": false,
+        "real_time_analytics": true,
+        "properties": {
+          "are_all_used": true,
+          "default_group": {
+            "properties": [
+              {
+                "property": "action",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "browser",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "device",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "item_level_1",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "location",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "os",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "path",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              },
+              {
+                "property": "position",
+                "type": "string",
+                "description": null,
+                "source": "data",
+                "used": true,
+                "private": false,
+                "deleting": false,
+                "example_values": null
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "default_forbidden": false,
+    "default_private": false,
+    "error": null
+  },
+  "isError": false
+}

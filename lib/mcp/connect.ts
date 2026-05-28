@@ -48,7 +48,15 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
   );
   try {
     await client.connect(transport);
-    return { ok: true, mcp: new McpClient(new SdkTransport(client)) };
+    // Bloomreach enforces ~1 request/second per user GLOBALLY (verified live:
+    // "rate limit reached ... (1 per 1 second)"). Space calls just over 1s to
+    // avoid "Too many requests". Combined with McpClient's 60s response cache,
+    // this keeps agents under the ceiling. (A retry/backoff on 429 is a Phase 2
+    // hardening follow-up.)
+    return {
+      ok: true,
+      mcp: new McpClient(new SdkTransport(client), { minIntervalMs: 1100 }),
+    };
   } catch (err) {
     // The SDK throws (UnauthorizedError) after calling redirectToAuthorization when
     // no valid token exists. If we captured an authorize URL, surface it for the

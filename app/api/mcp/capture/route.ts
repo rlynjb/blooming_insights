@@ -31,7 +31,9 @@ export async function GET(req: NextRequest) {
     const sid = await getOrCreateSessionId();
     const conn = await connectMcp(sid);
     if (!conn.ok) {
-      return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
+      // Browser-driven dev tool: bounce straight to the IdP. After approval the
+      // callback lands on /debug; re-open this URL and it captures.
+      return NextResponse.redirect(conn.authUrl);
     }
 
     const dir = join(process.cwd(), 'test', 'fixtures');

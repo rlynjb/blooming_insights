@@ -1,0 +1,107 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"success\":true,\"properties\":[{\"property\":\"city\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"country\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"email\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"external_score\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"first_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"gender\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"language\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"last_name\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null},{\"property\":\"phone\",\"type\":\"string\",\"description\":null,\"source\":\"data\",\"used\":true,\"private\":false,\"deleting\":false,\"example_values\":null}],\"are_all_used\":true,\"max_customer_properties\":255,\"error\":null}"
+    }
+  ],
+  "structuredContent": {
+    "success": true,
+    "properties": [
+      {
+        "property": "city",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "country",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "email",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "external_score",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "first_name",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "gender",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "language",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "last_name",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      },
+      {
+        "property": "phone",
+        "type": "string",
+        "description": null,
+        "source": "data",
+        "used": true,
+        "private": false,
+        "deleting": false,
+        "example_values": null
+      }
+    ],
+    "are_all_used": true,
+    "max_customer_properties": 255,
+    "error": null
+  },
+  "isError": false
+}
