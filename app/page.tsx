@@ -5,7 +5,6 @@ import type { Insight } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
-import ChangeChart from '@/components/feed/ChangeChart';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import QueryBox from '@/components/chat/QueryBox';
 import StreamingResponse from '@/components/chat/StreamingResponse';
@@ -505,16 +504,13 @@ export default function HomePage() {
         </p>
       )}
 
-      {/* loaded — comparison chart + the insight cards */}
+      {/* loaded — the insight cards (each shows its own provenance) */}
       {status === 'loaded' && (
-        <>
-          <ChangeChart insights={insights} />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-            {insights.map((insight) => (
-              <InsightCard key={insight.id} insight={insight} />
-            ))}
-          </div>
-        </>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          {insights.map((insight) => (
+            <InsightCard key={insight.id} insight={insight} />
+          ))}
+        </div>
       )}
 
       {/* how the data was gathered — the monitoring agent's real tool calls */}
@@ -543,6 +539,45 @@ export default function HomePage() {
             <ReasoningTrace items={traceItems} />
           </div>
         </details>
+      )}
+
+      {/* dev-only: snapshot the current LIVE briefing (with provenance) as the
+          demo data — writes lib/state/demo-insights.json, then commit it. */}
+      {process.env.NODE_ENV !== 'production' && !isDemo && status === 'loaded' && (
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              const res = await fetch('/api/mcp/capture-demo', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ insights, workspace, trace: traceItems }),
+              });
+              const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+              window.alert(
+                res.ok
+                  ? `captured ${body.insights} insights · ${body.traceItems} trace items · ${body.investigations} investigations\n${body.note ?? ''}\ncommit: ${((body.files as string[]) ?? []).join(', ')}`
+                  : `capture failed: ${body.error ?? res.status}`,
+              );
+            } catch (e) {
+              window.alert(`capture failed: ${String(e)}`);
+            }
+          }}
+          className="lowercase"
+          style={{
+            marginTop: 20,
+            background: 'transparent',
+            border: '1px dashed var(--border)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            color: 'var(--text-tertiary)',
+            fontFamily: 'var(--font-mono), monospace',
+            fontSize: '0.72rem',
+            padding: '6px 12px',
+          }}
+        >
+          ⓘ dev · capture this as the demo snapshot
+        </button>
       )}
 
       {!isDemo && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}

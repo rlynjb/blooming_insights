@@ -14,6 +14,9 @@ export interface Insight {
   change: { value: number; direction: 'up' | 'down'; baseline: string };
   scope: string[];              // ["mobile", "checkout step"]
   source: 'monitoring' | 'query';
+  // how this insight was found: the tool(s) the monitoring agent used and their
+  // result (e.g. { current, prior }). Optional — older snapshots lack it.
+  evidence?: { tool: string; result: unknown }[];
 }
 
 export interface ToolCall {

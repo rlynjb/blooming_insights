@@ -18,6 +18,7 @@ export function anomalyToInsight(a: Anomaly): Insight {
     change: a.change,
     scope: a.scope,
     source: 'monitoring',
+    evidence: a.evidence, // tool(s) + result that produced this insight
   };
 }
 
