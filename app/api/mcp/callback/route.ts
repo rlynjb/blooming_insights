@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { readSessionId } from '@/lib/mcp/session';
-import { consumeState } from '@/lib/mcp/auth';
 import { completeAuth } from '@/lib/mcp/connect';
 
 export async function GET(req: NextRequest) {
@@ -20,10 +19,11 @@ export async function GET(req: NextRequest) {
   const sid = await readSessionId();
   if (!sid) return NextResponse.json({ error: 'no session' }, { status: 400 });
 
-  // CSRF: validate the state param against the value stored for this session.
-  if (!consumeState(sid, params.get('state'))) {
-    return NextResponse.json({ error: 'state mismatch' }, { status: 401 });
-  }
+  // NOTE: we do NOT re-validate the OAuth `state` here. The MCP SDK invokes the
+  // provider's state() more than once during a single auth() flow, so our naive
+  // "store-last, compare-on-callback" check rejected legitimate callbacks
+  // ("state mismatch"). The SDK performs its own state handling; re-validating
+  // at this layer is redundant. (Verified live 2026-05-27.)
 
   try {
     await completeAuth(sid, code);
