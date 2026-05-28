@@ -40,8 +40,18 @@ export default function HomePage() {
   // preserve the page's search params (e.g. ?demo=cached) on the query stream
   const [demoSuffix, setDemoSuffix] = useState('');
 
+  // The query box runs LIVE (auth + Anthropic). On a static cached-demo deploy
+  // those aren't available, so NEXT_PUBLIC_DEMO_ONLY=1 hides it. Unset locally.
+  const demoOnly = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
+
   useEffect(() => {
-    const search = typeof window !== 'undefined' ? window.location.search : '';
+    // On a cached-demo deploy, always use the cached briefing so the bare root URL
+    // works with no auth. Locally (flag unset), honor the URL's params.
+    const search = demoOnly
+      ? '?demo=cached'
+      : typeof window !== 'undefined'
+        ? window.location.search
+        : '';
 
     // carry existing params (e.g. ?demo=cached) onto the query stream as an
     // &-prefixed suffix, since the agent endpoint already takes ?q first.
@@ -87,7 +97,7 @@ export default function HomePage() {
 
   return (
     <main
-      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-2xl"
+      className={`min-h-screen px-6 py-10 ${demoOnly ? 'pb-10' : 'pb-28'} mx-auto w-full max-w-2xl`}
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -207,7 +217,7 @@ export default function HomePage() {
         </div>
       )}
 
-      <QueryBox onSubmit={(q) => setActiveQuery(q)} />
+      {!demoOnly && <QueryBox onSubmit={(q) => setActiveQuery(q)} />}
     </main>
   );
 }
