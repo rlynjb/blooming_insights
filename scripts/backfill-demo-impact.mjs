@@ -39,16 +39,13 @@ const system =
   `You are the monitoring agent in blooming insights, an AI analyst for Bloomreach Engagement. ` +
   `Workspace "${ws.projectName ?? 'this workspace'}"` +
   (ws.totalCustomers ? ` — ${ws.totalCustomers.toLocaleString()} customers, ${(ws.totalEvents ?? 0).toLocaleString()} events.` : '.') +
-  `\n\nGiven ONE detected metric change, write TWO things as JSON:\n` +
-  `- "impact": ONE plain-language sentence on the BUSINESS IMPACT RIGHT NOW — what the change means ` +
-  `for the business and why the user should care, specific to the metric and magnitude (translate to ` +
-  `revenue / customers / funnel consequences). Do NOT just restate the percentage. ≤ ~40 words.\n` +
-  `- "outlook": ONE FORWARD-LOOKING sentence — what happens in the near term IF this trend continues ` +
-  `(projected direction/magnitude and the downstream metric it drags), framed conditionally ` +
-  `("if this holds…"). Distinct from impact. ≤ ~35 words.\n` +
-  `Output ONLY a JSON object {"impact": "...", "outlook": "..."} — no markdown, no preamble.`;
+  `\n\nGiven ONE detected metric change, write ONE plain-language sentence on its BUSINESS IMPACT: ` +
+  `what the change means for the business and why the user should care. Be specific to the metric and ` +
+  `magnitude, translate to revenue / customers / funnel consequences, and where it matters note the ` +
+  `downstream effect if the trend continues. Do NOT just restate the percentage. ` +
+  `Maximum ~40 words. Output ONLY the sentence — no preamble, no quotes, no markdown.`;
 
-const detailFor = async (i) => {
+const impactFor = async (i) => {
   const user =
     `Metric: ${i.metric}\n` +
     `Scope: ${(i.scope ?? []).join(', ') || 'global'}\n` +
@@ -56,22 +53,18 @@ const detailFor = async (i) => {
     `Severity: ${i.severity}`;
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 300,
+    max_tokens: 160,
     system,
     messages: [{ role: 'user', content: user }],
   });
   const text = res.content.find((b) => b.type === 'text')?.text ?? '';
-  const m = text.match(/\{[\s\S]*\}/);
-  const obj = m ? JSON.parse(m[0]) : {};
-  return { impact: (obj.impact ?? '').trim(), outlook: (obj.outlook ?? '').trim() };
+  return text.trim().replace(/^["']|["']$/g, '');
 };
 
 for (const i of snap.insights) {
-  const { impact, outlook } = await detailFor(i);
-  i.impact = impact;
-  i.outlook = outlook;
-  console.log(`• ${i.metric} (${i.severity})\n    impact:  ${impact}\n    outlook: ${outlook}`);
+  i.impact = await impactFor(i);
+  console.log(`• ${i.metric} (${i.severity}) → ${i.impact}`);
 }
 
 writeFileSync(FILE, JSON.stringify(snap, null, 2) + '\n');
-console.log(`\n✓ wrote impact + outlook for ${snap.insights.length} insights → lib/state/demo-insights.json`);
+console.log(`\n✓ wrote impact for ${snap.insights.length} insights → lib/state/demo-insights.json`);

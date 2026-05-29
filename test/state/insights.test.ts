@@ -21,18 +21,11 @@ describe('insight state', () => {
     expect(i.change).toEqual(anomaly.change);
     expect(typeof i.timestamp).toBe('string');
   });
-  it('carries the agent business-impact + outlook sentences onto the insight', () => {
-    const withDetail: Anomaly = {
-      ...anomaly,
-      impact: 'Conversion is the funnel hinge — an 18% drop here loses orders even at flat traffic.',
-      outlook: 'If this holds, expect order volume to keep sliding next period as the funnel leaks.',
-    };
-    const i = anomalyToInsight(withDetail);
-    expect(i.impact).toBe(withDetail.impact);
-    expect(i.outlook).toBe(withDetail.outlook);
-    // absent on anomalies that don't provide them (older snapshots)
+  it('carries the agent business-impact sentence onto the insight', () => {
+    const withImpact: Anomaly = { ...anomaly, impact: 'Conversion is the funnel hinge — an 18% drop here loses orders even at flat traffic.' };
+    expect(anomalyToInsight(withImpact).impact).toBe(withImpact.impact);
+    // absent on anomalies that don't provide it (older snapshots / no impact)
     expect(anomalyToInsight(anomaly).impact).toBeUndefined();
-    expect(anomalyToInsight(anomaly).outlook).toBeUndefined();
   });
   it('stores/retrieves insights and their source anomalies by id', () => {
     const i = anomalyToInsight(anomaly);

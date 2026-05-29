@@ -70,28 +70,6 @@ function scopeExplain(insight: Insight): string {
   return `localized to ${segs.join(' / ')} — the change is concentrated there, not workspace-wide. the monitor breaks a metric down by segment only when the shift is large enough to pin to one.`;
 }
 
-/** Forward-looking outlook — a conditional projection of where this heads if the
- *  trend holds. Used when the agent didn't write an `outlook` (demo / older
- *  snapshots). Honest: it's an explicit "if this continues" projection derived
- *  from the real direction + metric, not a claimed fact. */
-function forecastText(insight: Insight): string {
-  if (insight.severity === 'positive') {
-    return 'if this holds, the gain compounds into the next period — confirm what is driving it so you can sustain it.';
-  }
-  const m = insight.metric.toLowerCase();
-  const downstream = /revenue|purchase|sales|order|spend|aov|ltv|gmv/.test(m)
-    ? 'revenue keeps eroding'
-    : /conversion|checkout|cart|funnel|abandon/.test(m)
-      ? 'fewer visits turn into orders'
-      : /session|traffic|visit|view|reach|impression|open|click|ctr/.test(m)
-        ? 'the top of the funnel keeps shrinking'
-        : /retention|churn|repeat|return|reactivat|loyal/.test(m)
-          ? 'more customers lapse'
-          : 'the metric keeps drifting';
-  const move = insight.change.direction === 'down' ? 'the shortfall widens' : 'the change accelerates';
-  return `if the trend holds, expect ${move} next period and ${downstream} — best caught before it compounds.`;
-}
-
 /** Pull the provenance the monitoring agent recorded for this insight: which
  *  tool(s) ran, and the current vs prior values behind the change (when the
  *  evidence carries them). */
@@ -184,8 +162,6 @@ export default function InsightCard({ insight }: InsightCardProps) {
             // prefer the agent's business-impact sentence; fall back to the
             // derived explanation for demo / older snapshots that lack it.
             { label: 'why it matters', text: insight.impact?.trim() || whyItMatters(insight) },
-            // forward-looking: what happens if the trend continues
-            { label: 'outlook', text: insight.outlook?.trim() || forecastText(insight) },
             { label: 'scope', text: scopeExplain(insight) },
           ].map((d) => (
             <div key={d.label} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>

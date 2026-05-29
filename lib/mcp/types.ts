@@ -21,9 +21,6 @@ export interface Insight {
   // change matters for the business). Optional — older snapshots lack it, so
   // the UI falls back to a derived explanation.
   impact?: string;
-  // one-sentence forward-looking outlook: what happens in the near term if the
-  // trend continues. Optional — UI derives a fallback when absent.
-  outlook?: string;
 }
 
 export interface ToolCall {
@@ -52,7 +49,6 @@ export interface Anomaly {
   severity: Severity;
   evidence: { tool: string; result: unknown }[];
   impact?: string;                          // one-sentence business impact (agent-written)
-  outlook?: string;                         // one-sentence forward-looking outlook (agent-written)
 }
 
 // Diagnostic agent output (from spec "diagnostic agent" section)
