@@ -1,4 +1,5 @@
 import type { Anomaly, Insight, Investigation } from '../mcp/types';
+import { deriveInsightFields } from '../insights/derive';
 
 const insights = new Map<string, Insight>();
 const investigations = new Map<string, Investigation>();
@@ -20,6 +21,7 @@ export function anomalyToInsight(a: Anomaly): Insight {
     source: 'monitoring',
     evidence: a.evidence, // tool(s) + result that produced this insight
     impact: a.impact, // agent's one-sentence business impact (why it matters)
+    ...deriveInsightFields(a), // business-owner fields derived from the evidence
   };
 }
 

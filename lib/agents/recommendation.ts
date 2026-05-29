@@ -109,9 +109,14 @@ export class RecommendationAgent {
               'Based on the diagnosis above, output your best 2–3 recommendations as a single JSON ' +
               'array in a ```json fence. Each object: {"title": string, "rationale": string, ' +
               '"bloomreachFeature": "scenario"|"segment"|"campaign"|"voucher"|"experiment", ' +
-              '"steps": string[], "estimatedImpact": string, "confidence": "high"|"medium"|"low"}. ' +
-              'Order by predicted impact (highest first). Do NOT include an id field. ' +
-              'If you cannot propose grounded actions, return []. Do NOT request more queries.',
+              '"steps": string[], "estimatedImpact": {"range": string, "rangeUsd"?: {"low": number, ' +
+              '"high": number}, "assumption": string}, "effort": "low"|"medium"|"high", ' +
+              '"timeToSetUpMinutes": number, "readResultInDays": number, "prerequisites": ' +
+              '[{"label": string, "satisfied": boolean}], "successMetric": string, ' +
+              '"confidence": "high"|"medium"|"low"}. Compute the dollar impact from the diagnosis\'s ' +
+              'affected-customer count × AOV (revenue ÷ purchase count from the evidence) × a ' +
+              'reactivation % range. Order by predicted impact (highest first). Do NOT include an id ' +
+              'field. If you cannot propose grounded actions, return []. Do NOT request more queries.',
           },
         ],
       } as Anthropic.Messages.MessageCreateParamsNonStreaming);

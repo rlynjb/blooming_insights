@@ -81,6 +81,22 @@ describe('isRecommendationArray', () => {
     expect(isRecommendationArray([good])).toBe(true);
   });
 
+  it('accepts the richer object estimatedImpact shape', () => {
+    const rich = {
+      ...good,
+      estimatedImpact: {
+        range: '+$14k – $23k recovered this week',
+        rangeUsd: { low: 14000, high: 23000 },
+        assumption: 'assumes 15–25% reactivation of ~340 buyers at ~$1,124 aov',
+      },
+    };
+    expect(isRecommendationArray([rich])).toBe(true);
+  });
+
+  it('rejects an object estimatedImpact missing range', () => {
+    expect(isRecommendationArray([{ ...good, estimatedImpact: { assumption: 'x' } }])).toBe(false);
+  });
+
   it('accepts an empty array', () => {
     expect(isRecommendationArray([])).toBe(true);
   });

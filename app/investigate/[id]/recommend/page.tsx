@@ -157,7 +157,9 @@ export default function RecommendPage() {
             </h2>
 
             {recommendations.length > 0 ? (
-              recommendations.map((r) => <RecommendationCard key={r.id} recommendation={r} />)
+              recommendations.map((r, i) => (
+                <RecommendationCard key={r.id} recommendation={r} index={i} total={recommendations.length} />
+              ))
             ) : streaming ? (
               <p
                 className="text-sm lowercase"

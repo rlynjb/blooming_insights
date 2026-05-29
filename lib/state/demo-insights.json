@@ -26,7 +26,11 @@
           }
         }
       ],
-      "impact": "There are 21,570 purchases but only 10,296 session_start events — purchases outnumber sessions by 2:1, which is impossible in a valid funnel and indicates broken session tracking or missing session data that will corrupt all conversion-rate and attribution reporting."
+      "impact": "There are 21,570 purchases but only 10,296 session_start events — purchases outnumber sessions by 2:1, which is impossible in a valid funnel and indicates broken session tracking or missing session data that will corrupt all conversion-rate and attribution reporting.",
+      "downstreamReady": {
+        "diagnosis": true,
+        "recommendations": 3
+      }
     },
     {
       "id": "90d95295-0181-4951-b6ce-39e511f93f2f",
@@ -55,7 +59,12 @@
           }
         }
       ],
-      "impact": "The same 21,570 purchases sum to $2.1M over 90 days but $22.6M over 365 days — a 10× discrepancy for an identical transaction count — indicating severe duplicate or inflated total_price values in the event stream that make revenue reporting unreliable."
+      "impact": "The same 21,570 purchases sum to $2.1M over 90 days but $22.6M over 365 days — a 10× discrepancy for an identical transaction count — indicating severe duplicate or inflated total_price values in the event stream that make revenue reporting unreliable.",
+      "affectedCustomers": 2849,
+      "downstreamReady": {
+        "diagnosis": true,
+        "recommendations": 3
+      }
     },
     {
       "id": "c48e913f-eeed-47a8-b7cd-3e5e6b1bef8e",
@@ -83,7 +92,11 @@
           }
         }
       ],
-      "impact": "89.7% of checkout events convert to a purchase — an unusually high rate that may indicate checkout and purchase events are being double-fired or that abandoned checkouts are not being tracked, overstating conversion quality."
+      "impact": "89.7% of checkout events convert to a purchase — an unusually high rate that may indicate checkout and purchase events are being double-fired or that abandoned checkouts are not being tracked, overstating conversion quality.",
+      "downstreamReady": {
+        "diagnosis": true,
+        "recommendations": 3
+      }
     },
     {
       "id": "67d2b86a-6674-488d-a6fa-b1b51666f7c3",
@@ -111,7 +124,11 @@
           }
         }
       ],
-      "impact": "79.2% of cart_update events proceed to checkout — unusually high for ecommerce (industry norm is ~25–40%), suggesting cart abandonment events may not be captured, which would skew retargeting audiences and cart-recovery campaign triggers."
+      "impact": "79.2% of cart_update events proceed to checkout — unusually high for ecommerce (industry norm is ~25–40%), suggesting cart abandonment events may not be captured, which would skew retargeting audiences and cart-recovery campaign triggers.",
+      "downstreamReady": {
+        "diagnosis": true,
+        "recommendations": 3
+      }
     },
     {
       "id": "24464f3a-3327-4794-8651-686d6cd6124f",
@@ -140,7 +157,11 @@
           }
         }
       ],
-      "impact": "All 21,570 purchases and all funnel events fall within a single concentrated window — identical counts are returned for 90d, 180d, 365d, and 730d queries — meaning there is no prior baseline to compute period-over-period trend analysis, limiting the value of future scheduled reports."
+      "impact": "All 21,570 purchases and all funnel events fall within a single concentrated window — identical counts are returned for 90d, 180d, 365d, and 730d queries — meaning there is no prior baseline to compute period-over-period trend analysis, limiting the value of future scheduled reports.",
+      "downstreamReady": {
+        "diagnosis": true,
+        "recommendations": 3
+      }
     }
   ],
   "workspace": {

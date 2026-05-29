@@ -1,5 +1,6 @@
 import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
+import { impactRange } from '@/lib/insights/derive';
 
 interface InvestigationData {
   items: TraceItem[];
@@ -53,7 +54,7 @@ export function investigationToMarkdown(id: string, { items, diagnosis, recommen
         lines.push('steps:');
         r.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
       }
-      lines.push(`impact: ${r.estimatedImpact}`, '');
+      lines.push(`impact: ${impactRange(r.estimatedImpact)}`, '');
     }
   }
 

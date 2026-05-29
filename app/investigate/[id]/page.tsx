@@ -51,6 +51,10 @@ export default function InvestigatePage() {
 
   const canExport = (complete || diagnosis !== null) && !error;
 
+  // data-quality note: how many tool calls hit errors (e.g. rate limits)
+  const toolTotal = items.filter((it) => it.kind === 'tool').length;
+  const toolErrors = items.filter((it) => it.kind === 'tool' && it.error).length;
+
   return (
     <main
       className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-5xl"
@@ -144,6 +148,29 @@ export default function InvestigatePage() {
             {/* which feed item this is about — above the diagnosis, in column 1 */}
             <InvestigationSubject id={id} />
             <EvidencePanel diagnosis={diagnosis} loading={streaming} />
+
+            {toolErrors > 0 && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 10,
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                  padding: '10px 12px',
+                }}
+              >
+                <span aria-hidden style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace' }}>
+                  ⓘ
+                </span>
+                <span style={{ fontSize: '0.78rem', lineHeight: 1.5, color: 'var(--text-secondary)' }}>
+                  <strong style={{ fontWeight: 500, color: 'var(--text-primary)' }}>data quality note —</strong>{' '}
+                  {toolErrors} of {toolTotal} queries hit mcp rate limits and were retried; results are based
+                  on {toolTotal - toolErrors} successful {toolTotal - toolErrors === 1 ? 'query' : 'queries'}.
+                </span>
+              </div>
+            )}
 
             {diagnosisReady ? (
               <Link

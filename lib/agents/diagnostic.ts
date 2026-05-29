@@ -7,6 +7,7 @@ import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { diagnosticTools } from '../mcp/tools';
 import { parseAgentJson, isDiagnosis } from '../mcp/validate';
+import { diagnosisConfidence } from '../insights/derive';
 import type { Anomaly, Diagnosis, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
 
@@ -70,11 +71,15 @@ export class DiagnosticAgent {
     // loop didn't produce a valid diagnosis, run a dedicated tool-less synthesis
     // call that hands the model the evidence it already gathered and asks for the
     // structured conclusion only.
-    return (
-      tryParseDiagnosis(finalText) ??
-      (await this.synthesize(anomaly, toolCalls)) ??
-      FALLBACK
-    );
+    const diag =
+      tryParseDiagnosis(finalText) ?? (await this.synthesize(anomaly, toolCalls)) ?? FALLBACK;
+
+    // Derive confidence from how thoroughly hypotheses were tested; downgrade a
+    // "high" to "medium" when some queries errored (rate limits) so the surfaced
+    // confidence reflects the data we actually got.
+    const confidence = diagnosisConfidence(diag);
+    const hadErrors = toolCalls.some((tc) => tc.error);
+    return { ...diag, confidence: confidence === 'high' && hadErrors ? 'medium' : confidence };
   }
 
   /** Dedicated, tool-less call that turns the gathered query results into a

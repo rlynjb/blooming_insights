@@ -18,6 +18,23 @@ function fmtNum(n: number): string {
   return n.toLocaleString();
 }
 
+/** Compact USD like −$96.4k / $1.2m, using a true minus sign. */
+function fmtUsd(n: number): string {
+  const sign = n < 0 ? '−' : '';
+  const v = Math.abs(n);
+  const mag = v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}m` : v >= 1_000 ? `${(v / 1_000).toFixed(1)}k` : `${Math.round(v)}`;
+  return `${sign}$${mag}`;
+}
+
+/** Whole days since an ISO timestamp, or null if unparseable. */
+function daysSince(ts: string): number | null {
+  const t = Date.parse(ts);
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.round((Date.now() - t) / 86_400_000));
+}
+
+const fmtPct = (v: number): string => `${v >= 0 ? '+' : ''}${v}%`;
+
 /** "90d" → "90 days", "7d" → "7 days", else the raw baseline. */
 function humanizeBaseline(b: string): string {
   const m = b.match(/^(\d+)\s*d$/i);
@@ -115,6 +132,40 @@ export default function InsightCard({ insight }: InsightCardProps) {
       ];
   const barMax = Math.max(...compareRows.map((r) => r.bar), 1);
 
+  // ── business-owner enrichments (render only when the agent computed them) ──
+  const days = daysSince(insight.timestamp);
+  const dr = insight.downstreamReady;
+
+  const tiles: { label: string; value: string; color?: string; sub?: string }[] = [];
+  if (insight.revenueImpact) {
+    tiles.push({
+      label: 'revenue lost this window',
+      value: fmtUsd(insight.revenueImpact.lostUsd),
+      color: 'var(--accent-coral)',
+      sub: `vs expected ${fmtUsd(insight.revenueImpact.expectedUsd)}`,
+    });
+  }
+  if (insight.aov) {
+    const { current, prior } = insight.aov;
+    const delta = prior ? ((current - prior) / prior) * 100 : 0;
+    tiles.push({
+      label: 'aov',
+      value: fmtUsd(current),
+      sub: Math.abs(delta) < 2 ? 'stable vs prior' : `${delta < 0 ? 'down' : 'up'} ${Math.abs(Math.round(delta))}%`,
+    });
+  }
+  if (insight.affectedCustomers != null) {
+    tiles.push({ label: 'customers affected', value: `~${insight.affectedCustomers.toLocaleString()}` });
+  }
+
+  const funnel = insight.funnel;
+  const funnelStages = funnel
+    ? (['view', 'cart', 'checkout', 'purchase'] as const).map((k) => ({ k, v: funnel[k] }))
+    : [];
+  const leakKey = funnelStages.length
+    ? funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k
+    : null;
+
   return (
     <Link
       href={`/investigate/${insight.id}`}
@@ -129,7 +180,7 @@ export default function InsightCard({ insight }: InsightCardProps) {
           padding: '16px 20px',
         }}
       >
-        {/* top row: badge + headline */}
+        {/* top row: badge + headline + time-since */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
           <SeverityBadge severity={insight.severity} />
           <span
@@ -142,6 +193,20 @@ export default function InsightCard({ insight }: InsightCardProps) {
           >
             {insight.headline.toLowerCase()}
           </span>
+          {days != null && (
+            <span
+              className="lowercase"
+              style={{
+                marginLeft: 'auto',
+                flexShrink: 0,
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.68rem',
+                color: 'var(--text-tertiary)',
+              }}
+            >
+              started ~{days} {days === 1 ? 'day' : 'days'} ago
+            </span>
+          )}
         </div>
 
         {/* summary — the agent's one-line statement of what changed */}
@@ -155,6 +220,86 @@ export default function InsightCard({ insight }: InsightCardProps) {
         >
           {insight.summary.toLowerCase()}
         </p>
+
+        {/* metric strip — revenue lost · aov · customers affected (when computed) */}
+        {tiles.length > 0 && (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: `repeat(${tiles.length}, minmax(0, 1fr))`,
+              gap: 8,
+              margin: '0 0 12px',
+            }}
+          >
+            {tiles.map((t) => (
+              <div key={t.label} style={{ background: 'var(--bg-elevated)', borderRadius: 4, padding: 12 }}>
+                <div
+                  className="lowercase"
+                  style={{ fontSize: '0.62rem', color: 'var(--text-tertiary)', marginBottom: 4, fontFamily: 'var(--font-mono), monospace' }}
+                >
+                  {t.label}
+                </div>
+                <div style={{ fontSize: '1.15rem', fontWeight: 500, color: t.color ?? 'var(--text-primary)' }}>
+                  {t.value}
+                </div>
+                {t.sub && (
+                  <div className="lowercase" style={{ fontSize: '0.62rem', color: 'var(--text-tertiary)', marginTop: 2 }}>
+                    {t.sub}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* funnel-leak chip — view / cart / checkout / purchase % deltas */}
+        {funnel && (
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12, margin: '0 0 12px' }}>
+            <div
+              className="lowercase"
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                fontSize: '0.62rem',
+                color: 'var(--text-tertiary)',
+                fontFamily: 'var(--font-mono), monospace',
+                marginBottom: 8,
+              }}
+            >
+              <span>funnel · this window vs prior</span>
+              {leakKey && <span style={{ color: 'var(--accent-coral)' }}>▼ leak at {leakKey}</span>}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 6 }}>
+              {funnelStages.map((s) => {
+                const isLeak = s.k === leakKey;
+                return (
+                  <div
+                    key={s.k}
+                    style={{
+                      background: isLeak ? 'rgba(251,113,133,0.12)' : 'var(--bg-elevated)',
+                      border: isLeak ? '1px solid var(--accent-coral)' : '1px solid transparent',
+                      borderRadius: 4,
+                      padding: '8px 10px',
+                    }}
+                  >
+                    <div className="lowercase" style={{ fontSize: '0.62rem', color: 'var(--text-tertiary)' }}>{s.k}</div>
+                    <div
+                      style={{
+                        fontSize: '0.82rem',
+                        fontWeight: 500,
+                        fontFamily: 'var(--font-mono), monospace',
+                        color: isLeak ? 'var(--accent-coral)' : s.v < 0 ? 'var(--accent-coral)' : 'var(--text-primary)',
+                      }}
+                    >
+                      {fmtPct(s.v)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* the so-what: why this matters, and why it's scoped the way it is */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '0 0 12px' }}>
@@ -306,16 +451,24 @@ export default function InsightCard({ insight }: InsightCardProps) {
           </div>
         </div>
 
-        {/* investigate affordance */}
+        {/* investigate affordance + downstream-ready status */}
         <div
           style={{
             marginTop: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
             color: 'var(--text-tertiary)',
             fontSize: '0.8rem',
             fontFamily: 'var(--font-mono), monospace',
           }}
         >
-          investigate →
+          <span>investigate →</span>
+          {dr && (dr.diagnosis || dr.recommendations > 0) && (
+            <span className="lowercase" style={{ marginLeft: 'auto', fontSize: '0.68rem', color: 'var(--accent-teal)' }}>
+              ✓ diagnosis ready · {dr.recommendations} {dr.recommendations === 1 ? 'action' : 'actions'} proposed
+            </span>
+          )}
         </div>
       </article>
     </Link>

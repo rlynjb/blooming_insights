@@ -42,12 +42,16 @@ const CONFIDENCE = ['high', 'medium', 'low'];
 export function isRecommendationArray(v: unknown): v is Omit<Recommendation, 'id'>[] {
   return Array.isArray(v) && v.every((r) => {
     const x = r as any;
+    // estimatedImpact may be the legacy string OR the richer { range, ... } shape
+    const impactOk =
+      typeof x.estimatedImpact === 'string' ||
+      (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' && typeof x.estimatedImpact.range === 'string');
     return !!x && typeof x === 'object'
       && typeof x.title === 'string'
       && typeof x.rationale === 'string'
       && FEATURES.includes(x.bloomreachFeature)
       && Array.isArray(x.steps)
-      && typeof x.estimatedImpact === 'string'
+      && impactOk
       && CONFIDENCE.includes(x.confidence);
   });
 }

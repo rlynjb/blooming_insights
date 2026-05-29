@@ -37,9 +37,12 @@ Given a diagnosis of WHY something changed, propose **2–3 concrete actions** t
    - `voucher` — a discount/incentive to recover or amplify behaviour.
    - `experiment` — an A/B test to validate a fix before rolling it out.
 4. Write human-readable `steps` a marketer could follow to set the action up.
-5. Estimate impact qualitatively (e.g. "likely recovers ~20% of mobile abandonments").
-6. Order recommendations by predicted impact, highest first.
-7. Mark `confidence` honestly: `high` only with strong supporting evidence, `low` if you are largely guessing.
+5. Estimate impact **in dollars**: from the diagnosis's affected-customer count × the average order value (compute AOV from the diagnosis evidence — revenue ÷ purchase count — when available) × a reactivation/uplift percentage range you choose. State the assumption.
+6. Estimate `effort`, `timeToSetUpMinutes`, and `readResultInDays` for setting the action up in Bloomreach.
+7. From your tool checks, list `prerequisites` — what must be true to run this (e.g. email channel active, a voucher pool) — each marked satisfied (already present) or not (must be created).
+8. Give a `successMetric`: the one number that tells the merchant in N days whether it worked, with a baseline and target.
+9. Order recommendations by predicted impact, highest first.
+10. Mark `confidence` honestly: `high` only with strong supporting evidence, `low` if you are largely guessing.
 
 ## Output
 
@@ -52,7 +55,19 @@ Return ONLY a JSON array (in a ```json fenced block) of **at most 3** objects, e
     "rationale": "string — why this action addresses the diagnosis",
     "bloomreachFeature": "scenario",
     "steps": ["string — one human-readable setup step per item"],
-    "estimatedImpact": "string — qualitative estimate (e.g. 'likely recovers ~20% of mobile abandonments')",
+    "estimatedImpact": {
+      "range": "string — human-readable, e.g. '+$14k – $23k recovered this week'",
+      "rangeUsd": { "low": 14000, "high": 23000 },
+      "assumption": "string — the basis, e.g. 'assumes 15–25% reactivation of ~340 gap-window buyers at ~$1,124 aov'"
+    },
+    "effort": "low",
+    "timeToSetUpMinutes": 30,
+    "readResultInDays": 7,
+    "prerequisites": [
+      { "label": "email channel active", "satisfied": true },
+      { "label": "voucher pool (10% off) — optional", "satisfied": false }
+    ],
+    "successMetric": "string — the number that proves it worked, with baseline + target",
     "confidence": "high"
   }
 ]
@@ -61,6 +76,9 @@ Return ONLY a JSON array (in a ```json fenced block) of **at most 3** objects, e
 Field rules:
 - `bloomreachFeature` — exactly one of `scenario`, `segment`, `campaign`, `voucher`, `experiment`.
 - `confidence` — exactly one of `high`, `medium`, `low`.
+- `estimatedImpact` — the object above. `range` is required; include `rangeUsd` {low, high} when you can compute dollars from the diagnosis numbers; `assumption` is the one-line basis. If you genuinely cannot estimate dollars, set `range` to a qualitative estimate and omit `rangeUsd`.
+- `effort` — `low` | `medium` | `high`. `timeToSetUpMinutes` / `readResultInDays` — integers.
+- `prerequisites` — ≤3 items, each `{ label, satisfied }` (satisfied=true when it already exists/active, false when it must be created).
 - Do NOT include an `id` field — the system assigns it after validation.
 - Return at most 3 objects, ordered by predicted impact (highest first).
 
