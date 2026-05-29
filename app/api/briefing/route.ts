@@ -56,9 +56,20 @@ export async function GET(req: NextRequest) {
   }
 
   // Connect (and surface auth) BEFORE committing to a stream, so we can still
-  // return a 401 JSON the feed redirects on.
-  const sid = await getOrCreateSessionId();
-  const conn = await connectMcp(sid);
+  // return a 401 JSON the feed redirects on. Wrapped so a setup throw (e.g. a
+  // missing AUTH_SECRET breaking cookie encryption in production) returns the
+  // real message instead of a bare 500.
+  let conn: Awaited<ReturnType<typeof connectMcp>>;
+  try {
+    const sid = await getOrCreateSessionId();
+    conn = await connectMcp(sid);
+  } catch (e) {
+    console.error('[briefing] setup error:', e);
+    return NextResponse.json(
+      { error: `/api/briefing setup · ${e instanceof Error ? e.message : String(e)}` },
+      { status: 500 },
+    );
+  }
   if (!conn.ok) {
     return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
   }

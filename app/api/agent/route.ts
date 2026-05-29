@@ -150,8 +150,19 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
   }
 
-  const sid = await getOrCreateSessionId();
-  const conn = await connectMcp(sid);
+  // Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking cookie
+  // encryption in production) returns the real message instead of a bare 500.
+  let conn: Awaited<ReturnType<typeof connectMcp>>;
+  try {
+    const sid = await getOrCreateSessionId();
+    conn = await connectMcp(sid);
+  } catch (e) {
+    console.error('[agent] setup error:', e);
+    return NextResponse.json(
+      { error: `/api/agent setup · ${e instanceof Error ? e.message : String(e)}` },
+      { status: 500 },
+    );
+  }
   if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
 
   const encoder = new TextEncoder();
