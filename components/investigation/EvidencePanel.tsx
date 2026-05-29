@@ -47,21 +47,54 @@ const sectionLabel: React.CSSProperties = {
 
 export default function EvidencePanel({ diagnosis, loading }: EvidencePanelProps) {
   if (!diagnosis) {
+    if (!loading) {
+      return (
+        <div style={cardStyle}>
+          <p className="text-sm lowercase" style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: 0 }}>
+            no diagnosis yet
+          </p>
+        </div>
+      );
+    }
+    // skeleton shaped like the diagnosis below — confidence/customers tiles, the
+    // conclusion callout, and a couple of hypothesis rows — so the layout holds
+    // steady while the diagnostic agent streams its findings.
     return (
-      <div style={cardStyle}>
-        <p
-          className="text-sm lowercase"
-          style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: loading ? '0 0 12px' : 0 }}
-        >
-          {loading ? 'diagnosing…' : 'no diagnosis yet'}
-        </p>
-        {loading && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <Skeleton height={16} />
-            <Skeleton height={16} width="80%" />
-            <Skeleton height={16} width="60%" />
+      <div style={cardStyle} aria-hidden>
+        {/* tiles row */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 16 }}>
+          <div style={{ ...tileStyle, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <Skeleton height={10} width={64} />
+            <Skeleton height={18} width="55%" />
           </div>
-        )}
+          <div style={{ ...tileStyle, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <Skeleton height={10} width={96} />
+            <Skeleton height={18} width="55%" />
+          </div>
+        </div>
+        {/* conclusion callout */}
+        <div
+          style={{
+            background: 'var(--bg-elevated)',
+            borderLeft: '2px solid var(--accent-amber)',
+            borderRadius: 4,
+            padding: '12px 14px',
+            marginBottom: 18,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          <Skeleton height={10} width={72} />
+          <Skeleton height={14} />
+          <Skeleton height={14} width="80%" />
+        </div>
+        {/* hypotheses rows */}
+        <Skeleton height={10} width={104} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+          <Skeleton height={34} />
+          <Skeleton height={34} width="92%" />
+        </div>
       </div>
     );
   }

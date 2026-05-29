@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 import RecommendationCard from '@/components/investigation/RecommendationCard';
+import RecommendationCardSkeleton from '@/components/investigation/RecommendationCardSkeleton';
 import InvestigationSubject from '@/components/investigation/InvestigationSubject';
 import StatusLog from '@/components/shared/StatusLog';
 import { useInvestigation } from '@/lib/hooks/useInvestigation';
@@ -161,12 +162,16 @@ export default function RecommendPage() {
                 <RecommendationCard key={r.id} recommendation={r} index={i} total={recommendations.length} />
               ))
             ) : streaming ? (
-              <p
-                className="text-sm lowercase"
-                style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: 0 }}
-              >
-                {diagnosis ? 'proposing actions…' : 'awaiting diagnosis…'}
-              </p>
+              <>
+                <p
+                  className="text-sm lowercase"
+                  style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', margin: 0 }}
+                >
+                  {diagnosis ? 'proposing actions…' : 'awaiting diagnosis…'}
+                </p>
+                <RecommendationCardSkeleton />
+                <RecommendationCardSkeleton />
+              </>
             ) : (
               <p
                 className="text-sm lowercase"
