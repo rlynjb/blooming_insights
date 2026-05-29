@@ -113,9 +113,6 @@ export default function RecommendPage() {
         recommendation={{ state: recState, sub: recSub }}
       />
 
-      {/* which feed item this investigation is about — directly above the recommendations */}
-      <InvestigationSubject id={id} />
-
       {error ? (
         <div
           style={{
@@ -143,6 +140,8 @@ export default function RecommendPage() {
         <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
           {/* ── col 1 — the recommendations (step 3) ───────────────────────── */}
           <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {/* which feed item this is about — above the recommendations, in column 1 */}
+            <InvestigationSubject id={id} />
             <h2
               className="lowercase"
               style={{

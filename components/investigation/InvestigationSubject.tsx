@@ -26,7 +26,6 @@ export default function InvestigationSubject({ id }: { id?: string }) {
   return (
     <div
       style={{
-        marginBottom: 24,
         border: '1px solid var(--border)',
         borderRadius: 6,
         background: 'var(--bg-surface)',

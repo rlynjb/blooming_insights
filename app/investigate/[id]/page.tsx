@@ -117,9 +117,6 @@ export default function InvestigatePage() {
         recommendation={{ state: recState, sub: recSub, href: recsReady ? recommendHref : undefined }}
       />
 
-      {/* which feed item this investigation is about — directly above the diagnosis */}
-      <InvestigationSubject id={id} />
-
       {error ? (
         <div
           style={{
@@ -147,6 +144,8 @@ export default function InvestigatePage() {
         <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
           {/* ── col 1 — the diagnosis (step 2) ─────────────────────────────── */}
           <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* which feed item this is about — above the diagnosis, in column 1 */}
+            <InvestigationSubject id={id} />
             <EvidencePanel diagnosis={diagnosis} loading={streaming} />
 
             {recsReady ? (
