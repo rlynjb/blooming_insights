@@ -5,6 +5,8 @@ import type { AgentEvent } from '@/lib/mcp/events';
 import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
 
+export type InvestigationStep = 'diagnose' | 'recommend';
+
 export interface InvestigationState {
   items: TraceItem[];
   diagnosis: Diagnosis | null;
@@ -13,14 +15,26 @@ export interface InvestigationState {
   error: string | null;
 }
 
-const STASH_PREFIX = 'bi:inv:';
+const stashKey = (step: InvestigationStep, id: string) => `bi:inv:${step}:${id}`;
+const diagHandoffKey = (id: string) => `bi:diag:${id}`;
 
-/** Runs (or replays) an investigation and exposes its trace, diagnosis and
- *  recommendations. The full diagnostic → recommendation run happens once (on
- *  the step-2 page); the result is stashed in sessionStorage so the step-3 page
- *  — and any re-visit of step 2 — hydrates instantly without re-running the
- *  agents (which matters under the alpha server's rate limit + token churn). */
-export function useInvestigation(id: string | undefined): InvestigationState {
+/** Runs one step of an investigation and exposes its trace + result.
+ *
+ *  - step 'diagnose' runs the diagnostic agent only and stashes the diagnosis
+ *    for step 3 (the decision is NOT run here).
+ *  - step 'recommend' runs the recommendation agent with the handed-over
+ *    diagnosis.
+ *
+ *  Each step's result is stashed in sessionStorage so re-visits / back-nav
+ *  hydrate instantly without re-running the agents. In demo mode the server
+ *  replays the cached snapshot filtered to this step.
+ *
+ *  NOTE: we deliberately do NOT cancel the fetch on effect cleanup. React
+ *  StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first
+ *  cleanup, with the started-guard blocking the re-mount, aborted the stream
+ *  and left the logs empty. The started-guard prevents a double fetch; the
+ *  in-flight run simply completes (setState after unmount is a safe no-op). */
+export function useInvestigation(id: string | undefined, step: InvestigationStep): InvestigationState {
   const [items, setItems] = useState<TraceItem[]>([]);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
@@ -30,13 +44,12 @@ export function useInvestigation(id: string | undefined): InvestigationState {
 
   useEffect(() => {
     if (!id) return;
-    if (startedRef.current) return; // guard StrictMode double-invoke
+    if (startedRef.current) return; // run once per mount (survives StrictMode)
     startedRef.current = true;
 
-    // 1) hydrate from the session stash if this investigation already ran
-    //    (step 3 navigated from step 2, or a back-navigation to step 2).
+    // 1) hydrate from this step's stash (re-visit / back-nav).
     try {
-      const raw = sessionStorage.getItem(`${STASH_PREFIX}${id}`);
+      const raw = sessionStorage.getItem(stashKey(step, id));
       if (raw) {
         const s = JSON.parse(raw) as Partial<InvestigationState>;
         setItems(s.items ?? []);
@@ -49,10 +62,26 @@ export function useInvestigation(id: string | undefined): InvestigationState {
       /* ignore — fall through to a live/replay fetch */
     }
 
-    let cancelled = false;
     const cItems: TraceItem[] = [];
     let cDiag: Diagnosis | null = null;
     const cRecs: Recommendation[] = [];
+
+    // For the recommend step, load the diagnosis handed over from step 2 (shown
+    // for context + passed to the live recommendation run).
+    let handedDiagnosis: Diagnosis | null = null;
+    if (step === 'recommend') {
+      try {
+        const raw = sessionStorage.getItem(diagHandoffKey(id));
+        if (raw) {
+          const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
+          handedDiagnosis = d.diagnosis ?? null;
+          cDiag = handedDiagnosis;
+          if (handedDiagnosis) setDiagnosis(handedDiagnosis);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
 
     const replaceRunningTool = (arr: TraceItem[], e: Extract<AgentEvent, { type: 'tool_call_end' }>) => {
       for (let i = arr.length - 1; i >= 0; i--) {
@@ -66,7 +95,6 @@ export function useInvestigation(id: string | undefined): InvestigationState {
     };
 
     const handle = (e: AgentEvent) => {
-      if (cancelled) return;
       switch (e.type) {
         case 'reasoning_step': {
           const it: TraceItem = {
@@ -103,9 +131,13 @@ export function useInvestigation(id: string | undefined): InvestigationState {
           setComplete(true);
           try {
             sessionStorage.setItem(
-              `${STASH_PREFIX}${id}`,
+              stashKey(step, id),
               JSON.stringify({ items: cItems, diagnosis: cDiag, recommendations: cRecs }),
             );
+            // hand the diagnosis to step 3
+            if (step === 'diagnose' && cDiag) {
+              sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }));
+            }
           } catch {
             /* stash is best-effort */
           }
@@ -120,16 +152,16 @@ export function useInvestigation(id: string | undefined): InvestigationState {
 
     (async () => {
       try {
-        // Match the feed's mode: demo → cache-replay (default); live → run the
-        // agents, handing over the insight the feed stashed so the anomaly
-        // survives Vercel's per-instance memory across function calls.
-        let url = `/api/agent?insightId=${id}`;
+        let url = `/api/agent?insightId=${id}&step=${step}`;
         try {
-          const live = typeof window !== 'undefined' && localStorage.getItem('bi:mode') === 'live';
-          if (live) {
+          const liveMode = typeof window !== 'undefined' && localStorage.getItem('bi:mode') === 'live';
+          if (liveMode) {
             url += '&live=1';
             const stashed = sessionStorage.getItem(`bi:insight:${id}`);
             if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
+            if (step === 'recommend' && handedDiagnosis) {
+              url += `&diagnosis=${encodeURIComponent(JSON.stringify(handedDiagnosis))}`;
+            }
           }
         } catch {
           /* storage blocked — fall back to server-side lookup / cache */
@@ -145,7 +177,7 @@ export function useInvestigation(id: string | undefined): InvestigationState {
         }
         if (!res.ok || !res.body) {
           const b = await res.json().catch(() => ({}));
-          if (!cancelled) setError((b?.error as string) || `http ${res.status}`);
+          setError((b?.error as string) || `http ${res.status}`);
           return;
         }
 
@@ -154,10 +186,6 @@ export function useInvestigation(id: string | undefined): InvestigationState {
         let buf = '';
         for (;;) {
           const { done, value } = await reader.read();
-          if (cancelled) {
-            await reader.cancel();
-            return;
-          }
           if (done) break;
           buf += dec.decode(value, { stream: true });
           const lines = buf.split('\n');
@@ -179,14 +207,10 @@ export function useInvestigation(id: string | undefined): InvestigationState {
           }
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        setError(e instanceof Error ? e.message : String(e));
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [id]);
+  }, [id, step]);
 
   return { items, diagnosis, recommendations, complete, error };
 }

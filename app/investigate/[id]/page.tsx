@@ -33,24 +33,21 @@ function BackLink({ href = '/', label = '← feed' }: { href?: string; label?: s
 export default function InvestigatePage() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
-  const { items, diagnosis, recommendations, complete, error } = useInvestigation(id);
+  // step 2 runs ONLY the diagnostic — the decision (recommendation) is not run
+  // until the user moves to step 3.
+  const { items, diagnosis, complete, error } = useInvestigation(id, 'diagnose');
 
   const streaming = !complete && !error;
-  const recsReady = complete && !error; // recs are produced during this run
+  const diagnosisReady = complete && !error;
   const recommendHref = `/investigate/${id}/recommend`;
 
   // the user is ON the diagnosis step — keep it the current (active) step, never
   // ✓, while they're still here. The check appears once they move to step 3.
   const diagState: StepState = error && !diagnosis ? 'error' : 'active';
   const diagSub = diagState === 'error' ? 'failed' : diagnosis ? 'cause identified' : 'testing hypotheses…';
-  // recommendation is the next (future) step from here — pending, but jumpable
-  // once it's ready.
+  // recommendation is the next (future) step — pending, jumpable once diagnosis is ready.
   const recState: StepState = 'pending';
-  const recSub = recsReady
-    ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'} ready`
-    : diagnosis
-      ? 'preparing…'
-      : 'awaiting diagnosis';
+  const recSub = diagnosisReady ? 'ready →' : diagnosis ? 'almost ready' : 'awaiting diagnosis';
 
   const canExport = (complete || diagnosis !== null) && !error;
 
@@ -77,7 +74,7 @@ export default function InvestigatePage() {
               onClick={() =>
                 downloadMarkdown(
                   `investigation-${id ?? 'unknown'}.md`,
-                  investigationToMarkdown(id ?? 'unknown', { items, diagnosis, recommendations }),
+                  investigationToMarkdown(id ?? 'unknown', { items, diagnosis, recommendations: [] }),
                 )
               }
               className="lowercase"
@@ -114,7 +111,7 @@ export default function InvestigatePage() {
       <ProcessStepper
         monitoring={{ state: 'complete', sub: 'change detected', href: '/' }}
         diagnostic={{ state: diagState, sub: diagSub }}
-        recommendation={{ state: recState, sub: recSub, href: recsReady ? recommendHref : undefined }}
+        recommendation={{ state: recState, sub: recSub, href: diagnosisReady ? recommendHref : undefined }}
       />
 
       {error ? (
@@ -148,7 +145,7 @@ export default function InvestigatePage() {
             <InvestigationSubject id={id} />
             <EvidencePanel diagnosis={diagnosis} loading={streaming} />
 
-            {recsReady ? (
+            {diagnosisReady ? (
               <Link
                 href={recommendHref}
                 className="lowercase"
@@ -165,7 +162,7 @@ export default function InvestigatePage() {
                   textDecoration: 'none',
                 }}
               >
-                see recommendations ({recommendations.length}) →
+                see recommendations →
               </Link>
             ) : (
               <span
@@ -181,7 +178,7 @@ export default function InvestigatePage() {
                   padding: '8px 16px',
                 }}
               >
-                {diagnosis ? 'preparing recommendations…' : 'awaiting diagnosis…'}
+                diagnosing the issue…
               </span>
             )}
           </div>

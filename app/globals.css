@@ -40,3 +40,41 @@ input,
 }
 .bi-fade-up { animation: bi-fade-up 0.4s ease both; }
 @media (prefers-reduced-motion: reduce) { .bi-fade-up { animation: none; } }
+
+/* indeterminate progress bar — shown while an agent is working */
+@keyframes bi-indeterminate {
+  0%   { left: -40%; width: 40%; }
+  50%  { left: 25%;  width: 50%; }
+  100% { left: 100%; width: 40%; }
+}
+.bi-progress {
+  position: relative;
+  height: 2px;
+  overflow: hidden;
+  background: var(--border);
+  border-radius: 2px;
+}
+.bi-progress::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: var(--accent-teal);
+  border-radius: 2px;
+  animation: bi-indeterminate 1.2s ease-in-out infinite;
+}
+
+/* pulsing "thinking" dots */
+@keyframes bi-dot {
+  0%, 80%, 100% { opacity: 0.25; }
+  40%           { opacity: 1; }
+}
+.bi-dots > span {
+  animation: bi-dot 1.2s ease-in-out infinite;
+}
+.bi-dots > span:nth-child(2) { animation-delay: 0.2s; }
+.bi-dots > span:nth-child(3) { animation-delay: 0.4s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bi-progress::after, .bi-dots > span { animation: none; }
+}

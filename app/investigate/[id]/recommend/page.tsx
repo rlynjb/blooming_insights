@@ -32,7 +32,8 @@ function BackLink({ href, label }: { href: string; label: string }) {
 export default function RecommendPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
-  const { items, diagnosis, recommendations, complete, error } = useInvestigation(id);
+  // step 3 runs the recommendation agent with the diagnosis handed over from step 2
+  const { items, diagnosis, recommendations, complete, error } = useInvestigation(id, 'recommend');
 
   const streaming = !complete && !error;
   const diagnosisHref = `/investigate/${id}`;

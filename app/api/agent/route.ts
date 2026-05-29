@@ -13,7 +13,7 @@ import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { getAnomaly, getInsight } from '@/lib/state/insights';
 import { getCachedInvestigation, saveInvestigation } from '@/lib/state/investigations';
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
-import type { AgentName, Anomaly, Insight } from '@/lib/mcp/types';
+import type { AgentName, Anomaly, Diagnosis, Insight, ToolCall } from '@/lib/mcp/types';
 
 // 300s = Vercel Pro's max. A live investigation (diagnostic → recommendation)
 // runs ~100-115s under the ~1 req/s MCP limit; 60s (Hobby) cannot fit it.
@@ -21,16 +21,19 @@ export const maxDuration = 300;
 
 const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 
+// Which part of an investigation to run/replay. The investigate page runs these
+// as two steps (diagnose on step 2, recommend on step 3); a null step is the
+// legacy combined run used by the demo-snapshot capture.
+type Step = 'diagnose' | 'recommend';
+
 function insightToAnomaly(i: Insight): Anomaly {
   return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
 }
 
 /** Resolve the anomaly to investigate. Prefers the client-provided insight
  *  (handed from the feed via sessionStorage → `?insight=`), which is the only
- *  source that survives Vercel's per-instance memory: the feed request and this
- *  request can land on different function instances, so the in-memory store is
- *  unreliable in production. Falls back to in-memory (same-instance / dev) then
- *  the demo snapshot. */
+ *  source that survives Vercel's per-instance memory. Falls back to in-memory
+ *  (same-instance / dev) then the demo snapshot. */
 function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
   if (insightParam) {
     try {
@@ -58,6 +61,41 @@ function resolveAnomaly(insightId: string, insightParam?: string | null): Anomal
   return null;
 }
 
+/** Keep only the events belonging to one step, for cached (demo) replay — the
+ *  snapshot is a combined diagnose+recommend stream. */
+function filterByStep(events: AgentEvent[], step: Step): AgentEvent[] {
+  return events.filter((e) => {
+    const agent =
+      e.type === 'reasoning_step'
+        ? e.step.agent
+        : e.type === 'tool_call_start' || e.type === 'tool_call_end'
+          ? e.agent
+          : null;
+    if (step === 'diagnose') {
+      if (e.type === 'recommendation') return false;
+      if (agent === 'recommendation') return false;
+      return true; // diagnostic/coordinator reasoning + tools, diagnosis, done
+    }
+    // recommend: only recommendation-phase activity + recommendations + done
+    if (e.type === 'diagnosis') return false;
+    if (agent && agent !== 'recommendation') return false;
+    return true;
+  });
+}
+
+function parseDiagnosis(param: string | null): Diagnosis | null {
+  if (!param) return null;
+  try {
+    const d = JSON.parse(param);
+    if (d && typeof d.conclusion === 'string' && Array.isArray(d.evidence) && Array.isArray(d.hypothesesConsidered)) {
+      return d as Diagnosis;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 const TRUNC = 4000;
 const trunc = (v: unknown): unknown => {
   const s = JSON.stringify(v);
@@ -66,36 +104,40 @@ const trunc = (v: unknown): unknown => {
 
 const REPLAY_DELAY_MS = 180;
 
+const NDJSON_HEADERS = {
+  'Content-Type': 'application/x-ndjson; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+};
+
 export async function GET(req: NextRequest) {
   const insightId = req.nextUrl.searchParams.get('insightId');
   const insightParam = req.nextUrl.searchParams.get('insight');
   const q = req.nextUrl.searchParams.get('q')?.trim() || null;
+  const live = req.nextUrl.searchParams.get('live') === '1';
+  const stepParam = req.nextUrl.searchParams.get('step');
+  const step: Step | null = stepParam === 'diagnose' || stepParam === 'recommend' ? stepParam : null;
+  const diagnosisParam = req.nextUrl.searchParams.get('diagnosis');
+
   if (!insightId && !q) {
     return NextResponse.json({ error: 'insightId or q required' }, { status: 400 });
   }
 
-  const live = req.nextUrl.searchParams.get('live') === '1';
-
-  // Cache-first: replay a precomputed investigation (no auth/key needed).
-  // Only applies to the insightId investigation flow; query results are never cached.
+  // Cache-first: replay a precomputed investigation (no auth/key needed),
+  // filtered to the requested step. Query results are never cached.
   const cached = insightId && !live ? getCachedInvestigation(insightId) : null;
   if (cached) {
+    const events = step ? filterByStep(cached, step) : cached;
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
-        for (const e of cached) {
+        for (const e of events) {
           controller.enqueue(encoder.encode(encodeEvent(e)));
           await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
         }
         controller.close();
       },
     });
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'application/x-ndjson; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-      },
-    });
+    return new Response(stream, { headers: NDJSON_HEADERS });
   }
 
   // For the investigation flow we need a resolvable anomaly; the query flow does not.
@@ -111,13 +153,6 @@ export async function GET(req: NextRequest) {
   const sid = await getOrCreateSessionId();
   const conn = await connectMcp(sid);
   if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
-
-  const schema = await bootstrapSchema(conn.mcp);
-  const rawTools = await conn.mcp.listTools();
-  const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
-    ? ((rawTools as { tools: McpToolDef[] }).tools)
-    : [];
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -136,9 +171,8 @@ export async function GET(req: NextRequest) {
         onText: (t: string) => {
           if (t.trim()) stepFor(agent, 'thought', t);
         },
-        onToolCall: (tc: import('@/lib/mcp/types').ToolCall) =>
-          send({ type: 'tool_call_start', toolName: tc.toolName, agent }),
-        onToolResult: (tc: import('@/lib/mcp/types').ToolCall) =>
+        onToolCall: (tc: ToolCall) => send({ type: 'tool_call_start', toolName: tc.toolName, agent }),
+        onToolResult: (tc: ToolCall) =>
           send({
             type: 'tool_call_end',
             toolName: tc.toolName,
@@ -149,6 +183,18 @@ export async function GET(req: NextRequest) {
           }),
       });
       try {
+        // Bootstrap INSIDE the stream so the client sees progress immediately
+        // (instead of a silent wait while we connect + read the schema).
+        const leadAgent: AgentName =
+          q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
+        stepFor(leadAgent, 'thought', 'reading the workspace schema…');
+        const schema = await bootstrapSchema(conn.mcp);
+        const rawTools = await conn.mcp.listTools();
+        const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
+          ? (rawTools as { tools: McpToolDef[] }).tools
+          : [];
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
         // Free-form query flow (live; never cached) — runs when only `q` is provided.
         if (q && !insightId) {
           const intent = await classifyIntent(anthropic, q);
@@ -160,24 +206,41 @@ export async function GET(req: NextRequest) {
           return;
         }
 
-        // Investigation flow — `anomaly` is guaranteed present here (insightId path).
+        // Investigation flow — `anomaly` is guaranteed present here.
         const inv = anomaly!;
-        stepFor(
-          'diagnostic',
-          'thought',
-          `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
-        );
-        const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
-        const diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-        send({ type: 'diagnosis', diagnosis });
+        let diagnosis: Diagnosis | null = null;
 
-        stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-        const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
-        const recommendations = await recAgent.propose(inv, diagnosis, hooksFor('recommendation'));
-        for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+        // STEP 2 (diagnose) or the combined run: run the diagnostic agent.
+        if (step === 'recommend') {
+          // STEP 3: the diagnosis was handed over from step 2.
+          diagnosis = parseDiagnosis(diagnosisParam);
+          if (!diagnosis) {
+            throw new Error('no diagnosis was handed over — open the diagnosis step first');
+          }
+        } else {
+          stepFor(
+            'diagnostic',
+            'thought',
+            `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
+          );
+          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+          diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+          send({ type: 'diagnosis', diagnosis });
+        }
+
+        // STEP 3 (recommend) or the combined run: run the recommendation agent.
+        // Skipped on the diagnose step — the decision is NOT run until step 3.
+        if (step !== 'diagnose') {
+          stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
+          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+          const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+          for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+        }
 
         send({ type: 'done' });
-        saveInvestigation(insightId!, collected);
+        // Only the combined run (capture) is cached to disk; the split steps are
+        // handed off via the client's sessionStorage.
+        if (step == null) saveInvestigation(insightId!, collected);
       } catch (e) {
         console.error('[agent] error:', e); // full stack/cause in Vercel logs
         send({
@@ -190,10 +253,5 @@ export async function GET(req: NextRequest) {
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'application/x-ndjson; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-    },
-  });
+  return new Response(stream, { headers: NDJSON_HEADERS });
 }

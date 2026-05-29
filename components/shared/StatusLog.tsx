@@ -62,13 +62,22 @@ export default function StatusLog({
         {title}
         {countLabel ? ` · ${countLabel}` : ''}
         {scanning ? ' · running…' : ''}
+        {/* indeterminate progress bar while the agent is working */}
+        {scanning && <div className="bi-progress" style={{ marginTop: 8 }} aria-hidden />}
       </div>
       <div style={{ padding: '10px 16px 16px' }}>
         {items.length > 0 ? (
           <ReasoningTrace items={items} />
         ) : (
-          <p className="lowercase" style={muted}>
+          <p className="lowercase" style={{ ...muted, display: 'flex', alignItems: 'center', gap: 6 }}>
             {emptyMessage}
+            {scanning && (
+              <span className="bi-dots" aria-hidden style={{ display: 'inline-flex', gap: 2 }}>
+                <span>·</span>
+                <span>·</span>
+                <span>·</span>
+              </span>
+            )}
           </p>
         )}
       </div>
