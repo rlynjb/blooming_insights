@@ -1,6 +1,7 @@
 import type { AgentName } from '@/lib/mcp/types';
 import AgentBadge from '@/components/shared/AgentBadge';
 import ToolCallBlock from './ToolCallBlock';
+import TraceContent from './TraceContent';
 
 export type TraceItem =
   | {
@@ -87,17 +88,7 @@ export default function ReasoningTrace({ items }: ReasoningTraceProps) {
                 <span style={{ ...tsStyle, marginLeft: 'auto' }}>{fmtTs(item.ts)}</span>
               )}
             </div>
-            <p
-              style={{
-                color: 'var(--text-secondary)',
-                fontSize: '0.75rem',
-                lineHeight: 1.5,
-                margin: 0,
-                whiteSpace: 'pre-wrap',
-              }}
-            >
-              {item.content}
-            </p>
+            <TraceContent content={item.content} />
           </div>
         ) : (
           <div key={item.id} className="bi-fade-up">
