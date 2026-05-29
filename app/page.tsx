@@ -6,7 +6,6 @@ import InsightCard from '@/components/feed/InsightCard';
 import Skeleton from '@/components/shared/Skeleton';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
-import QueryBox from '@/components/chat/QueryBox';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 
 interface BriefingResponse {
@@ -456,7 +455,7 @@ export default function HomePage() {
 
   return (
     <main
-      className="min-h-screen px-6 py-10 pb-28 mx-auto w-full max-w-5xl"
+      className="min-h-screen px-6 py-10 mx-auto w-full max-w-5xl"
       style={{ fontFamily: 'var(--font-body), system-ui, sans-serif' }}
     >
       {/* header */}
@@ -783,9 +782,10 @@ export default function HomePage() {
         </aside>
       </div>
 
-      {/* shown in both modes so the "ask anything" feature is visible; inert in
-          demo (free-form Q&A runs the agents live against the workspace). */}
-      <QueryBox onSubmit={(q) => setActiveQuery(q)} disabled={isDemo} />
+      {/* the free-form "ask anything" query box is hidden for now. The QueryBox /
+          StreamingResponse components, the `?q=` flow in /api/agent, and the
+          query agent remain wired up — re-render <QueryBox onSubmit={setActiveQuery} />
+          here to bring it back. */}
     </main>
   );
 }
