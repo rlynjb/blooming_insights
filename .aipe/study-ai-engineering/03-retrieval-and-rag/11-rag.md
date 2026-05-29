@@ -203,7 +203,7 @@ The senior insight is that "RAG" is not synonymous with "embedding index." RAG i
 | Operational burden | None — read the source | Index build, freshness, incremental update (09/10) |
 | Right when | Data is a fresh, exact, queryable API | Static, fuzzy, free-text corpus |
 
-**What we gave up.** Semantic recall and microsecond retrieval. blooming insights cannot answer "find past investigations similar to this one" because it has no embedding index, and each retrieval pays a rate-limited network round-trip rather than a microsecond cosine. For its actual workload — a few deep, exact investigations — neither loss bites: the questions are exact analytics, and the latency budget (`maxDuration: 60`, `maxToolCalls` bounded) accommodates sequential live calls.
+**What we gave up.** Semantic recall and microsecond retrieval. blooming insights cannot answer "find past investigations similar to this one" because it has no embedding index, and each retrieval pays a rate-limited network round-trip rather than a microsecond cosine. For its actual workload — a few deep, exact investigations — neither loss bites: the questions are exact analytics, and the latency budget (`maxDuration = 300`, `maxToolCalls` bounded) accommodates sequential live calls.
 
 **What the alternative would have cost.** Embedding-RAG over the analytics data would buy nothing the live tool lacks and add every cost it avoids: a stale, lossy copy of data that is already a fresh, exact API; an embedding pipeline; a vector store; a freshness policy (`09`); incremental indexing (`10`); and the loss of exactness (an embedding of a number is a fuzzy point, not the number). It is the textbook over-engineering of forcing the canonical pattern onto data it does not fit.
 
@@ -348,3 +348,6 @@ A reviewer says "every serious AI product uses a vector database; add one." Defe
 ### Quick check — code reference test
 
 Does blooming insights do RAG, and what is its retriever? (Answer: yes — it does retrieval-augmented generation with a *live tool* as the retriever: the agent loop runs `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11/L16) against Bloomreach and grounds the answer in the fresh result; it deliberately has no embedding-index retriever because the data is a fresh, exact, queryable API where an index would be stale and lossy.)
+
+---
+Updated: 2026-05-28 — corrected one stale ref: `maxDuration: 60` → `maxDuration = 300`. Case-B rationale (live tool retrieval over embedding-RAG) unchanged.

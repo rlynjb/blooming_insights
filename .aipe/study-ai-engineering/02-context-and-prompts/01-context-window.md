@@ -80,7 +80,7 @@ each of 6 calls ≤ 16,000 chars → transcript stays bounded
 
 ### Inflow budget 2 — the UI stream (`route TRUNC = 4000`)
 
-A *separate, smaller* budget governs what is streamed to the browser — this one does not protect the window, it protects the wire. `app/api/agent/route.ts` L44–L48:
+A *separate, smaller* budget governs what is streamed to the browser — this one does not protect the window, it protects the wire. `app/api/agent/route.ts` L99–L103:
 
 ```typescript
 const TRUNC = 4000;
@@ -90,7 +90,7 @@ const trunc = (v: unknown): unknown => {
 };
 ```
 
-`trunc` is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L129). It is unrelated to the model's window. Two budgets, two purposes: `16_000` defends the model's context array; `4000` defends the NDJSON payload size to the UI.
+`trunc` is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L192). It is unrelated to the model's window. Two budgets, two purposes: `16_000` defends the model's context array; `4000` defends the NDJSON payload size to the UI.
 
 ```
 tool result ──┬── truncate(16_000) ──▶ tool_result block ──▶ model window
@@ -186,10 +186,10 @@ Inflow is capped in the Service layer; the answer's room is reserved by withhold
 ### Files, functions, and line ranges
 
 - **Tool-result inflow cap:** `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) and `truncate(s)` (L31–L34). Applied at L150 before each `tool_result` block (pushed L161–L171).
-- **UI-stream cap (separate):** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L44–L48. Applied at L129 to the `tool_call_end` event payload only — not the window.
+- **UI-stream cap (separate):** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the `tool_call_end` event payload only — not the window.
 - **Schema-prefix caps:** `MAX_EVENTS = 20` (`lib/agents/monitoring.ts` L21), `MAX_PROPS_PER_EVENT = 10` (L22), `MAX_CPROPS = 30` (L33); whole `schemaSummary` L15–L48; intent comment at L14. Imported and reused by `lib/agents/diagnostic.ts` L6 and `lib/agents/recommendation.ts` L6.
 - **Answer-room reservation:** `budgetSpent`/`forceFinal` (`lib/agents/base.ts` L90–L91), tools withheld on the final turn at L101, the create call at L102. Per-agent tool budgets: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57).
-- **Output cap (the one real token control):** `max_tokens` default `4096` (`lib/agents/base.ts` L74), synthesis `2048` (`diagnostic.ts` L94 / `recommendation.ts` L98), classifier `16` (`lib/agents/intent.ts` L20).
+- **Output cap (the one real token control):** `max_tokens` default `4096` (`lib/agents/base.ts` L74), synthesis `2048` (`diagnostic.ts` L99 / `recommendation.ts` L98), classifier `16` (`lib/agents/intent.ts` L20).
 
 The codebase bounds the *input* by characters and reserves the *output* with `max_tokens` and the forced-final turn. It never reads `res.usage` to learn how full the window actually got — that gap is named in → ../01-llm-foundations/06-token-economics.md.
 
@@ -266,7 +266,7 @@ The window is zero-sum between input and output. Every character you let into th
 
 ### `max_tokens` (output-room reservation)
 
-- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (`diagnostic.ts` L94 / `recommendation.ts` L98), `16` classifier (`lib/agents/intent.ts` L20).
+- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (`diagnostic.ts` L99 / `recommendation.ts` L98), `16` classifier (`lib/agents/intent.ts` L20).
 - **Why it's here:** it is the one token-denominated control the code sets directly, and it reserves the output slots so a packed input cannot starve the answer.
 - **Leading today:** every major provider exposes an output cap (2026); it is universal, not differentiated.
 - **Why it leads:** it bounds the most variable cost component with one integer and guarantees the answer has reserved room.
@@ -338,7 +338,7 @@ final turn: no tools → no tool_use → no append → transcript STOPS
 
 **[arch] The `16_000` and `4000` caps — same purpose?**
 
-No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* window, defending the shared context array. `4000` (`route.ts` L44) bounds the result payload streamed to the *browser*, defending wire size. They live in different layers and protect different limits; conflating them would couple the UI's payload size to the model's context budget.
+No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* window, defending the shared context array. `4000` (`route.ts` L99) bounds the result payload streamed to the *browser*, defending wire size. They live in different layers and protect different limits; conflating them would couple the UI's payload size to the model's context budget.
 
 ```
 16_000 ──▶ model window (base.ts)      4000 ──▶ NDJSON to UI (route.ts)
@@ -352,7 +352,7 @@ No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* window, defendi
 
 - `lib/agents/base.ts` L29, L31–L34 — `MAX_TOOL_RESULT_CHARS = 16_000`, tool-result inflow cap.
 - `lib/agents/base.ts` L90–L91, L101 — `forceFinal` withholds tools so the transcript stops growing.
-- `app/api/agent/route.ts` L44 — `TRUNC = 4000`, UI-stream budget (different layer/purpose).
+- `app/api/agent/route.ts` L99 — `TRUNC = 4000`, UI-stream budget (different layer/purpose).
 - `lib/agents/monitoring.ts` L15–L48 — `schemaSummary` caps the 112KB schema to a small prefix.
 - Input and output share one fixed array; bounding inflow protects the answer's room.
 
@@ -379,3 +379,6 @@ A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` so the diagnostic
 ### Quick check — code reference test
 
 Which line withholds the tool schemas so the model cannot grow the transcript on its final turn, and what condition gates it? (Answer: `lib/agents/base.ts` L101 — `if (!forceFinal) params.tools = toolSchemas`, gated by `forceFinal` set at L91.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); the character-budget/forced-final-turn mechanics and `base.ts`/`monitoring.ts` refs verified unchanged.

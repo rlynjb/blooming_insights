@@ -104,16 +104,16 @@ This is the LLM doing what the substring heuristic cannot: understanding that "w
 
 ### The route's own heuristic branch
 
-Before any classification at all, the route runs a free structural check: which flow to enter, based purely on *which query parameters are present* (`app/api/agent/route.ts` L135 and L145):
+Before any classification at all, the route runs a free structural check: which flow to enter, based purely on *which query parameters are present* (`app/api/agent/route.ts` L210 for the query branch, L121–L123 for the neither→400 guard):
 
 ```
 GET /api/agent
   q present, no insightId  → query flow:  classifyIntent → QueryAgent.answer
   insightId present        → investigation flow: DiagnosticAgent → RecommendationAgent
-  neither                  → 400  (route.ts L55–57)
+  neither                  → 400  (route.ts L121–123)
 ```
 
-The `q && !insightId` test (L135) is a heuristic — presence of a parameter — that decides the entire downstream path with zero model involvement. The expensive `classifyIntent` call (L136) runs *only inside* the query branch, only after the free structural check has already routed the request. Two layers of fast-path: structural routing (free) then keyword routing (free) then, last, the model.
+The `q && !insightId` test (L210) is a heuristic — presence of a parameter — that decides the entire downstream path with zero model involvement. The expensive `classifyIntent` call (L211) runs *only inside* the query branch, only after the free structural check has already routed the request. Two layers of fast-path: structural routing (free) then keyword routing (free) then, last, the model.
 
 ```
 ┌─ route: parameter-presence heuristic (free) ─┐
@@ -144,7 +144,7 @@ This diagram spans the route (structural heuristic) and the intent layer (keywor
 │                                                                       │
 │  app/api/agent/route.ts                                              │
 │    heuristic: parameter presence  (FREE)                            │
-│      q && !insightId ? query flow : investigation flow   L135/L145  │
+│      q && !insightId ? query flow : investigation flow   L210 / L221  │
 │              │ query flow                                            │
 │              ▼                                                       │
 │  lib/agents/intent.ts                                                │
@@ -176,7 +176,7 @@ The free heuristics gate the call; the model only runs for free-form queries wit
 - **The heuristic:** `parseIntent(raw)` — `lib/agents/intent.ts` L6–L12. Pure, lowercase + substring match, default `'diagnostic'`.
 - **The LLM fallback:** `classifyIntent(anthropic, query)` — `lib/agents/intent.ts` L17–L31. Haiku, `max_tokens: 16` (L20), output normalized via `parseIntent` (L30).
 - **The cheap model tier:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14 (vs sonnet `AGENT_MODEL`, `lib/agents/base.ts` L9).
-- **The route's structural heuristic:** parameter-presence branch — `app/api/agent/route.ts` L135 (`q && !insightId` → query flow), L145 (investigation flow), L55–L57 (neither → 400); `classifyIntent` invoked only inside the query branch at L136.
+- **The route's structural heuristic:** parameter-presence branch — `app/api/agent/route.ts` L210 (`q && !insightId` → query flow), L221 (investigation flow body; anomaly resolved at L144), L121–L123 (neither → 400); `classifyIntent` invoked only inside the query branch at L211.
 
 ### Why two layers, not one
 
@@ -261,7 +261,7 @@ Each tier covers what the cheaper tier cannot, at higher cost. The art is puttin
 
 ### parameter-presence routing (the route's structural heuristic)
 
-- **Codebase uses:** `app/api/agent/route.ts` L135 / L145 — branch on `q` vs `insightId`.
+- **Codebase uses:** `app/api/agent/route.ts` L210 / L221 — branch on `q` vs `insightId`.
 - **Why it's here:** the entire flow choice is decidable from request shape, with no model needed.
 - **Leading today:** structural request routing is universal (2026) — it is just controller logic, not AI.
 - **Why it leads:** the cheapest possible router; the model never sees requests it cannot help.
@@ -276,7 +276,7 @@ Each tier covers what the cheaper tier cannot, at higher cost. The art is puttin
 - **Exercise ID:** B1.5 (adapted) — heuristic-before-LLM observability.
 - **What to build:** in the query flow, run `parseIntent(q)` alongside `classifyIntent(q)` and record when they disagree, so you can measure the heuristic's mis-classification rate over real traffic.
 - **Why it earns its place:** shows you understand heuristics drift silently and that the way to catch it is to measure agreement with the more capable resolver.
-- **Files to touch:** `app/api/agent/route.ts` (compute both in the query branch near L136), a small log sink (e.g. extend the future `ai-call-log.ts` from → 06-token-economics.md).
+- **Files to touch:** `app/api/agent/route.ts` (compute both in the query branch near L211), a small log sink (e.g. extend the future `ai-call-log.ts` from → 06-token-economics.md).
 - **Done when:** running a batch of varied queries produces a disagreement rate, and a phrasing like "stop monitoring my spend" shows up as a heuristic/LLM mismatch.
 - **Estimated effort:** 1–4hr
 
@@ -293,7 +293,7 @@ Each tier covers what the cheaper tier cannot, at higher cost. The art is puttin
 
 ## Summary
 
-The cheapest way to answer a routing question beats the model, so blooming insights puts free deterministic checks in front of the paid LLM. `parseIntent` (`lib/agents/intent.ts` L6–L12) is a pure substring heuristic that resolves literal-keyword inputs at zero cost and also parses the LLM's one-word output; `classifyIntent` (L17–L31) is the haiku fallback for free-form queries the heuristic cannot understand; and the route's parameter-presence branch (`app/api/agent/route.ts` L135) decides the entire flow before any model call. The model is the last resort, reserved for genuine ambiguity — and even its answer is normalized by the free parser.
+The cheapest way to answer a routing question beats the model, so blooming insights puts free deterministic checks in front of the paid LLM. `parseIntent` (`lib/agents/intent.ts` L6–L12) is a pure substring heuristic that resolves literal-keyword inputs at zero cost and also parses the LLM's one-word output; `classifyIntent` (L17–L31) is the haiku fallback for free-form queries the heuristic cannot understand; and the route's parameter-presence branch (`app/api/agent/route.ts` L210) decides the entire flow before any model call. The model is the last resort, reserved for genuine ambiguity — and even its answer is normalized by the free parser.
 
 **Key points:**
 - An LLM call is the most expensive resolver — slow, paid, non-deterministic — so a free deterministic check belongs in front of it.
@@ -314,7 +314,7 @@ The cheapest way to answer a routing question beats the model, so blooming insig
 
 **[mid] How does the system route a query without always paying for a model call?**
 
-Two free checks first. The route branches on parameter presence (`q` vs `insightId`, `app/api/agent/route.ts` L135). Inside the query flow, `parseIntent` (`lib/agents/intent.ts` L6–L12) resolves any input containing a literal intent keyword for free. Only genuinely free-form queries reach `classifyIntent` (the haiku call).
+Two free checks first. The route branches on parameter presence (`q` vs `insightId`, `app/api/agent/route.ts` L210). Inside the query flow, `parseIntent` (`lib/agents/intent.ts` L6–L12) resolves any input containing a literal intent keyword for free. Only genuinely free-form queries reach `classifyIntent` (the haiku call).
 
 ```
 param presence (free) → parseIntent keyword (free) → classifyIntent (paid, last)
@@ -346,7 +346,7 @@ fix: log parseIntent vs classifyIntent disagreement → drift visible
 
 - `lib/agents/intent.ts` L6–L12 — `parseIntent`, free substring heuristic + LLM-output parser.
 - `lib/agents/intent.ts` L17–L31 — `classifyIntent`, the haiku fallback, output re-parsed at L30.
-- `app/api/agent/route.ts` L135 — parameter-presence routing before any model call.
+- `app/api/agent/route.ts` L210 — parameter-presence routing before any model call.
 - `lib/agents/intent.ts` L14 — haiku tier for the paid path (cheap, → 06-token-economics.md).
 - Heuristic risk: confidently wrong on tricky phrasing; drifts as inputs evolve.
 
@@ -373,3 +373,6 @@ A colleague wants to delete `parseIntent` and "just always call the classifier �
 ### Quick check — code reference test
 
 What does `parseIntent` return for an input with no intent keyword, and where is that default set? (Answer: `'diagnostic'` — `lib/agents/intent.ts` L11, the final `return 'diagnostic'`.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` structural-heuristic refs (query branch now L210, `classifyIntent` L211, neither→400 at L121–L123, investigation flow L221); `intent.ts` `parseIntent`/`classifyIntent` refs verified unchanged.

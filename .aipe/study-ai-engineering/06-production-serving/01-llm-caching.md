@@ -64,21 +64,21 @@ This is the cache the codebase leans on hardest. Every MCP tool call passes thro
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The cache key is built at `lib/mcp/client.ts` L35: `` const cacheKey = `${name}:${JSON.stringify(args)}` ``. The TTL defaults to `60_000` ms (L36). The read happens at L38–L42: if an entry exists and `cached.expiresAt > Date.now()`, the call returns `{ result, durationMs: 0, fromCache: true }` without touching the network. The write happens at L64–L65 on success only.
+The cache key is built at `lib/mcp/client.ts` L102: `` const cacheKey = `${name}:${JSON.stringify(args)}` ``. The TTL defaults to `60_000` ms (L103). The read happens at L105–L110: if an entry exists and `cached.expiresAt > Date.now()`, the call returns `{ result, durationMs: 0, fromCache: true }` without touching the network (L108). The write happens at L143–L144 on success only.
 
 ```
 callTool("execute_analytics_eql", { eql })
    │
    ├─ key = "execute_analytics_eql:{...}"
    ├─ cache.get(key)?.expiresAt > now ?
-   │     │ yes → return { result, durationMs: 0, fromCache: true }   ← L41
+   │     │ yes → return { result, durationMs: 0, fromCache: true }   ← L108
    │     │ no
-   ├─ liveCall (network)                                              ← L46
-   ├─ result.isError ? return WITHOUT caching                        ← L58–L60
-   └─ cache.set(key, { result, expiresAt: now + 60s })               ← L65
+   ├─ liveCall (network)                                              ← L113
+   ├─ result.isError ? return WITHOUT caching                        ← L137–L139
+   └─ cache.set(key, { result, expiresAt: now + 60s })               ← L143–L144
 ```
 
-The critical guard is no-cache-on-error at `lib/mcp/client.ts` L57–L60: an `isError` result is returned without a cache write, so a transient failure never poisons the cache for 60 seconds. This is the same rule React Query applies — queries cache, errors do not.
+The critical guard is no-cache-on-error at `lib/mcp/client.ts` L137–L139: an `isError` result is returned without a cache write, so a transient failure never poisons the cache for 60 seconds. This is the same rule React Query applies — queries cache, errors do not.
 
 Within a single investigation, the diagnostic and recommendation agents frequently issue overlapping EQL queries. The 60s TTL means the second agent's identical query returns instantly from L1 instead of re-spending a network round-trip against Bloomreach's ~1 req/s ceiling.
 
@@ -96,9 +96,9 @@ getCachedInvestigation(insightId)
    └─ demo seed                 ? return fromDemo ?? null     ← L26  (committed JSON)
 ```
 
-The lookup chain is at `lib/state/investigations.ts` L22–L28: in-memory `Map` first, then a dev-only on-disk file, then a committed demo seed. The write is `saveInvestigation` at L30–L41, called from the route after a live run completes (`app/api/agent/route.ts` L162).
+The lookup chain is at `lib/state/investigations.ts` L22–L28: in-memory `Map` first, then a dev-only on-disk file, then a committed demo seed. The write is `saveInvestigation` at L30–L41, called from the route after a live run completes (`app/api/agent/route.ts` L254).
 
-The route wires this in at `app/api/agent/route.ts` L63–L81: when an `insightId` is requested and `live !== 1`, it pulls the cached event array and re-emits it through a `ReadableStream`, sleeping `REPLAY_DELAY_MS = 180` (L50) between events so the replay *feels* like a live run.
+The route wires this in at `app/api/agent/route.ts` L127–L141: when an `insightId` is requested and `live !== 1`, it pulls the cached event array and re-emits it through a `ReadableStream`, sleeping `REPLAY_DELAY_MS = 180` (L105) between events so the replay *feels* like a live run.
 
 ```
 GET /api/agent?insightId=X            GET /api/agent?insightId=X&live=1
@@ -170,7 +170,7 @@ This diagram spans all four layers across the UI, Route, Agent, and Provider bou
   │       │                                                             │
   │  ┌────▼─────────────────────────────────────────────┐              │
   │  │  L0  investigation replay cache  (BUILT)          │              │
-  │  │  getCachedInvestigation(X)  L63                   │              │
+  │  │  getCachedInvestigation(X)  L127                  │              │
   │  │   hit → replay NDJSON @ 180ms, 0 Claude calls     │              │
   │  └────┬─────────────────────────────────────────────┘              │
   │       │ miss / live=1                                               │
@@ -194,10 +194,10 @@ This diagram spans all four layers across the UI, Route, Agent, and Provider bou
   │                                                                       │
   │  ┌────────────────────────────────────────────────────┐             │
   │  │  L1  exact-match tool cache  (BUILT)                │             │
-  │  │  key = name:JSON.stringify(args)   L35              │             │
-  │  │  ttl = 60_000   L36                                 │             │
-  │  │  hit → durationMs:0, fromCache:true   L41           │             │
-  │  │  no-cache-on-error   L57–L60                        │             │
+  │  │  key = name:JSON.stringify(args)   L102             │             │
+  │  │  ttl = 60_000   L103                                │             │
+  │  │  hit → durationMs:0, fromCache:true   L108          │             │
+  │  │  no-cache-on-error   L137–L139                      │             │
   │  └────────────────────────────────────────────────────┘             │
   │       │ miss → liveCall → Bloomreach MCP                              │
   └───────────────────────────────────────────────────────────────────────┘
@@ -215,9 +215,9 @@ This is partially implemented — two of the three layers exist.
 
 **File:** `lib/mcp/client.ts`
 **Function / class:** `McpClient.callTool`
-**Line range:** L30–L67 (key L35, ttl L36, read L38–L42, no-cache-on-error L57–L60, write L64–L65)
+**Line range:** L97–L146 (key L102, ttl L103, read L105–L110, no-cache-on-error L137–L139, write L143–L144)
 
-The cache field is `private cache = new Map<string, { result; expiresAt }>()` at L18. Default TTL `60_000` ms. Key format `` `${name}:${JSON.stringify(args)}` ``. A `skipCache` option (L38) bypasses the read but still writes through (L62–L63 comment), serving the `/debug` force-refresh path.
+The cache field is `private cache = new Map<string, { result; expiresAt }>()` at L80. Default TTL `60_000` ms. Key format `` `${name}:${JSON.stringify(args)}` ``. A `skipCache` option (L105) bypasses the read but still writes through (L141–L142 comment), serving the `/debug` force-refresh path.
 
 ### L0 investigation replay cache (Case A)
 
@@ -225,7 +225,7 @@ The cache field is `private cache = new Map<string, { result; expiresAt }>()` at
 **Function / class:** `getCachedInvestigation` (read), `saveInvestigation` (write)
 **Line range:** read L22–L28, write L30–L41
 
-Three-tier lookup: in-memory `Map` (L23) → dev file `.investigation-cache.json` (L24, dev only) → committed demo seed (L26). Wired into the route at `app/api/agent/route.ts` L63–L81 (replay branch, `REPLAY_DELAY_MS = 180` at L50) and L162 (`saveInvestigation` after a live run).
+Three-tier lookup: in-memory `Map` (L23) → dev file `.investigation-cache.json` (L24, dev only) → committed demo seed (L26). Wired into the route at `app/api/agent/route.ts` L127–L141 (replay branch, `REPLAY_DELAY_MS = 180` at L105) and L254 (`saveInvestigation` after a live run).
 
 ### L2 prompt caching (Case B — Not yet implemented)
 
@@ -291,7 +291,7 @@ Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If
 
 ### in-memory Map (cache-aside, exact-match)
 
-- **Codebase uses:** `Map<string, {result, expiresAt}>` in `McpClient` (`lib/mcp/client.ts` L18) and `Map<string, AgentEvent[]>` in `lib/state/investigations.ts` L11.
+- **Codebase uses:** `Map<string, {result, expiresAt}>` in `McpClient` (`lib/mcp/client.ts` L80) and `Map<string, AgentEvent[]>` in `lib/state/investigations.ts` L11.
 - **Why it's here:** zero dependencies, exact-match keying on serialized tool args, instant hit path for repeated EQL within a run.
 - **Leading today:** `lru-cache` (npm) for bounded in-process caches (adoption-leading, 2026); Redis/Upstash for cross-instance (innovation-leading for serverless, 2026).
 - **Why it leads:** `lru-cache` adds size-based eviction the raw `Map` lacks; Redis survives cold starts and coordinates across serverless instances.
@@ -308,7 +308,7 @@ Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If
 ### semantic caching
 
 - **Codebase uses:** nothing — the L1 cache is strictly exact-match on `JSON.stringify(args)`.
-- **Why it's here:** the `?q=` free-form query path (`app/api/agent/route.ts` L135) is the candidate surface where near-duplicate questions recur.
+- **Why it's here:** the `?q=` free-form query path (`app/api/agent/route.ts` L115, L211) is the candidate surface where near-duplicate questions recur.
 - **Leading today:** GPTCache (adoption-leading open-source semantic cache, 2026); managed semantic caches in LangChain / Vercel AI SDK (innovation-leading, 2026).
 - **Why it leads:** GPTCache bundles embedding + vector store + threshold logic; managed caches remove the operational surface.
 - **Runner-up:** a hand-rolled embedding + cosine-threshold lookup over a small `Map` for low query volume.
@@ -331,7 +331,7 @@ Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If
 - **Exercise ID:** C5.1 (caching) — fresh, no clean Build map.
 - **What to build:** Replace the raw `Map` in `McpClient` with an `lru-cache` instance capped at a max entry count, preserving the `name:JSON.stringify(args)` key and 60s TTL.
 - **Why it earns its place:** shows you spotted the unbounded-growth failure mode and chose a bounded cache without changing the cache-aside contract.
-- **Files to touch:** `lib/mcp/client.ts` (the `cache` field L18 and `callTool` read/write at L38–L42, L64–L65).
+- **Files to touch:** `lib/mcp/client.ts` (the `cache` field L80 and `callTool` read/write at L105–L110, L143–L144).
 - **Done when:** the existing `test/mcp/client.test.ts` suite still passes and a new test proves the cache evicts the least-recently-used entry past the cap.
 - **Estimated effort:** <1hr.
 
@@ -343,7 +343,7 @@ blooming insights caches at two layers it owns: an exact-match `Map` over MCP to
 
 **Key points:**
 - There are three cache layers — whole-response (L0), tool-result (L1), prompt-prefix (L2) — and they each remove a *different* cost.
-- L1 keys on `name:JSON.stringify(args)` and never caches an error result (`lib/mcp/client.ts` L57–L60), so a transient failure cannot poison the cache.
+- L1 keys on `name:JSON.stringify(args)` and never caches an error result (`lib/mcp/client.ts` L137–L139), so a transient failure cannot poison the cache.
 - L0 replay (`lib/state/investigations.ts`) collapses a full multi-agent run to a file read — the reason the demo runs without an API key.
 - The static system prompt is re-sent at full input price every turn; `cache_control` would cut turns 2–N to ~10% — the unbuilt cost lever.
 - Exact-match caching misses semantically identical queries; a semantic cache needs embeddings the codebase does not have.
@@ -360,12 +360,12 @@ blooming insights caches at two layers it owns: an exact-match `Map` over MCP to
 
 **[mid] What does blooming insights' tool cache key on, and why does it never cache errors?**
 
-It keys on `` `${name}:${JSON.stringify(args)}` `` (`lib/mcp/client.ts` L35) — tool name plus deterministic arg serialization. It skips the cache write when `result.isError === true` (L57–L60) because caching a 429 or a failure for 60s would serve that failure to every caller for a full minute with no retry.
+It keys on `` `${name}:${JSON.stringify(args)}` `` (`lib/mcp/client.ts` L102) — tool name plus deterministic arg serialization. It skips the cache write when `result.isError === true` (L137–L139) because caching a 429 or a failure for 60s would serve that failure to every caller for a full minute with no retry.
 
 ```
   result.isError ?
-   ┌── true  → return, NO cache write  (L58–L60)
-   └── false → cache.set(key, {result, expiresAt: now+60s})  (L65)
+   ┌── true  → return, NO cache write  (L137–L139)
+   └── false → cache.set(key, {result, expiresAt: now+60s})  (L143–L144)
 ```
 
 **[senior] You re-send a 2,000-token system prompt every turn. What does that cost and how do you fix it?**
@@ -397,10 +397,10 @@ Because blooming insights *does* (L0 replay) — and that only helps when the ex
 
 ### One-line anchors
 
-- `lib/mcp/client.ts` L35 — cache key `name:JSON.stringify(args)`
-- `lib/mcp/client.ts` L57–L60 — no-cache-on-error guard
+- `lib/mcp/client.ts` L102 — cache key `name:JSON.stringify(args)`
+- `lib/mcp/client.ts` L137–L139 — no-cache-on-error guard
 - `lib/state/investigations.ts` L22–L28 — three-tier replay lookup
-- `app/api/agent/route.ts` L63–L81 — replay branch, `REPLAY_DELAY_MS = 180`
+- `app/api/agent/route.ts` L127–L141 — replay branch, `REPLAY_DELAY_MS = 180`
 - `lib/agents/base.ts` L98 — the un-cached static `system` prefix (the gap)
 
 ---
@@ -425,4 +425,7 @@ A teammate says "remove the L0 investigation replay cache — it makes the demo 
 
 ### Quick check — code reference test
 
-What is the default TTL of the L1 tool cache, and on which line is it set? (Answer: `60_000` ms, `lib/mcp/client.ts` L36.)
+What is the default TTL of the L1 tool cache, and on which line is it set? (Answer: `60_000` ms, `lib/mcp/client.ts` L103.)
+
+---
+Updated: 2026-05-28 — Re-derived drifted refs after the client.ts/route.ts rewrites: cache key L102 / ttl L103 / read L105–L110 / no-cache-on-error L137–L139 / write L143–L144 (callTool L97–L146, field L80); replay branch route.ts L127–L141, REPLAY_DELAY_MS L105, saveInvestigation L254. L2 prompt-cache gap unchanged.

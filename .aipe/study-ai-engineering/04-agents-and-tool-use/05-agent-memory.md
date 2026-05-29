@@ -90,16 +90,17 @@ investigations.ts — getCachedInvestigation(insightId)   (L22–L28)
  return fromDemo ?? null                                   ← exact key or nothing (L27)
 ```
 
-`saveInvestigation` (L30–L41) writes to the in-process `Map` always, and to the dev cache file only when `PERSIST` (`NODE_ENV === 'development'`, L7) — because serverless filesystems are read-only in production. The route writes the collected events after a live investigation completes (`route.ts` L162) and replays them on a cache hit (`route.ts` L63–L81), pacing each event by `REPLAY_DELAY_MS = 180` so the replayed trace looks like a live run.
+`saveInvestigation` (L30–L41) writes to the in-process `Map` always, and to the dev cache file only when `PERSIST` (`NODE_ENV === 'development'`, L7) — because serverless filesystems are read-only in production. The route writes the collected events only after the *combined* `step==null` capture run completes (`route.ts` L254 — the split live steps hand off via the client's sessionStorage instead) and replays them on a cache hit (`route.ts` L127–L141), filtering the snapshot to the requested step via `filterByStep(cached, step)` (L129) and pacing each event by `REPLAY_DELAY_MS = 180` (L105) so the replayed trace looks like a live run.
 
 ```
-route.ts — replay branch   (L63–L81)
+route.ts — replay branch   (L127–L141)
 ─────────────────────────────────────────────────────────────
- cached = getCachedInvestigation(insightId)            L63
+ cached = getCachedInvestigation(insightId)            L127
  if cached:
-   for e of cached:
-     enqueue(encodeEvent(e))                            L69
-     await sleep(REPLAY_DELAY_MS = 180)                 L70  ← paced replay
+   events = step ? filterByStep(cached, step) : cached  L129  ← per-step slice
+   for e of events:
+     enqueue(encodeEvent(e))                            L134
+     await sleep(REPLAY_DELAY_MS = 180)                 L135  ← paced replay
 ```
 
 The key property: this is **exact-keyed snapshot replay**. The lookup is `mem.get(insightId)` — a hash lookup on an exact string. There is no notion of "similar" `insightId`s, no ranking, no distance. Either the exact `insightId` was investigated before (hit, instant replay) or it was not (miss, run live). It is `localStorage` semantics, not search semantics.
@@ -142,10 +143,11 @@ The diagram spans three layers. The Agent layer holds short-term memory (the per
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ROUTE LAYER   app/api/agent/route.ts                                 │
 │                                                                       │
-│  on entry:  cached = getCachedInvestigation(insightId)  L63          │
-│             if hit → replay events (paced 180ms)  L64–81  ← long-term  │
-│             if miss → run agents live                                 │
-│  on done:   saveInvestigation(insightId, collected)  L162  ← write    │
+│  on entry:  cached = getCachedInvestigation(insightId)  L127         │
+│             if hit → filterByStep(cached, step), replay  L129–135     │
+│                      (paced 180ms)                       ← long-term   │
+│             if miss → run agents live (per ?step)                     │
+│  on done:   if step==null: saveInvestigation(id, …)  L254  ← write    │
 └───────────┬───────────────────────────────────────┬───────────────────┘
    write/read│ (long-term)             run live      │
 ┌───────────▼───────────────────────┐  ┌─────────────▼───────────────────┐
@@ -188,8 +190,8 @@ A reader who sees only this diagram should grasp: short-term memory lives inside
 
 - **File:** `app/api/agent/route.ts`
 - **Function / class:** `GET` — replay branch + save call
-- **Line range:** replay L63–L81 (`REPLAY_DELAY_MS = 180` at L50/L70); save L162
-- **Role:** Reads the cache on entry (instant replay on hit) and writes the collected events on completion.
+- **Line range:** replay L127–L141 (`filterByStep(cached, step)` L129; `REPLAY_DELAY_MS = 180` at L105/L135); save L254 (gated on `step == null`)
+- **Role:** Reads the cache on entry (instant per-step replay on hit) and writes the collected events on completion of the combined capture run.
 
 ### What is NOT implemented
 
@@ -294,7 +296,7 @@ The short-term array grows unbounded within a run — every tool result (truncat
 - **Exercise ID:** C4.5 (adapted to blooming insights; aligns with the C2.x RAG builds)
 - **What to build:** A `lib/state/investigation-memory.ts` that, on `saveInvestigation`, embeds the anomaly + diagnosis conclusion and stores the vector; and a `findSimilar(anomaly, k)` that returns the top-k prior investigations by cosine similarity. Surface the matches on the investigate page as "we have seen this before."
 - **Why it earns its place:** This is the RAG-inside-an-agent pattern end to end — the highest-signal agent-memory build, demonstrating you can add semantic recall to an exact-key system.
-- **Files to touch:** new `lib/state/investigation-memory.ts`; `lib/state/investigations.ts` (hook into `saveInvestigation` L30); `app/api/agent/route.ts` (call `findSimilar` before live run); `app/investigate/[id]/page.tsx` (render matches).
+- **Files to touch:** new `lib/state/investigation-memory.ts`; `lib/state/investigations.ts` (hook into `saveInvestigation` L30); `app/api/agent/route.ts` (call `findSimilar` before the `step=diagnose` live run, ~L231–L238); `app/investigate/[id]/page.tsx` (render matches).
 - **Done when:** Investigating a new anomaly similar to a stored one surfaces the prior investigation above a tunable similarity threshold, verified with a fixture pair of near-duplicate anomalies.
 - **Estimated effort:** 1–2 days
 
@@ -303,7 +305,7 @@ The short-term array grows unbounded within a run — every tool result (truncat
 - **Exercise ID:** C4.5 (adapted to blooming insights)
 - **What to build:** Using the semantic memory above, inject the single most-similar past diagnosis conclusion into the diagnostic agent's system prompt as a "prior finding to consider or rule out," so the agent reasons with experience instead of from scratch.
 - **Why it earns its place:** Shows long-term memory feeding short-term — the closed loop that turns a replay cache into an experience base.
-- **Files to touch:** `lib/agents/diagnostic.ts` (L45–L48 system construction); `lib/agents/prompts/diagnostic.md` (a `{prior_finding}` slot); `lib/state/investigation-memory.ts`.
+- **Files to touch:** `lib/agents/diagnostic.ts` (L46–L49 system construction); `lib/agents/prompts/diagnostic.md` (a `{prior_finding}` slot); `lib/state/investigation-memory.ts`.
 - **Done when:** A diagnosis of a recurring anomaly cites or explicitly rules out the prior finding, and a novel anomaly's prompt contains no prior-finding text.
 - **Estimated effort:** 1–4hr
 
@@ -311,7 +313,7 @@ The short-term array grows unbounded within a run — every tool result (truncat
 
 ## Summary
 
-blooming insights has two memory layers and lacks a third. Short-term memory is the `messages` array inside one `runAgentLoop` run (`base.ts` L79–L171) — the model reasons over its full prior turns each call, and the array is discarded when the run returns. Long-term memory is exact-keyed snapshot replay: `getCachedInvestigation` (`investigations.ts` L22–L28) looks up an `insightId` across a process `Map`, a dev file, and a committed seed, and the route replays the stored events paced at 180ms (`route.ts` L63–L81). There is no semantic / vector memory — the store answers "this exact investigation" but not "investigations like this one," a deliberate deferral matching the codebase's "no RAG until a feature needs it" stance.
+blooming insights has two memory layers and lacks a third. Short-term memory is the `messages` array inside one `runAgentLoop` run (`base.ts` L79–L171) — the model reasons over its full prior turns each call, and the array is discarded when the run returns. Long-term memory is exact-keyed snapshot replay: `getCachedInvestigation` (`investigations.ts` L22–L28) looks up an `insightId` across a process `Map`, a dev file, and a committed seed, and the route replays the stored events — sliced to the requested step by `filterByStep` — paced at 180ms (`route.ts` L127–L141). There is no semantic / vector memory — the store answers "this exact investigation" but not "investigations like this one," a deliberate deferral matching the codebase's "no RAG until a feature needs it" stance.
 
 Key points:
 - Short-term memory = the per-run `messages` array; it is the substrate of multi-step reasoning and is garbage-collected on return.
@@ -371,7 +373,7 @@ The dodge is to say "yes" because there is a cache. The honest answer is "it has
 - `lib/agents/base.ts` L171 — tool results appended; the Observation enters short-term memory.
 - `lib/state/investigations.ts` L22–L28 — `getCachedInvestigation` — exact-key, three-tier long-term lookup.
 - `lib/state/investigations.ts` L7 — `PERSIST = NODE_ENV === 'development'` — why the file cache is dev-only.
-- `app/api/agent/route.ts` L162 — `saveInvestigation(insightId, collected)` — where long-term memory is written.
+- `app/api/agent/route.ts` L254 — `if (step == null) saveInvestigation(insightId, collected)` — where long-term memory is written (combined capture run only).
 
 ---
 
@@ -396,3 +398,6 @@ A colleague says: "Just add a vector DB now so the agent can learn from history.
 ### Quick check — code reference test
 
 In `getCachedInvestigation`, what are the three sources checked in order, and what is returned on a complete miss? (Answer: in-process `mem` Map → dev `CACHE_FILE` (only when `PERSIST`) → committed `DEMO_FILE`; returns `null` on a miss — `lib/state/investigations.ts` L22–L28.)
+
+---
+Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: replay is now `step`-filtered (`filterByStep`, L127–141) and `saveInvestigation` (L254) fires only on the combined `step==null` capture run; the split live steps hand off via sessionStorage.

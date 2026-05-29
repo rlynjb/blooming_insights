@@ -67,7 +67,7 @@ const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
 };
 ```
 
-No `temperature` field. Same for both synthesis calls (`lib/agents/diagnostic.ts` L92–L111, `lib/agents/recommendation.ts` L96–L117) and the intent classifier (`lib/agents/intent.ts` L18–L25).
+No `temperature` field. Same for both synthesis calls (`lib/agents/diagnostic.ts` L97–L116, `lib/agents/recommendation.ts` L96–L122) and the intent classifier (`lib/agents/intent.ts` L18–L25).
 
 ```
 every create() call in the codebase:
@@ -104,7 +104,7 @@ const res = await anthropic.messages.create({
 max_tokens by call          value   purpose
 ──────────────────────────  ─────   ──────────────────────────────
 agent turn   base.ts L74     4096    room for tool-use + JSON output
-synthesis    diagnostic L94  2048    one structured artifact, no exploration
+synthesis    diagnostic L99  2048    one structured artifact, no exploration
 synthesis    recommend.  L98 2048    one structured array
 classifier   intent.ts L20     16    one word — bound the answer hard
 ```
@@ -143,7 +143,7 @@ This diagram shows where decoding controls would act in the call path, and what 
 │                                                                       │
 │  classifier  intent.ts L18–25   model, max_tokens:16,  system, msgs  │
 │  agent turn  base.ts L92–100    model, max_tokens:4096, system, msgs │
-│  synthesis   diagnostic L92–111 model, max_tokens:2048, system, msgs │
+│  synthesis   diagnostic L97–116 model, max_tokens:2048, system, msgs │
 │       │                                                              │
 │       │  NO temperature / top_p / top_k on any call                  │
 └───────┼────────────────────────────────────────────────────────────────┘
@@ -171,8 +171,8 @@ The randomness knobs live entirely on the Provider side and are never overridden
 ### Files, functions, and line ranges
 
 - **Agent turn params (no temperature):** `lib/agents/base.ts` L92–L100; `max_tokens: maxTokens` with default `4096` at L74; call at L102.
-- **Diagnostic synthesis (no temperature):** `lib/agents/diagnostic.ts` L92–L111; `max_tokens: 2048` at L94.
-- **Recommendation synthesis (no temperature):** `lib/agents/recommendation.ts` L96–L117; `max_tokens: 2048` at L98.
+- **Diagnostic synthesis (no temperature):** `lib/agents/diagnostic.ts` L97–L116; `max_tokens: 2048` at L99.
+- **Recommendation synthesis (no temperature):** `lib/agents/recommendation.ts` L96–L122; `max_tokens: 2048` at L98.
 - **Intent classifier (no temperature; `max_tokens: 16`):** `lib/agents/intent.ts` L18–L25; the `16` at L20; one-word system prompt L21–L23.
 - **Models:** `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9); `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14).
 
@@ -347,7 +347,7 @@ agent turns  → default  (exploration, parsed downstream)
 
 - No `temperature`/`top_p`/`top_k` anywhere — `lib/agents/base.ts` L92–L100 is representative.
 - `lib/agents/intent.ts` L20 — `max_tokens: 16`, the one-word classifier bound (not a randomness control).
-- `lib/agents/diagnostic.ts` L94 / `recommendation.ts` L98 — synthesis `max_tokens: 2048`, default temperature.
+- `lib/agents/diagnostic.ts` L99 / `recommendation.ts` L98 — synthesis `max_tokens: 2048`, default temperature.
 - temperature 0 = argmax (deterministic); default = mild randomness; the classifier and synthesis want the former.
 
 ---
@@ -373,3 +373,6 @@ A colleague proposes `temperature: 0` on *every* call including the agent loop i
 ### Quick check — code reference test
 
 How many sampling-randomness parameters does any `anthropic.messages.create` call in this codebase set? (Answer: zero — only `max_tokens` is set; `temperature`/`top_p`/`top_k` are all left at Claude defaults.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted synthesis-call ranges (diagnostic L97–L116 / `max_tokens` L99, recommendation L96–L122); the no-temperature finding and `base.ts`/`intent.ts` refs verified unchanged.

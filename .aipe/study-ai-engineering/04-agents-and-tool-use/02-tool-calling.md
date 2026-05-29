@@ -61,10 +61,10 @@ tool-schemas.ts — filterToolSchemas(all, allowed)   (L9–L21)
  { name,                          { name,
    description?,        ──map──→     description: description ?? '',
    inputSchema: object }            input_schema: inputSchema }
-                                  filtered to: set.has(t.name)   (L14)
+                                  filtered to: set.has(t.name)   (L15)
 ```
 
-The transform is mechanical: rename `inputSchema` → `input_schema`, default a missing description to `''`, and drop any tool not in the allowed set (L14 `set.has(t.name)`). The *filtering* is the load-bearing part — it is also routing, covered in 04-tool-routing.md. For tool calling itself, the point is: the array handed to the API at `base.ts` L101 (`params.tools = toolSchemas`) is the complete, exhaustive description of every action the model can request this turn.
+The transform is mechanical: rename `inputSchema` → `input_schema`, default a missing description to `''`, and drop any tool not in the allowed set (L15 `set.has(t.name)`). The *filtering* is the load-bearing part — it is also routing, covered in 04-tool-routing.md. For tool calling itself, the point is: the array handed to the API at `base.ts` L101 (`params.tools = toolSchemas`) is the complete, exhaustive description of every action the model can request this turn.
 
 ---
 
@@ -114,7 +114,7 @@ Three details make this correct. First, **`tool_use_id` pairing** (L163): the `t
 
 ### Every MCP tool carries project_id
 
-Bloomreach MCP tools are multi-tenant: every analytics tool needs a `project_id` to know *which* workspace to query. The model does not invent it — it is injected into the system prompt. Each agent's `system` string runs `.replace(/\{project_id\}/g, this.schema.projectId)` (`diagnostic.ts` L47, `recommendation.ts` L43, `monitoring.ts` L63, `query.ts` L27) before the loop starts, so the model reads the real project id in its instructions and includes it in the `input` of every `tool_use` block. The argument the model emits — `{ eql: "...", project_id: "..." }` — is what `mcp.callTool` forwards verbatim to Bloomreach.
+Bloomreach MCP tools are multi-tenant: every analytics tool needs a `project_id` to know *which* workspace to query. The model does not invent it — it is injected into the system prompt. Each agent's `system` string runs `.replace(/\{project_id\}/g, this.schema.projectId)` (`diagnostic.ts` L48, `recommendation.ts` L43, `monitoring.ts` L71, `query.ts` L27) before the loop starts, so the model reads the real project id in its instructions and includes it in the `input` of every `tool_use` block. The argument the model emits — `{ eql: "...", project_id: "..." }` — is what `mcp.callTool` forwards verbatim to Bloomreach.
 
 ```
 schema.projectId ──.replace('{project_id}')──→ system prompt
@@ -177,7 +177,7 @@ A reader who sees only this diagram should grasp: the model names the tool, the 
 - **File:** `lib/agents/tool-schemas.ts`
 - **Function / class:** `filterToolSchemas` (+ `McpToolDef` interface L3–L7)
 - **Line range:** L9–L21
-- **Role:** Maps `McpToolDef[]` → `Anthropic.Messages.Tool[]`, renaming `inputSchema` → `input_schema`, defaulting `description` to `''`, and filtering to the allowed name set (L14).
+- **Role:** Maps `McpToolDef[]` → `Anthropic.Messages.Tool[]`, renaming `inputSchema` → `input_schema`, defaulting `description` to `''`, and filtering to the allowed name set (L15).
 
 ### The caller seam
 
@@ -202,7 +202,7 @@ A reader who sees only this diagram should grasp: the model names the tool, the 
 
 ### project_id injection
 
-- **File:** `lib/agents/diagnostic.ts` L47 (`recommendation.ts` L43, `monitoring.ts` L63, `query.ts` L27)
+- **File:** `lib/agents/diagnostic.ts` L48 (`recommendation.ts` L43, `monitoring.ts` L71, `query.ts` L27)
 - **Function / class:** system-prompt construction in each agent's entry method
 - **Line range:** the `.replace(/\{project_id\}/g, this.schema.projectId)` call
 - **Role:** Injects the real workspace id into the prompt so the model includes `project_id` in every tool call's `input`.
@@ -232,7 +232,7 @@ messages.push({ role: 'user', content: toolResults });             // L171 (resu
 
 ### Where this pattern comes from
 
-Tool use / function calling was popularized by OpenAI's June 2023 function-calling release and formalized across providers since. Anthropic's tool-use API expresses it as `tool_use` content blocks in the assistant message and `tool_result` blocks in the following user message — the exact shapes this codebase manipulates. The Model Context Protocol (MCP), the layer blooming insights uses to reach Bloomreach, generalizes this further: tools are *discovered* at runtime (`listTools` in `route.ts` L98) rather than hard-coded, so the available action set is whatever the connected MCP server exposes, mapped on the fly by `filterToolSchemas`.
+Tool use / function calling was popularized by OpenAI's June 2023 function-calling release and formalized across providers since. Anthropic's tool-use API expresses it as `tool_use` content blocks in the assistant message and `tool_result` blocks in the following user message — the exact shapes this codebase manipulates. The Model Context Protocol (MCP), the layer blooming insights uses to reach Bloomreach, generalizes this further: tools are *discovered* at runtime (`conn.mcp.listTools()` in `route.ts` L203) rather than hard-coded, so the available action set is whatever the connected MCP server exposes, mapped on the fly by `filterToolSchemas`.
 
 ### The deeper principle
 
@@ -244,7 +244,7 @@ The model emits arguments as free-form JSON conforming to the tool's `input_sche
 
 ### What to explore next
 
-- **MCP (Model Context Protocol)** — the discovery-and-transport layer that lets a client expose tools to any model; read how `listTools` populates `allTools` at `route.ts` L98.
+- **MCP (Model Context Protocol)** — the discovery-and-transport layer that lets a client expose tools to any model; read how `conn.mcp.listTools()` populates `allTools` at `route.ts` L203–L206.
 - **JSON Schema for tool inputs** — the `input_schema` field is a JSON Schema; constrained-decoding providers can enforce it at the token level (Anthropic does not at this codebase's vintage).
 - **Parallel tool use** — Anthropic models can emit multiple `tool_use` blocks in one turn; `base.ts` L129's `for` loop already handles the batch — trace what happens when `toolUses.length > 1`.
 
@@ -282,7 +282,7 @@ The model emits arguments as free-form JSON conforming to the tool's `input_sche
 
 ### Model Context Protocol (MCP)
 
-- **Codebase uses:** Bloomreach tools are discovered via `conn.mcp.listTools()` (`route.ts` L98) and mapped by `filterToolSchemas`; transported through `McpClient`/`SdkTransport`.
+- **Codebase uses:** Bloomreach tools are discovered via `conn.mcp.listTools()` (`route.ts` L203) and mapped by `filterToolSchemas`; transported through `McpClient`/`SdkTransport`.
 - **Why it's here:** It decouples the tool set from the code — the available actions are whatever the MCP server exposes, not a hard-coded list.
 - **Leading today:** MCP is the innovation-leading tool-interop standard in 2026, with fast-growing adoption.
 - **Why it leads:** Runtime discovery, a uniform tool shape across servers, and provider-agnostic transport.
@@ -314,7 +314,7 @@ The model emits arguments as free-form JSON conforming to the tool's `input_sche
 - **Exercise ID:** C4.1 (adapted to blooming insights)
 - **What to build:** Extend the `tool_call_end` event (`lib/mcp/events.ts`) and the per-tool loop to report the pre-truncation byte size of each result and whether truncation fired (result exceeded `MAX_TOOL_RESULT_CHARS`), then show it in `/debug` and the investigate trace.
 - **Why it earns its place:** Shows you can observe the brain/hands boundary and reason about token budget at the tool level — a production-readiness signal.
-- **Files to touch:** `lib/agents/base.ts` (L150), `lib/mcp/events.ts` (L7), `app/api/agent/route.ts` (`hooksFor`, L123–L131), `app/debug/page.tsx`.
+- **Files to touch:** `lib/agents/base.ts` (L150), `lib/mcp/events.ts` (L7), `app/api/agent/route.ts` (`hooksFor`, L181–L195), `app/debug/page.tsx`.
 - **Done when:** Every tool call in a trace shows its raw result size and a truncation flag, and a result over 16,000 chars is visibly marked truncated.
 - **Estimated effort:** 1–4hr
 
@@ -409,3 +409,6 @@ A reviewer says: "Drop the `McpCaller` interface and call the Bloomreach client 
 ### Quick check — code reference test
 
 What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps its size? (Answer: `truncate(JSON.stringify(result))` — capped at `MAX_TOOL_RESULT_CHARS = 16_000`, `lib/agents/base.ts` L29 / L150.)
+
+---
+Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTools` (L203) and `hooksFor` (L181–195) refs, and updated the per-agent `project_id`-injection line numbers.

@@ -84,7 +84,7 @@ diagnosis B: 5 sentences, same content + filler  → judge 4/5
                           ↑ longer ≠ better, but the judge rewards it
 ```
 
-**Fix — cap or control for length.** Cap the answer length the judge sees (truncate or instruct the agent to a length budget), or include length-neutrality in the judge instructions ("do not reward length; penalize padding"), or normalize the score by length post-hoc. In blooming insights, a `Diagnosis` (`lib/mcp/types.ts` L47–L52) has bounded structure — `conclusion`, `evidence[]`, `hypothesesConsidered[]` — so the cleanest control is a rubric that scores *per criterion* (did it name a specific cause? cite scoped evidence?) rather than a holistic "how good is this," which is where verbosity bias enters.
+**Fix — cap or control for length.** Cap the answer length the judge sees (truncate or instruct the agent to a length budget), or include length-neutrality in the judge instructions ("do not reward length; penalize padding"), or normalize the score by length post-hoc. In blooming insights, a `Diagnosis` (`lib/mcp/types.ts` L64–L73) has bounded structure — `conclusion`, `evidence[]`, `hypothesesConsidered[]` — so the cleanest control is a rubric that scores *per criterion* (did it name a specific cause? cite scoped evidence?) rather than a holistic "how good is this," which is where verbosity bias enters.
 
 ### Self-preference bias — the judge favors its own family
 
@@ -242,7 +242,7 @@ Every bias is a confound — a variable correlated with the score that is not qu
 
 ### verbosity-bias correction
 
-- **Codebase uses:** nothing — but `Diagnosis` (`lib/mcp/types.ts` L47–L52) is naturally bounded, easing the control.
+- **Codebase uses:** nothing — but `Diagnosis` (`lib/mcp/types.ts` L64–L73) is naturally bounded, easing the control.
 - **Why it's here (absent):** no holistic judge yet to exhibit length preference.
 - **Leading today:** per-criterion rubric scoring plus explicit length-neutral judge instructions (2026).
 - **Why it leads:** scores presence of required content, not length, so padding cannot win.
@@ -265,7 +265,7 @@ Every bias is a confound — a variable correlated with the score that is not qu
 - **Exercise ID:** B3.3 / B3.7 (adapted) — the debiased judge, the primary buildable target.
 - **What to build:** `evals/scorers/judge.ts` that scores `DiagnosticAgent` output against a golden reference with all three corrections wired in: a configurable judge model defaulting to a *different family* than `claude-sonnet-4-6` (self-preference), a per-criterion rubric prompt with length-neutral instructions (verbosity), and — for pairwise mode — swap-and-average over both orders (position). Expose a `flipRate` diagnostic that reports how often the judge changes its verdict on order swap.
 - **Why it earns its place:** demonstrates you treat the judge as a biased instrument and correct each offset — the precise senior signal that you do not trust a model-graded number blindly, and specifically that you would never let sonnet judge sonnet.
-- **Files to touch:** `evals/scorers/judge.ts`, `evals/scorers/pairwise.ts` (swap-and-average), `evals/runner.ts` (wires the judge); judge model config separate from `AGENT_MODEL` in `lib/agents/base.ts` L9; references the `Diagnosis` shape in `lib/mcp/types.ts` L47–L52.
+- **Files to touch:** `evals/scorers/judge.ts`, `evals/scorers/pairwise.ts` (swap-and-average), `evals/runner.ts` (wires the judge); judge model config separate from `AGENT_MODEL` in `lib/agents/base.ts` L9; references the `Diagnosis` shape in `lib/mcp/types.ts` L64–L73.
 - **Done when:** the judge defaults to a non-sonnet family, pairwise mode runs both orders and reports a `flipRate`, and a holdout of human-scored cases shows judge-human agreement above your chosen threshold.
 - **Estimated effort:** 1–2 days
 
@@ -321,7 +321,7 @@ I randomize or, better, average both orders: judge (v1,v2) and (v2,v1), and coun
 
 **[arch] How do you stop your eval from rewarding verbose diagnoses?**
 
-Score per criterion with a rubric instead of a holistic "how good is this," because verbosity bias enters through holistic scoring. A `Diagnosis` (`lib/mcp/types.ts` L47–L52) decomposes into checkable points — names a specific cause, cites scoped evidence, considers ≥2 hypotheses — and a rubric scores their *presence*, not the answer's length, so padding adds words but not score.
+Score per criterion with a rubric instead of a holistic "how good is this," because verbosity bias enters through holistic scoring. A `Diagnosis` (`lib/mcp/types.ts` L64–L73) decomposes into checkable points — names a specific cause, cites scoped evidence, considers ≥2 hypotheses — and a rubric scores their *presence*, not the answer's length, so padding adds words but not score.
 
 ```
 holistic: longer reads as thorough → padding wins
@@ -363,3 +363,6 @@ A colleague argues "cross-family judging is overkill — we'll just tell the jud
 ### Quick check — code reference test
 
 What model do the diagnostic and recommendation agents run on, and why does that make the choice of judge model a bias decision? (Answer: `claude-sonnet-4-6` — `AGENT_MODEL` at `lib/agents/base.ts` L9 — so judging their output with another `claude-sonnet-4-6` call is self-preference bias by construction; the judge must be a different family for the score to reflect quality rather than the judge recognizing its own style.)
+
+---
+Updated: 2026-05-28 — Re-derived `Diagnosis` ref (types.ts L64–L73). `AGENT_MODEL` (base.ts L9) and `CLASSIFIER_MODEL` (intent.ts L14) verified unchanged — the sonnet-judges-sonnet self-preference trap still holds. Still Case B (no judge wired).

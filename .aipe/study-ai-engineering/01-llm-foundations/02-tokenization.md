@@ -76,7 +76,7 @@ EQL result: 60,000 chars
 conversation stays bounded
 ```
 
-**Route event truncation** — a *separate, smaller* budget for what is streamed to the browser. `app/api/agent/route.ts` L44–L48:
+**Route event truncation** — a *separate, smaller* budget for what is streamed to the browser. `app/api/agent/route.ts` L99–L103:
 
 ```typescript
 const TRUNC = 4000;
@@ -86,7 +86,7 @@ const trunc = (v: unknown): unknown => {
 };
 ```
 
-This `4000` bound is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L129). It is unrelated to the model's window — it keeps the *wire payload to the UI* small. Two different budgets, two different reasons: `16_000` protects the model's context; `4000` protects the stream.
+This `4000` bound is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L192). It is unrelated to the model's window — it keeps the *wire payload to the UI* small. Two different budgets, two different reasons: `16_000` protects the model's context; `4000` protects the stream.
 
 **Schema summary caps** — bounding the prompt's static prefix. `lib/agents/monitoring.ts` L15–L48 builds a compact schema string instead of inlining the full ~112KB workspace schema:
 
@@ -104,7 +104,7 @@ The comment on L14 is explicit: "Compact, token-bounded schema summary for the p
 ```
 max_tokens (output token cap — the real unit)
   agent turn        4096   base.ts L74
-  synthesis call    2048   diagnostic.ts L94 / recommendation.ts L98
+  synthesis call    2048   diagnostic.ts L99 / recommendation.ts L98
   intent classifier   16   intent.ts L20   ← one word, nothing more
 ```
 
@@ -175,7 +175,7 @@ The Service layer governs input size in characters; the only token-denominated c
 ### Files, functions, and line ranges
 
 - **Tool-result char budget:** `MAX_TOOL_RESULT_CHARS = 16_000` and `truncate(s)` — `lib/agents/base.ts` L29, L31–L34. Applied at L150 before each `tool_result`.
-- **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L44–L48. Applied at L129 to the UI event payload only.
+- **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the UI event payload only.
 - **Schema-summary caps:** `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10` (`lib/agents/monitoring.ts` L21–L22), `MAX_CPROPS = 30` (L33); whole function L15–L48; intent comment at L14.
 - **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L94, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
 
@@ -253,7 +253,7 @@ The proxy's accuracy depends entirely on the *content*. blooming insights feeds 
 
 ### `max_tokens` (output cap)
 
-- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (diagnostic.ts L94 / recommendation.ts L98), `16` classifier (`lib/agents/intent.ts` L20).
+- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (diagnostic.ts L99 / recommendation.ts L98), `16` classifier (`lib/agents/intent.ts` L20).
 - **Why it's here:** it is the one hard token limit the SDK exposes that the code sets directly; the `16` on the classifier forces a single-word answer and caps that call's cost to near-nothing.
 - **Leading today:** every major provider exposes an output token cap (2026); it is universal, not differentiated.
 - **Why it leads:** it bounds the most variable cost component (output tokens cost more than input — see → 06-token-economics.md) with one integer.
@@ -324,7 +324,7 @@ payload ≈ window   →  proxy slop > margin    (bug) → count tokens
 
 **[arch] The `16_000` and `4000` constants — same purpose?**
 
-No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* conversation, protecting the context window. `4000` (`route.ts` L44) bounds the result payload streamed to the *browser*, protecting wire size. Conflating them would mean the UI dictates model context size or vice versa.
+No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* conversation, protecting the context window. `4000` (`route.ts` L99) bounds the result payload streamed to the *browser*, protecting wire size. Conflating them would mean the UI dictates model context size or vice versa.
 
 ```
 16_000 ──▶ model window        4000 ──▶ NDJSON to UI
@@ -338,7 +338,7 @@ No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* conversation, p
 ### One-line anchors
 
 - `lib/agents/base.ts` L29, L31–L34 — `MAX_TOOL_RESULT_CHARS = 16_000`, char truncation.
-- `app/api/agent/route.ts` L44 — `TRUNC = 4000`, UI-stream budget (different purpose).
+- `app/api/agent/route.ts` L99 — `TRUNC = 4000`, UI-stream budget (different purpose).
 - `lib/agents/monitoring.ts` L14, L21–L22, L33 — token-bounded schema summary via list caps.
 - `lib/agents/intent.ts` L20 — `max_tokens: 16`, the one-word classifier.
 - 4 chars ≈ 1 token (English); JSON tokenizes richer, so char budgets under-bound it.
@@ -366,3 +366,6 @@ A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` to stop truncatin
 ### Quick check — code reference test
 
 What `max_tokens` value forces the intent classifier to answer in one word, and where is it set? (Answer: `16` — `lib/agents/intent.ts` L20.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); character-budget facts and `base.ts`/`monitoring.ts`/`intent.ts` refs verified unchanged.

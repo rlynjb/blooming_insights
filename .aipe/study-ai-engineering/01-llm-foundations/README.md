@@ -8,7 +8,7 @@ Phase 1 of the blooming insights AI-engineering study guide: the load-bearing fa
 - **[02-tokenization.md](02-tokenization.md)** — Models bound and bill in tokens; blooming insights does no token counting and bounds prompts with *character* budgets (`MAX_TOOL_RESULT_CHARS=16_000`, route `TRUNC=4000`, `schemaSummary` caps) plus `max_tokens` — a coarse ≈4-chars/token proxy. (C1.1, learn-only)
 - **[03-sampling-parameters.md](03-sampling-parameters.md)** — No `temperature`/`top_p`/`top_k` set anywhere (Claude defaults); only `max_tokens` is tuned, including a deliberate `16` on the intent classifier. Why defaults are fine for the analysts and a small gap for the classifier/synthesis. (C1.3, B1.3)
 - **[04-structured-outputs.md](04-structured-outputs.md)** — The output contract: extract JSON from prose, validate the shape, repair via a clean-context `synthesize()` before `FALLBACK`. Native tool-use for *input*, parse-from-prose for the *final artifact*. (C1.4, B1.1) — **codebase strength.**
-- **[05-streaming.md](05-streaming.md)** — NDJSON over a `ReadableStream`, consumed by `fetch`+`getReader()`+`TextDecoder`, deliberately *not* `EventSource` (reconnect would re-fire the run). Streaming is the product surface, not a spinner. (C1.5, Case A here) — **codebase strength.**
+- **[05-streaming.md](05-streaming.md)** — NDJSON over a `ReadableStream` (schema bootstrap now happens *inside* the stream; `maxDuration = 300`), consumed by `fetch`+`getReader()`+`TextDecoder` in the StrictMode-safe `useInvestigation` hook, deliberately *not* `EventSource` (reconnect would re-fire the run). Streaming is the product surface, not a spinner. (C1.5, Case A here) — **codebase strength.**
 - **[06-token-economics.md](06-token-economics.md)** — Cost *bounds* present (`maxToolCalls` budgets, truncation, haiku-vs-sonnet tiering); cost *meter* absent (nothing reads `res.usage`, no `ai_call_log`). Bounded but blind. (C1.6, B1.2/B1.8)
 - **[07-heuristic-before-llm.md](07-heuristic-before-llm.md)** — The free path before the paid path: `parseIntent` substring heuristic before the `classifyIntent` haiku call, and the route's parameter-presence branch before either. (C1.9, B1.5/B1.8)
 - **[08-provider-abstraction.md](08-provider-abstraction.md)** — A *testability* seam (`McpCaller`/`McpTransport` + injected `anthropic` param → fakes in tests, no network), **not** multi-LLM-provider switching (one provider, concrete SDK type, no factory). (C1.8, B1.6)
@@ -21,3 +21,6 @@ Phase 1 of the blooming insights AI-engineering study guide: the load-bearing fa
 - **Honest gaps named, not hidden:** `06` (cost meter absent), `08` (provider portability absent), `03` (temperature unset) each state the absence plainly and name the fix — the gap *is* the interview signal.
 
 All citations are to blooming insights files (verified line numbers) and curriculum IDs for provenance only.
+
+---
+Updated: 2026-05-28 — Refreshed the 05-streaming entry for `maxDuration = 300`, bootstrap-in-stream, and the consumer's move to the `useInvestigation` hook; the rest of the index verified accurate against the current source.

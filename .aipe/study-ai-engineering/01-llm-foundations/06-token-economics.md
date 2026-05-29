@@ -18,7 +18,7 @@ LLM cost is the same problem with the meter missing. Every `anthropic.messages.c
 **The pivot: bounding cost and measuring cost are different jobs, and a system can do the first well while doing the second not at all.** A turn budget caps the worst case; a cost log tells you the typical case. blooming insights invests heavily in the bounds and skips the meter entirely — defensible for a demo, a real gap for production tuning.
 
 Before cost controls:
-- A diagnostic agent loops until the 60-second route timeout, burning tokens the whole way
+- A diagnostic agent loops until the 300-second route timeout, burning tokens the whole way
 - Every classification uses the full sonnet model
 - A 60KB tool result re-enters the conversation in full, inflating every subsequent turn
 
@@ -65,7 +65,7 @@ recommendation      4          fewer queries needed to propose actions
 query               6          free-form, broad tool access
 ```
 
-`budgetSpent` flips `forceFinal` once `toolCalls.length >= maxToolCalls` (`lib/agents/base.ts` L90–L91), forcing the model to stop querying and emit its answer. Without this, the loop runs until `maxTurns` (8) or the route's `maxDuration = 60` — burning tokens on every wasted turn. The budget is the primary defense against a runaway bill.
+`budgetSpent` flips `forceFinal` once `toolCalls.length >= maxToolCalls` (`lib/agents/base.ts` L90–L91), forcing the model to stop querying and emit its answer. Without this, the loop runs until `maxTurns` (8) or the route's `maxDuration = 300` (`app/api/agent/route.ts` L20) — burning tokens on every wasted turn. The budget is the primary defense against a runaway bill.
 
 ```
 turn 0  2 calls
@@ -105,7 +105,7 @@ A haiku call capped at `max_tokens: 16` (→ 03-sampling-parameters.md) costs a 
 
 ### Where the big line item is, and the meter that would show it
 
-The single most expensive call in an investigation is the **synthesis pass** when it runs. `synthesize()` (`lib/agents/diagnostic.ts` L82–L121, `lib/agents/recommendation.ts` L82–L127) is a *full sonnet call* with `max_tokens: 2048` of output, and it formats up to six tool results as evidence text in its input — large input, large output, on the dear model. It only fires when the loop's final turn fails to produce valid JSON (→ 04-structured-outputs.md), so its cost is conditional: zero on the happy path, ~2× the agent's tokens on the unlucky path.
+The single most expensive call in an investigation is the **synthesis pass** when it runs. `synthesize()` (`lib/agents/diagnostic.ts` L87–L126, `lib/agents/recommendation.ts` L82–L132) is a *full sonnet call* with `max_tokens: 2048` of output, and it formats up to six tool results as evidence text in its input — large input, large output, on the dear model. It only fires when the loop's final turn fails to produce valid JSON (→ 04-structured-outputs.md), so its cost is conditional: zero on the happy path, ~2× the agent's tokens on the unlucky path.
 
 ```
 investigation token cost (sonnet)
@@ -157,7 +157,7 @@ This diagram spans the call path and marks where each cost lever acts and where 
 │   truncate tool result → 16_000 chars  base.ts L31–34  ← smaller in  │
 │   schemaSummary caps   monitoring.ts L15–48            ← smaller in  │
 │       │                                                              │
-│   synthesize() (conditional)  diagnostic L82–121, 2048 out  ← spike  │
+│   synthesize() (conditional)  diagnostic L87–126, 2048 out  ← spike  │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  create(params)  base.ts L102
 ┌───────────────────────────▼───────────────────────────────────────────┐
@@ -183,12 +183,12 @@ Every lever the codebase pulls is upstream of the call (bound the spend); the on
 - **Call-count budgets (`maxToolCalls`):** monitoring `6` (`lib/agents/monitoring.ts` L74), diagnostic `6` (`lib/agents/diagnostic.ts` L61), recommendation `4` (`lib/agents/recommendation.ts` L57), query `6` (`lib/agents/query.ts` L41); enforced via `budgetSpent`/`forceFinal` at `lib/agents/base.ts` L90–L91.
 - **Input truncation:** `MAX_TOOL_RESULT_CHARS = 16_000` / `truncate` — `lib/agents/base.ts` L29, L31–L34; `schemaSummary` caps — `lib/agents/monitoring.ts` L15–L48.
 - **Model tiering:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14; `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9.
-- **The big line item:** `synthesize()` sonnet calls — `lib/agents/diagnostic.ts` L82–L121 (`max_tokens: 2048` at L94), `lib/agents/recommendation.ts` L82–L127 (L98).
+- **The big line item:** `synthesize()` sonnet calls — `lib/agents/diagnostic.ts` L87–L126 (`max_tokens: 2048` at L99), `lib/agents/recommendation.ts` L82–L132 (L98).
 - **The absent meter:** no read of `res.usage` anywhere; the model call at `lib/agents/base.ts` L102 returns it and discards it.
 
 ### Where the meter would live
 
-A token-accounting field would accumulate on `AgentRunResult` (`lib/agents/base.ts` L24–L27), populated by reading `res.usage` after `create` (L102) and after each `synthesize()` call. The route (`app/api/agent/route.ts`) would sum per-agent totals and either stream a final `usage` event or write an `ai_call_log` row alongside `saveInvestigation` (L162).
+A token-accounting field would accumulate on `AgentRunResult` (`lib/agents/base.ts` L24–L27), populated by reading `res.usage` after `create` (L102) and after each `synthesize()` call. The route (`app/api/agent/route.ts`) would sum per-agent totals and either stream a final `usage` event or write an `ai_call_log` row alongside `saveInvestigation` (called at `app/api/agent/route.ts` L254; the store is `lib/state/investigations.ts` L30).
 
 ---
 
@@ -334,7 +334,7 @@ Every model call bills by tokens, with output ~5× input, so cost engineering me
 
 **[senior] Output tokens cost ~5× input. Which call in an investigation is the expensive one, and how would you confirm it?**
 
-The conditional `synthesize()` pass — a full sonnet call with up to 2048 output tokens and large evidence input (`lib/agents/diagnostic.ts` L82–L121). It only fires when the loop's final turn fails to produce valid JSON. To *confirm* it, you would read `res.usage` per call — which this codebase does not do, so today it is a reasoned guess, not a measurement.
+The conditional `synthesize()` pass — a full sonnet call with up to 2048 output tokens and large evidence input (`lib/agents/diagnostic.ts` L87–L126). It only fires when the loop's final turn fails to produce valid JSON. To *confirm* it, you would read `res.usage` per call — which this codebase does not do, so today it is a reasoned guess, not a measurement.
 
 ```
 loop ok      → no synthesis → cheaper
@@ -361,7 +361,7 @@ Build the meter. Read `res.usage` per call and persist a per-run total (`ai_call
 - `lib/agents/diagnostic.ts` L61 / `recommendation.ts` L57 — `maxToolCalls` budgets (6 / 4).
 - `lib/agents/base.ts` L90–L91 — `budgetSpent`/`forceFinal`, the call-count cap.
 - `lib/agents/intent.ts` L14 — haiku classifier; `lib/agents/base.ts` L9 — sonnet agents (tiering).
-- `lib/agents/diagnostic.ts` L82–L121 — `synthesize()`, the conditional big line item.
+- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`, the conditional big line item.
 - `res.usage` returned at `base.ts` L102 and discarded — no cost meter exists.
 
 ---
@@ -387,3 +387,6 @@ A colleague says: "We have `maxToolCalls`, so cost is handled — skip the usage
 ### Quick check — code reference test
 
 Which model classifies intent, and why is it the cheap choice rather than the agent model? (Answer: `claude-haiku-4-5-20251001` — `lib/agents/intent.ts` L14; classification is a trivial three-way label, so it runs on the cheap haiku model while sonnet (`AGENT_MODEL`, `base.ts` L9) does the reasoning.)
+
+---
+Updated: 2026-05-28 — `maxDuration` 60→300 (route.ts L20); re-derived the `synthesize()` line ranges (diagnostic L87–L126, recommendation L82–L132) and the `saveInvestigation` location (now `lib/state/investigations.ts` L30, called at route.ts L254).

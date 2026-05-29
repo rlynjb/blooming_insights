@@ -71,10 +71,10 @@ lib/mcp/tools.ts — per-agent name subsets
  queryTools          L38–L40  [...new Set([...monitoring, ...diagnostic, ...recommendation])]
 ```
 
-Each agent passes its subset into `filterToolSchemas(this.allTools, <subset>)` when building the `toolSchemas` argument to `runAgentLoop` — diagnostic at `diagnostic.ts` L56, recommendation at `recommendation.ts` L52, monitoring at `monitoring.ts` L71, query at `query.ts` L36. `filterToolSchemas` (`tool-schemas.ts` L9–L21) keeps only the tools whose names are in the subset (`set.has(t.name)`, L14) and maps them to the Anthropic `Tool[]` shape.
+Each agent passes its subset into `filterToolSchemas(this.allTools, <subset>)` when building the `toolSchemas` argument to `runAgentLoop` — diagnostic at `diagnostic.ts` L57, recommendation at `recommendation.ts` L52, monitoring at `monitoring.ts` L79, query at `query.ts` L36. `filterToolSchemas` (`tool-schemas.ts` L9–L21) keeps only the tools whose names are in the subset (`set.has(t.name)`, L15) and maps them to the Anthropic `Tool[]` shape.
 
 ```
-filterToolSchemas as a router   (tool-schemas.ts L14)
+filterToolSchemas as a router   (tool-schemas.ts L15)
 ─────────────────────────────────────────────────────────────
  all (~40 McpToolDef) ──filter(set.has(name))──→ subset Tool[] ──→ params.tools
                                                  (base.ts L101)
@@ -113,21 +113,21 @@ intent.ts — classifyIntent   (L17–L31)
  return parseIntent(textOf(res))   ← heuristic coerces the model word  L30
 ```
 
-The ordering is the lesson. `parseIntent` is the heuristic layer (free, instant, no network); `classifyIntent` is the LLM layer (a real model call, but the cheapest/fastest model with a 16-token cap). In the route, the query path calls `classifyIntent` (`route.ts` L136) — and `classifyIntent`'s output still flows through `parseIntent` at L30, so the heuristic is the *normalizer* even on the LLM path. Heuristic at the front (and at the back, coercing the model's word), LLM in the middle for the hard cases the substring check cannot resolve.
+The ordering is the lesson. `parseIntent` is the heuristic layer (free, instant, no network); `classifyIntent` is the LLM layer (a real model call, but the cheapest/fastest model with a 16-token cap). In the route, the query path calls `classifyIntent` (`route.ts` L211) — and `classifyIntent`'s output still flows through `parseIntent` at L30, so the heuristic is the *normalizer* even on the LLM path. Heuristic at the front (and at the back, coercing the model's word), LLM in the middle for the hard cases the substring check cannot resolve.
 
 ---
 
 ### Where the two routers meet
 
-The route wires both. The investigation path (`insightId`) does not classify — the chain order is fixed (01-agents-vs-chains.md), so diagnostic and recommendation each get their subset directly. The query path (`q && !insightId`, `route.ts` L135–L142) runs `classifyIntent` (L136) to pick the framing, then constructs a `QueryAgent` whose tools are `queryTools` (the union). The intent does not change the tool set on the query path — `QueryAgent` always gets the union — it changes the *prompt framing* (the intent is injected into the system prompt, `query.ts` L28). So the two routers compose: intent routing picks the surface and framing; subset-scoping bounds what each surface can do.
+The route wires both. The investigation path (`insightId`) does not classify — the chain order is fixed and `step`-gated (01-agents-vs-chains.md), so diagnostic (on `step=diagnose`) and recommendation (on `step=recommend`) each get their subset directly. The query path (`q && !insightId`, `route.ts` L210–L218) runs `classifyIntent` (L211) to pick the framing, then constructs a `QueryAgent` whose tools are `queryTools` (the union). The intent does not change the tool set on the query path — `QueryAgent` always gets the union — it changes the *prompt framing* (the intent is injected into the system prompt, `query.ts` L28). So the two routers compose: intent routing picks the surface and framing; subset-scoping bounds what each surface can do.
 
 ```
-route.ts — both routers   (L135–L158)
+route.ts — both routers   (L210–L247)
 ─────────────────────────────────────────────────────────────
- q only:    classifyIntent(anthropic, q)          ← Router 2 (intent)
-            QueryAgent.answer(q, intent)            tools = queryTools (union)
- insightId: DiagnosticAgent.investigate(inv)       ← Router 1 (subset)
-            RecommendationAgent.propose(inv, diag)    diag tools / rec tools
+ q only:        classifyIntent(anthropic, q)          ← Router 2 (intent)
+                QueryAgent.answer(q, intent)            tools = queryTools (union)
+ step=diagnose: DiagnosticAgent.investigate(inv)       ← Router 1 (subset)
+ step=recommend:RecommendationAgent.propose(inv, diag)   diag tools / rec tools
 ```
 
 ---
@@ -150,7 +150,8 @@ The diagram spans three layers. The Route layer holds the intent classifier (Rou
 │              parseIntent(q)  ← heuristic (free)   intent.ts L6–12     │
 │              classifyIntent  ← haiku, 16 tok      intent.ts L17–31    │
 │              → QueryAgent.answer(q, intent)                           │
-│  insightId ─→ fixed chain (no intent classify): diagnostic → recommend│
+│  insightId ─→ fixed chain (no intent classify), step-gated:          │
+│              step=diagnose → diagnostic · step=recommend → recommend  │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ each agent selects its subset
 ┌───────────────────────────────▼───────────────────────────────────────┐
@@ -184,18 +185,18 @@ A reader who sees only this diagram should grasp: intent routing picks the surfa
 - **File:** `lib/mcp/tools.ts`
 - **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
 - **Line range:** L5–L13, L15–L25, L27–L34, L38–L40 (`queryTools` = de-duplicated union of all three)
-- **Role:** The allow-list of tool names each agent may use; `bootstrapTools` (L42–L46) is the separate session-start discovery set.
+- **Role:** The allow-list of tool names each agent may use; `bootstrapTools` (L50–L54) is the separate session-start discovery set.
 
 ### The filter that applies the subset
 
 - **File:** `lib/agents/tool-schemas.ts`
 - **Function / class:** `filterToolSchemas`
-- **Line range:** L9–L21; the filter at L14 (`set.has(t.name)`)
+- **Line range:** L9–L21; the filter at L15 (`set.has(t.name)`)
 - **Role:** Keeps only allowed tools and maps them to `Anthropic.Messages.Tool[]`; the result becomes `params.tools` at `base.ts` L101.
 
 ### Subset selection per agent
 
-- **File:** `lib/agents/diagnostic.ts` L56 · `recommendation.ts` L52 · `monitoring.ts` L71 · `query.ts` L36
+- **File:** `lib/agents/diagnostic.ts` L57 · `recommendation.ts` L52 · `monitoring.ts` L79 · `query.ts` L36
 - **Function / class:** the `toolSchemas: filterToolSchemas(this.allTools, <subset>)` argument to `runAgentLoop`
 - **Line range:** one line per agent
 - **Role:** Binds each agent to its subset at the call site.
@@ -211,13 +212,13 @@ A reader who sees only this diagram should grasp: intent routing picks the surfa
 
 - **File:** `app/api/agent/route.ts`
 - **Function / class:** `GET` → query branch
-- **Line range:** L135–L142 (`classifyIntent` at L136; `QueryAgent.answer(q, intent, ...)` at L139)
+- **Line range:** L210–L218 (`classifyIntent` at L211; `QueryAgent.answer(q, intent, ...)` at L214)
 - **Role:** Calls the classifier, then runs the query agent with the chosen intent as prompt framing (intent injected at `query.ts` L28).
 
 **Pseudocode — both routers** (`tools.ts` + `intent.ts` + `route.ts`):
 
 ```typescript
-// ROUTER 1 — subset by construction (diagnostic.ts L56)
+// ROUTER 1 — subset by construction (diagnostic.ts L57)
 toolSchemas: filterToolSchemas(this.allTools, diagnosticTools)  // model sees only these
 
 // ROUTER 2 — intent, heuristic-first (intent.ts)
@@ -232,7 +233,7 @@ async function classifyIntent(anthropic, query) {              // L17 — haiku 
     model: 'claude-haiku-4-5-...', max_tokens: 16, system: '...one word...' });
   return parseIntent(textOf(res));                             // L30 — heuristic normalizes
 }
-// route.ts L136: const intent = await classifyIntent(anthropic, q);
+// route.ts L211: const intent = await classifyIntent(anthropic, q);
 ```
 
 ---
@@ -283,7 +284,7 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 
 ### Static tool subsets via filterToolSchemas
 
-- **Codebase uses:** `const` name arrays in `lib/mcp/tools.ts`, applied by `filterToolSchemas` (`tool-schemas.ts` L14) to produce each agent's `params.tools`.
+- **Codebase uses:** `const` name arrays in `lib/mcp/tools.ts`, applied by `filterToolSchemas` (`tool-schemas.ts` L15) to produce each agent's `params.tools`.
 - **Why it's here:** Removing wrong tools from the menu is more robust than prompting against them.
 - **Leading today:** Per-agent / per-task static tool scoping is the adoption-leading approach in 2026; semantic tool retrieval is innovation-leading.
 - **Why it leads:** Deterministic, debuggable, and trivially correct for small catalogs.
@@ -291,7 +292,7 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 
 ### Intent classification (heuristic + small model)
 
-- **Codebase uses:** `parseIntent` substring heuristic + `classifyIntent` haiku call (`intent.ts` L6–L31), wired at `route.ts` L136.
+- **Codebase uses:** `parseIntent` substring heuristic + `classifyIntent` haiku call (`intent.ts` L6–L31), wired at `route.ts` L211.
 - **Why it's here:** A free deterministic check resolves the common case; a cheap model resolves ambiguity.
 - **Leading today:** Small-model / heuristic request classification is the adoption-leading router in 2026.
 - **Why it leads:** Fast, cheap, and good enough for a 3-way classification with a deterministic fallback.
@@ -314,7 +315,7 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 - **Exercise ID:** C1.9 (adapted to blooming insights)
 - **What to build:** Make the query path call `parseIntent(q)` first; only fall through to `classifyIntent` (the haiku call) when the heuristic hits its `'diagnostic'` *default* (i.e., no keyword matched), so unambiguous keyworded queries skip the model call entirely.
 - **Why it earns its place:** Demonstrates the heuristic-before-LLM ordering as a latency/cost optimization — a clean token-economics signal.
-- **Files to touch:** `app/api/agent/route.ts` (L135–L139); optionally a `parseIntentConfident` helper in `lib/agents/intent.ts`.
+- **Files to touch:** `app/api/agent/route.ts` (L210–L214); optionally a `parseIntentConfident` helper in `lib/agents/intent.ts`.
 - **Done when:** A query containing a keyword (e.g., "recommendation ideas") routes with zero model calls, and a keyword-free query still falls through to `classifyIntent`.
 - **Estimated effort:** <1hr
 
@@ -323,7 +324,7 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 - **Exercise ID:** C4.6 (adapted to blooming insights)
 - **What to build:** Today `QueryAgent` always gets `queryTools` (the full union, `query.ts` L36). Use the classified `intent` to narrow the subset — a `'monitoring'` query gets `monitoringTools`, etc. — so intent routing controls *both* framing and the tool menu, not just framing.
 - **Why it earns its place:** Shows you can compose the two routers — intent routing now drives subset-scoping — improving tool-selection accuracy on the free-form path.
-- **Files to touch:** `lib/agents/query.ts` (L24, L36 — accept and apply the subset for the intent); `app/api/agent/route.ts` (pass intent through, L139); `test/agents/query.test.ts`.
+- **Files to touch:** `lib/agents/query.ts` (L24, L36 — accept and apply the subset for the intent); `app/api/agent/route.ts` (pass intent through, L214); `test/agents/query.test.ts`.
 - **Done when:** A `'monitoring'` query's `runAgentLoop` is handed only `monitoringTools`, verified by a unit test with a fake MCP, and a `'diagnostic'` query gets `diagnosticTools`.
 - **Estimated effort:** 1–4hr
 
@@ -331,7 +332,7 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 
 ## Summary
 
-blooming insights routes at two levels. Router 1 is static tool scoping: each agent is constructed with only its tool subset (`monitoringTools` / `diagnosticTools` / `recommendationTools` in `lib/mcp/tools.ts`), applied by `filterToolSchemas` (`tool-schemas.ts` L14) so the model's menu (`params.tools`, `base.ts` L101) never contains a wrong tool — routing by construction. Router 2 is dynamic intent classification for the free-form `?q=` path: `parseIntent` (a free substring heuristic, `intent.ts` L6–L12) first, `classifyIntent` (a haiku call capped at 16 tokens, L17–L31) as the fallback, with the heuristic normalizing the model's output. The two compose at the route: intent picks the surface and framing, subset-scoping bounds what each surface can do.
+blooming insights routes at two levels. Router 1 is static tool scoping: each agent is constructed with only its tool subset (`monitoringTools` / `diagnosticTools` / `recommendationTools` in `lib/mcp/tools.ts`), applied by `filterToolSchemas` (`tool-schemas.ts` L15) so the model's menu (`params.tools`, `base.ts` L101) never contains a wrong tool — routing by construction. Router 2 is dynamic intent classification for the free-form `?q=` path: `parseIntent` (a free substring heuristic, `intent.ts` L6–L12) first, `classifyIntent` (a haiku call capped at 16 tokens, L17–L31) as the fallback, with the heuristic normalizing the model's output. The two compose at the route: intent picks the surface and framing, subset-scoping bounds what each surface can do.
 
 Key points:
 - Subset-scoping prevents the wrong tool by *removing it from the menu*, not by prompting against it.
@@ -352,7 +353,7 @@ Key points:
 
 **[mid] "How does the diagnostic agent avoid calling a recommendation-only tool?"**
 
-It cannot call one — `diagnostic.ts` L56 passes `filterToolSchemas(this.allTools, diagnosticTools)`, so `params.tools` (`base.ts` L101) contains only diagnostic tools. A recommendation-only tool like `list_voucher_pools` is not in the array the model is shown, so there is no `tool_use` block it could emit for it. The prevention is structural, not prompt-based.
+It cannot call one — `diagnostic.ts` L57 passes `filterToolSchemas(this.allTools, diagnosticTools)`, so `params.tools` (`base.ts` L101) contains only diagnostic tools. A recommendation-only tool like `list_voucher_pools` is not in the array the model is shown, so there is no `tool_use` block it could emit for it. The prevention is structural, not prompt-based.
 
 ```
 allTools (~40) ──filter(diagnosticTools)──→ ~17 tools shown
@@ -388,8 +389,8 @@ Honestly: `parseIntent` gets it *wrong* on the heuristic path. The string contai
 ### One-line anchors
 
 - `lib/mcp/tools.ts` L5–L34 — the three per-agent subsets; `queryTools` L38–L40 is their union.
-- `lib/agents/tool-schemas.ts` L14 — `set.has(t.name)` — the filter that enforces the subset.
-- `lib/agents/diagnostic.ts` L56 — `filterToolSchemas(this.allTools, diagnosticTools)` — subset binding.
+- `lib/agents/tool-schemas.ts` L15 — `set.has(t.name)` — the filter that enforces the subset.
+- `lib/agents/diagnostic.ts` L57 — `filterToolSchemas(this.allTools, diagnosticTools)` — subset binding.
 - `lib/agents/intent.ts` L6–L12 — `parseIntent` — the free heuristic and the normalizer.
 - `lib/agents/intent.ts` L17–L31 — `classifyIntent` — haiku fallback, `max_tokens: 16`.
 
@@ -407,7 +408,7 @@ Out loud: explain why subset-scoping prevents the wrong-tool failure more reliab
 
 ### Level 3 — Apply
 
-Scenario: a diagnostic investigation needs to inspect a voucher pool, but the agent never calls `list_voucher_pools`. Why? Check `lib/mcp/tools.ts` L15–L25 (`diagnosticTools`) — is `list_voucher_pools` in the subset? (It is in `recommendationTools`, L33, not `diagnosticTools`.) Explain that the tool is structurally absent from the diagnostic agent's menu, and name the two fixes: add it to `diagnosticTools`, or route the question to the recommendation surface.
+Scenario: a diagnostic investigation needs to inspect a voucher pool, but the agent never calls `list_voucher_pools`. Why? Check `lib/mcp/tools.ts` L15–L25 (`diagnosticTools`) — is `list_voucher_pools` in the subset? (It is in `recommendationTools`, L32, not `diagnosticTools`.) Explain that the tool is structurally absent from the diagnostic agent's menu, and name the two fixes: add it to `diagnosticTools`, or route the question to the recommendation surface.
 
 ### Level 4 — Defend
 
@@ -416,3 +417,6 @@ A reviewer says: "Hand-maintaining three tool arrays is a maintenance burden —
 ### Quick check — code reference test
 
 What does `classifyIntent` do with the haiku model's text output before returning it, and why? (Answer: it passes it through `parseIntent` — `intent.ts` L30 — to coerce a possibly-noisy one-word answer into a valid `Intent`, defaulting to `'diagnostic'`.)
+
+---
+Updated: 2026-05-28 — Corrected `set.has` to L15 and refreshed the `route.ts` query-branch refs (L210–L218); noted the investigation chain is now `step`-gated (`step=diagnose`/`step=recommend`) and fixed the `bootstrapTools`/`list_voucher_pools`/per-agent subset line numbers.

@@ -78,17 +78,16 @@ That is the entirety of what the model "returns" to the rest of the system: a jo
 
 ### The trust boundary: parse, validate, fall back
 
-The diagnostic agent shows the full discipline. After the loop returns `finalText`, `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts` L73–L77) runs a three-tier chain:
+The diagnostic agent shows the full discipline. After the loop returns `finalText`, `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts` L74–L75) runs a three-tier chain:
 
 ```typescript
-return (
-  tryParseDiagnosis(finalText) ??              // L74  parse + validate
-  (await this.synthesize(anomaly, toolCalls)) ?? // L75  retry, clean context
-  FALLBACK                                      // L76  hard-coded safe value
-);
+const diag =                                     // L74
+  tryParseDiagnosis(finalText)                   //      parse + validate
+  ?? (await this.synthesize(anomaly, toolCalls)) //      retry, clean context
+  ?? FALLBACK;                                    // L75  hard-coded safe value
 ```
 
-`tryParseDiagnosis` (`lib/agents/diagnostic.ts` L21–L28) does the two things you do to any untrusted payload: it parses (`parseAgentJson`, `lib/mcp/validate.ts` L3–L13) and it validates the shape (`isDiagnosis`, `lib/mcp/validate.ts` L29–L35). If either step fails, it returns `null` — it never lets a malformed object through.
+(`investigate` then post-derives `diag.confidence` via `diagnosisConfidence` at L80–L82 — see → 04-structured-outputs.md.) `tryParseDiagnosis` (`lib/agents/diagnostic.ts` L22–L29) does the two things you do to any untrusted payload: it parses (`parseAgentJson`, `lib/mcp/validate.ts` L3–L13) and it validates the shape (`isDiagnosis`, `lib/mcp/validate.ts` L29–L35). If either step fails, it returns `null` — it never lets a malformed object through.
 
 ```
 finalText (untrusted string)
@@ -103,7 +102,7 @@ isDiagnosis ──── false? ───▶ null
 typed Diagnosis ✓
 ```
 
-The `FALLBACK` (`lib/agents/diagnostic.ts` L15–L19) is the floor:
+The `FALLBACK` (`lib/agents/diagnostic.ts` L16–L20) is the floor:
 
 ```typescript
 const FALLBACK: Diagnosis = {
@@ -119,7 +118,7 @@ This object is a literal, written by hand, with no model involvement. It exists 
 
 ### Why the boundary is non-negotiable
 
-The monitoring agent makes the same point in its degradation path (`lib/agents/monitoring.ts` L85–L92):
+The monitoring agent makes the same point in its degradation path (`lib/agents/monitoring.ts` L95–L101):
 
 ```typescript
 let parsed: unknown;
@@ -177,7 +176,7 @@ This diagram spans the full path from prompt to typed value. The Provider layer 
 │  └──┬─────────────────────────────────┘                             │
 │     │ valid           │ invalid / threw                             │
 │     ▼                 ▼                                              │
-│  typed Diagnosis   synthesize() ?? FALLBACK   diagnostic.ts L73–L77 │
+│  typed Diagnosis   synthesize() ?? FALLBACK   diagnostic.ts L74–L75 │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -193,7 +192,7 @@ The model never hands the system a `Diagnosis`. It hands the system a string, an
 - **Text extraction:** `res.content.filter(b => b.type === 'text').map(b => b.text).join('')` — `lib/agents/base.ts` L108–L113 (surfacing to `onText`) and L122 (the returned `finalText`).
 - **Parse step:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three escalating strategies: markdown fence, bare `JSON.parse`, then a first-bracket-to-last-bracket substring scan; throws if all fail.
 - **Validate step (type guards):** `isAnomalyArray` (`lib/mcp/validate.ts` L17–L27), `isDiagnosis` (L29–L35), `isRecommendationArray` (L42–L53). Each is a `v is T` predicate that proves the shape field by field.
-- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L15–L19; the three-tier chain — `lib/agents/diagnostic.ts` L73–L77. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L85–L92.
+- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L16–L20; the three-tier chain — `lib/agents/diagnostic.ts` L74–L75. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L95–L101.
 - **Model identity:** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9. The one constant naming the function being called.
 
 ### Why three tiers, not one
@@ -308,7 +307,7 @@ An LLM is a function that maps a token sequence to a sampled token, looped until
 **Key points:**
 - An LLM call returns a `string`, not your domain type — the type is manufactured downstream by parse + validate.
 - `parseAgentJson` + a `v is T` type guard is the parse-and-validate boundary every model output crosses (`lib/mcp/validate.ts`).
-- `FALLBACK` is model-independent by design so the bottom tier of the chain can never itself fail (`lib/agents/diagnostic.ts` L15–L19).
+- `FALLBACK` is model-independent by design so the bottom tier of the chain can never itself fail (`lib/agents/diagnostic.ts` L16–L20).
 - Validation proves shape, not correctness — a hallucinated diagnosis passes every guard.
 - Treating the model like a flaky third-party `fetch` is what makes a bad generation degrade one investigation instead of crashing the system.
 
@@ -332,7 +331,7 @@ res.content → [text, text] → join → finalText: string → parse → valida
 
 **[senior] The model returns valid JSON 95% of the time. Why build a fallback chain for the other 5%?**
 
-Because at production volume 5% is not an edge case — it is a routine event, and an unhandled one crashes a real user's investigation. The chain (`lib/agents/diagnostic.ts` L73–L77) covers three distinct failure modes: malformed loop output (`tryParseDiagnosis`), salvageable-evidence-but-prose (`synthesize`), and total failure (`FALLBACK`). The bottom tier is hand-written so it cannot itself fail.
+Because at production volume 5% is not an edge case — it is a routine event, and an unhandled one crashes a real user's investigation. The chain (`lib/agents/diagnostic.ts` L74–L75) covers three distinct failure modes: malformed loop output (`tryParseDiagnosis`), salvageable-evidence-but-prose (`synthesize`), and total failure (`FALLBACK`). The bottom tier is hand-written so it cannot itself fail.
 
 ```
 95% → tryParseDiagnosis ✓
@@ -358,8 +357,8 @@ truth?         →  "is it correct?"   (evals — separate layer)
 - `lib/agents/base.ts` L102 — the one model call.
 - `lib/agents/base.ts` L122 — text blocks → `finalText: string`, the trust boundary.
 - `lib/mcp/validate.ts` L3–L13, L29–L35 — parse then prove shape.
-- `lib/agents/diagnostic.ts` L73–L77 — the three-tier chain.
-- `lib/agents/diagnostic.ts` L15–L19 — `FALLBACK`, the model-independent floor.
+- `lib/agents/diagnostic.ts` L74–L75 — the three-tier chain.
+- `lib/agents/diagnostic.ts` L16–L20 — `FALLBACK`, the model-independent floor.
 
 ---
 
@@ -375,7 +374,7 @@ Out loud: why is `finalText` typed `string` and not `Diagnosis`, even though the
 
 ### Level 3 — Apply
 
-Scenario: a new "summary" agent is added that should return `{ headline: string; bullets: string[] }`. Using `lib/agents/diagnostic.ts` L21–L28 and L73–L77 as the template, describe the parse function, the type guard you would add to `lib/mcp/validate.ts`, and the `FALLBACK` literal — and explain why the `FALLBACK` must not call the model.
+Scenario: a new "summary" agent is added that should return `{ headline: string; bullets: string[] }`. Using `lib/agents/diagnostic.ts` L22–L29 and L74–L75 as the template, describe the parse function, the type guard you would add to `lib/mcp/validate.ts`, and the `FALLBACK` literal — and explain why the `FALLBACK` must not call the model.
 
 ### Level 4 — Defend
 
@@ -384,3 +383,6 @@ A colleague says: "Anthropic supports tool-use JSON mode now; rip out `parseAgen
 ### Quick check — code reference test
 
 What is the exact return type of `runAgentLoop`, and which field of it is the untrusted model output? (Answer: `AgentRunResult = { finalText: string; toolCalls: ToolCall[] }` — `lib/agents/base.ts` L24–L27; `finalText` is the untrusted string.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted `diagnostic.ts`/`monitoring.ts` line refs (chain L74–L75, `tryParseDiagnosis` L22–L29, `FALLBACK` L16–L20, monitoring degradation L95–L101) and noted the post-derived `diag.confidence`; `base.ts`/`runAgentLoop` refs verified unchanged.

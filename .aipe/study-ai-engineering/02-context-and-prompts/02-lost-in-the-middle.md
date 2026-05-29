@@ -66,7 +66,7 @@ system: forceFinal && synthesisInstruction
   : system,
 ```
 
-The base system prompt — the persona, the schema summary, the task framing — comes first. The instruction "you have NO more tool calls available, stop and emit ONLY JSON" comes last (its text lives in each agent, e.g. `lib/agents/diagnostic.ts` L62–L66). On the final turn this is the single most important directive, and it sits at the high-attention tail of the system block rather than buried above the schema.
+The base system prompt — the persona, the schema summary, the task framing — comes first. The instruction "you have NO more tool calls available, stop and emit ONLY JSON" comes last (its text lives in each agent, e.g. `lib/agents/diagnostic.ts` L63–L67). On the final turn this is the single most important directive, and it sits at the high-attention tail of the system block rather than buried above the schema.
 
 ```
 system prompt on the forced-final turn
@@ -108,7 +108,7 @@ The accumulated middle (turns 1…N-1) is the sag; the latest tool result is at 
 
 ### The dedicated synthesize() call sidesteps the middle entirely
 
-When the loop's final turn still fails to produce JSON, `synthesize()` (`lib/agents/diagnostic.ts` L82–L121) makes a *fresh* single-turn call with no accumulated transcript at all — just the anomaly, the formatted evidence, and the instruction. There is no middle to get lost in: the whole context is short, and the directive ("output ONLY JSON") sits at the end of a compact message (L103–L108). Collapsing the context is the most direct lost-in-the-middle mitigation available without retrieval — if there is no long middle, nothing can be lost in it.
+When the loop's final turn still fails to produce JSON, `synthesize()` (`lib/agents/diagnostic.ts` L87–L126) makes a *fresh* single-turn call with no accumulated transcript at all — just the anomaly, the formatted evidence, and the instruction. There is no middle to get lost in: the whole context is short, and the directive ("output ONLY JSON") sits at the end of a compact message (L105–L113). Collapsing the context is the most direct lost-in-the-middle mitigation available without retrieval — if there is no long middle, nothing can be lost in it.
 
 ```
 loop context (long)                synthesize() context (short, flat)
@@ -182,9 +182,9 @@ The Service layer places the must-obey directive and the freshest evidence at th
 
 ### Files, functions, and line ranges
 
-- **`synthesisInstruction` appended last:** `lib/agents/base.ts` L95–L98 — the directive is concatenated to the end of the system prompt on the `forceFinal` turn. Per-agent instruction text: `lib/agents/diagnostic.ts` L62–L66, `lib/agents/recommendation.ts` L58–L62, `lib/agents/monitoring.ts` L75–L78.
+- **`synthesisInstruction` appended last:** `lib/agents/base.ts` L95–L98 — the directive is concatenated to the end of the system prompt on the `forceFinal` turn. Per-agent instruction text: `lib/agents/diagnostic.ts` L63–L67, `lib/agents/recommendation.ts` L58–L62, `lib/agents/monitoring.ts` L85–L89.
 - **Tool results as the most-recent turn:** `lib/agents/base.ts` L171 — `messages.push({ role: 'user', content: toolResults })`; the array starts at L79–L81 and grows with each assistant turn (L105) and each result batch (L171).
-- **Context-collapsing escape hatch:** `lib/agents/diagnostic.ts` L82–L121 (`synthesize()`) and `lib/agents/recommendation.ts` L82–L127 — a fresh single-turn call with a short flat context and the directive at the end (e.g. `diagnostic.ts` L103–L108).
+- **Context-collapsing escape hatch:** `lib/agents/diagnostic.ts` L87–L126 (`synthesize()`) and `lib/agents/recommendation.ts` L82–L132 — a fresh single-turn call with a short flat context and the directive at the end (e.g. `diagnostic.ts` L105–L113).
 
 ### Where retrieval reordering would live
 
@@ -330,7 +330,7 @@ Models recall content at the start and end of a context far better than the midd
 
 **[senior] Why is the dedicated `synthesize()` call more reliable than fixing the prompt inside the loop?**
 
-Two reasons compound. The loop context is long — six tool-call pairs pile up in the middle, the sag. `synthesize()` (`lib/agents/diagnostic.ts` L82–L121) makes a fresh single-turn call with a short flat context: there is no middle for evidence to get lost in, and the directive sits at the end of a compact message. Collapsing the context is the most direct lost-in-the-middle fix available without retrieval.
+Two reasons compound. The loop context is long — six tool-call pairs pile up in the middle, the sag. `synthesize()` (`lib/agents/diagnostic.ts` L87–L126) makes a fresh single-turn call with a short flat context: there is no middle for evidence to get lost in, and the directive sits at the end of a compact message. Collapsing the context is the most direct lost-in-the-middle fix available without retrieval.
 
 ```
 long loop context: evidence in the sag → underweighted
@@ -354,7 +354,7 @@ long, low-signal context     → need retrieval + rerank (absent)
 
 - `lib/agents/base.ts` L98 — `synthesisInstruction` appended last to the system prompt (strong-end placement).
 - `lib/agents/base.ts` L171 — tool results pushed as the most-recent turn (recency edge).
-- `lib/agents/diagnostic.ts` L82–L121 — `synthesize()` collapses the context so there is no middle.
+- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()` collapses the context so there is no middle.
 - Attention is U-shaped; placement reorders, retrieval+reranking curates — only the second cures the middle.
 - The real fix (reranking) is absent — → ../03-retrieval-and-rag/07-reranking.md.
 
@@ -381,3 +381,6 @@ A reviewer says: "Recency placement is enough — we don't need a reranker." Def
 ### Quick check — code reference test
 
 On the forced-final turn, where in the system prompt does the must-obey directive sit, and which line places it there? (Answer: at the *end* — `lib/agents/base.ts` L98 concatenates `synthesisInstruction` after the base `system` prompt.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted `synthesize()` ranges (diagnostic L87–L126, recommendation L82–L132, compact message L105–L113) and per-agent `synthesisInstruction` text refs (diagnostic L63–L67, monitoring L85–L89); the recency-placement `base.ts` refs (L95–L98, L171) verified unchanged.

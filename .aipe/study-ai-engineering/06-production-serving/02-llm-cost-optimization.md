@@ -83,13 +83,13 @@ Each agent caps the total number of tool calls it may make. Once the cap is hit,
 ```
 agent              maxToolCalls   where
 ─────────────      ────────────   ──────────────────────────
-MonitoringAgent         6         lib/agents/monitoring.ts L74
-DiagnosticAgent         6         lib/agents/diagnostic.ts L61
+MonitoringAgent         6         lib/agents/monitoring.ts L84
+DiagnosticAgent         6         lib/agents/diagnostic.ts L62
 RecommendationAgent     4         lib/agents/recommendation.ts L57
 QueryAgent              6         lib/agents/query.ts L41
 ```
 
-`budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls` at `lib/agents/base.ts` L90; `forceFinal` at L91 flips on when the budget is spent. Without this cap an agent could explore until the `maxDuration = 60` route limit (`app/api/agent/route.ts` L18) killed it — burning tokens the whole way with nothing to show.
+`budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls` at `lib/agents/base.ts` L90; `forceFinal` at L91 flips on when the budget is spent. Without this cap an agent could explore until the `maxDuration = 300` route limit (`app/api/agent/route.ts` L20) killed it — burning tokens the whole way with nothing to show.
 
 ```
 turn  toolCalls  budgetSpent  → tokens spent grow linearly per turn
@@ -107,16 +107,16 @@ Two truncation points keep token counts from ballooning as tool results accumula
 
 ```
  MCP result ──► truncate(16_000) ──► fed back as tool_result   lib/agents/base.ts L29,L31
- tool result ──► trunc(4000) ──────► sent to UI as NDJSON       app/api/agent/route.ts L44
+ tool result ──► trunc(4000) ──────► sent to UI as NDJSON       app/api/agent/route.ts L99
 ```
 
-`MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) caps what re-enters the model's context — critical because the full message history is re-sent on every turn (L99), so an un-truncated 50k result would be re-charged 5+ times. The route's `TRUNC = 4000` (L44) is a separate, smaller cap for what streams to the browser. `schemaSummary` (`lib/agents/monitoring.ts`) further caps the schema injected into prompts (20 events / 10 props / 30 customer-props).
+`MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) caps what re-enters the model's context — critical because the full message history is re-sent on every turn (L99), so an un-truncated 50k result would be re-charged 5+ times. The route's `TRUNC = 4000` (`app/api/agent/route.ts` L99) is a separate, smaller cap for what streams to the browser. `schemaSummary` (`lib/agents/monitoring.ts`) further caps the schema injected into prompts (20 events / 10 props / 30 customer-props).
 
 ---
 
 ### Shrink — caching (cross-reference)
 
-The 60s exact-match tool cache (`lib/mcp/client.ts` L35–L65) removes repeat network round-trips and the tokens of re-feeding an identical result. The investigation replay cache (`lib/state/investigations.ts`) removes entire runs. Both are covered in `01-llm-caching.md`. The cost lever they do *not* pull — prompt caching of the static prefix — is the unbuilt shrink lever below.
+The 60s exact-match tool cache (`lib/mcp/client.ts` L97–L146) removes repeat network round-trips and the tokens of re-feeding an identical result. The investigation replay cache (`lib/state/investigations.ts`) removes entire runs. Both are covered in `01-llm-caching.md`. The cost lever they do *not* pull — prompt caching of the static prefix — is the unbuilt shrink lever below.
 
 ---
 
@@ -131,7 +131,7 @@ Input tokens are many but cheap; output tokens are few but several times more ex
  synthesize()         output-heavy (JSON)  HIGH per token  ← line item
 ```
 
-`DiagnosticAgent.synthesize` (`lib/agents/diagnostic.ts` L82–L121) is a dedicated `anthropic.messages.create` with `max_tokens: 2048` (L94) on sonnet, emitting a full diagnosis JSON. `RecommendationAgent.synthesize` mirrors it at `max_tokens: 2048`. These output-heavy sonnet calls are the dominant cost per investigation — and the codebase has no telemetry pointing at them.
+`DiagnosticAgent.synthesize` (`lib/agents/diagnostic.ts` L87–L126) is a dedicated `anthropic.messages.create` with `max_tokens: 2048` (L99) on sonnet, emitting a full diagnosis JSON. `RecommendationAgent.synthesize` mirrors it at `max_tokens: 2048` (`lib/agents/recommendation.ts` L98). These output-heavy sonnet calls are the dominant cost per investigation — and the codebase has no telemetry pointing at them.
 
 ---
 
@@ -189,7 +189,7 @@ This diagram spans the Route, Agent, and Provider layers and marks each cost lev
   │  ┌────▼───────────────────────────────────────────────┐            │
   │  │  synthesize()  sonnet, max_tokens 2048, JSON out     │            │
   │  │  OUTPUT-HEAVY → dominant line item                   │            │
-  │  │  diagnostic.ts L82–L121 / recommendation.ts L82–L127 │            │
+  │  │  diagnostic.ts L87–L126 / recommendation.ts L82–L132 │            │
   │  └─────────────────────────────────────────────────────┘            │
   └───────┼──────────────────────────────────────────────────────────────┘
           │  mcp.callTool
@@ -221,19 +221,19 @@ A cheap haiku model decides the agent surface; sonnet does the actual work. Cont
 **Function / class:** `runAgentLoop` budget logic + `truncate`
 **Line range:** `budgetSpent`/`forceFinal` L90–L91; `MAX_TOOL_RESULT_CHARS = 16_000` L29, `truncate` L31–L34; default `maxTokens = 4096` L74.
 
-Per-agent caps: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Route-side `TRUNC = 4000` at `app/api/agent/route.ts` L44.
+Per-agent caps: monitoring 6 (`monitoring.ts` L84), diagnostic 6 (`diagnostic.ts` L62), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Route-side `TRUNC = 4000` at `app/api/agent/route.ts` L99.
 
 ### The output-heavy synthesis cost (Case A — the line item)
 
 **File:** `lib/agents/diagnostic.ts`
 **Function / class:** `DiagnosticAgent.synthesize`
-**Line range:** L82–L121 (sonnet at L93, `max_tokens: 2048` L94). Mirrored by `RecommendationAgent.synthesize` (`lib/agents/recommendation.ts` L82–L127).
+**Line range:** L87–L126 (sonnet at L98, `max_tokens: 2048` L99). Mirrored by `RecommendationAgent.synthesize` (`lib/agents/recommendation.ts` L82–L132, sonnet at L97, `max_tokens: 2048` L98).
 
 ### Cost telemetry + in-agent cascade + prompt caching (Case B — Not yet implemented)
 
 **Not yet implemented.** Every `anthropic.messages.create` response carries a `usage` object (`input_tokens`, `output_tokens`, cache fields), but blooming insights reads it nowhere — there is no per-run cost meter, no in-agent escalation from a cheaper model, and no `cache_control` on the prefix.
 
-Where it would live: a cost meter would accumulate `res.usage` inside `runAgentLoop` (`lib/agents/base.ts` L102) and the two `synthesize()` calls, summing per request in the route's `start()` block (`app/api/agent/route.ts` L106) and emitting a `cost` field on the `done` event. The cheap-first cascade would wrap the `model` choice in `runAgentLoop` (L93). Prompt caching attaches to the `system` field at L98 (see `01-llm-caching.md`).
+Where it would live: a cost meter would accumulate `res.usage` inside `runAgentLoop` (`lib/agents/base.ts` L102) and the two `synthesize()` calls, summing per request in the route's `start()` block (`app/api/agent/route.ts` L170) and emitting a `cost` field on the `done` event (sent at L251). The cheap-first cascade would wrap the `model` choice in `runAgentLoop` (L93). Prompt caching attaches to the `system` field at L98 (see `01-llm-caching.md`).
 
 ---
 
@@ -301,7 +301,7 @@ Edge routing has a ceiling: the classifier itself can be wrong, sending an easy 
 ### token budgeting
 
 - **Codebase uses:** `maxToolCalls` (6/6/4/6), `max_tokens` caps (4096 default, 2048 synthesis, 16 classifier), `truncate(16_000)`.
-- **Why it's here:** bounds tokens and latency so an agent cannot run up the bill against the 60s route ceiling.
+- **Why it's here:** bounds tokens and latency so an agent cannot run up the bill against the 300s route ceiling.
 - **Leading today:** framework-level budgets (LangGraph `recursion_limit`, Anthropic Agent SDK turn caps) (adoption-leading, 2026).
 - **Why it leads:** budgets are enforced by the orchestration layer, not hand-rolled per agent.
 - **Runner-up:** a hand-rolled turn/tool counter — exactly what `runAgentLoop` does.
@@ -323,7 +323,7 @@ Edge routing has a ceiling: the classifier itself can be wrong, sending an easy 
 - **Exercise ID:** C5.3 (cost) / B5.3 (adapted) — provenance C5.2/C5.3.
 - **What to build:** Accumulate `input_tokens` and `output_tokens` from every `res.usage` across an investigation — the loop turns in `runAgentLoop` plus both `synthesize()` calls — multiply by per-model rates, and emit a `cost` field (with a per-call breakdown) on the `done` NDJSON event so the UI can show what a run cost.
 - **Why it earns its place:** it proves you know cost optimization starts with measurement, and it surfaces the output-heavy `synthesize()` line item that is currently invisible.
-- **Files to touch:** `lib/agents/base.ts` (read `res.usage` after L102), `lib/agents/diagnostic.ts` + `lib/agents/recommendation.ts` (read `res.usage` in `synthesize()` at L92), `app/api/agent/route.ts` (sum per request in `start()` L106, emit on `done` L161), `lib/mcp/events.ts` (extend the `done` event shape).
+- **Files to touch:** `lib/agents/base.ts` (read `res.usage` after L102), `lib/agents/diagnostic.ts` + `lib/agents/recommendation.ts` (read `res.usage` in `synthesize()` after the create at L97/L96), `app/api/agent/route.ts` (sum per request in `start()` L170, emit on `done` L251), `lib/mcp/events.ts` (extend the `done` event shape).
 - **Done when:** a live diagnostic run emits a `done` event whose `cost` breakdown shows the synthesis calls outweighing the loop turns, matching a hand calculation from the printed token counts.
 - **Estimated effort:** 1–4hr.
 
@@ -332,7 +332,7 @@ Edge routing has a ceiling: the classifier itself can be wrong, sending an easy 
 - **Exercise ID:** B5.2 (adapted) — provenance C5.2 (latency/cost cascade).
 - **What to build:** In `DiagnosticAgent`, run the loop on haiku first; if the result fails `isDiagnosis`, escalate and re-run on sonnet. Gate it on the cost meter so you can prove whether the cascade nets out.
 - **Why it earns its place:** demonstrates the FrugalGPT cascade and an honest reckoning with its double-pay failure mode using real measurement.
-- **Files to touch:** `lib/agents/base.ts` (parameterize the `model` at L93), `lib/agents/diagnostic.ts` (`investigate` L44–L78 — add the escalation path).
+- **Files to touch:** `lib/agents/base.ts` (parameterize the `model` at L93), `lib/agents/diagnostic.ts` (`investigate` L45–L83 — add the escalation path).
 - **Done when:** runs where haiku's output passes `isDiagnosis` cost measurably less; runs where it fails show the double-pay clearly in the cost meter — proving you measured the tradeoff rather than assumed it.
 - **Estimated effort:** 1–2 days.
 
@@ -370,7 +370,7 @@ It routes once at the edge: `classifyIntent` uses haiku at `max_tokens: 16` (`li
 
 **[senior] Which single call is the dominant cost in an investigation, and why?**
 
-`synthesize()` (`lib/agents/diagnostic.ts` L82–L121, `max_tokens: 2048`, sonnet). Loop turns are input-heavy (cheap per token); synthesis emits a full JSON diagnosis — output tokens, which cost several times more each. The output-heavy call on the strong model is where the money concentrates.
+`synthesize()` (`lib/agents/diagnostic.ts` L87–L126, `max_tokens: 2048`, sonnet). Loop turns are input-heavy (cheap per token); synthesis emits a full JSON diagnosis — output tokens, which cost several times more each. The output-heavy call on the strong model is where the money concentrates.
 
 ```
   loop turns   : many input tokens × low $
@@ -399,7 +399,7 @@ Because a diagnosis is a reasoning task — haiku may fail the `isDiagnosis` val
 - `lib/agents/base.ts` L9 — `AGENT_MODEL = 'claude-sonnet-4-6'` (uniform agent model)
 - `lib/agents/base.ts` L90–L91 — `maxToolCalls` budget enforcement
 - `lib/agents/base.ts` L29 — `MAX_TOOL_RESULT_CHARS = 16_000`
-- `lib/agents/diagnostic.ts` L82–L121 — output-heavy `synthesize()`, the line item
+- `lib/agents/diagnostic.ts` L87–L126 — output-heavy `synthesize()`, the line item
 
 ---
 
@@ -415,7 +415,7 @@ Out loud: explain why "switch everything to a cheaper model" can *increase* cost
 
 ### Level 3 — Apply
 
-Scenario: the monthly LLM bill spiked. Open `lib/agents/diagnostic.ts` L82–L121. Explain why this `synthesize()` call is the first place to suspect, citing its `max_tokens: 2048` (L94) and that it emits JSON (output tokens). Then state exactly where you would read `res.usage` to confirm it (after the create at L92).
+Scenario: the monthly LLM bill spiked. Open `lib/agents/diagnostic.ts` L87–L126. Explain why this `synthesize()` call is the first place to suspect, citing its `max_tokens: 2048` (L99) and that it emits JSON (output tokens). Then state exactly where you would read `res.usage` to confirm it (after the create at L97).
 
 ### Level 4 — Defend
 
@@ -424,3 +424,6 @@ A teammate wants to add a haiku-first cascade to every agent immediately. Defend
 ### Quick check — code reference test
 
 Which model does the intent classifier use, on which line, and what is its `max_tokens`? (Answer: `claude-haiku-4-5-20251001` at `lib/agents/intent.ts` L14, `max_tokens: 16` at L20.)
+
+---
+Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived drifted refs: synthesize ranges (diagnostic L87–L126, recommendation L82–L132), route TRUNC/start()/done (L99/L170/L251), tool-cache range (client.ts L97–L146), monitoring maxToolCalls L84.

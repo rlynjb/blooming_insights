@@ -26,7 +26,7 @@ Before the seam:
 
 After the seam:
 - `runAgentLoop` receives `anthropic` and `mcp` as parameters
-- Tests inject fakes; 125 tests run with no network and no key
+- Tests inject fakes; 157 tests run with no network and no key
 - The loop's control flow is verified against scripted responses
 
 It is the inject-the-fetcher pattern, applied to the model client and the tool client.
@@ -56,7 +56,7 @@ The consumer is written once against the interface; production and tests differ 
 
 ### The MCP seam: `McpTransport` and `McpCaller`
 
-There are two narrow interfaces, one nested inside the other's stack. `McpTransport` (`lib/mcp/transport.ts` L6–L9) is the minimal surface the *client* depends on — just `callTool` and `listTools`:
+There are two narrow interfaces, one nested inside the other's stack. `McpTransport` (`lib/mcp/transport.ts` L7–L10) is the minimal surface the *client* depends on — just `callTool` and `listTools`:
 
 ```typescript
 export interface McpTransport {
@@ -65,7 +65,7 @@ export interface McpTransport {
 }
 ```
 
-`SdkTransport` (`lib/mcp/transport.ts` L12–L21) is the production implementation that wraps the real MCP SDK `Client`. A test passes a fake `McpTransport` instead.
+`SdkTransport` (`lib/mcp/transport.ts` L41–L74) is the production implementation that wraps the real MCP SDK `Client`. A test passes a fake `McpTransport` instead. `SdkTransport` also carries an optional `HttpErrorHolder` (`transport.ts` L15–L17) populated by `makeCapturingFetch` (L24–L36) — a `fetch` wrapper handed to the SDK that records the body of any non-OK HTTP response (cloning so the SDK can still read it). On a failed `callTool`/`listTools`, `SdkTransport` attaches that captured body to the thrown error (L52–L58, L66–L72) so callers see the real server message instead of a bare "Unauthorized." This is error-detail plumbing *behind* the same narrow interface — it does not change the seam's shape (`callTool`/`listTools` still return `Promise<unknown>`), so test fakes are unaffected.
 
 `McpCaller` (`lib/agents/base.ts` L16–L22) is the interface the *agent loop* depends on — the richer caller surface with caching/timing metadata:
 
@@ -107,7 +107,7 @@ The loop never calls `new Anthropic(...)`. It uses the injected instance at the 
 const res = await anthropic.messages.create(params);
 ```
 
-In production, the route constructs the real client once and passes it down (`app/api/agent/route.ts` L102): `const anthropic = new Anthropic({ apiKey: ... })`, then hands it to each agent's constructor. In tests, a fake object with a `messages.create` method that returns scripted content blocks is passed instead — no key, no network. Every agent (`DiagnosticAgent`, `RecommendationAgent`, etc.) takes `anthropic` as a constructor argument, propagating the seam from the route down to the loop.
+In production, the route constructs the real client once and passes it down (`app/api/agent/route.ts` L207): `const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })`, then hands it to each agent's constructor. In tests, a fake object with a `messages.create` method that returns scripted content blocks is passed instead — no key, no network. Every agent (`DiagnosticAgent`, `RecommendationAgent`, etc.) takes `anthropic` as a constructor argument, propagating the seam from the route down to the loop.
 
 ```
 route: new Anthropic({apiKey})  ──┐
@@ -131,7 +131,7 @@ AGENT_MODEL is a hard-coded const      model/provider chosen at runtime/config
 
 The injected `anthropic` parameter is typed as the concrete `Anthropic` SDK type — not a vendor-neutral `LLMProvider` interface. The loop calls `anthropic.messages.create` with Anthropic-shaped params (`messages`, `tools`, `tool_use` blocks). Swapping in OpenAI would require translating message shapes, tool-call formats, and response parsing — there is no abstraction over that, and no factory to select a provider. The curriculum's "swap Claude ↔ OpenAI" is a **Case B** capability here: study material and a buildable target, not something the codebase does.
 
-What the seam *does* enable, fully and well, is the thing that matters most for a 125-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
+What the seam *does* enable, fully and well, is the thing that matters most for a 157-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
 
 ---
 
@@ -150,7 +150,7 @@ This diagram spans the route (constructs real clients), the agent layer (depends
 │  ROUTE / TEST (where implementations are chosen)                     │
 │                                                                       │
 │  PRODUCTION  app/api/agent/route.ts                                  │
-│    new Anthropic({apiKey})  L102 ──┐                                 │
+│    new Anthropic({apiKey})  L207 ──┐                                 │
 │    connectMcp → McpClient        ──┤                                 │
 │  TEST                              │                                 │
 │    fakeAnthropic { messages.create }──┤   inject                     │
@@ -165,7 +165,7 @@ This diagram spans the route (constructs real clients), the agent layer (depends
 │     mcp.callTool(name, args)                       base.ts L144      │
 │                                                                       │
 │  interfaces:  McpCaller  base.ts L16–22                              │
-│               McpTransport  transport.ts L6–9                        │
+│               McpTransport  transport.ts L7–10                       │
 │  NOTE: `anthropic` is the CONCRETE SDK type — not a vendor-neutral   │
 │         LLMProvider. No factory. Single provider.                    │
 └────────────────────────────────────────────────────────────────────────┘
@@ -181,9 +181,10 @@ The agent layer depends on interfaces and receives implementations from above. T
 
 ### Files, functions, and line ranges
 
-- **MCP transport interface:** `McpTransport` — `lib/mcp/transport.ts` L6–L9; production `SdkTransport` wrapping the SDK `Client` — L12–L21.
+- **MCP transport interface:** `McpTransport` — `lib/mcp/transport.ts` L7–L10; production `SdkTransport` wrapping the SDK `Client` — L41–L74. Error-detail plumbing behind the interface: `HttpErrorHolder` (L15–L17), `makeCapturingFetch` (L24–L36), and the captured-body attach on failure (L52–L58, L66–L72).
+- **Tool-error type:** `McpToolError` — `lib/mcp/client.ts` L68–L77, thrown by `McpClient.liveCall` (L161) to tag a failed call with its tool name + the underlying server detail; `errorDetail` (L55–L62) unwraps the nested cause. This is the application-layer counterpart to the transport's captured body — both make a failure legible without widening the `McpCaller` interface.
 - **MCP caller interface (agent-facing):** `McpCaller` — `lib/agents/base.ts` L16–L22; intent comment ("inject a fake without depending on the concrete McpClient class or any network") — L11–L14. `McpClient` satisfies it structurally.
-- **Injected Anthropic client:** `anthropic: Anthropic` in `runAgentLoop` opts — `lib/agents/base.ts` L48–L49; the single call site — L102. Real client constructed in the route — `app/api/agent/route.ts` L102; propagated through each agent's constructor.
+- **Injected Anthropic client:** `anthropic: Anthropic` in `runAgentLoop` opts — `lib/agents/base.ts` L48–L49; the single call site — L102. Real client constructed in the route — `app/api/agent/route.ts` L207 (inside the stream's `start`); propagated through each agent's constructor.
 - **Hard-coded model identity (no runtime selection):** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9; `CLASSIFIER_MODEL` — `lib/agents/intent.ts` L14.
 
 ### Where multi-provider would live
@@ -255,7 +256,7 @@ These are two independent properties that happen to share a mechanism (injection
 
 ### dependency injection via narrow interfaces (`McpCaller`, `McpTransport`)
 
-- **Codebase uses:** `McpCaller` (`lib/agents/base.ts` L16–L22), `McpTransport` (`lib/mcp/transport.ts` L6–L9) — minimal structural interfaces the consumers depend on; implementations injected by parameter.
+- **Codebase uses:** `McpCaller` (`lib/agents/base.ts` L16–L22), `McpTransport` (`lib/mcp/transport.ts` L7–L10) — minimal structural interfaces the consumers depend on; implementations injected by parameter.
 - **Why it's here:** to let tests pass fakes and run with no network or API key, isolating the loop's logic.
 - **Leading today:** constructor/parameter injection against interfaces is the universal testability pattern (2026); structural typing makes it ceremony-free in TypeScript.
 - **Why it leads:** isolates the unit under test from slow, networked, non-deterministic collaborators with no framework.
@@ -347,7 +348,8 @@ multi-provider required  → neutral interface + factory (then)
 ### One-line anchors
 
 - `lib/agents/base.ts` L16–L22 — `McpCaller`, the structural test interface.
-- `lib/mcp/transport.ts` L6–L9 — `McpTransport`; `SdkTransport` (prod) at L12–L21.
+- `lib/mcp/transport.ts` L7–L10 — `McpTransport`; `SdkTransport` (prod) at L41–L74; `HttpErrorHolder`/`makeCapturingFetch` at L15–L36.
+- `lib/mcp/client.ts` L68–L77 — `McpToolError`, the tool-tagged failure type thrown by `McpClient.liveCall` (L161).
 - `lib/agents/base.ts` L48–L62 — injected `anthropic` + `mcp` params; concrete SDK type.
 - `lib/agents/base.ts` L9 — `AGENT_MODEL` hard-coded; no runtime/vendor selection.
 - Test seam ≠ provider portability: same mechanism, different (and here, only the first) property.
@@ -375,3 +377,6 @@ A colleague says: "We already inject the client, so we're provider-agnostic — 
 ### Quick check — code reference test
 
 Is the `anthropic` parameter of `runAgentLoop` a vendor-neutral interface or a concrete SDK type, and what does that imply about provider-swapping? (Answer: the concrete `Anthropic` SDK type — `lib/agents/base.ts` L48–L49; swapping providers requires a vendor-neutral interface and translation layers that do not exist, so it is a refactor, not a config change.)
+
+---
+Updated: 2026-05-28 — Documented the transport's `HttpErrorHolder`/`makeCapturingFetch` error-body capture and `client.ts`'s `McpToolError` (both error-detail plumbing behind the unchanged narrow interface); re-derived transport.ts (`McpTransport` L7–10, `SdkTransport` L41–74) and the route's `new Anthropic` location (now L207, inside the stream).

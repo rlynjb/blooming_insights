@@ -88,9 +88,10 @@ interface Recommendation {
   rationale: string;
   bloomreachFeature: ...;
   steps: string[];
-  estimatedImpact: string;
+  estimatedImpact: EstimatedImpact;  // string | { range, rangeUsd?, assumption } (types.ts L77–L79)
   confidence: ...;
-  // override metadata (NEW)
+  effort?: ...; timeToSetUpMinutes?: number; ...  // current optional, agent-emitted fields
+  // override metadata (NEW — none of the above is human-edit metadata)
   _overridden_at?: string;          // ISO timestamp of the human edit
   _overridden_fields?: string[];    // optional: which fields the human owns
   _dismissed?: boolean;             // a dismissal is an override too
@@ -174,7 +175,7 @@ The marker on the State-layer record is the contract between the human (UI) and 
 
 **Not yet implemented.** blooming insights is a read-only analyst — it streams a diagnosis and recommendations for viewing and Markdown export, but there are no user-editable persisted fields, so there is no regeneration-vs-edit conflict to guard and no `_overridden_at` anywhere.
 
-This is confirmed by the data model and state: `lib/mcp/types.ts` defines `Recommendation` (L58–L66) and `Diagnosis` (L47–L52) with *only* machine-generated fields — no override metadata, no `_dismissed`, no `_overridden_at`. `lib/state/insights.ts` exposes `putInsights` / `getInsight` / `getAnomaly` / `putInvestigation` (L24–L49) and an in-memory `Map` store with *no edit or patch path* — every write is a machine write. The investigate UI (`app/investigate/[id]/page.tsx`) renders recommendations as read-only cards and offers Markdown export (L253–L264) but no edit or dismiss control. The `id` assigned to each recommendation (`lib/agents/recommendation.ts` L76) exists for React keys and rendering, not for tracking human edits.
+This is confirmed by the data model and state: `lib/mcp/types.ts` defines `Recommendation` (L85–L99) and `Diagnosis` (L64–L73) with *only* machine-generated fields. The recent enrichments (`effort`, `prerequisites`, `successMetric`, `estimatedImpact` as a union on `Recommendation`; `confidence`, `timeSeries` on `Diagnosis`) are all agent-emitted or *derived* — none is human-edit metadata, so there is still no `_dismissed` and no `_overridden_at`. `lib/state/insights.ts` exposes `putInsights` / `getInsight` / `getAnomaly` / `putInvestigation` (L29–L57) over an in-memory `Map` store (L4–L6) with *no edit or patch path* — every write is a machine write. The investigate UI (`app/investigate/[id]/page.tsx`) is now the *diagnose* step only: it renders the diagnosis read-only and offers Markdown export (L75–L98) but no edit or dismiss control. The `id` assigned to each recommendation (`lib/agents/recommendation.ts` L76) exists for React keys and rendering, not for tracking human edits.
 
 Where the lock would live: `lib/mcp/types.ts` (`Recommendation` gains `_overridden_at?` / `_dismissed?`), `lib/state/` (a patch/edit path that sets the marker, and a `mergeOnRegenerate` used by re-runs), and `app/investigate/[id]/page.tsx` (edit/dismiss controls). The `Project exercises` block below is the primary buildable target.
 
@@ -241,7 +242,7 @@ The marker is the minimum viable ownership encoding for the two-writer (one mach
 
 ### per-field override marker (`_overridden_at`)
 
-- **Codebase uses:** nothing — `Recommendation` (`lib/mcp/types.ts` L58–L66) has no override metadata; the data is read-only.
+- **Codebase uses:** nothing — `Recommendation` (`lib/mcp/types.ts` L85–L99) has no override metadata; the data is read-only.
 - **Why it's here (absent):** the analyst does not expose editable fields, so there is no regeneration-vs-edit conflict to guard.
 - **Leading today:** dirty-field tracking with a per-field timestamp/flag is the standard guard for AI-generated-but-human-editable values (2026).
 - **Why it leads:** minimal encoding of human ownership; a single optional field plus a merge check implements user-wins.
@@ -249,7 +250,7 @@ The marker is the minimum viable ownership encoding for the two-writer (one mach
 
 ### optimistic locking (version column)
 
-- **Codebase uses:** nothing — state is an in-memory `Map` (`lib/state/insights.ts` L3–L5) with machine-only writes.
+- **Codebase uses:** nothing — state is an in-memory `Map` (`lib/state/insights.ts` L4–L6) with machine-only writes.
 - **Why it's here (absent):** no concurrent writers and no persistent store where a write race could occur.
 - **Leading today:** version/`updated_at` columns checked on write are the database-native concurrency guard (2026).
 - **Why it leads:** detects and rejects conflicting writes at the storage layer, independent of application logic.
@@ -310,7 +311,7 @@ When a machine regenerates a value a human can also edit, "last write wins" defa
 
 **[mid] A user edits an AI recommendation, then the investigation re-runs. What should happen, and what does happen here?**
 
-It should preserve the edit — the re-run should skip human-owned fields. In blooming insights it does not arise: recommendations are read-only (`lib/mcp/types.ts` L58–L66 has no edit metadata; the UI only renders and exports). To support editing safely you would add an `_overridden_at` marker and check it on re-run.
+It should preserve the edit — the re-run should skip human-owned fields. In blooming insights it does not arise: recommendations are read-only (`lib/mcp/types.ts` L85–L99 has no edit metadata; the UI only renders and exports). To support editing safely you would add an `_overridden_at` marker and check it on re-run.
 
 ```
 edit → _overridden_at=now() → re-run sees it → SKIP → edit preserved
@@ -340,9 +341,9 @@ field-level:  _overridden_fields[], partial refresh (granular)
 
 ### One-line anchors
 
-- `lib/mcp/types.ts` L58–L66 — `Recommendation`: machine fields only, no override metadata (confirms Case B).
-- `lib/state/insights.ts` L24–L49 — machine-only writes, no edit/patch path.
-- `app/investigate/[id]/page.tsx` L253–L264 — read-only render + export, no edit control.
+- `lib/mcp/types.ts` L85–L99 — `Recommendation`: machine fields only, no override metadata (confirms Case B).
+- `lib/state/insights.ts` L29–L57 — machine-only writes, no edit/patch path.
+- `app/investigate/[id]/page.tsx` L75–L98 — read-only render + export, no edit control.
 - `_overridden_at` marker + a merge check = user-wins reconciliation.
 - The lock ships *with* the edit feature; a dismissal is an override too.
 
@@ -360,7 +361,7 @@ Out loud: why does "last write wins" structurally favor the machine over the hum
 
 ### Level 3 — Apply
 
-Scenario: a PM asks for dismissible recommendations. Open `lib/mcp/types.ts` L58–L66 and `lib/state/insights.ts` L24–L49 — name exactly which type gains which fields, where the dismiss write sets the marker, and where the re-run's merge check goes. Explain why shipping the dismiss button *without* the marker is a bug.
+Scenario: a PM asks for dismissible recommendations. Open `lib/mcp/types.ts` L85–L99 and `lib/state/insights.ts` L29–L57 — name exactly which type gains which fields, where the dismiss write sets the marker, and where the re-run's merge check goes. Explain why shipping the dismiss button *without* the marker is a bug.
 
 ### Level 4 — Defend
 
@@ -368,4 +369,7 @@ A colleague wants to ship editable recommendations now and "add the override pro
 
 ### Quick check — code reference test
 
-Does the `Recommendation` type carry any field that records a human edit, and what does its absence tell you about this concept's status in the codebase? (Answer: no — `lib/mcp/types.ts` L58–L66 has only machine-generated fields and no `_overridden_at`/`_dismissed`; its absence confirms blooming insights is a read-only analyst, so user-override locks are a buildable target, not a present feature.)
+Does the `Recommendation` type carry any field that records a human edit, and what does its absence tell you about this concept's status in the codebase? (Answer: no — `lib/mcp/types.ts` L85–L99 has only machine-generated fields and no `_overridden_at`/`_dismissed`; its absence confirms blooming insights is a read-only analyst, so user-override locks are a buildable target, not a present feature.)
+
+---
+Updated: 2026-05-28 — Re-derived the drifted refs (`Recommendation` types.ts L85–L99, `Diagnosis` L64–L73, `insights.ts` surface L29–L57 + Map store L4–L6, investigate-page export L75–L98) and noted the new enrichment fields are agent-emitted/derived, not human-edit metadata — Case B still holds (no `_overridden_at`/`_dismissed`).

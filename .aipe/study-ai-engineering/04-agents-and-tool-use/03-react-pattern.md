@@ -3,7 +3,7 @@
 **Industry name(s):** ReAct (Reason + Act), Thought–Action–Observation loop, interleaved reasoning and tool use
 **Type:** Industry standard · Language-agnostic
 
-> ReAct interleaves Thought (the model reasons in text), Action (it emits a tool call), and Observation (your code runs the tool and feeds the result back). blooming insights makes each step a streamed NDJSON event — `onText` → reasoning_step is the Thought, `tool_call_start` is the Action, `tool_call_end` + result-as-next-user-turn is the Observation — so the reasoning trace is a live product surface.
+> ReAct interleaves Thought (the model reasons in text), Action (it emits a tool call), and Observation (your code runs the tool and feeds the result back). blooming insights makes each step a streamed NDJSON event — `onText` → reasoning_step is the Thought, `tool_call_start` is the Action, `tool_call_end` + result-as-next-user-turn is the Observation — so the reasoning trace is a live product surface, consumed by `useInvestigation` (the StrictMode-safe reader hook) and rendered on the investigate page.
 
 **See also:** → 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design-dsa/01-system-design/05-streaming-ndjson.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
@@ -73,16 +73,16 @@ base.ts — text extraction   (L108–L113)
    onText(textBlocks.map(b => b.text).join(''))            L112
 ```
 
-The route wires `onText` to emit a `reasoning_step` of kind `'thought'` (`route.ts` L118–L120):
+The route wires `onText` to emit a `reasoning_step` of kind `'thought'` (`route.ts` L182–L184):
 
 ```
-route.ts — hooksFor(agent).onText   (L118–L120)
+route.ts — hooksFor(agent).onText   (L182–L184)
 ─────────────────────────────────────────────────────────────
  onText: (t) => { if (t.trim()) stepFor(agent, 'thought', t) }
- stepFor → send({ type:'reasoning_step', step:{ kind:'thought', content:t, agent } })
+ stepFor → send({ type:'reasoning_step', step:{ id, agent, kind:'thought', content:t } })  L176–180
 ```
 
-So every chunk of the model's textual reasoning becomes a `reasoning_step` event on the wire. On the investigate page, `handleEvent` (`page.tsx` L63–L75) appends it as a visible thought bubble. The Thought is not hidden chain-of-thought you discard — it is rendered.
+So every chunk of the model's textual reasoning becomes a `reasoning_step` event on the wire. The client's `useInvestigation` hook's `handle` (`useInvestigation.ts` L99–L111) appends it to the trace as a visible thought bubble. The Thought is not hidden chain-of-thought you discard — it is rendered.
 
 ---
 
@@ -98,7 +98,7 @@ base.ts — action hook   (L129–L138)
    onToolCall?.(tc)   ← fired BEFORE the call               L138
 ```
 
-The route maps this to a `tool_call_start` event (`route.ts` L121–L122, `events.ts` L6):
+The route maps this to a `tool_call_start` event (`route.ts` L185, `events.ts` L6):
 
 ```
 events.ts — Action event   (L6)
@@ -106,13 +106,13 @@ events.ts — Action event   (L6)
  | { type:'tool_call_start'; toolName: string; agent: AgentName }
 ```
 
-The page renders a tool row with `status: 'running'` (`page.tsx` L76–L87). The Action is the second visible phase: the user sees not just that the agent is thinking, but *what* it chose to do.
+The hook's `handle` pushes a tool row with `status: 'running'` (`useInvestigation.ts` L112–L117). The Action is the second visible phase: the user sees not just that the agent is thinking, but *what* it chose to do.
 
 ---
 
 ### Observation — code runs the tool, result feeds back (onToolResult)
 
-After the tool returns, `runAgentLoop` fires `onToolResult` (`base.ts` L159) and pushes the result back into the conversation as a user turn (`base.ts` L171). The route maps `onToolResult` to a `tool_call_end` event carrying `durationMs`, a truncated `result`, and any `error` (`route.ts` L123–L131, `events.ts` L7).
+After the tool returns, `runAgentLoop` fires `onToolResult` (`base.ts` L159) and pushes the result back into the conversation as a user turn (`base.ts` L171). The route maps `onToolResult` to a `tool_call_end` event carrying `durationMs`, a truncated `result`, and any `error` (`route.ts` L186–L194, `events.ts` L7).
 
 ```
 base.ts — observation     (L144–L171)
@@ -130,13 +130,13 @@ events.ts — Observation event   (L7)
  | { type:'tool_call_end'; toolName; agent; durationMs; result?; error? }
 ```
 
-Two roles in one phase. The `tool_call_end` event is the Observation made *visible* (the page flips the tool row to `status: 'done'` with its duration, `page.tsx` L88–L107). The `messages.push` at L171 is the Observation made *available to the model* — the result re-enters the context so the next Thought is informed by it. The same data serves the UI and the next reasoning turn; that dual role is what makes the trace both a debugging surface and a functional part of the loop.
+Two roles in one phase. The `tool_call_end` event is the Observation made *visible* (the hook flips the matching running tool row to `status: 'done'` with its duration via `replaceRunningTool`, `useInvestigation.ts` L86–L95 / L118–L121). The `messages.push` at L171 is the Observation made *available to the model* — the result re-enters the context so the next Thought is informed by it. The same data serves the UI and the next reasoning turn; that dual role is what makes the trace both a debugging surface and a functional part of the loop.
 
 ---
 
 ### The trace as a product surface
 
-The events are NDJSON (`encodeEvent` = `JSON.stringify(e) + '\n'`, `events.ts` L15). The route enqueues them into a `ReadableStream` (`route.ts` L105–L169); the client reads them with `res.body.getReader()` + `TextDecoder`, splits on `\n`, and `JSON.parse`s each line (`page.tsx` L143–L159). There is no `EventSource` — it is a raw streamed reader over `fetch`. Because the Thought/Action/Observation events arrive *as they happen*, the investigation page is a live trace: the analyst watches the agent reason, query, and observe, step by step. When a diagnosis is wrong, the analyst scrolls the trace and sees which Observation the reasoning misread — debugging by reading, not by re-running.
+The events are NDJSON (`encodeEvent` = `JSON.stringify(e) + '\n'`, `events.ts` L15). The route enqueues them into a `ReadableStream` (`route.ts` L169–L265); the client reads them inside `useInvestigation` with `res.body.getReader()` + `TextDecoder`, splits on `\n`, and `JSON.parse`s each line (`useInvestigation.ts` L184–L201). There is no `EventSource` — it is a raw streamed reader over `fetch`, started once per mount behind a `startedRef` guard so React StrictMode's double-mount does not double-fetch. Because the Thought/Action/Observation events arrive *as they happen*, the investigation page is a live trace: the analyst watches the agent reason, query, and observe, step by step. When a diagnosis is wrong, the analyst scrolls the trace and sees which Observation the reasoning misread — debugging by reading, not by re-running.
 
 ```
 NDJSON stream over fetch (no EventSource)
@@ -180,11 +180,11 @@ The diagram spans three layers. The Model layer produces Thoughts and Actions. T
 └───────────┬──────────────────────────────┬────────────────────────────┘
             │ onText                        │ onToolCall / onToolResult    
 ┌───────────▼──────────────────────────────▼────────────────────────────┐
-│  STREAM / UI BOUNDARY   lib/mcp/events.ts + route + page              │
+│  STREAM / UI BOUNDARY   lib/mcp/events.ts + route + useInvestigation │
 │                                                                       │
 │  reasoning_step (thought)   tool_call_start   tool_call_end          │
 │        └──────── encodeEvent → NDJSON line → ReadableStream ──────────┤
-│  page: getReader() → split('\n') → JSON.parse → handleEvent (render) │
+│  hook: getReader() → split('\n') → JSON.parse → handle() (render)    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -200,29 +200,29 @@ A reader who sees only this diagram should grasp: three phases, each tapped by a
 
 - **File:** `lib/agents/base.ts` (extraction) + `app/api/agent/route.ts` (event)
 - **Function / class:** `runAgentLoop` text-block extraction → `hooksFor(agent).onText`
-- **Line range:** `base.ts` L108–L113; `route.ts` L118–L120 (`stepFor(agent, 'thought', t)`)
+- **Line range:** `base.ts` L108–L113; `route.ts` L182–L184 (`stepFor(agent, 'thought', t)`; `stepFor` L176–L180)
 - **Role:** The model's text blocks become `reasoning_step` events of kind `'thought'`.
 
 ### Action (tool_use → tool_call_start)
 
 - **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
 - **Function / class:** `runAgentLoop` per-tool loop → `onToolCall` → `tool_call_start`
-- **Line range:** `base.ts` L138 (hook fired before the call); `events.ts` L6; `route.ts` L121–L122
+- **Line range:** `base.ts` L138 (hook fired before the call); `events.ts` L6; `route.ts` L185
 - **Role:** Emitted *before* execution so the UI shows the in-flight action.
 
 ### Observation (result → tool_call_end + fed back)
 
 - **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
 - **Function / class:** `runAgentLoop` → `onToolResult` → `tool_call_end`; result pushed as user turn
-- **Line range:** `base.ts` L144 (run), L159 (hook), L171 (fed back); `events.ts` L7; `route.ts` L123–L131
+- **Line range:** `base.ts` L144 (run), L159 (hook), L171 (fed back); `events.ts` L7; `route.ts` L186–L194
 - **Role:** `tool_call_end` carries `durationMs`/`result`/`error` for the UI; L171 re-enters the result into the conversation so the next Thought is conditioned on it.
 
 ### The streamed trace (product surface)
 
-- **File:** `lib/mcp/events.ts` + `app/api/agent/route.ts` + `app/investigate/[id]/page.tsx`
-- **Function / class:** `encodeEvent` (NDJSON); route `ReadableStream` `start()`; page reader loop + `handleEvent`
-- **Line range:** `events.ts` L15 (`JSON.stringify(e)+'\n'`); `route.ts` L105–L169; `page.tsx` L143–L159 (reader), L60–L123 (`handleEvent`)
-- **Role:** Each phase becomes an NDJSON line streamed over `fetch` (no `EventSource`) and rendered live.
+- **File:** `lib/mcp/events.ts` + `app/api/agent/route.ts` + `lib/hooks/useInvestigation.ts`
+- **Function / class:** `encodeEvent` (NDJSON); route `ReadableStream` `start()`; the `useInvestigation` reader loop + `handle`
+- **Line range:** `events.ts` L15 (`JSON.stringify(e)+'\n'`); `route.ts` L169–L265; `useInvestigation.ts` L184–L201 (reader, behind the `startedRef` StrictMode guard L43/L47), L97–L151 (`handle`)
+- **Role:** Each phase becomes an NDJSON line streamed over `fetch` (no `EventSource`) and rendered live. The consumer moved out of `app/investigate/[id]/page.tsx` into the hook so both step pages (`useInvestigation(id,'diagnose')` and `(id,'recommend')`) share one reader.
 
 **Pseudocode — one ReAct cycle, tapped** (`base.ts` L108–L171):
 
@@ -256,7 +256,7 @@ The Observation-feeds-Thought edge is what distinguishes ReAct from a plan-then-
 
 ### Where this breaks down
 
-The streamed Thought is whatever text the model emits between tool calls — it is not guaranteed to be faithful to the model's actual decision process (models can post-hoc rationalize). So the trace is a strong *debugging* and *UX* aid but a weak *correctness proof*: a plausible-looking Thought can precede a wrong Action. It also breaks under verbosity — a chatty model floods the trace with low-value thoughts (the `if (t.trim())` guard at `route.ts` L119 only drops empties, not noise). And the Observation re-entered at L171 is the *truncated* result (16k cap), so a Thought conditioned on a truncated Observation can miss data that was cut.
+The streamed Thought is whatever text the model emits between tool calls — it is not guaranteed to be faithful to the model's actual decision process (models can post-hoc rationalize). So the trace is a strong *debugging* and *UX* aid but a weak *correctness proof*: a plausible-looking Thought can precede a wrong Action. It also breaks under verbosity — a chatty model floods the trace with low-value thoughts (the `if (t.trim())` guard at `route.ts` L183 only drops empties, not noise). And the Observation re-entered at L171 is the *truncated* result (16k cap), so a Thought conditioned on a truncated Observation can miss data that was cut.
 
 ### What to explore next
 
@@ -282,7 +282,7 @@ The streamed Thought is whatever text the model emits between tool calls — it 
 
 **What the alternative would have cost.** A final-answer-only agent would be simpler and slightly cheaper (no per-phase hooks, no NDJSON), but it would be undebuggable: a wrong diagnosis would offer no trace to inspect, no place to see which Observation the model misread. The entire debugging story would become "re-run with logging and hope it reproduces." The streamed trace is cheap to add (three hooks) and pays for itself the first time a diagnosis goes wrong.
 
-**The breakpoint.** Streamed ReAct is right while traces are read by humans and the per-step round-trips fit the 60s `maxDuration` budget. It stops being right at high tool counts where per-step re-reasoning blows the latency budget — at which point batching (plan-and-execute) for the exploration phase, while keeping ReAct for the final synthesis, becomes the move. The trace surface stays; only the loop's round-trip discipline changes.
+**The breakpoint.** Streamed ReAct is right while traces are read by humans and the per-step round-trips fit the route's `maxDuration` budget (300s; a live diagnose→recommend run is ~100–115s under the ~1 req/s MCP limit). It stops being right at high tool counts where per-step re-reasoning blows the latency budget — at which point batching (plan-and-execute) for the exploration phase, while keeping ReAct for the final synthesis, becomes the move. The trace surface stays; only the loop's round-trip discipline changes.
 
 ---
 
@@ -298,7 +298,7 @@ The streamed Thought is whatever text the model emits between tool calls — it 
 
 ### NDJSON over fetch ReadableStream (the trace transport)
 
-- **Codebase uses:** `encodeEvent` writes `JSON.stringify(e)+'\n'` (`events.ts` L15); the page reads with `getReader()` + `TextDecoder` and splits on `\n` (`page.tsx` L143–L159).
+- **Codebase uses:** `encodeEvent` writes `JSON.stringify(e)+'\n'` (`events.ts` L15); `useInvestigation` reads with `getReader()` + `TextDecoder` and splits on `\n` (`useInvestigation.ts` L184–L201).
 - **Why it's here:** Each ReAct phase is one self-contained JSON object; line-delimited JSON streams them with zero framing overhead and no `EventSource` constraints.
 - **Leading today:** NDJSON / line-delimited streaming and SSE are the two adoption-leading agent-trace transports in 2026.
 - **Why it leads:** Works over plain `fetch`, supports POST bodies, and parses incrementally line by line.
@@ -319,16 +319,16 @@ The streamed Thought is whatever text the model emits between tool calls — it 
 ### Tag reasoning steps as hypothesis vs thought from the trace
 
 - **Exercise ID:** C4.3 (adapted to blooming insights)
-- **What to build:** The `ReasoningStep` type already supports `kind: 'hypothesis' | 'conclusion'` (`lib/mcp/types.ts` L32), but `onText` only ever emits `'thought'` (`route.ts` L119). Detect hypothesis-shaped reasoning (e.g., the model's text proposing a candidate cause) and emit it as kind `'hypothesis'`, so the trace visually distinguishes hypotheses from observations.
+- **What to build:** The `ReasoningStep` type already supports `kind: 'thought' | 'tool_call' | 'hypothesis' | 'conclusion'` (`lib/mcp/types.ts` L47), but `onText` only ever emits `'thought'` (`route.ts` L183). Detect hypothesis-shaped reasoning (e.g., the model's text proposing a candidate cause) and emit it as kind `'hypothesis'`, so the trace visually distinguishes hypotheses from observations.
 - **Why it earns its place:** Shows you can enrich a ReAct trace's semantics, the foundation for trace-based evals and better UX.
-- **Files to touch:** `app/api/agent/route.ts` (L117–L120 `onText`); `app/investigate/[id]/page.tsx` (`handleEvent` rendering, L63–L75).
+- **Files to touch:** `app/api/agent/route.ts` (L181–L195 `hooksFor`/`onText`); `lib/hooks/useInvestigation.ts` (`handle` rendering, L99–L111).
 - **Done when:** A diagnostic run shows at least one step rendered as a hypothesis distinct from plain thoughts, and existing thought rendering is unchanged.
 - **Estimated effort:** 1–4hr
 
 ### Persist the streamed trace as a reusable eval transcript
 
 - **Exercise ID:** C3.10 (adapted to blooming insights)
-- **What to build:** Extend `saveInvestigation` (`lib/state/investigations.ts` L30) usage so each completed investigation's full Thought/Action/Observation event list is exportable as a JSONL transcript file, then add a `/api/agent/trace/[id]` route that returns it — the raw material for an offline eval set.
+- **What to build:** Extend `saveInvestigation` (`lib/state/investigations.ts` L30) usage so each completed investigation's full Thought/Action/Observation event list is exportable as a JSONL transcript file, then add a `/api/agent/trace/[id]` route that returns it — the raw material for an offline eval set. Note the live two-step split only `saveInvestigation`s on the combined `step==null` capture run (`route.ts` L254); a two-step live run hands its events through the client's sessionStorage instead.
 - **Why it earns its place:** Demonstrates the trace is structured data, not just UI — the bridge from observability to evals.
 - **Files to touch:** `lib/state/investigations.ts` (L30–L41); new `app/api/agent/trace/[id]/route.ts`; `lib/mcp/events.ts` (reuse `encodeEvent`).
 - **Done when:** Hitting the trace route for a completed investigation returns valid JSONL with one `AgentEvent` per line, replayable by `decodeEvent`.
@@ -399,7 +399,7 @@ Yes, and candidates dodge because admitting it undercuts the demo. Every Observa
 - `lib/agents/base.ts` L138 — `onToolCall` fired before the call — the Action event.
 - `lib/agents/base.ts` L108–L113 — text blocks → `onText` — the Thought.
 - `lib/mcp/events.ts` L6–L7 — `tool_call_start` / `tool_call_end` — Action and Observation on the wire.
-- `app/investigate/[id]/page.tsx` L143–L159 — `getReader()` + split on `\n` — the trace consumed live (no `EventSource`).
+- `lib/hooks/useInvestigation.ts` L184–L201 — `getReader()` + split on `\n` — the trace consumed live (no `EventSource`), once per mount behind `startedRef`.
 
 ---
 
@@ -424,3 +424,6 @@ A reviewer says: "Showing users the model's raw reasoning is a liability — it 
 ### Quick check — code reference test
 
 Which line in `lib/agents/base.ts` turns an Observation into input for the model's next Thought, and what role does that message take? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`; the result enters as a `user` turn.)
+
+---
+Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page.tsx` to `lib/hooks/useInvestigation.ts` (StrictMode-safe `startedRef` reader, shared by both step pages) and refreshed all `route.ts` hook/stream and `ReasoningStep` line refs.

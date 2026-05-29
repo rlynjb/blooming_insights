@@ -81,7 +81,7 @@ recall    = 2/3   (2 of 3 expected were caught)
 F1        = 0.67  (harmonic mean)
 ```
 
-`MonitoringAgent.scan` (`lib/agents/monitoring.ts` L60–L93) returns an *array* of anomalies, sorted by severity and sliced to the top 10. Its quality is not one label — it is a set: did it catch the anomalies that matter (recall) without flagging noise (precision)? F1 is the exact instrument. Exact-match is too strict here (the order or one extra item should not zero the score); a rubric is overkill (the items are structured, not prose).
+`MonitoringAgent.scan` (`lib/agents/monitoring.ts` L68–L103) returns an *array* of anomalies, sorted by severity and sliced to the top 10. Its quality is not one label — it is a set: did it catch the anomalies that matter (recall) without flagging noise (precision)? F1 is the exact instrument. Exact-match is too strict here (the order or one extra item should not zero the score); a rubric is overkill (the items are structured, not prose).
 
 ### Rung 3 — rubric grading (a checklist for prose)
 
@@ -97,7 +97,7 @@ rubric for a Diagnosis
                                                   score = Σ(passed×weight)/Σweight
 ```
 
-A `Diagnosis` (`lib/mcp/types.ts` L47–L52) has `conclusion`, `evidence[]`, and `hypothesesConsidered[]`. Some criteria are checkable by code (is `hypothesesConsidered.length >= 2`? does `evidence` reference the anomaly's `scope`?); others need a judge. A rubric is the structured middle: more tolerant than exact-match (wording is free), more objective than a single holistic judge score (each criterion is explicit). It is the recommended first method for diagnosis and recommendation prose because it forces you to *define* what good means.
+A `Diagnosis` (`lib/mcp/types.ts` L64–L73) has `conclusion`, `evidence[]`, and `hypothesesConsidered[]`. Some criteria are checkable by code (is `hypothesesConsidered.length >= 2`? does `evidence` reference the anomaly's `scope`?); others need a judge. A rubric is the structured middle: more tolerant than exact-match (wording is free), more objective than a single holistic judge score (each criterion is explicit). It is the recommended first method for diagnosis and recommendation prose because it forces you to *define* what good means.
 
 ### Rung 4 — LLM-as-judge (a model grades the prose)
 
@@ -200,7 +200,7 @@ One harness, many methods. The cheap rungs stay local and free; only diagnosis/r
 
 **Not yet implemented.** blooming insights has no eval harness and no scoring code — there is no `evals/runner.ts`, no exact-match scorer, no F1 computation over monitoring output, no rubric, and no LLM-as-judge. The closest existing code is *shape* validation (`lib/mcp/validate.ts` L17–L53), which is a pass/fail on structure, not a quality score.
 
-You can confirm the absence: nothing in the repo compares an agent's output to a reference answer or assigns a quality score; the 125 Vitest tests assert structure and control flow against fakes (see `01-eval-set-types.md`).
+You can confirm the absence: nothing in the repo compares an agent's output to a reference answer or assigns a quality score; the 157 Vitest tests assert structure and control flow against fakes (see `01-eval-set-types.md`).
 
 Where the methods would live: a new `evals/runner.ts` that loads cases from `evals/fixtures/` (built in `01-eval-set-types.md`), runs the live agent, and dispatches each output to a scorer — `evals/scorers/exact.ts`, `evals/scorers/f1.ts`, `evals/scorers/rubric.ts`, `evals/scorers/judge.ts` — chosen by the case's declared surface. The judge scorer is hardened against bias in `03-llm-as-judge-bias.md`. The exercises below are the harness.
 
@@ -276,7 +276,7 @@ The method tracks the *entropy* of the correct-answer space. A single enum has n
 
 ### rubric grading
 
-- **Codebase uses:** nothing — `Diagnosis` (`lib/mcp/types.ts` L47–L52) is rubric-shaped but ungraded.
+- **Codebase uses:** nothing — `Diagnosis` (`lib/mcp/types.ts` L64–L73) is rubric-shaped but ungraded.
 - **Why it's here (absent):** structured prose output exists with no quality decomposition.
 - **Leading today:** explicit weighted criteria checklists, partly code-checkable, are the standard for structured-prose eval (2026).
 - **Why it leads:** forces you to define "good" as concrete sub-questions; more objective and debuggable than a holistic score.
@@ -337,7 +337,7 @@ Once you have an eval set, you score it with a method matched to the output's va
 
 **[mid] How would you score the monitoring agent's output?**
 
-`MonitoringAgent.scan` (`lib/agents/monitoring.ts` L60–L93) returns an *array* of anomalies, not one label, so it is a set-overlap problem: precision (were the flagged ones real?) and recall (did it catch the ones that matter?), combined as F1. Exact-match is too strict — one extra item or a different order should not zero the score — and a rubric is overkill for structured items.
+`MonitoringAgent.scan` (`lib/agents/monitoring.ts` L68–L103) returns an *array* of anomalies, not one label, so it is a set-overlap problem: precision (were the flagged ones real?) and recall (did it catch the ones that matter?), combined as F1. Exact-match is too strict — one extra item or a different order should not zero the score — and a rubric is overkill for structured items.
 
 ```
 expected ∩ flagged → precision & recall → F1
@@ -386,7 +386,7 @@ Out loud: why is exact-match correct for `classifyIntent` output but wrong for a
 
 ### Level 3 — Apply
 
-Scenario: you must eval `MonitoringAgent.scan`. Open `lib/agents/monitoring.ts` L60–L93 and note it returns an array sorted by severity and sliced to 10. Explain why F1 (not exact-match, not a rubric) fits, and why you would weight recall on `critical` (`lib/mcp/types.ts` L3) above `info`.
+Scenario: you must eval `MonitoringAgent.scan`. Open `lib/agents/monitoring.ts` L68–L103 and note it returns an array sorted by severity and sliced to 10. Explain why F1 (not exact-match, not a rubric) fits, and why you would weight recall on `critical` (`lib/mcp/types.ts` L3) above `info`.
 
 ### Level 4 — Defend
 
@@ -395,3 +395,6 @@ A colleague proposes one LLM-as-judge scorer for every surface "so the harness i
 ### Quick check — code reference test
 
 What does `classifyIntent` (`lib/agents/intent.ts` L17–L31) return, and which scoring method fits it and why? (Answer: one of three enum words — it caps `max_tokens` at 16 to force a single-word answer — so exact-match (`===`) is the correct method: the output space is a single label with zero correct variation, so no tolerance is needed and a judge would only add cost and bias.)
+
+---
+Updated: 2026-05-28 — Test count 125→157; re-derived `MonitoringAgent.scan` (monitoring.ts L68–L103) and `Diagnosis` (types.ts L64–L73) refs. `classifyIntent` (intent.ts L17–L31), `propose` (recommendation.ts L36–L77), and Severity (types.ts L3) unchanged. Still Case B.

@@ -3,7 +3,7 @@
 **Industry name(s):** client-side throttling / request spacing, fixed-interval rate limiting, backpressure, load shedding, concurrency-bounded queue
 **Type:** Industry standard · Language-agnostic
 
-> `McpClient.liveCall` enforces a fixed minimum interval between outbound calls — set to 1100 ms in `connectMcp` to satisfy Bloomreach's ~1 req/s/user limit — but this is serial spacing for ONE user's call chain, not a real request queue with backpressure or load-shedding when many users share the limit.
+> `McpClient.liveCall` enforces a fixed minimum interval between outbound calls — set to 1100 ms in `connectMcp` to satisfy Bloomreach's ~1 req/s/user limit — but this is serial spacing for ONE user's call chain, not a real request queue with backpressure or load-shedding when many users share the limit. (The routes do wrap the pre-stream setup — `getOrCreateSessionId` + `connectMcp` — in a try/catch that returns the real error JSON instead of a bare 500.)
 
 **See also:** → 05-retry-circuit-breaker.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
 
@@ -52,16 +52,16 @@ The gap matters because spacing assumes calls arrive *one at a time*. The instan
 Every live MCP call goes through `liveCall`, which is the single place the transport is touched. Before each call it measures how long since the last one and sleeps the remainder of the minimum interval.
 
 ```
- liveCall(name, args):                          lib/mcp/client.ts L69–L77
-   elapsed = Date.now() - lastCallAt            L70
-   if elapsed < minIntervalMs:                  L71
-     await sleep(minIntervalMs - elapsed)       L72
-   result = transport.callTool(name, args)      L74
-   lastCallAt = Date.now()                       L75
+ liveCall(name, args):                          lib/mcp/client.ts L148–L163
+   elapsed = Date.now() - lastCallAt            L149
+   if elapsed < minIntervalMs:                  L150
+     await sleep(minIntervalMs - elapsed)       L151
+   result = transport.callTool(name, args)      L154
+   lastCallAt = Date.now()                       L155
    return result
 ```
 
-`lastCallAt` is a single instance field on `McpClient` (`lib/mcp/client.ts` L19). Every live call — whether a cache miss or a retry — updates it after the transport returns, so two back-to-back calls always have at least `minIntervalMs` between their network hits.
+`lastCallAt` is a single instance field on `McpClient` (`lib/mcp/client.ts` L81). Every live call — whether a cache miss or a retry — updates it after the transport returns, so two back-to-back calls always have at least `minIntervalMs` between their network hits.
 
 ```
 time ─────────────────────────────────────────────────────────────▶
@@ -81,25 +81,26 @@ This is a *strict* throttle: at most one call per `minIntervalMs`. Unlike a toke
 
 ### The interval — 1100 ms for Bloomreach's ~1 req/s
 
-The interval is set where the client is constructed. The default in `McpClient` is 200 ms (`lib/mcp/client.ts` L25), but `connectMcp` overrides it to 1100 ms for the real Bloomreach connection.
+The interval is set where the client is constructed. The default in `McpClient` is 200 ms (`lib/mcp/client.ts` L88), but `connectMcp` overrides it to 1100 ms for the real Bloomreach connection.
 
 ```
- connectMcp(sessionId):                         lib/mcp/connect.ts L40–L69
+ connectMcpInner(sessionId):                    lib/mcp/connect.ts L66–L107
    ...
-   // Bloomreach enforces ~1 req/second per user GLOBALLY      L51–L55 (comment)
+   // Bloomreach rate-limits per user GLOBALLY  L81–L88 (comment)
    return {
      ok: true,
-     mcp: new McpClient(new SdkTransport(client),
-                        { minIntervalMs: 1100 }),    ← L56–L59
+     mcp: new McpClient(new SdkTransport(client, httpErrors),
+                        { minIntervalMs: 1100, retryDelayMs: 10_000,
+                          retryCeilingMs: 20_000, maxRetries: 3 }),  ← L91–L96
    };
 ```
 
-The 1100 ms (just over one second) is deliberate headroom over Bloomreach's documented ~1 req/s/user ceiling. Combined with the 60s tool cache (`01-llm-caching.md`), this keeps a single user's agent run under the limit: even a 13-call briefing spaces out to ~14 seconds of network time, comfortably inside the `maxDuration = 60` route budget (`app/api/agent/route.ts` L18).
+The 1100 ms (just over one second) is deliberate headroom over Bloomreach's documented ~1 req/s/user ceiling. Combined with the 60s tool cache (`01-llm-caching.md`), this keeps a single user's agent run under the limit: even a 13-call briefing spaces out to ~14 seconds of network time, comfortably inside the `maxDuration = 300` route budget (`app/api/agent/route.ts` L20).
 
 ```
   Bloomreach limit:  ~1 req / 1 sec / user
   spacing chosen:    1100 ms  (10% headroom)
-  13-call run:       ~14.3 sec of spaced network calls < 60s budget
+  13-call run:       ~14.3 sec of spaced network calls < 300s budget
 ```
 
 ---
@@ -120,7 +121,7 @@ Spacing assumes a *serial* caller. The agent loop is serial within one run — i
                                        no bound on how many wait
 ```
 
-There is no request queue. If N call chains run concurrently against one `McpClient`, they all contend on the same `lastCallAt` field — each `liveCall` waits, but there is no ordering, no fairness, and no bound on how many can pile up waiting. Worse, each `connectMcp` call creates a *new* `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L56–L59), so two concurrent users get two independent spacers and can both hit Bloomreach at once — 2 req/s against a 1 req/s per-user limit if they share a quota, or simply uncoordinated load.
+There is no request queue. If N call chains run concurrently against one `McpClient`, they all contend on the same `lastCallAt` field — each `liveCall` waits, but there is no ordering, no fairness, and no bound on how many can pile up waiting. Worse, each `connectMcp` call creates a *new* `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L91–L96), so two concurrent users get two independent spacers and can both hit Bloomreach at once — 2 req/s against a 1 req/s per-user limit if they share a quota, or simply uncoordinated load.
 
 And there is no **load shedding**: under a burst, the system does not reject excess work or signal backpressure to the producer. It just makes everyone wait, unbounded.
 
@@ -168,11 +169,11 @@ This diagram spans the Agent, Service (McpClient), and Provider layers. The spac
   │                                                                       │
   │  ┌──────────────────────────────────────────────────┐               │
   │  │  liveCall — spacing gate  (BUILT)                  │               │
-  │  │  elapsed = now - lastCallAt   L70                  │               │
-  │  │  elapsed < 1100 ? await (1100 - elapsed)   L71–L72 │               │
-  │  │  lastCallAt = now   L75                            │               │
+  │  │  elapsed = now - lastCallAt   L149                 │               │
+  │  │  elapsed < 1100 ? await (1100 - elapsed) L150–151  │               │
+  │  │  lastCallAt = now   L155                           │               │
   │  └──────────────────────────────────────────────────┘               │
-  │       │ minIntervalMs = 1100 set in connectMcp L56–L59               │
+  │       │ minIntervalMs = 1100 set in connectMcp L91–L96               │
   │                                                                       │
   │  ╎ GAP  no backpressure: under burst everyone waits, unbounded ╎      │
   │  ╎ GAP  lastCallAt is per-instance — concurrent users uncoordinated ╎ │
@@ -180,7 +181,7 @@ This diagram spans the Agent, Service (McpClient), and Provider layers. The spac
           │  NETWORK / PROVIDER BOUNDARY
   ┌───────▼──────────────────────────────────────────────────────────────┐
   │  PROVIDER   Bloomreach MCP server                                     │
-  │  limit: ~1 req / 1 sec / user GLOBALLY  (connect.ts L51–L55 comment)  │
+  │  limit: ~1 req / 1 sec / user GLOBALLY  (connect.ts L81–L88 comment)  │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -196,19 +197,21 @@ Partially implemented — fixed-interval spacing is built; queueing, backpressur
 
 **File:** `lib/mcp/client.ts`
 **Function / class:** `McpClient.liveCall`
-**Line range:** L69–L77 (`elapsed` L70, sleep gate L71–L72, transport call L74, `lastCallAt = Date.now()` L75). State field `lastCallAt` at L19; default `minIntervalMs = 200` at L25.
+**Line range:** L148–L163 (`elapsed` L149, sleep gate L150–L151, transport call L154, `lastCallAt = Date.now()` L155). State field `lastCallAt` at L81; default `minIntervalMs = 200` at L88.
 
 ### The 1100 ms interval for Bloomreach (Case A)
 
 **File:** `lib/mcp/connect.ts`
-**Function / class:** `connectMcp`
-**Line range:** L40–L69; the rate-limit comment at L51–L55 and the `{ minIntervalMs: 1100 }` construction at L56–L59. The route's `maxDuration = 60` budget that this spacing must fit inside is at `app/api/agent/route.ts` L18.
+**Function / class:** `connectMcpInner`
+**Line range:** L66–L107; the rate-limit comment at L81–L88 and the `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }` construction at L91–L96. The route's `maxDuration = 300` budget that this spacing must fit inside is at `app/api/agent/route.ts` L20.
+
+Note: both routes now guard the pre-stream setup. In `app/api/agent/route.ts` L155–L165 (and the parallel `app/api/briefing/route.ts` L62–L72), `getOrCreateSessionId()` + `connectMcp()` run inside a `try/catch` that returns the real error JSON (`/api/agent setup · <message>`, status 500) instead of a bare 500 — so a setup throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production) surfaces the actual cause. The 401 `needsAuth`/`authUrl` response follows a successful connect.
 
 ### Request queue + backpressure + load shedding (Case B — Not yet implemented)
 
-**Not yet implemented.** blooming insights spaces a single serial caller with a timestamp-and-sleep (`liveCall`) but has no request queue, no depth bound, no backpressure signal, and no load-shedding — concurrent call chains contend on `lastCallAt` with no ordering, and each `connectMcp` builds a fresh per-instance spacer (`lib/mcp/connect.ts` L56–L59) so multiple users are uncoordinated.
+**Not yet implemented.** blooming insights spaces a single serial caller with a timestamp-and-sleep (`liveCall`) but has no request queue, no depth bound, no backpressure signal, and no load-shedding — concurrent call chains contend on `lastCallAt` with no ordering, and each `connectMcp` builds a fresh per-instance spacer (`lib/mcp/connect.ts` L91–L96) so multiple users are uncoordinated.
 
-Where it would live: a concurrency-bounded queue would wrap `liveCall` inside `McpClient` (`lib/mcp/client.ts` L69), serializing all callers through one ordered queue with a max depth that triggers backpressure (reject or block) when full. Cross-user coordination would require a shared limiter (a Redis/Upstash sliding window keyed per Bloomreach user) constructed in `connectMcp` (`lib/mcp/connect.ts` L56) instead of a per-instance field.
+Where it would live: a concurrency-bounded queue would wrap `liveCall` inside `McpClient` (`lib/mcp/client.ts` L148), serializing all callers through one ordered queue with a max depth that triggers backpressure (reject or block) when full. Cross-user coordination would require a shared limiter (a Redis/Upstash sliding window keyed per Bloomreach user) constructed in `connectMcp` (`lib/mcp/connect.ts` L91) instead of a per-instance field.
 
 ---
 
@@ -233,7 +236,7 @@ The transition from "one" to "many" is where rate limiting becomes a systems pro
 
 ### Where this breaks down
 
-Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp` builds a new `McpClient` (`lib/mcp/connect.ts` L56–L59); on serverless, each cold-started function instance has its own `lastCallAt = 0` and can fire immediately, so two instances serving one user can send 2 req/s against a 1 req/s quota. Even within one process, concurrent call chains contend on `lastCallAt` with no fairness — a later caller can win the slot a earlier one was waiting for. And there is no bound: under a burst, the number of callers parked in `await sleep(...)` grows without limit, so latency climbs unboundedly instead of the system shedding excess work and failing fast.
+Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp` builds a new `McpClient` (`lib/mcp/connect.ts` L91–L96); on serverless, each cold-started function instance has its own `lastCallAt = 0` and can fire immediately, so two instances serving one user can send 2 req/s against a 1 req/s quota. Even within one process, concurrent call chains contend on `lastCallAt` with no fairness — a later caller can win the slot a earlier one was waiting for. And there is no bound: under a burst, the number of callers parked in `await sleep(...)` grows without limit, so latency climbs unboundedly instead of the system shedding excess work and failing fast.
 
 ### What to explore next
 
@@ -266,7 +269,7 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 
 ### fixed-interval spacing (timestamp + sleep)
 
-- **Codebase uses:** `liveCall`'s `lastCallAt` + `sleep(minIntervalMs - elapsed)` (`lib/mcp/client.ts` L69–L77), `minIntervalMs: 1100` (`lib/mcp/connect.ts` L56–L59).
+- **Codebase uses:** `liveCall`'s `lastCallAt` + `sleep(minIntervalMs - elapsed)` (`lib/mcp/client.ts` L148–L163), `minIntervalMs: 1100` (`lib/mcp/connect.ts` L91–L96).
 - **Why it's here:** zero dependencies, provably correct for one serial caller against a ~1 req/s limit.
 - **Leading today:** `p-throttle` (adoption-leading minimal throttle, 2026); `Bottleneck` `minTime` (innovation-leading with reservoir/clustering, 2026).
 - **Why it leads:** `p-throttle` is a drop-in for the spacing logic; `Bottleneck` adds the queue and clustering the bare field lacks.
@@ -282,7 +285,7 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 
 ### distributed / cross-instance limiting
 
-- **Codebase uses:** nothing — `lastCallAt` is per `McpClient` instance (`lib/mcp/connect.ts` L56–L59).
+- **Codebase uses:** nothing — `lastCallAt` is per `McpClient` instance (`lib/mcp/connect.ts` L91–L96).
 - **Why it's here:** serverless cold starts and concurrent users each get an independent spacer.
 - **Leading today:** Upstash Rate Limit (`@upstash/ratelimit`) (adoption-leading serverless limiter, 2026); Redis `SET NX PX` sliding windows (innovation-leading self-hosted, 2026).
 - **Why it leads:** state lives in a shared store all instances read/write atomically, so the per-user limit holds across the fleet.
@@ -297,7 +300,7 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 - **Exercise ID:** B5.1 (adapted) — provenance C5.4 (rate-limiting).
 - **What to build:** Replace the bare `lastCallAt` spacing in `McpClient` with a concurrency-bounded queue (e.g. `p-queue` with `concurrency: 1` + `interval`/`intervalCap`) that serializes ALL callers through one ordered queue, caps queue depth, and applies backpressure — rejecting (or signaling) excess work when the depth bound is hit instead of letting waiters pile up unbounded.
 - **Why it earns its place:** it shows you understand the difference between spacing one caller and coordinating many, and that you have a load-shedding policy rather than unbounded latency growth.
-- **Files to touch:** `lib/mcp/client.ts` (wrap `liveCall` at L69 in the queue; the `callTool` path at L46/L52 routes through it), `test/mcp/client.test.ts` (extend the spacing tests to cover concurrent callers and a full queue).
+- **Files to touch:** `lib/mcp/client.ts` (wrap `liveCall` at L148 in the queue; the `callTool` path at L113/L131 routes through it), `test/mcp/client.test.ts` (extend the spacing tests to cover concurrent callers and a full queue).
 - **Done when:** N concurrent `callTool` invocations on one `McpClient` are ordered and spaced at ≥1100 ms with a bounded number in flight, and exceeding the depth bound triggers the chosen backpressure policy — verified by a test firing a burst.
 - **Estimated effort:** 1–2 days.
 
@@ -306,7 +309,7 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 - **Exercise ID:** B5.1 (adapted) — provenance C5.4 (rate-limiting, distributed).
 - **What to build:** Construct a shared limiter (Upstash/Redis sliding window keyed per Bloomreach user) in `connectMcp` so that two serverless instances serving the same user collectively stay under ~1 req/s, instead of each running an independent per-instance spacer.
 - **Why it earns its place:** demonstrates you recognized that per-instance state is the failure mode under horizontal scaling and chose the correct distributed fix.
-- **Files to touch:** `lib/mcp/connect.ts` (construct the shared limiter at L56 instead of the per-instance `minIntervalMs`), `lib/mcp/client.ts` (consult the shared limiter in `liveCall` L69).
+- **Files to touch:** `lib/mcp/connect.ts` (construct the shared limiter at L91 instead of the per-instance `minIntervalMs`), `lib/mcp/client.ts` (consult the shared limiter in `liveCall` L148).
 - **Done when:** two `McpClient` instances for the same user, sharing the limiter, collectively respect the ~1 req/s ceiling — verified with a fake shared store in a test.
 - **Estimated effort:** 1–2 days.
 
@@ -314,12 +317,12 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 
 ## Summary
 
-blooming insights enforces a fixed minimum interval between outbound MCP calls in `McpClient.liveCall` (`lib/mcp/client.ts` L69–L77) — set to 1100 ms in `connectMcp` (`lib/mcp/connect.ts` L56–L59) to stay under Bloomreach's ~1 req/s/user limit with headroom. This is strict client-side spacing for a single serial caller, and it is provably correct for the one-user, one-run-at-a-time deployment shape. What it lacks is the multi-caller machinery: a request queue to order concurrent callers, a depth bound, a backpressure/load-shedding policy under burst, and cross-instance coordination (each `connectMcp` builds an independent per-instance spacer). The buildable target is a concurrency-bounded queue with backpressure, and a shared distributed limiter for the serverless concurrent-user case.
+blooming insights enforces a fixed minimum interval between outbound MCP calls in `McpClient.liveCall` (`lib/mcp/client.ts` L148–L163) — set to 1100 ms in `connectMcp` (`lib/mcp/connect.ts` L91–L96) to stay under Bloomreach's ~1 req/s/user limit with headroom. This is strict client-side spacing for a single serial caller, and it is provably correct for the one-user, one-run-at-a-time deployment shape. What it lacks is the multi-caller machinery: a request queue to order concurrent callers, a depth bound, a backpressure/load-shedding policy under burst, and cross-instance coordination (each `connectMcp` builds an independent per-instance spacer). The buildable target is a concurrency-bounded queue with backpressure, and a shared distributed limiter for the serverless concurrent-user case.
 
 **Key points:**
 - Rate limiting splits into spacing (one caller) and backpressure (many callers sharing a limit); the second is the hard part.
-- `liveCall` spaces one serial caller at 1100 ms via a timestamp + sleep (`lib/mcp/client.ts` L70–L75) — a strict throttle, no bursts.
-- The interval is set in `connectMcp` (`lib/mcp/connect.ts` L56–L59) for Bloomreach's ~1 req/s/user ceiling, fitting inside the 60s route budget.
+- `liveCall` spaces one serial caller at 1100 ms via a timestamp + sleep (`lib/mcp/client.ts` L149–L155) — a strict throttle, no bursts.
+- The interval is set in `connectMcp` (`lib/mcp/connect.ts` L91–L96) for Bloomreach's ~1 req/s/user ceiling, fitting inside the 300s route budget.
 - There is no queue, no depth bound, and no load-shedding — under burst, waiters pile up unbounded.
 - `lastCallAt` is per-instance, so concurrent users (or serverless instances) are uncoordinated; a shared limiter is the fix.
 
@@ -335,7 +338,7 @@ blooming insights enforces a fixed minimum interval between outbound MCP calls i
 
 **[mid] How does blooming insights stay under Bloomreach's ~1 req/s limit?**
 
-`liveCall` (`lib/mcp/client.ts` L69–L77) measures `Date.now() - lastCallAt` and sleeps the remainder of `minIntervalMs` (1100 ms, set in `connectMcp` L56–L59) before each network call, updating `lastCallAt` after. A serial call chain is gapped at ≥1100 ms.
+`liveCall` (`lib/mcp/client.ts` L148–L163) measures `Date.now() - lastCallAt` and sleeps the remainder of `minIntervalMs` (1100 ms, set in `connectMcp` L91–L96) before each network call, updating `lastCallAt` after. A serial call chain is gapped at ≥1100 ms.
 
 ```
   call ─► liveCall ─► wait until lastCallAt+1100 ─► network ─► lastCallAt = now
@@ -343,7 +346,7 @@ blooming insights enforces a fixed minimum interval between outbound MCP calls i
 
 **[senior] Two users run investigations at the same time. Is the limit still respected?**
 
-Not reliably. Each `connectMcp` builds a separate `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L56–L59), so the two spacers are independent and can both fire — 2 req/s if they share a per-user quota. And there is no queue ordering them.
+Not reliably. Each `connectMcp` builds a separate `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L91–L96), so the two spacers are independent and can both fire — 2 req/s if they share a per-user quota. And there is no queue ordering them.
 
 ```
   user A: McpClient.lastCallAt = 0 ─► fire @ T₀
@@ -367,11 +370,11 @@ For one serial caller they are functionally identical — the caller never accum
 
 ### One-line anchors
 
-- `lib/mcp/client.ts` L69–L77 — `liveCall`, the spacing gate
-- `lib/mcp/client.ts` L19 — `lastCallAt`, the per-instance spacing state
-- `lib/mcp/connect.ts` L56–L59 — `minIntervalMs: 1100` for Bloomreach's ~1 req/s
-- `lib/mcp/connect.ts` L51–L55 — the rate-limit comment documenting the ceiling
-- `app/api/agent/route.ts` L18 — `maxDuration = 60`, the budget spacing must fit inside
+- `lib/mcp/client.ts` L148–L163 — `liveCall`, the spacing gate
+- `lib/mcp/client.ts` L81 — `lastCallAt`, the per-instance spacing state
+- `lib/mcp/connect.ts` L91–L96 — `minIntervalMs: 1100` for Bloomreach's ~1 req/s
+- `lib/mcp/connect.ts` L81–L88 — the rate-limit comment documenting the ceiling
+- `app/api/agent/route.ts` L20 — `maxDuration = 300`, the budget spacing must fit inside
 
 ---
 
@@ -387,12 +390,15 @@ Out loud: explain why per-instance `lastCallAt` is correct for one serial caller
 
 ### Level 3 — Apply
 
-Scenario: traffic grows and multiple users investigate at once. Open `lib/mcp/connect.ts` L56–L59 — each call builds a new `McpClient`. Explain precisely why this means the ~1 req/s/user limit is no longer guaranteed, and name the minimum change (a shared per-user limiter constructed at L56) that restores it.
+Scenario: traffic grows and multiple users investigate at once. Open `lib/mcp/connect.ts` L91–L96 — each call builds a new `McpClient`. Explain precisely why this means the ~1 req/s/user limit is no longer guaranteed, and name the minimum change (a shared per-user limiter constructed at L91) that restores it.
 
 ### Level 4 — Defend
 
-A teammate wants to replace the fixed delay with a token bucket to "handle bursts better." Defend the position that the bucket is the wrong fix: for a single serial caller it is functionally identical to the fixed delay, and the actual gap is the absence of a queue and load-shedding for concurrent callers — cite `lib/mcp/client.ts` L69–L77 and explain what a bounded queue adds that a bucket does not.
+A teammate wants to replace the fixed delay with a token bucket to "handle bursts better." Defend the position that the bucket is the wrong fix: for a single serial caller it is functionally identical to the fixed delay, and the actual gap is the absence of a queue and load-shedding for concurrent callers — cite `lib/mcp/client.ts` L148–L163 and explain what a bounded queue adds that a bucket does not.
 
 ### Quick check — code reference test
 
-What value is `minIntervalMs` set to for the live Bloomreach connection, and on which line? (Answer: 1100 ms, `lib/mcp/connect.ts` L58, constructed L56–L59.)
+What value is `minIntervalMs` set to for the live Bloomreach connection, and on which line? (Answer: 1100 ms, `lib/mcp/connect.ts` L92, in the construction at L91–L96.)
+
+---
+Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived liveCall refs (client.ts L148–L163, lastCallAt L81) and connectMcp construction (connect.ts L91–L96, comment L81–L88); added the pre-stream setup try/catch note (both routes return real error JSON, not a bare 500).

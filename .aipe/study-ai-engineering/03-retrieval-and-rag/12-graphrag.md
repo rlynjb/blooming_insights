@@ -11,7 +11,7 @@
 
 ## Why care
 
-The `WorkspaceSchema` blooming insights builds is already a graph, not a flat list. An *event* (`purchase`) has a set of *properties* (`amount`, `currency`); a *catalog* relates to the events that reference it; a customer property links customers to events. `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) walks this structure with four sequential tool calls — event schema, customer properties, catalogs, overview — and assembles the nodes-and-edges into one `WorkspaceSchema`. That is a graph traversal that produces a graph. Flat embedding retrieval (files 01–10) throws that structure away — it treats every chunk as an independent point and only knows "similar to," never "connected to."
+The `WorkspaceSchema` blooming insights builds is already a graph, not a flat list. An *event* (`purchase`) has a set of *properties* (`amount`, `currency`); a *catalog* relates to the events that reference it; a customer property links customers to events. `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks this structure with four sequential tool calls — event schema, customer properties, catalogs, overview — and assembles the nodes-and-edges into one `WorkspaceSchema`. That is a graph traversal that produces a graph. Flat embedding retrieval (files 01–10) throws that structure away — it treats every chunk as an independent point and only knows "similar to," never "connected to."
 
 The question GraphRAG answers is: when the answer depends on *relationships* between entities, not just their textual similarity, how do you retrieve by traversing the connections?
 
@@ -65,7 +65,7 @@ The body walks the graph shape, the traversal, and the hybrid that combines it w
      └──has──▶ (customer property: lifetime_value)
 ```
 
-`bootstrapSchema` (L152–L176) *walks* this: it calls `get_event_schema` (events + their properties), `get_customer_property_schema`, `list_catalogs`, and `get_project_overview`, then `parseWorkspaceSchema` (L73–L124) assembles the edges — each event mapped to its property list (L91–L99). That assembly *is* building a graph from a traversal of the source. The structure is there; it is just not yet *queried* as a graph.
+`bootstrapSchema` (L170–L192) *walks* this: it calls `get_event_schema` (events + their properties), `get_customer_property_schema`, `list_catalogs`, and `get_project_overview`, then `parseWorkspaceSchema` (L73–L124) assembles the edges — each event mapped to its property list (L91–L99). That assembly *is* building a graph from a traversal of the source. The structure is there; it is just not yet *queried* as a graph.
 
 ### Insights form a second graph: shared metric and scope
 
@@ -154,7 +154,7 @@ Vector similarity finds the start; graph edges find the connected — the schema
 
 **Not yet implemented (graph retrieval).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, with neither a flat embedding index nor a graph index — so there is no edge-traversal retrieval anywhere.
 
-The honest analog is strong and structural: the Bloomreach schema is graph-shaped (events → properties → catalogs; customers → events) and `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) already *walks* it. It issues four sequential tool calls to gather the event schema, customer properties, catalogs, and overview, then `parseWorkspaceSchema` (L73–L124) assembles the relationships — mapping each event to its property list (L91–L99) and each catalog to its id/name (L105–L108). That assembly is building a graph from a traversal of the source. A second latent graph lives in the `Insight` type (`lib/mcp/types.ts` L7–L17): `metric` and `scope` are edges waiting to be drawn between insights. GraphRAG retrieval over either graph would live in a `lib/mcp/retrieval.ts` reading a graph built in `lib/state/`. The `Project exercises` block below is the primary buildable target.
+The honest analog is strong and structural: the Bloomreach schema is graph-shaped (events → properties → catalogs; customers → events) and `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) already *walks* it. It issues four sequential tool calls to gather the event schema, customer properties, catalogs, and overview, then `parseWorkspaceSchema` (L73–L124) assembles the relationships — mapping each event to its property list (L91–L99) and each catalog to its id/name (L105–L108). That assembly is building a graph from a traversal of the source. A second latent graph lives in the `Insight` type (`lib/mcp/types.ts` L7–L17): `metric` and `scope` are edges waiting to be drawn between insights. GraphRAG retrieval over either graph would live in a `lib/mcp/retrieval.ts` reading a graph built in `lib/state/`. The `Project exercises` block below is the primary buildable target.
 
 ---
 
@@ -222,7 +222,7 @@ Like all of this section, GraphRAG is Case B and subject to the same threshold r
 
 ### knowledge-graph retrieval
 
-- **Codebase uses:** the analog — `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) walks the graph-shaped Bloomreach schema; `parseWorkspaceSchema` (L91–L99) assembles event→property edges. No graph *query*.
+- **Codebase uses:** the analog — `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks the graph-shaped Bloomreach schema; `parseWorkspaceSchema` (L91–L99) assembles event→property edges. No graph *query*.
 - **Why it's here (absent as retrieval):** the schema graph is built but used as a flat summary, not traversed for retrieval.
 - **Leading today:** Neo4j (property graph) and Microsoft GraphRAG lead knowledge-graph retrieval (2026).
 - **Why it leads:** native edge traversal and multi-hop queries that similarity retrieval cannot express.
@@ -266,7 +266,7 @@ GraphRAG retrieves by traversing relationships between entities — shared attri
 
 **Key points:**
 - Vector similarity captures "same meaning"; graph traversal captures "connected" — different relations.
-- The Bloomreach schema is graph-shaped and `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) already walks it.
+- The Bloomreach schema is graph-shaped and `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) already walks it.
 - `Insight.metric` and `Insight.scope` are edges — "related insights" is a graph query over exact fields.
 - Production GraphRAG uses vector similarity for the entry node and edges for expansion.
 - "Related insights" needs no embeddings — the edges are exact structured fields, the cheapest graph win.
@@ -292,7 +292,7 @@ GraphRAG:   follow edges (shared metric/scope), even if worded differently
 
 **[senior] blooming insights has no graph index — but is its data graph-shaped?**
 
-Yes. The Bloomreach schema is a graph (events → properties → catalogs), and `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) already walks it and assembles event→property edges (L91–L99). Separately, `Insight.metric` and `Insight.scope` (`lib/mcp/types.ts` L7–L17) are edges between insights. The structure is there; it just is not queried as a graph yet.
+Yes. The Bloomreach schema is a graph (events → properties → catalogs), and `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) already walks it and assembles event→property edges (L91–L99). Separately, `Insight.metric` and `Insight.scope` (`lib/mcp/types.ts` L7–L17) are edges between insights. The structure is there; it just is not queried as a graph yet.
 
 ```
 bootstrapSchema walks: event ──has──▶ property, ──references──▶ catalog
@@ -314,7 +314,7 @@ edges are exact fields → no embeddings, no extraction
 
 ### One-line anchors
 
-- `lib/mcp/schema.ts` L152–L176 — `bootstrapSchema`: walks the graph-shaped schema (the traversal analog).
+- `lib/mcp/schema.ts` L170–L192 — `bootstrapSchema`: walks the graph-shaped schema (the traversal analog).
 - `lib/mcp/schema.ts` L91–L99 — `parseWorkspaceSchema`: assembles event→property edges.
 - `lib/mcp/types.ts` L7–L17 — `Insight.metric` / `Insight.scope`: edges between insights.
 - Vector similarity = "similar to"; graph traversal = "connected to" — different relations.
@@ -334,7 +334,7 @@ Out loud: why is vector similarity blind to relationships? Why does the vector-e
 
 ### Level 3 — Apply
 
-Scenario: build "related insights." Open `lib/mcp/types.ts` L7–L17 (`Insight.metric`, `Insight.scope`) and `lib/mcp/schema.ts` L152–L176 (`bootstrapSchema`'s traversal-to-build-a-graph pattern). Name the nodes and edges, why no embeddings are needed, and how `relatedInsights(id)` would traverse the shared-metric and shared-scope edges.
+Scenario: build "related insights." Open `lib/mcp/types.ts` L7–L17 (`Insight.metric`, `Insight.scope`) and `lib/mcp/schema.ts` L170–L192 (`bootstrapSchema`'s traversal-to-build-a-graph pattern). Name the nodes and edges, why no embeddings are needed, and how `relatedInsights(id)` would traverse the shared-metric and shared-scope edges.
 
 ### Level 4 — Defend
 
@@ -342,4 +342,7 @@ A colleague wants to build "related insights" with an embedding index ("just emb
 
 ### Quick check — code reference test
 
-What graph-shaped data does blooming insights already build and walk, and what edges would a "related insights" graph use? (Answer: `bootstrapSchema` (`lib/mcp/schema.ts` L152–L176) walks the graph-shaped Bloomreach schema and `parseWorkspaceSchema` assembles event→property edges (L91–L99); a "related insights" graph would use the exact structured `metric` and `scope` fields on the `Insight` type (`lib/mcp/types.ts` L7–L17) as edges — no embeddings required.)
+What graph-shaped data does blooming insights already build and walk, and what edges would a "related insights" graph use? (Answer: `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks the graph-shaped Bloomreach schema and `parseWorkspaceSchema` assembles event→property edges (L91–L99); a "related insights" graph would use the exact structured `metric` and `scope` fields on the `Insight` type (`lib/mcp/types.ts` L7–L17) as edges — no embeddings required.)
+
+---
+Updated: 2026-05-28 — corrected one stale ref: `bootstrapSchema` moved to `lib/mcp/schema.ts` L170–L192 (was L152–L176). Case-B rationale (graph-shaped schema, no graph query yet) unchanged.

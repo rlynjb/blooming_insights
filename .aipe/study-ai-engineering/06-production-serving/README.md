@@ -35,7 +35,7 @@ The `?q=` input is only `.trim()`'d (`app/api/agent/route.ts` L54) then passed v
 **Built:** fixed-interval inter-call spacing — `liveCall` enforces `minIntervalMs` (`lib/mcp/client.ts` L69–L77), set to 1100 ms in `connectMcp` (`lib/mcp/connect.ts` L58) for Bloomreach's ~1 req/s/user limit. **Absent:** a real request queue, backpressure, and load-shedding under burst — it is serial spacing for one user, not a multi-tenant queue. Exercise: a concurrency-bounded queue with backpressure when N users share the limit.
 
 ### `05-retry-circuit-breaker.md` — Case A (partial) + Case B
-**Built:** bounded rate-limit retry — `while (isRateLimited && retries < maxRetries)` (`lib/mcp/client.ts` L49–L53), `maxRetries = 3`, `retryDelayMs = 1200` — honestly a FIXED delay, not exponential backoff with jitter. **Absent:** a circuit breaker. Exercise: add exponential backoff + jitter and a breaker that fails fast during a provider outage.
+**Built:** bounded rate-limit retry with EXPONENTIAL backoff — `while (isRateLimited && retries < maxRetries)` (`lib/mcp/client.ts` L122–L132), `maxRetries = 3`, base `retryDelayMs = 10_000`, capped at `retryCeilingMs = 20_000`, preferring a parsed Retry-After window + a 500ms buffer — honestly missing only jitter. **Absent:** jitter, and a circuit breaker. Exercise: add jitter and a breaker that fails fast during a provider outage.
 
 ---
 
@@ -48,7 +48,7 @@ The `?q=` input is only `.trim()`'d (`app/api/agent/route.ts` L54) then passed v
   02 cost optimization        Case A        cost meter + in-agent cascade
   03 prompt injection         Case B        input guard on ?q=
   04 rate limiting            Case A        queue + backpressure
-  05 retry / circuit breaker  Case A + B    backoff+jitter + breaker
+  05 retry / circuit breaker  Case A + B    jitter + breaker
 ```
 
 **Caching, rate limiting, and retry are Case A** — real, working implementations in `lib/mcp/client.ts` and `lib/mcp/connect.ts` that the exercises extend and harden. **Prompt injection and the circuit breaker are the Case-B hardening gaps** — prompt injection is an honest, bounded security finding, and the circuit breaker is the missing companion to the existing retry.
@@ -63,3 +63,6 @@ Each file is self-contained, but they pair naturally:
 - **Standalone:** `03-prompt-injection` (the security finding; read whenever the threat model comes up).
 
 All five anchor to the same two files — `lib/mcp/client.ts` and `lib/mcp/connect.ts` — which together form the single choke-point where caching, spacing, and retry meet.
+
+---
+Updated: 2026-05-28 — Fixed the 05 summary: retry is exponential backoff (10s base, 20s ceiling) with a parsed Retry-After window, not a fixed 1200ms delay; the remaining gaps are jitter + breaker.
