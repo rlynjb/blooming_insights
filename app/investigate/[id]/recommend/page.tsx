@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 import RecommendationCard from '@/components/investigation/RecommendationCard';
+import InvestigationSubject from '@/components/investigation/InvestigationSubject';
 import StatusLog from '@/components/shared/StatusLog';
 import { useInvestigation } from '@/lib/hooks/useInvestigation';
 import { investigationToMarkdown, downloadMarkdown } from '@/lib/export/investigationMarkdown';
@@ -103,6 +104,9 @@ export default function RecommendPage() {
           your workspace, in bloom
         </p>
       </div>
+
+      {/* which feed item this investigation is about */}
+      <InvestigationSubject id={id} />
 
       <ProcessStepper
         monitoring={{ state: 'complete', sub: 'change detected', href: '/' }}
