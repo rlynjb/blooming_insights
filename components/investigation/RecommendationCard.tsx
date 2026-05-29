@@ -151,7 +151,7 @@ export default function RecommendationCard({ recommendation }: RecommendationCar
           margin: 0,
         }}
       >
-        impact: <span style={{ textTransform: 'none' }}>{estimatedImpact}</span>
+        expected impact: <span style={{ textTransform: 'none' }}>{estimatedImpact}</span>
       </p>
     </div>
   );
