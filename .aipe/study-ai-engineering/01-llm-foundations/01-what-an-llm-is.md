@@ -118,7 +118,7 @@ This object is a literal, written by hand, with no model involvement. It exists 
 
 ### Why the boundary is non-negotiable
 
-The monitoring agent makes the same point in its degradation path (`lib/agents/monitoring.ts` L95–L101):
+The monitoring agent makes the same point in its degradation path (`lib/agents/monitoring.ts` L113–L118):
 
 ```typescript
 let parsed: unknown;
@@ -192,7 +192,7 @@ The model never hands the system a `Diagnosis`. It hands the system a string, an
 - **Text extraction:** `res.content.filter(b => b.type === 'text').map(b => b.text).join('')` — `lib/agents/base.ts` L108–L113 (surfacing to `onText`) and L122 (the returned `finalText`).
 - **Parse step:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three escalating strategies: markdown fence, bare `JSON.parse`, then a first-bracket-to-last-bracket substring scan; throws if all fail.
 - **Validate step (type guards):** `isAnomalyArray` (`lib/mcp/validate.ts` L17–L27), `isDiagnosis` (L29–L35), `isRecommendationArray` (L42–L53). Each is a `v is T` predicate that proves the shape field by field.
-- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L16–L20; the three-tier chain — `lib/agents/diagnostic.ts` L74–L75. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L95–L101.
+- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L16–L20; the three-tier chain — `lib/agents/diagnostic.ts` L74–L75. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L113–L118.
 - **Model identity:** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9. The one constant naming the function being called.
 
 ### Why three tiers, not one
@@ -370,7 +370,7 @@ From memory, draw the path from `anthropic.messages.create` to a typed `Diagnosi
 
 ### Level 2 — Explain
 
-Out loud: why is `finalText` typed `string` and not `Diagnosis`, even though the prompt asked for a diagnosis? Why does `monitoring.ts` declare `parsed: unknown` (L85) before validating?
+Out loud: why is `finalText` typed `string` and not `Diagnosis`, even though the prompt asked for a diagnosis? Why does `monitoring.ts` declare `parsed: unknown` (L112) before validating?
 
 ### Level 3 — Apply
 
@@ -386,3 +386,4 @@ What is the exact return type of `runAgentLoop`, and which field of it is the un
 
 ---
 Updated: 2026-05-28 — Re-derived the drifted `diagnostic.ts`/`monitoring.ts` line refs (chain L74–L75, `tryParseDiagnosis` L22–L29, `FALLBACK` L16–L20, monitoring degradation L95–L101) and noted the post-derived `diag.confidence`; `base.ts`/`runAgentLoop` refs verified unchanged.
+Updated: 2026-05-29 — Monitoring degradation path moved: `parseAgentJson` + degrade guard now L113–L118 (was L95–L101), `parsed: unknown` declaration now L112 (was L85).

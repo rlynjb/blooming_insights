@@ -101,6 +101,17 @@ recommendation  prompts/recommendation.md  recommendationTools isRecommendationA
 
 The diagnostic step never sees the recommendation catalog; the recommendation step never sees the detection rules. Each prompt is scoped to its single job, which keeps the context small (→ 01-context-window.md) and the behavior testable in isolation.
 
+### The monitoring link is gated to the workspace's runnable categories
+
+The first link — monitoring detection — does not run a fixed 10-category sweep. The briefing route gates the anomaly checklist against the live schema *before* the agent call, then injects only the supported categories into the prompt, so the link never spends EQL budget querying a category this workspace's events cannot support. `MonitoringAgent.scan` now takes the runnable categories as a parameter — `scan(hooks?, categories: AnomalyCategory[] = [])` (`lib/agents/monitoring.ts` L69) — and builds a per-category checklist (one bullet per category: its `whyItMatters`, its suggested EQL recipe, and its `|Δ|` thresholds) that it interpolates into the prompt through a `{categories}` slot (checklist built L73–L81, `.replace('{categories}', checklist)` at L86). The route computes the runnable set with `runnableCategories` (`lib/agents/categories.ts` L157–L160), which drops any category missing a hard dependency, and hands it to `scan` (`runnable = runnableCategories(capabilities)` at `app/api/briefing/route.ts` L204; `agent.scan({…}, runnable)` at L223).
+
+```
+schemaCapabilities(schema) → runnableCategories(…) → checklist → {categories} slot → scan
+            (route L202–204)                              (monitoring L73–L86, L69)
+```
+
+This is the prompt-chaining payoff applied to a single link: the detection step's prompt is sized to exactly the categories the data can answer, so the link is both cheaper (no wasted queries on unsupported categories) and more focused (the model is told precisely what to check). The gate itself — schema capabilities → coverage → runnable set — is the subject of → ../04-agents-and-tool-use/07-capability-gating.md.
+
 ### Errors are isolated per link
 
 Each step degrades to a safe default for *that step* rather than failing the chain. `MonitoringAgent.scan` returns `[]` on any parse failure (`lib/agents/monitoring.ts` L95–L101); `DiagnosticAgent.investigate` falls through to `FALLBACK` (`lib/agents/diagnostic.ts` L74–L75); `RecommendationAgent.propose` falls through to `[]` (`lib/agents/recommendation.ts` L69–L73). And the whole route body is wrapped in `try/catch` (`app/api/agent/route.ts` L196–L263) that emits an `error` event and still closes the stream cleanly in `finally`.
@@ -404,3 +415,4 @@ Which two `await` calls in `app/api/agent/route.ts` run the investigation chain'
 
 ---
 Updated: 2026-05-28 — Rewrote the chain orchestration as the two-step `?step=diagnose`/`?step=recommend` split with the `bi:diag:<id>` sessionStorage handoff (was a single in-process `await` chain); `maxDuration` 60→300; re-derived all route.ts/diagnostic.ts/recommendation.ts/monitoring.ts/useInvestigation.ts line refs.
+Updated: 2026-05-29 — Added "The monitoring link is gated to the workspace's runnable categories": `scan(hooks?, categories=[])` (monitoring.ts L69) injects a per-category checklist via the `{categories}` slot (L73–L86), gated by `runnableCategories` (categories.ts L157–L160) at briefing route L204/L223; cross-refs the new capability-gating file.

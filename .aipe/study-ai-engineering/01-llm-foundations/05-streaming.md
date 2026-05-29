@@ -165,7 +165,7 @@ for (;;) {
 
 The critical detail is `buf = lines.pop()` — a chunk boundary can land mid-line, so the last (possibly incomplete) segment is held back until the next chunk completes it. `dec.decode(value, { stream: true })` similarly handles multi-byte UTF-8 characters split across chunks. After the loop, a trailing buffered line is flushed (L202–L208). `handle` (L97–L151) is the `switch (e.type)` that updates React state per variant.
 
-The hook runs the reader **exactly once per mount** even under React StrictMode (dev mount → cleanup → re-mount): a `startedRef` guard (L43, L47–L48) blocks the second run, and the effect deliberately does *not* abort the fetch on cleanup — cancelling on the first StrictMode cleanup would kill the only stream and leave the log empty (comment L31–L36). Because each `GET /api/agent?step=…` is one expensive run, "run once" is the same non-idempotency concern that rules out `EventSource` below — here enforced at the hook level. The feed page has its *own* separate reader loop for the briefing stream (`app/page.tsx` L311–L312, consuming `/api/briefing`).
+The hook runs the reader **exactly once per mount** even under React StrictMode (dev mount → cleanup → re-mount): a `startedRef` guard (L43, L47–L48) blocks the second run, and the effect deliberately does *not* abort the fetch on cleanup — cancelling on the first StrictMode cleanup would kill the only stream and leave the log empty (comment L31–L36). Because each `GET /api/agent?step=…` is one expensive run, "run once" is the same non-idempotency concern that rules out `EventSource` below — here enforced at the hook level. The feed page has its *own* separate reader loop for the briefing stream (`app/page.tsx`: `getReader()` at L323, read loop at L439–L457, consuming `/api/briefing` — see "Briefing route — a second streaming surface" above).
 
 ```
 chunk 1: '{"type":"reasoning_step"...}\n{"type":"tool_'
@@ -175,6 +175,51 @@ chunk 2: 'call_start"...}\n'
   buf + chunk → '{"type":"tool_call_start"...}\n'
   now complete → parse
 ```
+
+---
+
+### Briefing route — a second streaming surface
+
+The investigation stream is not the only NDJSON surface. The morning briefing (`app/api/briefing/route.ts`) is a *second* `ReadableStream` that the feed page consumes with the same `getReader()` + line-buffer loop. It reuses the agent route's NDJSON shape but differs in three deliberate ways worth studying side by side.
+
+**1. A local superset event type — the shared union is left untouched.** The briefing needs two event variants the investigation does not — a `workspace` header (project name + totals) and coverage events for the anomaly grid. Rather than widen the shared `AgentEvent` union in `lib/mcp/events.ts` (which the agent route and the investigation view depend on), the briefing defines a *local* `BriefingEvent` superset (`app/api/briefing/route.ts` L54–L58):
+
+```typescript
+type BriefingEvent =
+  | AgentEvent                                            // reuse the live-activity variants
+  | { type: 'workspace'; workspace: BriefingWorkspace }
+  | { type: 'coverage_item'; item: CoverageItem }         // one category's tile
+  | { type: 'coverage'; coverage: CoverageReport };       // bulk form (plain-JSON fallback)
+```
+
+`BriefingEvent` *includes* `AgentEvent` (so `reasoning_step` / `tool_call_*` / `insight` / `done` / `error` still stream exactly as before) and adds the briefing-only variants on top. The shared `AgentEvent` contract is unchanged — the comment at L49–L53 states this explicitly — so the investigation consumer never has to handle variants it will never receive. The feed page mirrors the same local type for its reader (`app/page.tsx` L28–L32).
+
+**2. Demo-mode paced replay — a slower delay than the agent route.** When `?demo=cached` is set and a snapshot file exists, the briefing replays the captured snapshot as a *paced* NDJSON stream instead of running the live agent: each `emit()` enqueues one event then `await`s `REPLAY_DELAY_MS = 140` (`app/api/briefing/route.ts` L23, L99–L102). This is the same replay idea as the agent route's cache branch, but with a *different* tempo — the agent route replays at `REPLAY_DELAY_MS = 180` (`app/api/agent/route.ts` L105). The briefing reveals slightly faster (140ms vs 180ms) because it is narrating a longer monitoring sweep into the feed, and the snapshot replay deliberately mirrors the *live* event order (workspace → coverage checklist → trace → insights) so the demo and the real run look identical to the consumer.
+
+**3. Per-category `coverage_item` events fill the grid tile-by-tile.** The most distinctive part: the live briefing does *not* send the coverage report as one bulk event. After gating the 10-category checklist against the schema, it emits one `coverage_item` per category, each paired with a status line, so the coverage grid resolves one tile at a time in step with the checklist log (`app/api/briefing/route.ts` L209–L212):
+
+```typescript
+coverage.forEach((item, i) => {
+  step(coverageLines[i]);                 // a 'reasoning_step' status line
+  send({ type: 'coverage_item', item }); // one tile of the grid
+});
+```
+
+The feed's `handle` accumulates each tile into the grid state (`app/page.tsx` L333–L338: `setCoverage(prev => [...prev, evt.item])`), so the grid *fills progressively* rather than appearing all at once. The bulk `coverage` variant exists only for the plain-JSON fallback path (when the response is not NDJSON). This is the same "the trace is the product" principle applied to coverage: the user watches the schema-gate decision resolve category by category.
+
+```
+LIVE BRIEFING (app/api/briefing/route.ts)              FEED (app/page.tsx)
+──────────────────────────────────────────            ──────────────────────────────
+send({type:'workspace', ...})                  ══▶     setWorkspace(...)                L330–331
+for each category:                                      reader.read() loop               L439–457
+  step(coverageLines[i])  ─ reasoning_step ──▶          → setStepStatus / trace log
+  send({type:'coverage_item', item})  L211    ══▶       setCoverage(p => [...p, item])   L333–338
+                                                          → grid fills ONE TILE at a time
+...trace + insight events (AgentEvent shape)   ══▶       same switch as investigation
+send({type:'done'})                            ══▶       setInsights(collected)           L390–399
+```
+
+Demo mode replays this exact sequence from the snapshot, paced at 140ms/event, so the only difference the consumer sees is the source — live agent vs recorded file — not the shape or the order.
 
 ---
 
@@ -250,10 +295,10 @@ The server emits one JSON line per increment; the client buffers bytes, splits o
 
 - **Event union + framing:** `AgentEvent` — `lib/mcp/events.ts` L4–L12; `encodeEvent` (JSON + `\n`) and `decodeEvent` — L15–L22.
 - **Server stream:** `ReadableStream` with `start(controller)` — `app/api/agent/route.ts` L169–L265; `send` choke-point at L172–L175; `hooksFor` wiring agent callbacks to `send` at L181–L195; schema bootstrap *inside* the stream at L201–L202; `done`/`saveInvestigation` at L251/L254; `try/catch/finally` body at L196–L263; NDJSON `Response` (`NDJSON_HEADERS`) at L107–L110 / L267. `maxDuration = 300` at L20 (was 60; 300 = Vercel Pro's max — a live diagnostic→recommendation run is ~100–115s under the ~1 req/s MCP limit). Pre-stream `connectMcp` try/catch at L155–L165.
-- **Briefing stream (same shape):** `app/api/briefing/route.ts` — `maxDuration = 300` at L16, bootstrap inside `start` at L88–L141, pre-stream try/catch at L62–L72.
+- **Briefing stream (same shape, local `BriefingEvent` superset):** `app/api/briefing/route.ts` — `maxDuration = 300` at L17, bootstrap inside the live `start` at L188–L189, pre-stream try/catch at L161–L171, `BriefingEvent` superset at L54–L58 (deliberately does NOT widen the shared `AgentEvent`), demo-mode paced replay (`REPLAY_DELAY_MS = 140` at L23) at L97–L143, per-category `coverage_item` emit at L209–L212.
 - **Cache-replay stream (same NDJSON shape):** precomputed events replayed with `REPLAY_DELAY_MS = 180`, filtered to the requested `step` via `filterByStep` — `app/api/agent/route.ts` L127–L141 (the `getCachedInvestigation` branch; `REPLAY_DELAY_MS` L105, `filterByStep` L66–L84).
 - **UI-stream payload truncation:** `TRUNC = 4000` / `trunc` — `app/api/agent/route.ts` L99–L103; applied to `result` at L192.
-- **Client consumer (now a hook):** `fetch` at `lib/hooks/useInvestigation.ts` L170; `getReader()` + `TextDecoder` + line-buffer loop at L184–L201; trailing flush at L202–L208; `handle` switch at L97–L151; StrictMode-safe single-run `startedRef` guard at L43, L47–L48. The investigate page (`app/investigate/[id]/page.tsx`) no longer reads the stream itself — it calls `useInvestigation(id, 'diagnose')` (L38). The feed page keeps its own briefing reader loop at `app/page.tsx` L311–L312.
+- **Client consumer (now a hook):** `fetch` at `lib/hooks/useInvestigation.ts` L170; `getReader()` + `TextDecoder` + line-buffer loop at L184–L201; trailing flush at L202–L208; `handle` switch at L97–L151; StrictMode-safe single-run `startedRef` guard at L43, L47–L48. The investigate page (`app/investigate/[id]/page.tsx`) no longer reads the stream itself — it calls `useInvestigation(id, 'diagnose')` (L38). The feed page keeps its own briefing reader loop at `app/page.tsx` (`getReader()` L323, `handle` switch L328–L437, read loop L439–L457; `BriefingEvent` type L28–L32).
 - **Not EventSource:** confirmed — the consumer uses `fetch`/`getReader()` (hook L184), and the route returns `application/x-ndjson` (`NDJSON_HEADERS`, route L108), not `text/event-stream`.
 
 ### Why this is a codebase strength
@@ -453,3 +498,4 @@ What `Content-Type` does the agent route return, and why does that choice rule o
 
 ---
 Updated: 2026-05-28 — `maxDuration` 60→300; documented schema bootstrap moved inside the `ReadableStream` (+ try/catch error events, briefing route mirror); NDJSON consumer relocated from the investigate page to the StrictMode-safe `useInvestigation` hook; re-derived all route.ts/hook line refs.
+Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (local `BriefingEvent` superset L54–L58 that does NOT widen the shared `AgentEvent`; demo paced replay `REPLAY_DELAY_MS = 140` vs the agent route's 180; per-category `coverage_item` streaming L209–L212 that fills the grid tile-by-tile); refreshed drifted refs — briefing `maxDuration` L16→L17, and the feed's briefing reader from the stale `app/page.tsx` L311–L312 to the live reader (`getReader()` L323, loop L439–L457, `BriefingEvent` L28–L32).

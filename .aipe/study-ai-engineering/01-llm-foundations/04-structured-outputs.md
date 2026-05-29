@@ -133,7 +133,7 @@ estimatedImpact accepted by isRecommendationArray:
 
 The contract has two repair mechanisms before the final fallback.
 
-**The synthesis instruction** (the in-loop nudge) is appended to the system prompt on the forced-final turn (`lib/agents/base.ts` L95–L98). For the diagnostic agent it reads (`lib/agents/diagnostic.ts` L63–L67): "You have NO more tool calls available... Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape." This tells the model exactly what to emit and prohibits further exploration — so the loop's final turn usually produces fence-wrapped JSON that clears stages 1 and 2 directly.
+**The synthesis instruction** (the in-loop nudge) is appended to the system prompt on the forced-final turn (`lib/agents/base.ts` L96–L98). For the diagnostic agent it reads (`lib/agents/diagnostic.ts` L63–L67): "You have NO more tool calls available... Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape." This tells the model exactly what to emit and prohibits further exploration — so the loop's final turn usually produces fence-wrapped JSON that clears stages 1 and 2 directly.
 
 **The dedicated `synthesize()` call** is the clean-context retry when the nudge fails. `DiagnosticAgent.synthesize` (`lib/agents/diagnostic.ts` L87–L126) is a *separate* `anthropic.messages.create` (L97) — no tools, no loop history. It formats the gathered `toolCalls` as evidence text and asks for only the JSON:
 
@@ -186,7 +186,7 @@ This diagram spans the full contract. The Provider layer emits prose-with-JSON; 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PROVIDER LAYER (Anthropic)                                           │
 │                                                                       │
-│  forced-final turn: system + synthesisInstruction  base.ts L95–98    │
+│  forced-final turn: system + synthesisInstruction  base.ts L96–98    │
 │  "Respond with ONLY a JSON object in a ```json fence"                │
 │           │                                                          │
 │           ▼                                                          │
@@ -406,7 +406,7 @@ clean call:   [evidence + "output JSON"]               → emits JSON
 
 - `lib/mcp/validate.ts` L3–L13 — `parseAgentJson`: fenced → bare → substring scan.
 - `lib/mcp/validate.ts` L17–L57 — the three type guards; recommendation validates the id-less shape and accepts either `estimatedImpact` shape (`impactOk`, L46–L48).
-- `lib/agents/base.ts` L95–L98 — `synthesisInstruction` appended on the forced-final turn.
+- `lib/agents/base.ts` L96–L98 — `synthesisInstruction` appended on the forced-final turn.
 - `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`: clean-context, tool-less repair.
 - `lib/agents/diagnostic.ts` L74–L75 — the contract chain: `tryParse ?? synthesize ?? FALLBACK`.
 
@@ -436,3 +436,4 @@ In `parseAgentJson`, what are the three extraction strategies in order, and what
 
 ---
 Updated: 2026-05-28 — Refreshed the output contract for grown types (Insight/Diagnosis/Recommendation optional fields, `EstimatedImpact` union), the loosened `isRecommendationArray` `impactOk` check, post-validation derivation via `deriveInsightFields`/`diagnosisConfidence`, and re-derived all validate.ts/diagnostic.ts/recommendation.ts line refs.
+Updated: 2026-05-29 — Synthesis-instruction append ref drifted to L96–L98 (was L95–L98); corrected the three remaining occurrences (the In-this-codebase line already read L96–L98).

@@ -10,12 +10,14 @@ This is the codebase's strongest sub-section. The four specialist agents (monito
 - **[04-tool-routing.md](04-tool-routing.md)** — Two routings: per-agent tool SUBSETS (routing by construction — the wrong tool is never offered, `tools.ts`) and heuristic-first / LLM-second intent routing for `?q=` (`parseIntent` then `classifyIntent`, `intent.ts`).
 - **[05-agent-memory.md](05-agent-memory.md)** — Short-term = the per-run `messages` array (`base.ts`); long-term = exact-keyed snapshot replay (`state/investigations.ts`), now `step`-filtered on replay and saved only on the combined capture run. No semantic/vector recall — that is the RAG-inside-an-agent pattern, deliberately deferred (cross-link `../03-retrieval-and-rag/`).
 - **[06-error-recovery.md](06-error-recovery.md)** — Every failure has a coded recovery: forced-final tool-less turn caps the loop, `synthesize()` rescues unparseable output, `FALLBACK`/`[]` are the safe defaults, exponential-backoff rate-limit retry + no-cache-on-error, the route's pre-stream setup `try/catch`, and a one-time client auto-reconnect on a revoked alpha token. The budget IS the loop protection.
+- **[07-capability-gating.md](07-capability-gating.md)** — Scope before spend: a cheap in-memory check (`schemaCapabilities` → `coverageReport` → `runnableCategories`, `lib/agents/categories.ts`) classifies a 10-category anomaly checklist against the live schema BEFORE the rate-limited monitoring agent runs, so `agent.scan(hooks, runnable)` never queries data the workspace can't support. One computation feeds both the agent's scope and the coverage grid.
 
 ## Reading order
 
-Read in order: **02 (the round-trip) → 03 (streamed as ReAct) → 04 (which tools, which agent) → 01 (how the agents compose) → 05 (what they remember) → 06 (how each fails safely).**
+Read in order: **02 (the round-trip) → 03 (streamed as ReAct) → 04 (which tools, which agent) → 07 (which checks the schema even allows) → 01 (how the agents compose) → 05 (what they remember) → 06 (how each fails safely).**
 
 This guide is the AI-engineering lens on the same loop the system-design guide covers in `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` — read that file for the orchestration/streaming systems view; read this directory for the agent-design view. They are consistent, not duplicative.
 
 ---
 Updated: 2026-05-28 — Refreshed the run-flow one-liners for the two-step `?step=diagnose`/`?step=recommend` split, the `useInvestigation` trace consumer, exponential-backoff retry, and the new route/client recovery guards.
+Updated: 2026-05-29 — Added `07-capability-gating.md` (the anomaly-coverage schema gate: scope the monitoring agent's checklist against the live schema before spending budget) to the file list and the reading order.

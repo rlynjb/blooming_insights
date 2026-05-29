@@ -107,6 +107,31 @@ The key property: this is **exact-keyed snapshot replay**. The lookup is `mem.ge
 
 ---
 
+### Cross-step memory — the diagnosis handed across HTTP requests
+
+There is a *third* memory location, distinct from both the per-run `messages` array and the long-term snapshot store: the diagnosis the two-step investigation carries from step 2 (diagnose) to step 3 (recommend). The two steps are separate HTTP requests — `?step=diagnose` then `?step=recommend` — so the diagnosis cannot live in the agent's in-loop `messages` (that array is GC'd when the diagnose request returns) and is not yet in the long-term store (the disk write only fires on the combined `step==null` capture run, `route.ts` L254). It lives, for the span between two requests, in the browser's `sessionStorage`.
+
+```
+cross-step handoff (live two-step path)
+─────────────────────────────────────────────────────────────────
+ REQUEST 1  GET /api/agent?step=diagnose
+   route runs DiagnosticAgent.investigate → sends {type:'diagnosis'}
+   client (useInvestigation.ts) on 'done':
+     sessionStorage['bi:diag:<id>'] = JSON.stringify({ diagnosis })   L138–139
+                       │  diagnosis serialized, survives route change
+                       ▼
+ REQUEST 2  GET /api/agent?step=recommend&diagnosis=<…>
+   route: parseDiagnosis(diagnosisParam) ← re-hydrated from the client  L227
+   RecommendationAgent.propose(inv, diagnosis)   ← step 3 reads step 2
+
+ (demo path) cached snapshot replayed FILTERED to the step:
+   getCachedInvestigation(id) → filterByStep(cached, step)   L127/L129
+```
+
+This is agent memory carried *across HTTP requests and a route change*, not within an agent loop. In-loop message memory (the `messages` array above) is the model reasoning over its own turns inside one request; this is the orchestration layer persisting one node's typed output so the next node — running in a *later* request, after the user has advanced to step 3 — can consume it. On the demo path there is no live agent at all: the cached snapshot is replayed `filterByStep(cached, step)` (`route.ts` L129) so step 3 replays only the recommendation slice. So the diagnosis crosses the step boundary by exactly one of two routes — `sessionStorage` re-hydration on the live path, or a step-filtered snapshot replay on the demo path — neither of which is the agent's working memory. It is the chain's handoff (01-agents-vs-chains.md) made durable across the gap between two requests.
+
+---
+
 ### What is NOT here — semantic memory
 
 There is no vector store, no embeddings, no cosine similarity, no "retrieve relevant past investigations." An analyst cannot ask "have we seen a mobile-conversion drop like this before?" and have the system surface a similar prior investigation, because nothing maps an anomaly to its *neighbors* — only to its exact-key replay or a fresh run.
@@ -401,3 +426,6 @@ In `getCachedInvestigation`, what are the three sources checked in order, and wh
 
 ---
 Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: replay is now `step`-filtered (`filterByStep`, L127–141) and `saveInvestigation` (L254) fires only on the combined `step==null` capture run; the split live steps hand off via sessionStorage.
+
+---
+Updated: 2026-05-29 — Added a "cross-step memory" sub-section (with diagram) on the two-step investigation's diagnosis handoff: step 2 serializes to `sessionStorage['bi:diag:<id>']` (useInvestigation.ts L138–139), step 3 re-hydrates via `parseDiagnosis` (route.ts L227); demo path replays the snapshot `filterByStep` (route.ts L129). Framed as memory carried across HTTP requests, distinct from in-loop message memory.

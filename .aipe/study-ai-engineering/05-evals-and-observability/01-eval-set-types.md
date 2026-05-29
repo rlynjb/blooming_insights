@@ -3,7 +3,7 @@
 **Industry name(s):** evaluation datasets, golden sets / ground-truth sets, adversarial test sets, regression suites, held-out eval data
 **Type:** Industry standard · Language-agnostic
 
-> An eval set is a fixed collection of inputs paired with the answer you expect, run against the live model to score output *quality* — not a unit test that asserts plumbing. blooming insights has 157 Vitest tests, but they inject fakes and assert control flow; not one scores an LLM's answer, so the codebase has no eval set, and the three set types below are the buildable target.
+> An eval set is a fixed collection of inputs paired with the answer you expect, run against the live model to score output *quality* — not a unit test that asserts plumbing. blooming insights has 169 Vitest tests, but they inject fakes and assert control flow; not one scores an LLM's answer, so the codebase has no eval set, and the three set types below are the buildable target.
 
 **See also:** → 02-eval-methods.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../06-production-serving/03-prompt-injection.md · → ../04-agents-and-tool-use/06-error-recovery.md
 
@@ -15,7 +15,7 @@ You write a test for a `formatCurrency` helper: `expect(formatCurrency(1234.5)).
 
 Now point that same instinct at an LLM. `DiagnosticAgent.investigate(anomaly)` does not return `'$1,234.50'` — it returns a paragraph of prose explaining *why* mobile conversion dropped. Run it twice and you get two different paragraphs, both arguably correct. The question an eval set answers is: **how do you build a fixed, scoreable dataset for a function whose output is non-deterministic prose, so you can tell whether a model swap or a prompt edit made the answers better or worse?**
 
-**Why answering it matters: without an eval set, every prompt change and model upgrade is a blind deploy.** You edit `lib/agents/prompts/diagnostic.md`, the demo still "looks good," you ship — and you have no idea whether you improved diagnosis quality, left it flat, or regressed it on the inputs you did not happen to click. The 157 Vitest tests will stay green through all three outcomes, because they never look at answer quality. An eval set is the only instrument that turns "looks good" into a number you can compare across versions.
+**Why answering it matters: without an eval set, every prompt change and model upgrade is a blind deploy.** You edit `lib/agents/prompts/diagnostic.md`, the demo still "looks good," you ship — and you have no idea whether you improved diagnosis quality, left it flat, or regressed it on the inputs you did not happen to click. The 169 Vitest tests will stay green through all three outcomes, because they never look at answer quality. An eval set is the only instrument that turns "looks good" into a number you can compare across versions.
 
 Before an eval set:
 - A prompt edit ships on vibes — "the diagnosis reads better to me on this one insight"
@@ -52,14 +52,14 @@ That single swap — from "did the loop call the tool" to "is the answer good" �
 
 ---
 
-### Why the 157 Vitest tests are not evals
+### Why the 169 Vitest tests are not evals
 
 The repo has real, well-built tests. They are unit/integration tests with injected fakes, and they are valuable — but they are categorically not evals, and conflating the two is the trap.
 
-`test/agents/diagnostic.test.ts`, `test/agents/recommendation.test.ts`, `test/agents/base.test.ts`, and the rest construct a fake `McpCaller` (the `McpCaller` interface lives at `lib/agents/base.ts` L16–L22) and frequently a fake Anthropic client. They assert that the loop pushed the right messages, that `tryParseDiagnosis ?? synthesize ?? FALLBACK` (`lib/agents/diagnostic.ts` L73–L77) returns the right *shape*, that `maxToolCalls` is respected, that NDJSON encodes/decodes round-trip (`lib/mcp/events.ts` L15–L22). Every one of these is a plumbing assertion.
+`test/agents/diagnostic.test.ts`, `test/agents/recommendation.test.ts`, `test/agents/base.test.ts`, and the rest construct a fake `McpCaller` (the `McpCaller` interface lives at `lib/agents/base.ts` L16–L22) and frequently a fake Anthropic client. They assert that the loop pushed the right messages, that `tryParseDiagnosis ?? synthesize ?? FALLBACK` (`lib/agents/diagnostic.ts` L74–L75) returns the right *shape*, that `maxToolCalls` is respected, that NDJSON encodes/decodes round-trip (`lib/mcp/events.ts` L15–L22). Every one of these is a plumbing assertion.
 
 ```
-what the 157 tests assert          what they NEVER assert
+what the 169 tests assert          what they NEVER assert
 ─────────────────────────────      ──────────────────────────────────
 no network is hit                  is the conclusion correct?
 the loop terminates                is the evidence relevant?
@@ -136,7 +136,7 @@ This is the eval-world equivalent of "write a failing test that reproduces the b
 ```
 CURRENT (Case B)                    FUTURE (the buildable target)
 ──────────────────────────────      ──────────────────────────────────
-test/ — 157 Vitest unit tests       test/ — unchanged (plumbing)
+test/ — 169 Vitest unit tests       test/ — unchanged (plumbing)
   fakes injected, no model           +
   asserts shape & control flow      evals/ — new directory
                                        fixtures/ golden, adversarial,
@@ -182,7 +182,7 @@ This diagram spans the State layer (where eval datasets live as fixtures), the S
 │   Anthropic API — claude-sonnet-4-6 / claude-haiku-4-5                │
 │   returns real prose / classification → scored vs. reference          │
 └───────────────────────────────────────────────────────────────────────┘
-   (contrast: the 157 tests in test/ inject buildFakeMcp + fake Anthropic
+   (contrast: the 169 tests in test/ inject buildFakeMcp + fake Anthropic
     and NEVER reach this boundary — that is why they are not evals)
 ```
 
@@ -192,7 +192,7 @@ The eval set is a dataset that exercises the real Provider boundary; the unit su
 
 ## In this codebase
 
-**Not yet implemented.** blooming insights has no eval set — its 157 Vitest tests are unit/integration tests that inject fakes (`McpCaller`, often a fake Anthropic client) and assert plumbing (control flow, output *shape* via `isDiagnosis`/`isAnomalyArray`/`isRecommendationArray`, NDJSON round-trip, budget enforcement); none of them call the real model or score answer quality.
+**Not yet implemented.** blooming insights has no eval set — its 169 Vitest tests are unit/integration tests that inject fakes (`McpCaller`, often a fake Anthropic client) and assert plumbing (control flow, output *shape* via `isDiagnosis`/`isAnomalyArray`/`isRecommendationArray`, NDJSON round-trip, budget enforcement); none of them call the real model or score answer quality.
 
 You can confirm the absence: `test/agents/diagnostic.test.ts` and its siblings build fake MCP callers and assert structure, not correctness; `lib/mcp/validate.ts` (L17–L53) validates *shape* (`metric` is a string, `evidence` is an array), not whether a conclusion is true; there is no `evals/` directory, no reference-answer fixtures, and no scoring code anywhere in the repo.
 
@@ -240,7 +240,7 @@ The eval set keeps the *discipline* of unit testing (fixed inputs, expected outp
 
 ### Three eval set types vs. relying on the existing unit suite vs. manual demo review
 
-| Dimension | Golden + adversarial + regression sets | Existing 157 Vitest tests | Manual demo review ("it looks good") |
+| Dimension | Golden + adversarial + regression sets | Existing 169 Vitest tests | Manual demo review ("it looks good") |
 |---|---|---|---|
 | What it measures | Answer quality, robustness, non-regression | Plumbing, control flow, output shape | One reviewer's gut on a few inputs |
 | Catches a quality regression | Yes — score drops | No — stays green | Only if the reviewer happens to click the broken input |
@@ -252,7 +252,7 @@ The eval set keeps the *discipline* of unit testing (fixed inputs, expected outp
 
 **What we gave up (by not having them).** Today, every change to a prompt file or the `AGENT_MODEL` constant (`lib/agents/base.ts` L9) ships with zero quality measurement. The cost is latent and compounding: prompt edits accumulate, each "improving" one observed case while silently regressing unobserved ones, and there is no instrument that would ever surface the drift. The first model upgrade will be a pure gamble — no number says whether diagnosis quality went up or down.
 
-**What the alternative would have cost.** Leaning on the unit suite as if it were an eval suite is worse than having nothing, because green tests create false confidence: an engineer sees 157 passing tests and believes quality is guarded when not one test looks at quality. Manual demo review is honest about its limits but does not scale and does not survive the reviewer leaving.
+**What the alternative would have cost.** Leaning on the unit suite as if it were an eval suite is worse than having nothing, because green tests create false confidence: an engineer sees 169 passing tests and believes quality is guarded when not one test looks at quality. Manual demo review is honest about its limits but does not scale and does not survive the reviewer leaving.
 
 **The breakpoint.** No eval set is defensible while blooming insights is a demo with a fixed, hand-checked set of insights. The instant the product (a) accepts real user `?q=` traffic, (b) swaps or upgrades the model, or (c) ships a second prompt iteration intended to improve quality, an eval set becomes mandatory — each of those is a change whose effect on quality is otherwise unmeasurable. The adversarial set specifically becomes mandatory the day `?q=` is exposed to untrusted users.
 
@@ -310,7 +310,7 @@ The eval set keeps the *discipline* of unit testing (fixed inputs, expected outp
 
 ## Summary
 
-An eval set is a fixed collection of inputs paired with expected answers, run against the *real* model to score output quality — distinct from a unit test, which mocks the model and asserts plumbing. blooming insights has 157 Vitest tests that inject fakes and check control flow and output shape (`isDiagnosis` at `lib/mcp/validate.ts` L29–L35 checks structure, not truth); not one scores an answer, so the codebase has no eval set. Golden sets measure quality, adversarial sets measure robustness (especially apt for the unsanitized `?q=` path at `app/api/agent/route.ts` L115), and regression sets freeze every past failure. The three live in a new `evals/` directory and are the buildable target.
+An eval set is a fixed collection of inputs paired with expected answers, run against the *real* model to score output quality — distinct from a unit test, which mocks the model and asserts plumbing. blooming insights has 169 Vitest tests that inject fakes and check control flow and output shape (`isDiagnosis` at `lib/mcp/validate.ts` L29–L35 checks structure, not truth); not one scores an answer, so the codebase has no eval set. Golden sets measure quality, adversarial sets measure robustness (especially apt for the unsanitized `?q=` path at `app/api/agent/route.ts` L115), and regression sets freeze every past failure. The three live in a new `evals/` directory and are the buildable target.
 
 **Key points:**
 - The only difference between a unit test and an eval case is the assertion: `=== expected` (mocked model) vs. `score(output, reference) ≥ τ` (real model).
@@ -325,7 +325,7 @@ An eval set is a fixed collection of inputs paired with expected answers, run ag
 
 ### What an interviewer is really asking
 
-"How do you test your LLM feature?" is probing whether you know that your unit tests do not test quality. The junior answer is "we have 157 tests." The senior answer names the gap: those tests mock the model and assert plumbing; quality needs a separate golden/adversarial/regression set run against the real model. The signal is that you can articulate *why* a passing test suite tells you nothing about whether the diagnosis is correct.
+"How do you test your LLM feature?" is probing whether you know that your unit tests do not test quality. The junior answer is "we have 169 tests." The senior answer names the gap: those tests mock the model and assert plumbing; quality needs a separate golden/adversarial/regression set run against the real model. The signal is that you can articulate *why* a passing test suite tells you nothing about whether the diagnosis is correct.
 
 ### Likely questions
 
@@ -362,7 +362,7 @@ adversarial.json ─▶ ?q= path ─▶ assert: no destructive tool / no leak
 
 ### One-line anchors
 
-- 157 Vitest tests inject fakes and assert plumbing — not one scores an answer (Case B).
+- 169 Vitest tests inject fakes and assert plumbing — not one scores an answer (Case B).
 - `isDiagnosis` (`lib/mcp/validate.ts` L29–L35) checks shape, not truth.
 - `?q=` is `.trim()`'d only (`app/api/agent/route.ts` L115) → adversarial set is apt.
 - Golden = quality, adversarial = robustness, regression = never-again.
@@ -378,7 +378,7 @@ From memory, draw the one-line difference between a unit test case and an eval c
 
 ### Level 2 — Explain
 
-Out loud: why does a green run of all 157 Vitest tests tell you nothing about whether `DiagnosticAgent` produces a *correct* diagnosis? Use `isDiagnosis` to make the point concrete.
+Out loud: why does a green run of all 169 Vitest tests tell you nothing about whether `DiagnosticAgent` produces a *correct* diagnosis? Use `isDiagnosis` to make the point concrete.
 
 ### Level 3 — Apply
 
@@ -386,7 +386,7 @@ Scenario: a teammate edits `lib/agents/prompts/diagnostic.md` to "make diagnoses
 
 ### Level 4 — Defend
 
-A colleague says "we already have 157 tests, we don't need evals." Argue the distinction: name what the tests guard, name what they cannot, and give the concrete change (a model swap or a `?q=` injection) that the test suite would pass through silently while an eval set would catch.
+A colleague says "we already have 169 tests, we don't need evals." Argue the distinction: name what the tests guard, name what they cannot, and give the concrete change (a model swap or a `?q=` injection) that the test suite would pass through silently while an eval set would catch.
 
 ### Quick check — code reference test
 
@@ -394,3 +394,4 @@ What does `isDiagnosis` (`lib/mcp/validate.ts` L29–L35) actually assert about 
 
 ---
 Updated: 2026-05-28 — Test count 125→157 (17 files, `vitest run`); re-derived `?q=` path refs (trim L115, answer L214) and the eval-exercise type ranges (Anomaly L53–L61, Diagnosis L64–L73, Recommendation L85–L99). Still Case B — no eval harness; `isDiagnosis` (validate.ts L29–L35) unchanged.
+Updated: 2026-05-29 — Test count 157→169 (all live occurrences); diagnostic try-parse chain ref L73–L77→L74–L75 (verified against current `diagnostic.ts`).

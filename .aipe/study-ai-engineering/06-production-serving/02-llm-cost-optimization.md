@@ -120,6 +120,26 @@ The 60s exact-match tool cache (`lib/mcp/client.ts` L97–L146) removes repeat n
 
 ---
 
+### Shrink — gate before spend (the coverage gate)
+
+There is a fourth shrink lever that costs nothing per request: refuse to spend on work the data cannot support. Before the monitoring agent runs, the briefing route computes `runnable = runnableCategories(schemaCapabilities(schema))` (`app/api/briefing/route.ts` L202–L204) — a pure in-memory schema check (`lib/agents/categories.ts`) — and passes only those categories into `agent.scan({…}, runnable)` (L223/L240). The agent's prompt checklist (`lib/agents/monitoring.ts` L73–L86) therefore lists only categories this workspace's events can support, so the agent never burns one of its ~1 req/s MCP calls querying a category the schema cannot answer.
+
+```
+ gate-before-spend (free) ── then the agent spends (metered)
+ ─────────────────────────────────────────────────────────────
+ schemaCapabilities(schema)        ← in-memory Set build, $0
+        │
+ runnableCategories(...)           ← filter 10 → runnable, $0   categories.ts
+        │ runnable
+ agent.scan({…}, runnable)         ← only runnable categories enter the prompt
+        │
+ runAgentLoop (≤6 MCP calls)       ← spends the ~1 req/s budget here, gated set only
+```
+
+The lever is "do not pay the metered cost (MCP budget, tokens, latency) for work a cheap free check already proved impossible." It is the same discipline as the haiku classifier — decide cheaply before committing the expensive resource — applied to *which categories* rather than *which model*. See `../04-agents-and-tool-use/07-capability-gating.md` for the full treatment of the gate.
+
+---
+
 ### The output-token line item — where the bill actually concentrates
 
 Input tokens are many but cheap; output tokens are few but several times more expensive each. The agents' loop turns are input-heavy (re-sending history, tool results). The `synthesize()` calls are output-heavy: they emit a complete structured JSON object.
@@ -427,3 +447,6 @@ Which model does the intent classifier use, on which line, and what is its `max_
 
 ---
 Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived drifted refs: synthesize ranges (diagnostic L87–L126, recommendation L82–L132), route TRUNC/start()/done (L99/L170/L251), tool-cache range (client.ts L97–L146), monitoring maxToolCalls L84.
+
+---
+Updated: 2026-05-29 — Added a "gate before spend" shrink lever: `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204) gates the monitoring agent's category checklist before it spends any of the ~1 req/s MCP budget (monitoring.ts L73–86 / scan call L223/240). Verified maxDuration L20 already cites 300. Cross-ref ../04-agents-and-tool-use/07-capability-gating.md.

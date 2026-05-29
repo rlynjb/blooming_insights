@@ -99,7 +99,7 @@ schemaSummary caps  (monitoring.ts L21, L22, L33)
 
 The comment on L14 is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This is the one place the *intent* is named as token-bounding, even though the implementation counts list lengths, not tokens.
 
-**Output ceiling** — `max_tokens`, the one real token unit in the codebase. This bounds the *output* (the only place token counts appear directly): `4096` default for agent turns (`lib/agents/base.ts` L74), `2048` for synthesis calls (`lib/agents/diagnostic.ts` L94, `lib/agents/recommendation.ts` L98), and a deliberate `16` on the intent classifier (`lib/agents/intent.ts` L20) to force a one-word answer.
+**Output ceiling** — `max_tokens`, the one real token unit in the codebase. This bounds the *output* (the only place token counts appear directly): `4096` default for agent turns (`lib/agents/base.ts` L74), `2048` for synthesis calls (`lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98), and a deliberate `16` on the intent classifier (`lib/agents/intent.ts` L20) to force a one-word answer.
 
 ```
 max_tokens (output token cap — the real unit)
@@ -177,7 +177,7 @@ The Service layer governs input size in characters; the only token-denominated c
 - **Tool-result char budget:** `MAX_TOOL_RESULT_CHARS = 16_000` and `truncate(s)` — `lib/agents/base.ts` L29, L31–L34. Applied at L150 before each `tool_result`.
 - **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the UI event payload only.
 - **Schema-summary caps:** `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10` (`lib/agents/monitoring.ts` L21–L22), `MAX_CPROPS = 30` (L33); whole function L15–L48; intent comment at L14.
-- **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L94, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
+- **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
 
 ### Where real tokenization would live
 
@@ -369,3 +369,4 @@ What `max_tokens` value forces the intent classifier to answer in one word, and 
 
 ---
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); character-budget facts and `base.ts`/`monitoring.ts`/`intent.ts` refs verified unchanged.
+Updated: 2026-05-29 — Corrected the two stale diagnostic-synthesis `max_tokens` citations from L94 to L99 (verified against current `diagnostic.ts`: `max_tokens: 2048` is at L99).

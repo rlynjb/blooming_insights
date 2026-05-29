@@ -81,6 +81,8 @@ app/api/agent/route.ts — start(controller)  (L170–L254)
 
 The order is hard-coded. `propose` receives `diagnosis` as an argument (route.ts L247) — the data flows through a function parameter, not a shared blackboard. On the two-step path the diagnosis crosses an HTTP boundary: `step=diagnose` emits the `diagnosis` event, the client stashes it (`bi:diag:<id>` in sessionStorage), and `step=recommend` reads it back via `parseDiagnosis(diagnosisParam)` (route.ts L227) before running node 2. Either way it is a chain in its purest form: step N+1 reads step N's typed output. Note the morning-briefing's *third* agent, monitoring, runs in a different route (`app/api/briefing/route.ts`) and produces the `Insight` rows that become the `insightId` this route investigates — the full briefing pipeline monitoring→diagnostic→recommendation is a chain spread across two routes.
 
+The monitoring node is itself schema-gated by its caller before its loop runs. `MonitoringAgent.scan` now takes a second parameter — `scan(hooks?, categories: AnomalyCategory[] = [])` (`lib/agents/monitoring.ts` L69) — and injects a per-category checklist into its prompt (`{categories}` slot, built L73–L86). The briefing route does not pass the full 10-category registry; it passes `runnable = runnableCategories(schemaCapabilities(schema))` (`app/api/briefing/route.ts` L202–L204) into `agent.scan({…}, runnable)` (L223/L240). So the deterministic spine narrows the monitoring node's adaptive surface *before* the model owns control flow: a cheap in-memory schema check decides which categories the agent is even allowed to explore, and the agent loop then chooses freely within that gated set. It is the same chain-bounds-agent boundary applied one layer up — code shapes the node's option space, the model picks within it. See `07-capability-gating.md` for the full treatment of the gate.
+
 ---
 
 ### The agent at each node (runAgentLoop)
@@ -418,3 +420,6 @@ Which line in `lib/agents/base.ts` is the single point where the *model*, not yo
 
 ---
 Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`?step=recommend` split (separate calls, sessionStorage diagnosis handoff via `parseDiagnosis`), added the derived `confidence` step, and refreshed all route/diagnostic line refs.
+
+---
+Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [])` signature (monitoring.ts L69) and per-category checklist; the briefing route gates the list to `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204/223) before the agent runs, so the monitoring node is schema-gated. Cross-ref 07-capability-gating.md.

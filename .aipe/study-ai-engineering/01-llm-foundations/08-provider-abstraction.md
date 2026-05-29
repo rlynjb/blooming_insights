@@ -26,7 +26,7 @@ Before the seam:
 
 After the seam:
 - `runAgentLoop` receives `anthropic` and `mcp` as parameters
-- Tests inject fakes; 157 tests run with no network and no key
+- Tests inject fakes; 169 tests run with no network and no key
 - The loop's control flow is verified against scripted responses
 
 It is the inject-the-fetcher pattern, applied to the model client and the tool client.
@@ -131,7 +131,7 @@ AGENT_MODEL is a hard-coded const      model/provider chosen at runtime/config
 
 The injected `anthropic` parameter is typed as the concrete `Anthropic` SDK type — not a vendor-neutral `LLMProvider` interface. The loop calls `anthropic.messages.create` with Anthropic-shaped params (`messages`, `tools`, `tool_use` blocks). Swapping in OpenAI would require translating message shapes, tool-call formats, and response parsing — there is no abstraction over that, and no factory to select a provider. The curriculum's "swap Claude ↔ OpenAI" is a **Case B** capability here: study material and a buildable target, not something the codebase does.
 
-What the seam *does* enable, fully and well, is the thing that matters most for a 157-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
+What the seam *does* enable, fully and well, is the thing that matters most for a 169-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
 
 ---
 
@@ -380,3 +380,4 @@ Is the `anthropic` parameter of `runAgentLoop` a vendor-neutral interface or a c
 
 ---
 Updated: 2026-05-28 — Documented the transport's `HttpErrorHolder`/`makeCapturingFetch` error-body capture and `client.ts`'s `McpToolError` (both error-detail plumbing behind the unchanged narrow interface); re-derived transport.ts (`McpTransport` L7–10, `SdkTransport` L41–74) and the route's `new Anthropic` location (now L207, inside the stream).
+Updated: 2026-05-29 — Test count 157→169 (both occurrences).
