@@ -3,7 +3,7 @@
 **Industry name(s):** output mode mismatch, format contract drift, JSON-vs-prose mismatch, output-mode declaration
 **Type:** Industry standard · Language-agnostic
 
-> blooming insights runs three JSON agents and one prose agent — the query agent deliberately opts out of JSON ("No JSON shape is required", `query.md` L36) while the other three demand it. Each prompt declares its mode, the validators enforce it at the boundary, and the bug to watch for is a prompt whose declared mode doesn't match the consumer that handles its output: the `parseAgentJson`/`synthesize()` path assumes JSON, and query is the one path that must not touch it.
+> blooming insights runs three JSON agents and one prose agent — the query agent deliberately opts out of JSON ("No JSON shape is required", `query.md` L49) while the other three demand it. Each prompt declares its mode, the validators enforce it at the boundary, and the bug to watch for is a prompt whose declared mode doesn't match the consumer that handles its output: the `parseAgentJson`/`synthesize()` path assumes JSON, and query is the one path that must not touch it.
 
 **See also:** → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
 
@@ -19,7 +19,7 @@ The question this file answers: blooming insights has four agents, three emittin
 
 The two modes in this codebase:
 - **JSON mode** (monitoring, diagnostic, recommendation): "Return ONLY a JSON … fenced block" → consumed by `parseAgentJson` + a type guard
-- **Prose mode** (query): "No JSON shape is required — just the answer text" (`query.md` L36) → consumed as a trimmed string
+- **Prose mode** (query): "No JSON shape is required — just the answer text" (`query.md` L49) → consumed as a trimmed string
 
 It is the content-type contract, applied to an agent whose declared mode lives in one prompt line and whose enforcement lives in a different file.
 
@@ -48,9 +48,9 @@ Three switches point at the JSON path; one points at the prose path. The mismatc
 The structured agents each declare JSON mode unambiguously in `## Output`, with "ONLY" and a fenced example:
 
 ```
-monitoring.md   L52  "Return ONLY a JSON array of anomaly objects … wrapped in a ```json fenced block"
-diagnostic.md   L46  "Return ONLY a JSON object (in a ```json fenced block) of exactly this shape"
-recommendation.md L46 "Return ONLY a JSON array (in a ```json fenced block) of at most 3 objects"
+monitoring.md   L71  "Return ONLY a JSON array of anomaly objects … wrapped in a ```json fenced block"
+diagnostic.md   L61  "Return ONLY a JSON object (in a ```json fenced block) of exactly this shape"
+recommendation.md L49 "Return ONLY a JSON array (in a ```json fenced block) of at most 3 objects"
 ```
 
 "ONLY" is doing real work — it tells the model the *entire* response is the artifact, no prose around it. The fence is the extraction anchor (→ 02-structured-outputs.md). These three feed the parse-validate-repair funnel: their `finalText` goes into `parseAgentJson` and a type guard, and a `synthesize()` retry exists for diagnostic and recommendation when the JSON doesn't materialize.
@@ -62,7 +62,7 @@ recommendation.md L46 "Return ONLY a JSON array (in a ```json fenced block) of a
 The query agent's `## Output` says the opposite, and the opposite-ness is the whole point:
 
 ```
-query.md L36
+query.md L49
   Give a clear, concise answer in plain prose — a few sentences; you may use
   short markdown bullets. Cite the key numbers you found. If you couldn't get
   the data, say so plainly. No JSON shape is required — just the answer text.
@@ -140,11 +140,11 @@ This diagram spans producers (four prompts, two modes) and consumers (two enforc
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PRODUCERS — each prompt's ## Output declares a MODE                  │
 │                                                                       │
-│   monitoring.md L52   "ONLY a JSON array … ```json fenced"   ─┐       │
-│   diagnostic.md  L46  "ONLY a JSON object … ```json fenced"   ├─JSON  │
-│   recommendation.md L46 "ONLY a JSON array … ```json fenced" ─┘       │
+│   monitoring.md L71   "ONLY a JSON array … ```json fenced"   ─┐       │
+│   diagnostic.md  L61  "ONLY a JSON object … ```json fenced"   ├─JSON  │
+│   recommendation.md L49 "ONLY a JSON array … ```json fenced" ─┘       │
 │                                                                       │
-│   query.md L36  "No JSON shape is required — just the answer text" ─ PROSE │
+│   query.md L49  "No JSON shape is required — just the answer text" ─ PROSE │
 └───────────────┬───────────────────────────────────────────┬───────────┘
        JSON mode │                                  prose mode │
 ┌────────────────▼──────────────────────────┐  ┌──────────────▼───────────┐
@@ -173,14 +173,14 @@ Mode is declared per prompt and enforced per consumer; three agents share the JS
 
 - **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md` + their `.ts`
 - **Function / class:** `## Output` (declaration) → `parseAgentJson` + type guard (enforcement)
-- **Line range:** declarations at `monitoring.md` L52, `diagnostic.md` L46, `recommendation.md` L46; consumers at `monitoring.ts` L85–92 (`parseAgentJson` + `isAnomalyArray` else `[]`), `diagnostic.ts` L73–77 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), `recommendation.ts` L69–76 (`tryParseRecommendations ?? synthesize` then `[]`).
+- **Line range:** declarations at `monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49; consumers at `monitoring.ts` L85–92 (`parseAgentJson` + `isAnomalyArray` else `[]`), `diagnostic.ts` L73–77 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), `recommendation.ts` L69–76 (`tryParseRecommendations ?? synthesize` then `[]`).
 - **Role:** declare fenced JSON; enforce by extracting, validating, and rejecting non-conforming output to a safe floor.
 
 ### Prose-mode declaration and consumer
 
 - **File:** `lib/agents/prompts/query.md` + `lib/agents/query.ts`
 - **Function / class:** `## Output` (declaration) → `finalText.trim()` (consumption)
-- **Line range:** declaration at `query.md` L36 ("No JSON shape is required — just the answer text"); consumer at `query.ts` L47 (`finalText.trim() || '<fallback>'`); prose synthesis nudge at `query.ts` L42–44.
+- **Line range:** declaration at `query.md` L49 ("No JSON shape is required — just the answer text"); consumer at `query.ts` L47 (`finalText.trim() || '<fallback>'`); prose synthesis nudge at `query.ts` L42–44.
 - **Role:** declares prose, consumes as a trimmed string, never touches `parseAgentJson` — the deliberately separate path.
 
 ### The mode declared twice (must agree)
@@ -253,7 +253,7 @@ A mode contract is two-ended. Declaring it only biases the producer; enforcing i
 
 ### Per-prompt output-mode declaration
 
-- **Codebase uses:** each `## Output` declares its mode — fenced JSON (`monitoring.md` L52, `diagnostic.md` L46, `recommendation.md` L46) or prose (`query.md` L36).
+- **Codebase uses:** each `## Output` declares its mode — fenced JSON (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49) or prose (`query.md` L49).
 - **Why it's here:** biasing the model toward the right format at the source, per agent, so the consumer's assumption is usually met.
 - **Leading today (2026):** explicit format declaration in the prompt is standard, increasingly paired with native structured-output modes for the JSON case.
 - **Why it leads:** declaring the mode reduces (doesn't eliminate) wrong-format output before the consumer has to reject it.
@@ -285,7 +285,7 @@ A mode contract is two-ended. Declaring it only biases the producer; enforcing i
 - **What to build:** a Vitest test that, for each agent, asserts the declared mode is consistent across three sites — the prompt's `## Output` (JSON-fence vs prose), the `synthesisInstruction`, and the consumer (`parseAgentJson` present vs `.trim()` only) — so a refactor that flips one site without the others fails CI.
 - **Why it earns its place:** turns the "read declaration and consumer together" review step into an enforced invariant, catching the silent mismatch class before it ships.
 - **Files to touch:** new `test/agents/output-mode.test.ts`; reads the four `lib/agents/prompts/*.md` and inspects the four agent `.ts` modules.
-- **Done when:** the test passes for the current four agents and fails if you change `query.md` L36 to demand JSON without also wiring `query.ts` to `parseAgentJson`.
+- **Done when:** the test passes for the current four agents and fails if you change `query.md` L49 to demand JSON without also wiring `query.ts` to `parseAgentJson`.
 - **Estimated effort:** 1–4hr
 
 ### Add a grounding check to the prose consumer
@@ -301,10 +301,10 @@ A mode contract is two-ended. Declaring it only biases the producer; enforcing i
 
 ## Summary
 
-blooming insights mixes output modes deliberately: three agents declare fenced JSON (`monitoring.md` L52, `diagnostic.md` L46, `recommendation.md` L46) consumed by `parseAgentJson` + a type guard that rejects wrong-shape output to a safe floor, and the query agent declares prose ("No JSON shape is required — just the answer text", `query.md` L36) consumed by `finalText.trim()` (`query.ts` L47) with no parsing at all. The mode is a two-ended contract: the prompt declares it (in both `## Output` and the synthesis nudge), the consumer enforces it, and the two ends must agree. A mismatch never throws — feed prose to the JSON consumer and it floors to `[]`; feed JSON to the prose consumer and the user sees raw JSON — so you catch it in review by reading the declared mode, the synthesis nudge, and the consumer side by side, not by waiting for an exception.
+blooming insights mixes output modes deliberately: three agents declare fenced JSON (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49) consumed by `parseAgentJson` + a type guard that rejects wrong-shape output to a safe floor, and the query agent declares prose ("No JSON shape is required — just the answer text", `query.md` L49) consumed by `finalText.trim()` (`query.ts` L47) with no parsing at all. The mode is a two-ended contract: the prompt declares it (in both `## Output` and the synthesis nudge), the consumer enforces it, and the two ends must agree. A mismatch never throws — feed prose to the JSON consumer and it floors to `[]`; feed JSON to the prose consumer and the user sees raw JSON — so you catch it in review by reading the declared mode, the synthesis nudge, and the consumer side by side, not by waiting for an exception.
 
 **Key points:**
-- Three JSON agents + one prose agent; the query agent opts out of JSON on purpose (`query.md` L36) because its consumer is a human reader.
+- Three JSON agents + one prose agent; the query agent opts out of JSON on purpose (`query.md` L49) because its consumer is a human reader.
 - Mode is declared in the prompt and enforced at the consuming boundary — declare to bias the model, enforce to guarantee.
 - The two modes have *separate* consumer code (`parseAgentJson`+guard vs `.trim()`), so they can't accidentally share enforcement.
 - Both mismatch directions are silent — `[]` or raw-JSON-to-user — never an exception, which is what makes the bug insidious.
@@ -322,7 +322,7 @@ blooming insights mixes output modes deliberately: three agents declare fenced J
 
 **[mid] "Which of your agents return JSON and which return prose, and how do you know?"**
 
-Three return JSON — monitoring, diagnostic, recommendation — each `## Output` says "Return ONLY a JSON … fenced block" (`monitoring.md` L52, `diagnostic.md` L46, `recommendation.md` L46), and their consumers run `parseAgentJson` + a type guard. The query agent returns prose: `query.md` L36 says "No JSON shape is required — just the answer text," and its consumer is `finalText.trim()` (`query.ts` L47), no parsing.
+Three return JSON — monitoring, diagnostic, recommendation — each `## Output` says "Return ONLY a JSON … fenced block" (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49), and their consumers run `parseAgentJson` + a type guard. The query agent returns prose: `query.md` L49 says "No JSON shape is required — just the answer text," and its consumer is `finalText.trim()` (`query.ts` L47), no parsing.
 
 ```
 JSON: ## Output "ONLY JSON fenced" → parseAgentJson + guard
@@ -354,9 +354,9 @@ answer for a human reader     → prose (.trim())
 
 ### One-line anchors
 
-- `lib/agents/prompts/query.md` L36 — "No JSON shape is required — just the answer text" — the prose mode declaration.
+- `lib/agents/prompts/query.md` L49 — "No JSON shape is required — just the answer text" — the prose mode declaration.
 - `lib/agents/query.ts` L47 — `finalText.trim() || '<fallback>'` — the prose consumer, no `parseAgentJson`.
-- `lib/agents/prompts/monitoring.md` L52 — "Return ONLY a JSON array … fenced" — a JSON mode declaration.
+- `lib/agents/prompts/monitoring.md` L71 — "Return ONLY a JSON array … fenced" — a JSON mode declaration.
 - `lib/agents/monitoring.ts` L85–92 — `parseAgentJson` + `isAnomalyArray` else `[]` — JSON boundary enforcement.
 - mode stated twice: `## Output` + the `synthesisInstruction` (`query.ts` L42–44 prose vs `diagnostic.ts` L62–66 JSON) — both must agree.
 
@@ -374,7 +374,7 @@ Out loud: why does the query agent deliberately *not* use `parseAgentJson` (`que
 
 ### Level 3 — Apply
 
-Scenario: a teammate's PR changes `query.md` L36 to "Return ONLY a JSON object with an `answer` field" but leaves `query.ts` L47 as `finalText.trim()`. Walk through what the user sees, why no test that checks "didn't throw" catches it, and which two other sites (`## Output`, the synthesis nudge at `query.ts` L42–44, the consumer) you'd read together to flag it in review.
+Scenario: a teammate's PR changes `query.md` L49 to "Return ONLY a JSON object with an `answer` field" but leaves `query.ts` L47 as `finalText.trim()`. Walk through what the user sees, why no test that checks "didn't throw" catches it, and which two other sites (`## Output`, the synthesis nudge at `query.ts` L42–44, the consumer) you'd read together to flag it in review.
 
 ### Level 4 — Defend
 
@@ -382,4 +382,8 @@ A reviewer says: "Make all four agents return JSON so there's one consumer and n
 
 ### Quick check — code reference test
 
-Which agent consumes its `finalText` without calling `parseAgentJson`, and what is the exact consuming expression? (Answer: the query agent — `finalText.trim() || 'I was unable to find enough data to answer that question.'` at `lib/agents/query.ts` L47; it declares prose mode at `query.md` L36 and never touches the JSON parse path.)
+Which agent consumes its `finalText` without calling `parseAgentJson`, and what is the exact consuming expression? (Answer: the query agent — `finalText.trim() || 'I was unable to find enough data to answer that question.'` at `lib/agents/query.ts` L47; it declares prose mode at `query.md` L49 and never touches the JSON parse path.)
+
+---
+Updated: 2026-05-29 — Corrected the monitoring.md JSON-output fence reference L52→L71 (the `## Output` "Return ONLY a JSON array" line moved down after the `{categories}` section) across all 7 citations.
+Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an earlier prompt-file revision): diagnostic.md output fence L46→L61, recommendation.md output fence L46→L49, query.md prose-output L36→L49, across all prose + diagram citations.

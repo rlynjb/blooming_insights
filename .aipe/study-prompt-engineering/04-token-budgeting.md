@@ -23,7 +23,7 @@ Before budgeting:
 - The model "thinks" forever on the final turn and never emits the JSON because nothing bounds output
 
 After:
-- `schemaSummary` ships a compact, bounded schema instead of the raw 112KB blob (`monitoring.ts` L15–L48)
+- `schemaSummary` ships a compact, bounded schema instead of the raw 112KB blob (`monitoring.ts` L16–L49)
 - `truncate()` caps every observation at 16,000 chars (`base.ts` L29–L34)
 - `maxToolCalls` + `max_tokens` bound how big the transcript and the output can grow
 
@@ -58,7 +58,7 @@ Each cap targets one source. None of them is optional — remove any one and a s
 
 ### The static prefix — `schemaSummary` bounds the biggest variable
 
-The four prompt files end with `## Workspace schema\n{schema}` (`monitoring.md` L75–L77, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40). That `{schema}` placeholder is the single largest variable input to every agent call, and it is *not* injected raw. `schemaSummary` (`monitoring.ts` L15–L48) compacts the full workspace schema — which the comment at L14 records as ~112KB — into a hard-bounded summary:
+The four prompt files end with `## Workspace schema\n{schema}` (`monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40). That `{schema}` placeholder is the single largest variable input to every agent call, and it is *not* injected raw. `schemaSummary` (`monitoring.ts` L16–L49) compacts the full workspace schema — which the comment at L15 records as ~112KB — into a hard-bounded summary:
 
 ```
 schemaSummary caps   (monitoring.ts L21–L34)
@@ -104,7 +104,7 @@ base.ts — the budget gate   (L90–L101)
  if (!forceFinal) params.tools = toolSchemas                L101  ← tools dropped when spent
 ```
 
-Each agent sets its own cap: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Recommendation gets fewer because it "mostly reason[s] from the diagnosis" (`recommendation.md` L10) — it does not need the exploration budget the others do. The prompts reinforce the same number in prose: "Make at most 6 tool calls" (`monitoring.md` L11, `diagnostic.md` L11), "at most 4 tool calls" (`recommendation.md` L10). The cap lives in two places — the code enforces it, the prompt tells the model so it spends its budget wisely instead of being cut off mid-exploration.
+Each agent sets its own cap: monitoring 6 (`monitoring.ts` L101), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Recommendation gets fewer because it "mostly reason[s] from the diagnosis" (`recommendation.md` L10) — it does not need the exploration budget the others do. The prompts reinforce the same number in prose: "Make at most 6 tool calls" (`monitoring.md` L17, `diagnostic.md` L11), "at most 4 tool calls" (`recommendation.md` L10). The cap lives in two places — the code enforces it, the prompt tells the model so it spends its budget wisely instead of being cut off mid-exploration.
 
 ```
 each Observation ≤ 16k chars   AND   at most N Observations
@@ -142,7 +142,7 @@ Here is what blooming insights does *not* do, and it is the most consequential o
 
 The static prefix is the *ideal* cache target: the same system prompt and schema are re-sent on every turn of every loop, and the schema is identical across the diagnostic and recommendation calls of a single investigation (both inject the same `schemaSummary`). That prefix is exactly the "stable content kept at the front" that caching rewards.
 
-But there is a structural anti-pattern even before caching is added. The canonical rule is *keep the most stable content at the front of the prompt so the cacheable prefix is as long as possible.* blooming insights does the opposite for its largest stable input: `{schema}` is appended **last** in all four prompt files (`monitoring.md` L75–L77, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40), *after* the volatile placeholders. The schema varies *less* than `{anomaly}` (diagnostic) or `{intent}` (query) — it changes per workspace, not per call — yet it sits behind them.
+But there is a structural anti-pattern even before caching is added. The canonical rule is *keep the most stable content at the front of the prompt so the cacheable prefix is as long as possible.* blooming insights does the opposite for its largest stable input: `{schema}` is appended **last** in all four prompt files (`monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40), *after* the volatile placeholders. The schema varies *less* than `{anomaly}` (diagnostic) or `{intent}` (query) — it changes per workspace, not per call — yet it sits behind them.
 
 ```
 current prompt layout (anti-pattern for prefix caching)
@@ -174,8 +174,8 @@ This diagram spans the full budget. The Service layer assembles a bounded prefix
 ┌──────────────────────────────────────────────────────────────────────┐
 │  SERVICE LAYER (agent classes)                                       │
 │                                                                       │
-│  PROMPT.replace('{schema}', schemaSummary(schema))  monitoring.ts L62│
-│     schemaSummary caps 20 events / 10 props / 30 cprops  L15–48      │
+│  PROMPT.replace('{schema}', schemaSummary(schema))  monitoring.ts L84│
+│     schemaSummary caps 20 events / 10 props / 30 cprops  L16–49      │
 │     {schema} appended LAST in the .md  (anti-pattern for caching)    │
 │  runAgentLoop({ maxToolCalls: 6|6|4|6, maxTokens: 4096 (default) })  │
 └───────────────────────────┬───────────────────────────────────────────┘
@@ -213,8 +213,8 @@ The window is finite; four caps keep the sum under the practical fraction, and t
 
 - **File:** `lib/agents/monitoring.ts`
 - **Function / class:** `schemaSummary(schema: WorkspaceSchema): string`
-- **Line range:** L15–L48 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L33 `MAX_CPROPS=30`)
-- **Role:** Compacts the ~112KB raw workspace schema (noted at L14) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents.
+- **Line range:** L16–L49 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`)
+- **Role:** Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents.
 
 ### Per-observation cap — `truncate`
 
@@ -227,7 +227,7 @@ The window is finite; four caps keep the sum under the practical fraction, and t
 
 - **File:** `lib/agents/base.ts` (gate) + each agent (value)
 - **Function / class:** `budgetSpent` / `forceFinal` in `runAgentLoop`
-- **Line range:** gate `base.ts` L90–L91, L101; values monitoring `monitoring.ts` L74 (6), diagnostic `diagnostic.ts` L61 (6), recommendation `recommendation.ts` L57 (4), query `query.ts` L41 (6)
+- **Line range:** gate `base.ts` L90–L91, L101; values monitoring `monitoring.ts` L101 (6), diagnostic `diagnostic.ts` L61 (6), recommendation `recommendation.ts` L57 (4), query `query.ts` L41 (6)
 - **Role:** Bounds how many Observation blocks ever enter the transcript; recommendation uses 4 because it reasons from the diagnosis rather than exploring.
 
 ### Output cap — `max_tokens`
@@ -241,7 +241,7 @@ The window is finite; four caps keep the sum under the practical fraction, and t
 
 - **File:** the four prompt files + `base.ts`
 - **Function / class:** prompt layout; absence of `cache_control`
-- **Line range:** `{schema}` last at `monitoring.md` L75–L77, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40; no `cache_control` in `base.ts` L92–L102
+- **Line range:** `{schema}` last at `monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40; no `cache_control` in `base.ts` L92–L102
 - **Role:** The largest stable input sits behind volatile placeholders, and no call marks a cacheable prefix — the prefix is re-billed in full on every turn.
 
 ### Why this is a codebase strength (with one honest weakness)
@@ -309,7 +309,7 @@ The hard window is where the call *errors*. The practical window is where the ca
 
 ### `schemaSummary` (bounded prefix injection)
 
-- **Codebase uses:** `lib/agents/monitoring.ts` L15–L48 — caps the raw schema to 20 events / 10 props / 30 customer-props before injecting `{schema}`.
+- **Codebase uses:** `lib/agents/monitoring.ts` L16–L49 — caps the raw schema to 20 events / 10 props / 30 customer-props before injecting `{schema}`.
 - **Why it's here:** the raw workspace schema is ~112KB; injecting it raw would dominate every call's input tokens.
 - **Leading today:** retrieval-over-injection (pull only the relevant schema slice per query) and structured context compaction lead for large-context apps in 2026.
 - **Why it leads:** sending only what the call needs beats sending a fixed cap of everything.
@@ -357,7 +357,7 @@ The hard window is where the call *errors*. The practical window is where the ca
 
 ## Summary
 
-Token budgeting is hygiene, not optimization: every call fills a finite window from the prefix, the transcript, and the output reservation, and each source needs a cap. blooming insights caps three of them at the seam — `schemaSummary` bounds the injected `{schema}` to 20 events / 10 props / 30 customer-props (`monitoring.ts` L15–L48), `truncate()` clips every observation to 16,000 chars (`base.ts` L29–L34), and `maxToolCalls` (6/6/4/6) plus `max_tokens` (4096 / 2048 / 16) bound transcript growth and output. It leaves the fourth lever untouched: no prefix caching, and `{schema}` is appended *last* in all four prompts — behind the volatile placeholders it varies less than — which is a prefix-caching anti-pattern that makes the cacheable prefix short and re-bills the schema on every turn.
+Token budgeting is hygiene, not optimization: every call fills a finite window from the prefix, the transcript, and the output reservation, and each source needs a cap. blooming insights caps three of them at the seam — `schemaSummary` bounds the injected `{schema}` to 20 events / 10 props / 30 customer-props (`monitoring.ts` L16–L49), `truncate()` clips every observation to 16,000 chars (`base.ts` L29–L34), and `maxToolCalls` (6/6/4/6) plus `max_tokens` (4096 / 2048 / 16) bound transcript growth and output. It leaves the fourth lever untouched: no prefix caching, and `{schema}` is appended *last* in all four prompts — behind the volatile placeholders it varies less than — which is a prefix-caching anti-pattern that makes the cacheable prefix short and re-bills the schema on every turn.
 
 **Key points:**
 - A finite window is filled from the prefix, the transcript, and the output reservation; budgeting caps each source independently.
@@ -378,7 +378,7 @@ Token budgeting is hygiene, not optimization: every call fills a finite window f
 
 **[mid] "The workspace schema is 112KB. How does it not blow the context window on every call?"**
 
-`schemaSummary` (`monitoring.ts` L15–L48) compacts it before injection — top 20 events, 10 properties each, 30 customer properties — so the `{schema}` placeholder always carries a bounded summary, not the raw blob. The cap is constant regardless of workspace size.
+`schemaSummary` (`monitoring.ts` L16–L49) compacts it before injection — top 20 events, 10 properties each, 30 customer properties — so the `{schema}` placeholder always carries a bounded summary, not the raw blob. The cap is constant regardless of workspace size.
 
 ```
 raw 112KB ──schemaSummary (20/10/30)──▶ bounded ──.replace('{schema}',…)──▶ system prompt
@@ -408,11 +408,11 @@ fixed: [static][{schema}][cache_control][VOLATILE]  ← long cacheable prefix
 
 ### One-line anchors
 
-- `lib/agents/monitoring.ts` L15–L48 — `schemaSummary`: caps the prefix to 20/10/30.
+- `lib/agents/monitoring.ts` L16–L49 — `schemaSummary`: caps the prefix to 20/10/30.
 - `lib/agents/base.ts` L29–L34 — `truncate` + `MAX_TOOL_RESULT_CHARS=16_000`: per-observation cap.
 - `lib/agents/base.ts` L90–L91 — `budgetSpent` / `forceFinal`: the `maxToolCalls` gate.
 - `lib/agents/intent.ts` L20 — `max_tokens: 16`: output budget enforcing a one-word format.
-- `monitoring.md` L75–L77 — `{schema}` appended last: the prefix-caching anti-pattern.
+- `monitoring.md` L99–L101 — `{schema}` appended last: the prefix-caching anti-pattern.
 
 ---
 
@@ -432,8 +432,11 @@ Scenario: you are adding prefix caching. Open `lib/agents/prompts/diagnostic.md`
 
 ### Level 4 — Defend
 
-A reviewer says: "The schema is 112KB and re-sent every turn — that's wasteful, rewrite the agents to fetch schema on demand." State what is *already* done (`schemaSummary` caps it to a bounded summary, `monitoring.ts` L15–L48), what the reviewer's real target should be (no prefix caching, `{schema}` placed last), and the measured condition — rising investigation volume — under which caching pays for itself.
+A reviewer says: "The schema is 112KB and re-sent every turn — that's wasteful, rewrite the agents to fetch schema on demand." State what is *already* done (`schemaSummary` caps it to a bounded summary, `monitoring.ts` L16–L49), what the reviewer's real target should be (no prefix caching, `{schema}` placed last), and the measured condition — rising investigation volume — under which caching pays for itself.
 
 ### Quick check — code reference test
 
 What is `MAX_TOOL_RESULT_CHARS`, where is it defined, and what does `truncate` append when it clips? (Answer: `16_000`, defined at `lib/agents/base.ts` L29; `truncate` returns `s.slice(0, 16_000) + '\n…[truncated]'` — L31–L34.)
+
+---
+Updated: 2026-05-29 — Resynced monitoring refs after the `{categories}` shift: `schemaSummary` L15–48→L16–49, monitoring `maxToolCalls` L74→L101, `{schema}` placement L75–77→L99–101, plus the ~112KB comment L14→L15 and the `.replace('{schema}',…)` call L62→L84.

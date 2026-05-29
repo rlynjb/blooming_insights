@@ -39,7 +39,7 @@ It is the templates-in-the-repo discipline, applied to strings a model reads —
 AUTHORING HALF  (have it)              OBSERVABILITY HALF  (don't)
 ─────────────────────────────         ─────────────────────────────
 file:    monitoring.md                 pair:  prompt@sha + model id
-load:    readFileSync (mon.ts L12)     log:   which prompt → which output
+load:    readFileSync (mon.ts L13)     log:   which prompt → which output
 version: git history                   trace: bisect a regression to a line
 review:  PR diff                       alert: failure rate per prompt version
 ```
@@ -53,7 +53,7 @@ The left column is what makes a prompt a maintainable artifact. The right column
 Each agent reads its prompt off disk at module load — once, synchronously, as the module is imported:
 
 ```
-monitoring.ts   L12  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/monitoring.md'),'utf8');
+monitoring.ts   L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/monitoring.md'),'utf8');
 diagnostic.ts   L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/diagnostic.md'),'utf8');
 recommendation.ts L14 const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/recommendation.md'),'utf8');
 query.ts        L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/query.md'),'utf8');
@@ -71,6 +71,24 @@ Because `readFileSync` runs at import, the prompt is also baked into the running
 ### The `.md` choice: prose that reviews like prose
 
 The prompts are Markdown, not TypeScript template literals, and that matters for review. A reviewer reading `diagnostic.md`'s "Investigation approach" (L18–24) reads it as prose — the way the model reads it — not as an escaped string with `\n`s. The instruction *is* the artifact; Markdown keeps it legible as one. The headings (`## Role`, `## Hard rules`) double as a structure a reviewer can scan (→ 01-anatomy.md).
+
+### Runtime interpolation is part of the same pattern: `{categories}`
+
+The versioned-`.md`-plus-runtime-interpolation pattern is not only for static values like `{schema}` and `{project_id}`. `monitoring.md` has a `## Your category checklist` section (L7) whose body is a single `{categories}` slot (L11), and that slot is filled with a string the code *builds at call time*:
+
+```
+monitoring.ts L69–86
+  async scan(hooks?, categories: AnomalyCategory[] = []) {     // ← new param, L69
+    const checklist = categories.length
+      ? categories.map(c => `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} …`).join('\n')
+      : '(no checklist provided — scan for any significant recent change)';
+    const system = PROMPT
+      .replace('{schema}', schemaSummary(this.schema))
+      .replace(/\{project_id\}/g, this.schema.projectId)
+      .replace('{categories}', checklist);                     // ← same .replace pattern, L86
+```
+
+This is the *same* discipline as `{schema}`/`{project_id}`: the constant lives in the version-controlled `.md`, and a runtime value is stamped into a named slot with `.replace` right before the call. The only thing that differs is provenance — `{schema}` is a workspace summary and `{project_id}` is one id, while `{categories}` is a checklist *assembled in code* (`monitoring.ts` L70–86) from the `AnomalyCategory[]` argument that `scan` now takes (L69). The prompt file stays the diffable, reviewable artifact; the per-call payload is the runnable-category list the route gates and passes in. For the prompts-as-code lens, the takeaway is that "what's in the file" and "what's injected" is still a clean two-way split even when the injected value is computed — the slot is committed, the content is built per call. (The gate that decides which categories get passed is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
 
 ---
 
@@ -93,10 +111,10 @@ prompt version:  monitoring.md@abc123   ─┐
 model version:   claude-sonnet-4-6  (base.ts L9) ─┘
 ```
 
-**Gap 2 — no prompt-version → output observability.** The route streams the trace (`route.ts` L105–169) and `saveInvestigation` persists the events (`route.ts` L162), but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which `monitoring.md` was live then, on which model?" without correlating git history to a deploy timestamp by hand.
+**Gap 2 — no prompt-version → output observability.** The route streams the trace (`route.ts` L169–256, the `ReadableStream` body) and `saveInvestigation` persists the events (`route.ts` L254), but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which `monitoring.md` was live then, on which model?" without correlating git history to a deploy timestamp by hand.
 
 ```
-saved (route.ts L162):  reasoning_step · diagnosis · recommendation · done
+saved (route.ts L254):  reasoning_step · diagnosis · recommendation · done
 NOT saved:              prompt sha · model id · prompt version tag
 → can't bisect a regression to a prompt line or a model bump
 ```
@@ -120,7 +138,7 @@ This diagram spans the authoring half (solid) and the observability half (dashed
 │  AUTHORING HALF — IMPLEMENTED                                         │
 │                                                                       │
 │  lib/agents/prompts/*.md  ──readFileSync──▶  PROMPT const            │
-│   monitoring.md (mon.ts L12) · diagnostic.md (diag.ts L13)           │
+│   monitoring.md (mon.ts L13) · diagnostic.md (diag.ts L13)           │
 │   recommendation.md (rec.ts L14) · query.md (query.ts L13)          │
 │                                                                       │
 │   git history ── PR diff ── review ── ships in the build             │
@@ -135,7 +153,7 @@ This diagram spans the authoring half (solid) and the observability half (dashed
                             ┊  (no pairing, no co-logging)
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
    OBSERVABILITY HALF — NOT IMPLEMENTED
-   saveInvestigation (route.ts L162) persists OUTPUTS only:
+   saveInvestigation (route.ts L254) persists OUTPUTS only:
      reasoning_step · diagnosis · recommendation · done
    MISSING: prompt sha · model id · version tag per output
    → a model bump (base.ts L9) is a 1-line diff that can silently regress
@@ -154,7 +172,7 @@ The authoring half is solid; the model ID is decoupled; the observability half i
 
 - **File:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` + `lib/agents/prompts/*.md`
 - **Function / class:** module-level `PROMPT` constant via `readFileSync`
-- **Line range:** `monitoring.ts` L12, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13.
+- **Line range:** `monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13.
 - **Role:** the prompt is a repo file loaded as source at import — diffable, reviewable, runtime-immutable.
 
 ### Model IDs (separate from the prompts)
@@ -168,7 +186,7 @@ The authoring half is solid; the model ID is decoupled; the observability half i
 
 - **File:** `app/api/agent/route.ts`
 - **Function / class:** `saveInvestigation` call in the stream's `start`
-- **Line range:** L162 (`saveInvestigation(insightId!, collected)`); `collected` is the `AgentEvent[]` of outputs (L107–131).
+- **Line range:** L254 (`saveInvestigation(insightId!, collected)`); `collected` is the `AgentEvent[]` of outputs, declared at L171 and pushed to in `send` at L173.
 - **Role:** persists the streamed outputs for cache-replay; carries no prompt SHA, model ID, or version tag — the observability gap.
 
 ### Why this is a codebase strength (the half it has)
@@ -204,7 +222,7 @@ The progression is: make it a file (review), then make it observable (trace). A 
 
 ### What to explore next
 
-- **Co-log the pair:** add `{ promptSha, model }` to the persisted investigation record (`route.ts` L162) so every output is traceable to a prompt version and model version.
+- **Co-log the pair:** add `{ promptSha, model }` to the persisted investigation record (`route.ts` L254) so every output is traceable to a prompt version and model version.
 - **Pin the pairing in code:** colocate the model ID with the prompt (e.g. front-matter in the `.md`, or a per-agent config) so a model change forces a deliberate prompt-pairing decision rather than a silent decoupled edit.
 - **Prompt version tags:** stamp a semantic version or git SHA into the loaded prompt and surface it in the trace, so a regression can be bisected to a prompt line automatically.
 
@@ -223,7 +241,7 @@ The progression is: make it a file (review), then make it observable (trace). A 
 | Operational weight | Zero deps, zero infra | Extra service + instrumentation |
 | Time to incident root cause | Slow (correlate by hand) | Fast (filter by prompt/model version) |
 
-**What we gave up.** Traceability. With outputs persisted but no prompt SHA or model ID alongside them (`route.ts` L162), root-causing "diagnoses got worse" means correlating git history against deploy timestamps manually. Full observability tooling would make it a filter query.
+**What we gave up.** Traceability. With outputs persisted but no prompt SHA or model ID alongside them (`route.ts` L254), root-causing "diagnoses got worse" means correlating git history against deploy timestamps manually. Full observability tooling would make it a filter query.
 
 **What the alternative would have cost.** An extra service (or self-hosted store), instrumentation on every agent call, and a dependency the rest of the stack doesn't need. For an early-stage app with four prompts, files-plus-git is the right amount of process; the obs tooling would be premature weight.
 
@@ -251,7 +269,7 @@ The progression is: make it a file (review), then make it observable (trace). A 
 
 ### Output persistence without provenance (`saveInvestigation`)
 
-- **Codebase uses:** `route.ts` L162 persists the `AgentEvent[]` of outputs for cache-replay; no prompt SHA or model ID attached.
+- **Codebase uses:** `route.ts` L254 persists the `AgentEvent[]` of outputs for cache-replay; no prompt SHA or model ID attached.
 - **Why it's here:** the immediate need was replay (serve a precomputed investigation without re-running), not regression tracing.
 - **Leading today (2026):** run records that carry `{ promptVersion, model, params, inputHash, output }` lead for any team doing eval-driven iteration.
 - **Why it leads:** provenance is what turns a saved output into a debuggable, evaluatable record.
@@ -264,7 +282,7 @@ The progression is: make it a file (review), then make it observable (trace). A 
 ### Co-log prompt SHA and model ID with every investigation
 
 - **Exercise ID:** C1.7 (adapted) — prompts-as-code observability.
-- **What to build:** compute a content hash of each loaded prompt at import (alongside the `PROMPT` const), and include `{ promptSha, model: AGENT_MODEL }` in the record `saveInvestigation` persists (`route.ts` L162), so every saved investigation is traceable to the exact prompt version and model that produced it.
+- **What to build:** compute a content hash of each loaded prompt at import (alongside the `PROMPT` const), and include `{ promptSha, model: AGENT_MODEL }` in the record `saveInvestigation` persists (`route.ts` L254), so every saved investigation is traceable to the exact prompt version and model that produced it.
 - **Why it earns its place:** closes the highest-value half of the observability gap — turns "diagnoses got worse last week" from a manual git/deploy correlation into a field on the record.
 - **Files to touch:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` (export the prompt hash), `lib/state/investigations.ts` (widen the persisted shape), `app/api/agent/route.ts` (L162 — attach provenance).
 - **Done when:** a saved investigation record carries the prompt SHA and model ID, and changing a prompt changes the recorded SHA on the next run.
@@ -283,13 +301,13 @@ The progression is: make it a file (review), then make it observable (trace). A 
 
 ## Summary
 
-blooming insights treats prompts as code in the authoring sense: four `.md` files under `lib/agents/prompts/`, loaded as source with `readFileSync` (`monitoring.ts` L12, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13), version-controlled, diffed and reviewed in PRs, and runtime-immutable because the read happens at import. The observability half is absent: model IDs live separately (`base.ts` L9, `intent.ts` L14), unpaired with the prompts, and `saveInvestigation` (`route.ts` L162) persists outputs with no prompt SHA or model ID attached. That gap is exactly what makes a one-line model bump a potential silent regression — the prompts are tuned to a specific model, and nothing records or enforces which prompt version was validated against which model.
+blooming insights treats prompts as code in the authoring sense: four `.md` files under `lib/agents/prompts/`, loaded as source with `readFileSync` (`monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13), version-controlled, diffed and reviewed in PRs, and runtime-immutable because the read happens at import. The observability half is absent: model IDs live separately (`base.ts` L9, `intent.ts` L14), unpaired with the prompts, and `saveInvestigation` (`route.ts` L254) persists outputs with no prompt SHA or model ID attached. That gap is exactly what makes a one-line model bump a potential silent regression — the prompts are tuned to a specific model, and nothing records or enforces which prompt version was validated against which model.
 
 **Key points:**
 - Prompts are repo files loaded as source — diffable, reviewable, runtime-immutable (read at import).
 - `.md` keeps the instruction legible as prose, the way the model reads it and the way a reviewer reads it.
 - Model IDs are code constants in different files (`base.ts` L9, `intent.ts` L14), not paired with the prompts.
-- Persisted investigations (`route.ts` L162) carry outputs only — no prompt SHA, model ID, or version tag.
+- Persisted investigations (`route.ts` L254) carry outputs only — no prompt SHA, model ID, or version tag.
 - The missing pairing is the precise reason a model upgrade can silently regress prompts tuned to the prior model.
 
 ---
@@ -304,7 +322,7 @@ blooming insights treats prompts as code in the authoring sense: four `.md` file
 
 **[mid] "Where do your prompts live and how are they changed?"**
 
-In `lib/agents/prompts/*.md`, loaded with `readFileSync` at import (`monitoring.ts` L12 etc.). Changing one is a PR diff on the `.md` with git history and review, and because the read is at import time the deployed prompt always equals the committed one — no live editing.
+In `lib/agents/prompts/*.md`, loaded with `readFileSync` at import (`monitoring.ts` L13 etc.). Changing one is a PR diff on the `.md` with git history and review, and because the read is at import time the deployed prompt always equals the committed one — no live editing.
 
 ```
 edit monitoring.md → PR diff → review → merge → ships (import-time read)
@@ -312,7 +330,7 @@ edit monitoring.md → PR diff → review → merge → ships (import-time read)
 
 **[senior] "A diagnosis quality dropped last week. How do you find the cause?"**
 
-Today, with difficulty — `saveInvestigation` (`route.ts` L162) persists the outputs but not the prompt SHA or model ID, so I'd correlate `git log lib/agents/prompts/` and `base.ts` L9 history against the deploy timeline by hand. The right fix is co-logging `{ promptSha, model }` with each record so I can filter by version. The gap is the observability half of prompts-as-code; the authoring half (files + git) is there.
+Today, with difficulty — `saveInvestigation` (`route.ts` L254) persists the outputs but not the prompt SHA or model ID, so I'd correlate `git log lib/agents/prompts/` and `base.ts` L9 history against the deploy timeline by hand. The right fix is co-logging `{ promptSha, model }` with each record so I can filter by version. The gap is the observability half of prompts-as-code; the authoring half (files + git) is there.
 
 ```
 have:  outputs persisted
@@ -334,10 +352,10 @@ no pairing/co-log → regression untraceable to the model change
 
 ### One-line anchors
 
-- `lib/agents/monitoring.ts` L12 — prompt loaded as source via `readFileSync` (same at `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13).
+- `lib/agents/monitoring.ts` L13 — prompt loaded as source via `readFileSync` (same at `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13).
 - `lib/agents/base.ts` L9 — `AGENT_MODEL` constant, decoupled from the prompts.
 - `lib/agents/intent.ts` L14 — `CLASSIFIER_MODEL`, separately versioned.
-- `app/api/agent/route.ts` L162 — `saveInvestigation` persists outputs only, no prompt/model provenance.
+- `app/api/agent/route.ts` L254 — `saveInvestigation` persists outputs only, no prompt/model provenance.
 - the gap: prompt version + model version are neither paired nor co-logged → untraceable regression.
 
 ---
@@ -350,11 +368,11 @@ From memory, draw the two halves of prompts-as-code (authoring: file → load �
 
 ### Level 2 — Explain
 
-Out loud: why does loading the prompt with `readFileSync` *at import* (`monitoring.ts` L12) guarantee the deployed prompt equals the committed one, and what does that immutability cost during an incident?
+Out loud: why does loading the prompt with `readFileSync` *at import* (`monitoring.ts` L13) guarantee the deployed prompt equals the committed one, and what does that immutability cost during an incident?
 
 ### Level 3 — Apply
 
-Scenario: you change `AGENT_MODEL` at `base.ts` L9 to a newer model and the diagnostic agent's parse-failure rate climbs. Walk through why the persisted records (`route.ts` L162) don't let you confirm the model bump as the cause, and name the one field you'd add to make it traceable.
+Scenario: you change `AGENT_MODEL` at `base.ts` L9 to a newer model and the diagnostic agent's parse-failure rate climbs. Walk through why the persisted records (`route.ts` L254) don't let you confirm the model bump as the cause, and name the one field you'd add to make it traceable.
 
 ### Level 4 — Defend
 
@@ -362,4 +380,7 @@ A reviewer says: "We don't need prompt observability — git history is enough."
 
 ### Quick check — code reference test
 
-Where does the model ID that runs the three agents live, and is it stored anywhere alongside the prompt or the output? (Answer: `AGENT_MODEL = 'claude-sonnet-4-6'` at `lib/agents/base.ts` L9; it is *not* paired with the prompt files and *not* persisted by `saveInvestigation` at `app/api/agent/route.ts` L162 — the observability gap.)
+Where does the model ID that runs the three agents live, and is it stored anywhere alongside the prompt or the output? (Answer: `AGENT_MODEL = 'claude-sonnet-4-6'` at `lib/agents/base.ts` L9; it is *not* paired with the prompt files and *not* persisted by `saveInvestigation` at `app/api/agent/route.ts` L254 — the observability gap.)
+
+---
+Updated: 2026-05-29 — Documented the `{categories}` runtime checklist injection as a prompts-as-code interpolation pattern (`monitoring.ts` L69–86: `scan` now takes a `categories` param at L69, builds a checklist, and `.replace('{categories}', checklist)` at L86 — same versioned-`.md`-plus-runtime-interpolation as `{schema}`/`{project_id}`). Also corrected stale code refs: `monitoring.ts` L12→L13 and `saveInvestigation` `route.ts` L162→L254 (with the stream body L169–256 and `collected` declared L171).

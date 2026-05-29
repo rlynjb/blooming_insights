@@ -79,10 +79,10 @@ WHAT YOU OWN
 
 For blooming insights the cases are obvious because the prompts already name them. Every "CRITICAL"/"Never"/"Do NOT" block is a case waiting to be written down:
 
-- `monitoring.md` L25–31: a workspace whose recent 90 days are empty. Expected: agent anchors `execution_time` or returns `[]` — NOT a ±100% swing.
-- `monitoring.md` L23: a metric with a prior value < 500 events. Expected: agent ignores it, does not report a "swing."
-- `diagnostic.md` L36–42: queries for recent windows return 0. Expected: conclusion honestly states data is historical — NOT an invented cause.
-- `diagnostic.md` L33: a hypothesis that would need `customers matching`. Expected: agent uses `by <attribute>` and does not waste a call.
+- `monitoring.md` L31–37: a workspace whose recent 90 days are empty. Expected: agent anchors `execution_time` or returns `[]` — NOT a ±100% swing.
+- `monitoring.md` L29: a metric with a prior value < 500 events. Expected: agent ignores it, does not report a "swing."
+- `diagnostic.md` L38–50: queries for recent windows return 0. Expected: conclusion honestly states data is historical — NOT an invented cause.
+- `diagnostic.md` L35: a hypothesis that would need `customers matching`. Expected: agent uses `by <attribute>` and does not waste a call.
 
 Each of those is a regression fix that currently lives only as a sentence in a prompt. The dataset turns each sentence into an enforceable case.
 
@@ -107,13 +107,13 @@ RUNNER must use the SAME path as production
  scorer reads THIS, not a mock
 ```
 
-The seam that makes this cheap already exists. `runAgentLoop` injects both the Anthropic client and the `McpCaller` (`lib/agents/base.ts` L48–L62, L16–L22) — the same seam the 125 unit tests use to pass fakes. For evals you do the opposite of the unit tests: you keep the real Anthropic client (you want real model behavior) and inject a *deterministic* `McpCaller` that returns canned tool results per case, so the case's "empty 90-day window" is reproducible run to run.
+The seam that makes this cheap already exists. `runAgentLoop` injects both the Anthropic client and the `McpCaller` (`lib/agents/base.ts` L48–L62, L16–L22) — the same seam the 169 unit tests use to pass fakes. For evals you do the opposite of the unit tests: you keep the real Anthropic client (you want real model behavior) and inject a *deterministic* `McpCaller` that returns canned tool results per case, so the case's "empty 90-day window" is reproducible run to run.
 
 ---
 
 ### Part 2.5 — current state: unit tests are not evals
 
-This is the distinction the brief demands be named plainly. blooming insights has 125 Vitest tests. They are unit tests with injected fakes, and they test **shape, not answer quality.**
+This is the distinction the brief demands be named plainly. blooming insights has 169 Vitest tests. They are unit tests with injected fakes, and they test **shape, not answer quality.**
 
 ```
 UNIT TEST (exists)                  EVAL (does not exist)
@@ -127,7 +127,7 @@ assert: parseAgentJson returns      assert: the diagnosis is CORRECT
 deterministic, no model call        non-deterministic, real model call
 ```
 
-`test/agents/diagnostic.test.ts` proves that when the fake model returns fenced JSON, `investigate` returns a typed `Diagnosis`, and when it returns garbage, the chain falls to `FALLBACK`. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 125 tests. The eval is the layer that would catch it, and it is the layer that does not exist.
+`test/agents/diagnostic.test.ts` proves that when the fake model returns fenced JSON, `investigate` returns a typed `Diagnosis`, and when it returns garbage, the chain falls to `FALLBACK`. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 169 tests. The eval is the layer that would catch it, and it is the layer that does not exist.
 
 So the honest framing of the current state: the prompts ARE iterated against real failures — the dense warning blocks prove it — but the iteration loop runs in someone's head, manually, one case at a time, with no record of the case and no automated re-check. It is a regression suite with no harness. That works until the person who remembers all the edge cases changes a prompt and forgets one.
 
@@ -155,7 +155,7 @@ The trap to name: an LLM judge is itself a model that can be wrong, and it is of
 
 ### The principle
 
-Eval-driven iteration moves the definition of "better prompt" out of your head and into a number on a fixed dataset, and it gates every change on two conditions, not one: the aggregate improved AND no critical case regressed. The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the misses (they are written into the prompts as CRITICAL blocks) and the injection seam (used by 125 unit tests) but has not yet turned either into a scored harness, so it iterates by memory.
+Eval-driven iteration moves the definition of "better prompt" out of your head and into a number on a fixed dataset, and it gates every change on two conditions, not one: the aggregate improved AND no critical case regressed. The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the misses (they are written into the prompts as CRITICAL blocks) and the injection seam (used by 169 unit tests) but has not yet turned either into a scored harness, so it iterates by memory.
 
 ---
 
@@ -167,7 +167,7 @@ This diagram spans the loop. The Engineer edits a prompt; the Harness layer runs
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ENGINEER                                                             │
 │   edits lib/agents/prompts/<name>.md  (e.g. tighten the empty-window  │
-│   rule in monitoring.md L25–31)                                       │
+│   rule in monitoring.md L31–37)                                       │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼───────────────────────────────────────────┐
@@ -202,9 +202,9 @@ A reader who sees only this should grasp: the dataset is fixed and growing, the 
 
 ## In this codebase
 
-**Not yet implemented.** There is no eval set, no eval runner, and no LLM-judge anywhere in blooming insights; the 125 Vitest tests under `test/` are unit tests that inject fake Anthropic/MCP clients and assert output *shape* (e.g. `test/agents/diagnostic.test.ts` checks that a fenced-JSON fake yields a typed `Diagnosis` and that garbage falls to `FALLBACK`) — they never score answer quality, so a hallucinated-but-well-formed output passes all of them.
+**Not yet implemented.** There is no eval set, no eval runner, and no LLM-judge anywhere in blooming insights; the 169 Vitest tests under `test/` are unit tests that inject fake Anthropic/MCP clients and assert output *shape* (e.g. `test/agents/diagnostic.test.ts` checks that a fenced-JSON fake yields a typed `Diagnosis` and that garbage falls to `FALLBACK`) — they never score answer quality, so a hallucinated-but-well-formed output passes all of them.
 
-The closest partial analog is the prompts themselves: every "CRITICAL"/"Never"/"Do NOT" block (`monitoring.md` L25–31 and L23, `diagnostic.md` L36–42 and L33, `recommendation.md` L64) is a regression fix encoded as prose — an informal, harness-less regression suite. A real harness would live in a new `evals/` directory at the repo root, reusing the injection seam in `lib/agents/base.ts` (L48–L62) that the unit tests already exploit.
+The closest partial analog is the prompts themselves: every "CRITICAL"/"Never"/"Do NOT" block (`monitoring.md` L31–37 and L29, `diagnostic.md` L38–50 and L35, `recommendation.md` L82) is a regression fix encoded as prose — an informal, harness-less regression suite. A real harness would live in a new `evals/` directory at the repo root, reusing the injection seam in `lib/agents/base.ts` (L48–L62) that the unit tests already exploit.
 
 ---
 
@@ -270,7 +270,7 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ### the eval dataset (golden set / regression set)
 
-- **Codebase uses:** nothing formal; the de-facto cases live as prose in `monitoring.md` (L23, L25–31), `diagnostic.md` (L33, L36–42), `recommendation.md` (L64).
+- **Codebase uses:** nothing formal; the de-facto cases live as prose in `monitoring.md` (L23, L31–37), `diagnostic.md` (L33, L38–50), `recommendation.md` (L64).
 - **Why it's here:** each CRITICAL/Never/Do-NOT block is a real production miss someone fixed once; the prompt is where the fix was written down for lack of a dataset.
 - **Leading today:** a versioned dataset of input→grader cases checked into the repo (2026), the practice Hamel Husain advocates — read your outputs, label them, accrete cases.
 - **Why it leads:** the dataset is the only artifact that lets you change a prompt without gambling on memory; it outlives prompts and survives model upgrades.
@@ -278,7 +278,7 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ### the eval runner
 
-- **Codebase uses:** nothing; would reuse the injection seam in `lib/agents/base.ts` (L48–L62) that the 125 unit tests already use to pass fakes.
+- **Codebase uses:** nothing; would reuse the injection seam in `lib/agents/base.ts` (L48–L62) that the 169 unit tests already use to pass fakes.
 - **Why it's here:** the seam exists because the unit tests need it; an eval runner is the same seam with a real model and deterministic tool results instead of a fake model.
 - **Leading today:** lightweight in-repo runners and frameworks like promptfoo / OpenAI Evals / Inspect (2026) that run a dataset through a real call path and produce a per-case results table.
 - **Why it leads:** running the REAL prompt+model+parser path is the only way the score reflects production; a mocked path measures fiction.
@@ -286,7 +286,7 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ### LLM-as-judge (scorer for prose)
 
-- **Codebase uses:** nothing; the query agent's prose output (`query.md` L36) has no field to assert on, so it is the natural place a judge would be added.
+- **Codebase uses:** nothing; the query agent's prose output (`query.md` L49) has no field to assert on, so it is the natural place a judge would be added.
 - **Why it's here:** structured outputs score with field assertions, but free prose needs a rubric-based grader.
 - **Leading today:** LLM-as-judge with a rubric, validated against human labels before trust (2026) — Hamel's required step.
 - **Why it leads:** it is the only scalable scorer for open-ended text; the validation-against-humans step is what separates it from vibes.
@@ -299,7 +299,7 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 ### Build a golden set + runner under `evals/`
 
 - **Exercise ID:** C3.1 / C3.2 (adapted) — stand up an offline eval harness for the agents.
-- **What to build:** a new `evals/` directory with (1) `evals/cases/` holding 20–50 JSON cases, each an input anomaly (or query) plus the canned MCP tool results that case implies plus a grader spec; (2) `evals/run.ts` that constructs `DiagnosticAgent`/`QueryAgent` with the real Anthropic client and a deterministic `McpCaller` that replays the case's canned results, runs each case, and applies the grader; (3) a results table printing aggregate pass-rate and a per-case pass/fail column. Seed the set directly from the prompts' CRITICAL blocks: the empty-90-day-window case (`monitoring.md` L25–31), the < 500-events baseline case (L23), the historical-data case (`diagnostic.md` L36–42).
+- **What to build:** a new `evals/` directory with (1) `evals/cases/` holding 20–50 JSON cases, each an input anomaly (or query) plus the canned MCP tool results that case implies plus a grader spec; (2) `evals/run.ts` that constructs `DiagnosticAgent`/`QueryAgent` with the real Anthropic client and a deterministic `McpCaller` that replays the case's canned results, runs each case, and applies the grader; (3) a results table printing aggregate pass-rate and a per-case pass/fail column. Seed the set directly from the prompts' CRITICAL blocks: the empty-90-day-window case (`monitoring.md` L31–37), the < 500-events baseline case (L29), the historical-data case (`diagnostic.md` L38–50).
 - **Why it earns its place:** it converts the informal in-prose regression suite into an executable one and gives every future prompt edit a number to gate on — the single highest-leverage thing missing from the system.
 - **Files to touch:** new `evals/cases/*.json`, new `evals/run.ts`, new `evals/grade.ts`; reuse `lib/agents/base.ts` (the injection seam), `lib/agents/diagnostic.ts`, `lib/agents/query.ts`, `lib/mcp/validate.ts`.
 - **Done when:** `tsx evals/run.ts` runs every case through the real agent path, prints an aggregate score and a per-case table, and the three seeded edge-case cases pass on `main` and fail when the corresponding CRITICAL block is deleted from the prompt.
@@ -308,7 +308,7 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 ### Add an LLM-judge for the query agent's prose
 
 - **Exercise ID:** C3.3 (adapted) — rubric-based grading for free-form output.
-- **What to build:** a grader for the query agent's prose answer (`query.md` L36) that calls a model with a rubric ("grounded in real numbers? honest when data is missing? answers the question asked?") returning a 0–1 score, then a small validation step: hand-label 15 query answers and report the judge's agreement with your labels so the judge is trusted only after it matches humans.
+- **What to build:** a grader for the query agent's prose answer (`query.md` L49) that calls a model with a rubric ("grounded in real numbers? honest when data is missing? answers the question asked?") returning a 0–1 score, then a small validation step: hand-label 15 query answers and report the judge's agreement with your labels so the judge is trusted only after it matches humans.
 - **Why it earns its place:** demonstrates you know prose needs a different scorer than JSON and that an LLM judge is worthless until validated against human labels — the step teams skip.
 - **Files to touch:** new `evals/judge.ts`, new `evals/cases/query/*.json` (with human labels), `evals/run.ts` (wire the judge for query cases).
 - **Done when:** the judge scores a held-out set of query answers, and you report its agreement rate with your 15 hand labels before any score from it is used to gate a prompt change.
@@ -318,11 +318,11 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ## Summary
 
-Eval-driven iteration replaces "I changed the prompt and the one output looked fine" with "I changed the prompt and the score on a fixed dataset held while no critical case regressed." The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the raw material (its CRITICAL/Never/Do-NOT blocks are regression fixes written as prose) and the wiring (the `runAgentLoop` injection seam used by 125 unit tests) but no harness, so it iterates by memory. The killer failure mode it is exposed to is a "better" prompt that lifts the average while regressing an untracked edge case — which is why the gate is two conditions, not one.
+Eval-driven iteration replaces "I changed the prompt and the one output looked fine" with "I changed the prompt and the score on a fixed dataset held while no critical case regressed." The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the raw material (its CRITICAL/Never/Do-NOT blocks are regression fixes written as prose) and the wiring (the `runAgentLoop` injection seam used by 169 unit tests) but no harness, so it iterates by memory. The killer failure mode it is exposed to is a "better" prompt that lifts the average while regressing an untracked edge case — which is why the gate is two conditions, not one.
 
 **Key points:**
-- The 125 Vitest tests check output *shape* with injected fakes; they are not evals — a hallucinated-but-well-formed answer passes all of them.
-- The prompts' CRITICAL/Never/Do-NOT blocks (`monitoring.md` L23/L25–31, `diagnostic.md` L33/L36–42) are an informal regression suite living in prose with no runner.
+- The 169 Vitest tests check output *shape* with injected fakes; they are not evals — a hallucinated-but-well-formed answer passes all of them.
+- The prompts' CRITICAL/Never/Do-NOT blocks (`monitoring.md` L29/L31–37, `diagnostic.md` L35/L38–50) are an informal regression suite living in prose with no runner.
 - The dataset is the expensive, irreplaceable asset; the prompt is cheap and disposable (Hamel Husain).
 - The eval gate is two conditions: aggregate improved AND no critical case regressed — averages alone ship silent regressions.
 - LLM-as-judge is necessary for prose but worthless until validated against human labels.
@@ -338,7 +338,7 @@ Eval-driven iteration replaces "I changed the prompt and the one output looked f
 
 ### Likely questions
 
-**[mid] "You have 125 passing tests. Why isn't that enough to iterate on prompts safely?"**
+**[mid] "You have 169 passing tests. Why isn't that enough to iterate on prompts safely?"**
 
 Because they test shape, not answer quality. `test/agents/diagnostic.test.ts` injects a fake model and asserts that fenced JSON parses to a typed `Diagnosis` and garbage falls to `FALLBACK` — that is the structured-output contract under test. A hallucinated diagnosis with the right fields passes every one of those tests. Evals are the missing layer that scores whether the answer is *correct*.
 
@@ -349,7 +349,7 @@ eval      → "is the answer right?"  (real model, scored on a dataset)
 
 **[senior] "Walk me through the failure mode of iterating without a golden set."**
 
-A prompt edit raises the average but regresses one untracked critical case. Concretely: I tighten `monitoring.md`'s happy-path phrasing, mean score goes up, every demo case looks better — but I broke the empty-90-day-window path (L25–31) and now a historical-data workspace gets a ±100% swing reported as critical. With no per-case diff, the average hid it; the merchant finds it for me. The gate has to be two conditions: average up AND no critical case down.
+A prompt edit raises the average but regresses one untracked critical case. Concretely: I tighten `monitoring.md`'s happy-path phrasing, mean score goes up, every demo case looks better — but I broke the empty-90-day-window path (L31–37) and now a historical-data workspace gets a ±100% swing reported as critical. With no per-case diff, the average hid it; the merchant finds it for me. The gate has to be two conditions: average up AND no critical case down.
 
 ```
 edit → avg ↑ (looks great)  ── but ──▶ empty-window case ↓ (silent)
@@ -373,8 +373,8 @@ new prod miss → new permanent case (dataset grows)
 ### One-line anchors
 
 - `test/agents/diagnostic.test.ts` — unit test of shape, not quality; the gap evals fill.
-- `lib/agents/prompts/monitoring.md` L25–31 — empty-window CRITICAL block = an eval case in prose.
-- `lib/agents/prompts/diagnostic.md` L36–42 — historical-data block = an eval case in prose.
+- `lib/agents/prompts/monitoring.md` L31–37 — empty-window CRITICAL block = an eval case in prose.
+- `lib/agents/prompts/diagnostic.md` L38–50 — historical-data block = an eval case in prose.
 - `lib/agents/base.ts` L48–L62 — the injection seam an eval runner would reuse.
 - Hamel Husain, "Your AI Product Needs Evals" — the canonical reference.
 
@@ -388,16 +388,20 @@ From memory, draw the eval loop: edit prompt → dataset → runner (real path) 
 
 ### Level 2 — Explain
 
-Out loud: why are the 125 Vitest tests (e.g. `test/agents/diagnostic.test.ts`) NOT evals? Name what they assert (shape) versus what an eval asserts (answer quality), and give an example of an output that passes all 125 tests but should fail an eval.
+Out loud: why are the 169 Vitest tests (e.g. `test/agents/diagnostic.test.ts`) NOT evals? Name what they assert (shape) versus what an eval asserts (answer quality), and give an example of an output that passes all 169 tests but should fail an eval.
 
 ### Level 3 — Apply
 
-Scenario: turn `monitoring.md` L25–31 (the empty-90-day-window CRITICAL block) into an eval case. Specify the input anomaly, the canned MCP tool results that make the recent window empty, the expected output (`[]` or an `execution_time`-anchored result, NOT a ±100% swing), and which class you'd run it through (`MonitoringAgent`) with which injected dependency made deterministic (the `McpCaller`).
+Scenario: turn `monitoring.md` L31–37 (the empty-90-day-window CRITICAL block) into an eval case. Specify the input anomaly, the canned MCP tool results that make the recent window empty, the expected output (`[]` or an `execution_time`-anchored result, NOT a ±100% swing), and which class you'd run it through (`MonitoringAgent`) with which injected dependency made deterministic (the `McpCaller`).
 
 ### Level 4 — Defend
 
-A reviewer says: "We have 125 green tests, we don't need evals." State the distinction between shape and quality, give the average-up-edge-case-down failure mode as the concrete risk, point to a real CRITICAL block (`diagnostic.md` L36–42) that no unit test pins for correctness, and name the breakpoint event that makes building `evals/` mandatory.
+A reviewer says: "We have 169 green tests, we don't need evals." State the distinction between shape and quality, give the average-up-edge-case-down failure mode as the concrete risk, point to a real CRITICAL block (`diagnostic.md` L38–50) that no unit test pins for correctness, and name the breakpoint event that makes building `evals/` mandatory.
 
 ### Quick check — code reference test
 
 Which seam in `lib/agents/base.ts` would an eval runner reuse to feed deterministic tool results to the real agent, and how does its use differ from the unit tests'? (Answer: the injected `anthropic` client and `McpCaller` parameters of `runAgentLoop` — `lib/agents/base.ts` L48–L62, interface L16–L22. Unit tests inject a fake model AND a fake MCP; an eval runner keeps the REAL Anthropic client for real model behavior but injects a deterministic `McpCaller` that replays the case's canned results.)
+
+---
+Updated: 2026-05-29 — Updated the Vitest test count from 125 to 169 across all 11 body references (the suite grew this session).
+Updated: 2026-05-29 — Resynced stale prompt-line refs (the {categories} shift + earlier prompt revisions): monitoring.md CRITICAL block L25–31→L31–37, small-baseline caution L23→L29; diagnostic.md historical-data block L36–42→L38–50, "customers matching" ban L33→L35; recommendation.md id-ban L64→L82; query.md prose L36→L49.

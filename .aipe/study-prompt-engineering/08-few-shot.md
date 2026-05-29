@@ -52,10 +52,10 @@ The distinction matters: a format exemplar shapes *how the answer looks*; a true
 
 ### Format exemplars for EQL — showing the supported syntax
 
-The prompts do not describe EQL grammar; they show it. The `## EQL reminders` blocks are worked one-liners (`monitoring.md` L43–L48, `diagnostic.md` L26–L34):
+The prompts do not describe EQL grammar; they show it. The `## EQL reminders` blocks are worked one-liners (`monitoring.md` L49–L54, `diagnostic.md` L27–L37):
 
 ```
-diagnostic.md — EQL reminders   (L26–L34)
+diagnostic.md — EQL reminders   (L27–L37)
 ─────────────────────────────────────────────────────────────
  Count one event:   select count event purchase in last 7 days        L28
  Sum a property:    select sum event purchase.total_price ...          L29
@@ -77,17 +77,17 @@ one forbidden shape shown →  model avoids `customers matching`
 
 ### A worked end-to-end exemplar — the monitoring query plan
 
-monitoring.md goes further: it shows a worked *sequence* of calls, not just isolated lines. The `## Suggested query plan` (`monitoring.md` L33–L41) is a five-step exemplar of an entire investigation:
+monitoring.md goes further: it shows a worked *sequence* of calls, not just isolated lines. The `## Suggested query plan` (`monitoring.md` L39–L47) is a five-step exemplar of an entire investigation:
 
 ```
-monitoring.md — Suggested query plan   (L33–L41)
+monitoring.md — Suggested query plan   (L39–L47)
 ─────────────────────────────────────────────────────────────
- 1. select count event purchase, sum ...total_price in last 90 days  L35
- 2. select ... in last 180 days                                       L36
- 3. select count event view_item, cart_update, checkout, purchase...  L37
- 4. select ... in last 180 days                                       L38
- 5. select count event session_start in last 90 days                  L39
- "Derive: purchase count & revenue change, the conversion-rate ..."   L41
+ 1. select count event purchase, sum ...total_price in last 90 days  L41
+ 2. select ... in last 180 days                                       L42
+ 3. select count event view_item, cart_update, checkout, purchase...  L43
+ 4. select ... in last 180 days                                       L44
+ 5. select count event session_start in last 90 days                  L45
+ "Derive: purchase count & revenue change, the conversion-rate ..."   L47
 ```
 
 This is the strongest exemplar in the codebase — a full worked example of *which queries to run in what order to produce a briefing*. It shapes the agent's whole exploration trajectory, not just one query's syntax. It is still format/process-shaping, not a labeled "input anomaly → output anomaly-array" pair, but it is the closest the prompts get to demonstrating the task end to end.
@@ -96,10 +96,10 @@ This is the strongest exemplar in the codebase — a full worked example of *whi
 
 ### The JSON output block IS a few-shot of the output form
 
-The single clearest few-shot pattern is the output example block in each prompt. The model is handed a fully-populated instance of the exact shape it must return (`monitoring.md` L54–L64, `diagnostic.md` L48–L66, `recommendation.md` L49–L59):
+The single clearest few-shot pattern is the output example block in each prompt. The model is handed a fully-populated instance of the exact shape it must return (`monitoring.md` L73–L85, `diagnostic.md` L63–L85, `recommendation.md` L49–L74):
 
 ```
-monitoring.md — output exemplar   (L54–L64)
+monitoring.md — output exemplar   (L73–L85)
 ─────────────────────────────────────────────────────────────
  [
    {
@@ -167,9 +167,9 @@ This diagram spans the prompt's example use. The Format-exemplar layer shows sha
 ┌──────────────────────────────────────────────────────────────────────┐
 │  FORMAT EXEMPLARS (syntax/process shaping)                           │
 │                                                                       │
-│  EQL reminders        monitoring.md L43–48 · diagnostic.md L26–34    │
-│    6 correct query shapes + 1 forbidden (customers matching, L33)    │
-│  Suggested query plan monitoring.md L33–41                           │
+│  EQL reminders        monitoring.md L49–54 · diagnostic.md L27–37    │
+│    6 correct query shapes + 1 forbidden (customers matching, L35)    │
+│  Suggested query plan monitoring.md L39–47                           │
 │    5-step worked investigation (shapes the whole trajectory)         │
 │           │ model imitates the demonstrated shapes                   │
 └───────────┼────────────────────────────────────────────────────────────┘
@@ -177,8 +177,8 @@ This diagram spans the prompt's example use. The Format-exemplar layer shows sha
 ┌──────────────────────────────────────────────────────────────────────┐
 │  OUTPUT EXEMPLARS = few-shot of the OUTPUT FORM                      │
 │                                                                       │
-│  filled JSON block   monitoring.md L54–64 · diagnostic.md L48–66     │
-│                      recommendation.md L49–59 (id-less, L64)         │
+│  filled JSON block   monitoring.md L73–85 · diagnostic.md L63–85     │
+│                      recommendation.md L49–74 (id-less, L82)         │
 │    ── this is the REQUEST side of the structured-output contract ──  │
 │       (parseAgentJson + type guard = the GUARANTEE side, → 02)       │
 └──────────────────────────────────────────────────────────────────────┘
@@ -206,21 +206,21 @@ The codebase demonstrates shapes pervasively and the actual classification decis
 
 - **File:** `lib/agents/prompts/monitoring.md`, `lib/agents/prompts/diagnostic.md`
 - **Function / class:** the `## EQL reminders` blocks (prompt text)
-- **Line range:** `monitoring.md` L43–L48; `diagnostic.md` L26–L34 (negative example at L33)
+- **Line range:** `monitoring.md` L49–L54; `diagnostic.md` L27–L37 (negative example at L35)
 - **Role:** worked query one-liners that demonstrate supported EQL syntax (and one forbidden clause), so the model copies the shapes instead of inventing grammar.
 
 ### The worked query plan (end-to-end process exemplar)
 
 - **File:** `lib/agents/prompts/monitoring.md`
 - **Function / class:** the `## Suggested query plan` section
-- **Line range:** L33–L41
+- **Line range:** L39–L47
 - **Role:** a five-step worked sequence that shapes the agent's whole exploration trajectory — the closest the prompts get to demonstrating the task end to end.
 
 ### Output exemplars (few-shot of the output form)
 
 - **File:** the three JSON prompts
 - **Function / class:** the `## Output` example blocks
-- **Line range:** `monitoring.md` L54–L64; `diagnostic.md` L48–L66; `recommendation.md` L49–L59 (id-less; reinforced by L64 "Do NOT include an `id` field")
+- **Line range:** `monitoring.md` L73–L85; `diagnostic.md` L63–L85; `recommendation.md` L49–L74 (id-less; reinforced by L82 "Do NOT include an `id` field")
 - **Role:** a filled instance of the exact return shape — the request side of the structured-output contract (`parseAgentJson` + type guards in `validate.ts` are the guarantee side).
 
 ### The classifier — zero-shot (the absence)
@@ -295,7 +295,7 @@ An instruction is parsed; an example is imitated. The model's strongest behavior
 
 ### Format exemplars (worked EQL lines + JSON output block)
 
-- **Codebase uses:** `monitoring.md` L43–L48 / L54–L64, `diagnostic.md` L26–L34 / L48–L66 — worked query shapes and a filled output instance.
+- **Codebase uses:** `monitoring.md` L49–L54 / L73–L85, `diagnostic.md` L27–L37 / L63–L85 — worked query shapes and a filled output instance.
 - **Why it's here:** to pin the *shape* of queries and output; the model imitates a demonstrated form more reliably than a described rule.
 - **Leading today:** format exemplars remain the adoption-leading way to constrain output shape in 2026, alongside native structured-output modes that make the format request unnecessary.
 - **Why it leads:** demonstration beats description for structure, at low token cost when examples are few.
@@ -333,7 +333,7 @@ An instruction is parsed; an example is imitated. The model's strongest behavior
 ### Diversify the monitoring output exemplar to reduce content-echo
 
 - **Exercise ID:** B1.8 (adapted) — example diversity over count.
-- **What to build:** replace the single `purchase_revenue` output exemplar (`monitoring.md` L54–L64) with two objects of different metrics, directions, and severities (e.g. a `conversion_rate` "up"/"positive" alongside the revenue "down"/"critical"), so the model imitates the *shape* without anchoring on one metric's literal values.
+- **What to build:** replace the single `purchase_revenue` output exemplar (`monitoring.md` L73–L85) with two objects of different metrics, directions, and severities (e.g. a `conversion_rate` "up"/"positive" alongside the revenue "down"/"critical"), so the model imitates the *shape* without anchoring on one metric's literal values.
 - **Why it earns its place:** demonstrates the "diverse beats numerous" rule and addresses the over-constraint failure where the model echoes the exemplar's content.
 - **Files to touch:** `lib/agents/prompts/monitoring.md` (the output block), `test/agents/monitoring.test.ts` (assert the agent still parses both shapes).
 - **Done when:** monitoring runs still parse via `isAnomalyArray`, and a manual check shows the model varying metric names rather than echoing `purchase_revenue`.
@@ -343,7 +343,7 @@ An instruction is parsed; an example is imitated. The model's strongest behavior
 
 ## Summary
 
-Examples constrain output more reliably than instructions because the model imitates a demonstrated shape better than it parses a described rule. blooming insights uses format exemplars pervasively — the EQL reminder one-liners (`monitoring.md` L43–L48, `diagnostic.md` L26–L34, with a negative example at L33), the five-step worked query plan (`monitoring.md` L33–L41), and the filled JSON output blocks that double as the request side of the structured-output contract (`monitoring.md` L54–L64, recommendation's id-less shape at L49–L59 / L64). But its one true classifier, `classifyIntent` (`intent.ts` L17–L31), is zero-shot — label definitions, no labeled query→label pairs, mirrored in query.md's Framing (L15–L21). The split is honest: format wants demonstration, the classifier's distinct categories survive on definitions, and whether examples would help the classifier is a measurable open question.
+Examples constrain output more reliably than instructions because the model imitates a demonstrated shape better than it parses a described rule. blooming insights uses format exemplars pervasively — the EQL reminder one-liners (`monitoring.md` L49–L54, `diagnostic.md` L27–L37, with a negative example at L35), the five-step worked query plan (`monitoring.md` L39–L47), and the filled JSON output blocks that double as the request side of the structured-output contract (`monitoring.md` L73–L85, recommendation's id-less shape at L49–L74 / L82). But its one true classifier, `classifyIntent` (`intent.ts` L17–L31), is zero-shot — label definitions, no labeled query→label pairs, mirrored in query.md's Framing (L15–L21). The split is honest: format wants demonstration, the classifier's distinct categories survive on definitions, and whether examples would help the classifier is a measurable open question.
 
 **Key points:**
 - A demonstrated shape constrains output more reliably than a described rule — the model pattern-completes.
@@ -364,7 +364,7 @@ Examples constrain output more reliably than instructions because the model imit
 
 **[mid] "Show me a few-shot example in this codebase."**
 
-The clearest one is the output block — `monitoring.md` L54–L64 hands the model a fully-filled anomaly object (`18.5`, `"down"`, `"critical"`) and the model returns the same shape with its own values. That is a one-shot of the output form. The EQL reminders (`diagnostic.md` L26–L34) are format exemplars too — worked query shapes the model copies.
+The clearest one is the output block — `monitoring.md` L73–L85 hands the model a fully-filled anomaly object (`18.5`, `"down"`, `"critical"`) and the model returns the same shape with its own values. That is a one-shot of the output form. The EQL reminders (`diagnostic.md` L27–L37) are format exemplars too — worked query shapes the model copies.
 
 ```
 filled JSON exemplar  →  model emits same shape, own values
@@ -391,13 +391,13 @@ example     → imitated → gaps filled by analogy   ← stronger structural co
 
 ### The question candidates always dodge
 
-**"Does showing the model six correct EQL shapes make it write the *right* query?"** No — it makes it write a *well-formed* query. Format exemplars constrain syntax, not judgment; the model can emit a perfectly-shaped EQL line that tests the wrong hypothesis (`diagnostic.md` L26–L34 teaches form, not which dimension to segment by). Conflating "the output is shaped right" with "the decision is right" is the dodge — and it is why format few-shot needs evals on top.
+**"Does showing the model six correct EQL shapes make it write the *right* query?"** No — it makes it write a *well-formed* query. Format exemplars constrain syntax, not judgment; the model can emit a perfectly-shaped EQL line that tests the wrong hypothesis (`diagnostic.md` L27–L37 teaches form, not which dimension to segment by). Conflating "the output is shaped right" with "the decision is right" is the dodge — and it is why format few-shot needs evals on top.
 
 ### One-line anchors
 
-- `monitoring.md` L54–L64 — the output exemplar: a one-shot of the return shape.
-- `diagnostic.md` L26–L34 — EQL format exemplars, with a negative example at L33.
-- `monitoring.md` L33–L41 — the five-step worked query plan (process exemplar).
+- `monitoring.md` L73–L85 — the output exemplar: a one-shot of the return shape.
+- `diagnostic.md` L27–L37 — EQL format exemplars, with a negative example at L35.
+- `monitoring.md` L39–L47 — the five-step worked query plan (process exemplar).
 - `intent.ts` L21–L23 — the classifier system prompt: definitions, zero-shot.
 - `query.md` L15–L21 — Framing: the same three label definitions, no examples.
 
@@ -411,7 +411,7 @@ From memory, draw the zero-shot → format-exemplar → few-shot spectrum and pl
 
 ### Level 2 — Explain
 
-Out loud: why is the JSON output block (`monitoring.md` L54–L64) both a few-shot example *and* the request side of the structured-output contract? Tie it to `parseAgentJson` + `isAnomalyArray` (the guarantee side, → 02-structured-outputs.md) — the example makes the model emit the shape, the validator enforces it.
+Out loud: why is the JSON output block (`monitoring.md` L73–L85) both a few-shot example *and* the request side of the structured-output contract? Tie it to `parseAgentJson` + `isAnomalyArray` (the guarantee side, → 02-structured-outputs.md) — the example makes the model emit the shape, the validator enforces it.
 
 ### Level 3 — Apply
 
@@ -424,3 +424,7 @@ A reviewer says: "Add examples to the classifier — few-shot always beats zero-
 ### Quick check — code reference test
 
 Is `classifyIntent` few-shot or zero-shot, and what does its system prompt contain? (Answer: zero-shot — its system prompt at `intent.ts` L21–L23 contains label *definitions* for monitoring/diagnostic/recommendation and "Reply with ONLY the one word," with no labeled query→label examples.)
+
+---
+Updated: 2026-05-29 — Resynced monitoring.md exemplar refs after the `{categories}` shift: EQL reminders L43–48→L49–54, Suggested query plan L33–41→L39–47 (with inner step annotations L35–41→L41–47), output exemplar L54–64→L73–85 (verified against the live JSON block, which sits lower than the +6 estimate due to the expanded field-rules).
+Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md EQL reminders L26–34→L27–37 and negative-example L33→L35, diagnostic.md output exemplar L48–66→L63–85, recommendation.md output exemplar L49–59→L49–74 and id-ban L64→L82.

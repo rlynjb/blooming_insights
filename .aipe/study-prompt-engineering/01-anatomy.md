@@ -24,7 +24,7 @@ Before you see the anatomy:
 
 After:
 - Six named sections, same order in all four files — you read the new one in 30 seconds
-- The injected placeholders are a closed set you can grep for: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`
+- The injected placeholders are a closed set you can grep for: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, `{categories}` (the last is monitoring-only)
 - The synthesis nudge is in one place (`base.ts` L98), not smeared into every prompt
 
 It is the markup-vs-data discipline, applied to a string the model reads instead of a browser.
@@ -67,7 +67,23 @@ Every prompt file is the same six blocks in the same order. This is not a coinci
 ## Workspace schema   {schema}   ← the injected data dictionary
 ```
 
-You can lay the four files side by side and the headings line up. `monitoring.md` L3/L7/L14/L43/L50/L75 are Role / Hard rules / method / EQL reminders / Output / schema. `diagnostic.md` L3/L7/L18/L26/L44/L83 is the same skeleton. `recommendation.md` L3/L7/L29/—/L44/L73 (it swaps EQL reminders for an "Available tools" list at L15). `query.md` L3/L7/L13/L23/L34/L38 — same six, with its Output section saying the opposite of the other three (more on that in → 07-output-mode-mismatch.md).
+You can lay the four files side by side and the headings line up. `monitoring.md` L3/L13/L20/L49/L69/L99 are Role / Hard rules / method / EQL reminders / Output / schema — note it carries an extra section the other three don't: `## Your category checklist` at L7, with a `{categories}` slot at L11 (covered below). `diagnostic.md` L3/L7/L18/L27/L59/L103 is the same skeleton. `recommendation.md` L3/L7/L29/—/L47/L91 (it swaps EQL reminders for an "Available tools" list at L15). `query.md` L3/L7/L13/L23/L47/L51 — same six, with its Output section saying the opposite of the other three (more on that in → 07-output-mode-mismatch.md).
+
+---
+
+### The one structural exception: monitoring's `## Your category checklist`
+
+`monitoring.md` is not a clean instance of the six-section skeleton. Between `## Role` (L3) and `## Hard rules` (L13) it has a seventh section the other three prompts don't:
+
+```
+## Your category checklist     monitoring.md L7
+  "Check each of these — and only these…"
+  {categories}                 monitoring.md L11   ← per-call injection slot
+```
+
+This matters for two reasons. First, it is a *fourth* per-call injection placeholder, sitting alongside `{schema}`, `{project_id}`, and the per-agent anomaly/diagnosis/intent injections — bringing monitoring's runtime-stamped slots to `{schema}` + `{project_id}` + `{categories}`. Second, `{categories}` is unlike the others: `{schema}` is the same data dictionary for every agent and `{project_id}` is a single id, but `{categories}` is a *runtime-assembled checklist string* — `monitoring.ts` L69–86 builds it from the `AnomalyCategory[]` passed into `scan()` and stamps it in with `.replace('{categories}', checklist)` (~L86), right next to the existing `{schema}` and `{project_id}` replacements. The categories it receives are the schema-runnable subset: `app/api/briefing/route.ts` computes `runnableCategories(schemaCapabilities(schema))` (`lib/agents/categories.ts`) at ~L204 and passes it as `agent.scan(hooks, runnable)` at ~L223. So the section's *body* is data — only the anomaly categories this workspace's events can support — assembled at call time and dropped into a fixed slot. (The gate that decides which categories are runnable is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
+
+The takeaway for anatomy: do not assume all four prompts are the identical six-section shape. Three are; monitoring is six sections **plus** a checklist section whose content is injected per call. When you grep the placeholder set, `{categories}` is the one that's monitoring-only and the one whose value is computed, not constant.
 
 ---
 
@@ -106,6 +122,7 @@ placeholder      injected by                  appears in
 {anomaly}        JSON.stringify(anomaly)       diagnostic only  (L48)
 {diagnosis}      JSON.stringify(diagnosis)     recommendation only (recommendation.ts L44)
 {intent}         the classified label (/g)     query only  (query.ts L28)
+{categories}     runtime-built checklist str   monitoring only (monitoring.ts L86)
 userPrompt       a fixed per-agent string      passed separately, NOT in the .md
 ```
 
@@ -185,14 +202,14 @@ The shape is authored once; the bytes the model receives are assembled per turn 
 
 - **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md`
 - **Function / class:** the prompt source itself (the constant Layer 1)
-- **Line range:** Role at L3–5 in all four; Hard rules at L7 in all four; method at `monitoring.md` L14 / `diagnostic.md` L18 / `recommendation.md` L29 / `query.md` L13; EQL reminders at `monitoring.md` L43 / `diagnostic.md` L26 / `query.md` L23 (recommendation swaps in "Available tools" L15); Output at `monitoring.md` L50 / `diagnostic.md` L44 / `recommendation.md` L44 / `query.md` L34; `{schema}` at `monitoring.md` L77 / `diagnostic.md` L85 / `recommendation.md` L75 / `query.md` L40.
-- **Role:** the constant system prompt, one job per file, each Role disclaiming the others (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5).
+- **Line range:** Role at L3–5 in all four; Hard rules at `monitoring.md` L13 (pushed down by its extra `## Your category checklist` section at L7) / L7 in the other three; method at `monitoring.md` L20 / `diagnostic.md` L18 / `recommendation.md` L29 / `query.md` L13; EQL reminders at `monitoring.md` L49 / `diagnostic.md` L27 / `query.md` L23 (recommendation swaps in "Available tools" L15); Output at `monitoring.md` L69 / `diagnostic.md` L59 / `recommendation.md` L47 / `query.md` L47; `{schema}` at `monitoring.md` L101 / `diagnostic.md` L105 / `recommendation.md` L93 / `query.md` L53.
+- **Role:** the constant system prompt, one job per file, each Role disclaiming the others (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5). `monitoring.md` alone carries a seventh section — `## Your category checklist` (L7) with a `{categories}` injection slot (L11) — making it the one prompt that isn't a clean six-section instance.
 
 ### Layer 2 — per-call injection
 
 - **File:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts`
 - **Function / class:** the `.replace` chain that builds `system` before `runAgentLoop`
-- **Line range:** `monitoring.ts` L61–63 (`{schema}`, `{project_id}`); `diagnostic.ts` L45–48 (adds `{anomaly}`); `recommendation.ts` L41–44 (adds `{diagnosis}`); `query.ts` L25–28 (adds `{intent}`). `userPrompt` passed separately: `monitoring.ts` L70, `diagnostic.ts` L55, `recommendation.ts` L51, `query.ts` L35 (the raw `query`).
+- **Line range:** `monitoring.ts` L83–86 (`{schema}`, `{project_id}`, and `{categories}` — the runtime checklist built at L69–86); `diagnostic.ts` L45–48 (adds `{anomaly}`); `recommendation.ts` L41–44 (adds `{diagnosis}`); `query.ts` L25–28 (adds `{intent}`). `userPrompt` passed separately: `monitoring.ts` L93, `diagnostic.ts` L56, `recommendation.ts` L51, `query.ts` L35 (the raw `query`).
 - **Role:** stamps runtime values into the closed placeholder set; keeps `userPrompt` out of the `.md`.
 
 ### Layer 3 — synthesis append
@@ -317,7 +334,7 @@ A production prompt in blooming insights is a constant `.md` skeleton (Role → 
 **Key points:**
 - One six-section skeleton, four instances; the headings line up across the files.
 - Each `## Role` names and disclaims the other agents' jobs — decomposition encoded in prose (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5).
-- The placeholder set is closed and greppable: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`.
+- The placeholder set is closed and greppable: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, `{categories}` (monitoring-only, a runtime-built checklist).
 - `userPrompt` is a separate function argument, not in the `.md` — system is constant, user is per-call.
 - The synthesis nudge lives in one place (`base.ts` L96–98), appended last to exploit recency, and only on the forced-final turn.
 
@@ -368,7 +385,7 @@ synthesis append (L98)  = "emit it NOW, no tools" (last thing read → wins)
 - `lib/agents/diagnostic.ts` L45–48 — per-call `.replace` injection, `/g` on `{project_id}`.
 - `lib/agents/base.ts` L80 — `userPrompt` becomes the first user message (per-call task).
 - `lib/agents/base.ts` L96–98 — `synthesisInstruction` appended last on the forced-final turn.
-- placeholder set: `{schema}` `{project_id}` `{anomaly}` `{diagnosis}` `{intent}` — closed and greppable.
+- placeholder set: `{schema}` `{project_id}` `{anomaly}` `{diagnosis}` `{intent}` `{categories}` — closed and greppable (`{categories}` is monitoring-only, injected as a runtime-built checklist).
 
 ---
 
@@ -393,3 +410,6 @@ A reviewer says: "Just inline the synthesis instruction into each prompt's `## O
 ### Quick check — code reference test
 
 In `lib/agents/base.ts`, what exactly is the `system` value on the forced-final turn, and what else changes on that turn? (Answer: `` `${system}\n\n${synthesisInstruction}` `` at L98 when `forceFinal && synthesisInstruction`; additionally `params.tools` is *not* set at L101, removing the tools so the model must produce a final answer.)
+
+---
+Updated: 2026-05-29 — Corrected stale monitoring.md section line refs (Role L3 / Hard rules L13 / method L20 / EQL reminders L49 / Output L69 / schema L99) and added the `## Your category checklist` section (L7, `{categories}` slot L11) as monitoring's seventh section and a 4th per-call injection placeholder (`monitoring.ts` L69–86).

@@ -172,6 +172,8 @@ A reader who sees only this should grasp: meta-prompting acts at authoring time,
 
 There is no partial analog at runtime — the system never produces prompt text, only consumes it. The closest *shape* in the codebase is the static intent-classifier prompt written inline in `lib/agents/intent.ts` (L21–24), which is still hand-authored, not generated. A meta-prompting helper would be a dev-time tool (not part of the request path) that drafts a new agent prompt from a goal plus the workspace schema and outputs a candidate file for human review into `lib/agents/prompts/`.
 
+One nuance worth ruling out: the monitoring prompt now builds its `## Your category checklist` section by interpolating a code-assembled string into a `{categories}` slot (`monitoring.ts` builds the checklist, then `PROMPT.replace('{categories}', checklist)`). That is *dynamic prompt assembly* — code stitching a prompt section from data — not meta-prompting; no model writes the section, code does. Its closest analog is the template interpolation covered in `03-prompts-as-code.md` (the same `{schema}`/`{project_id}` replacement mechanism), not the model-drafts-a-prompt loop this file is about. The Case B verdict stands: nothing in the repo has an LLM generate a prompt.
+
 ---
 
 ## Elaborate
@@ -196,7 +198,7 @@ The deep idea: a model is good at producing structure-complete first drafts and 
 
 1. **The hedging drift.** The headline failure: drafts default to "try to" and "where possible," and a prompt with soft rules has soft enforcement. The empty-window rule in `monitoring.md` works because it is "Never," not "be careful to." Review must convert every soft rule to an imperative.
 
-2. **Plausible-but-wrong domain content.** A drafting model will happily invent EQL syntax that looks right but is not — exactly the trap `diagnostic.md` L33 warns about ("`customers matching` is NOT supported in this EQL flavor"). A generated prompt can confidently include unsupported syntax; only a reviewer who knows the EQL flavor catches it.
+2. **Plausible-but-wrong domain content.** A drafting model will happily invent EQL syntax that looks right but is not — exactly the trap `diagnostic.md` L35 warns about ("`customers matching` is NOT supported in this EQL flavor"). A generated prompt can confidently include unsupported syntax; only a reviewer who knows the EQL flavor catches it.
 
 3. **Tweaks cost more than they save.** Round-tripping a one-line change through a model is slower than editing the line. Meta-prompting on small edits is negative leverage.
 
@@ -290,7 +292,7 @@ Meta-prompting uses a model to draft or improve the prompts you feed other model
 - It saves real time on the 0→70% draft of a complex prompt and loses time on small tweaks and hourly eval-driven iteration.
 - The meta-prompt must encode the house anatomy (→ 01) or it drafts a generic prompt that ignores `{schema}`, the tool-call budget, and the JSON shape.
 - The failure mode is hedging drift: "try to" / "where possible" where the spec needs "Never" / "no exceptions"; review must convert soft rules to imperatives.
-- Generated drafts can invent unsupported EQL syntax (the `customers matching` trap, `diagnostic.md` L33) — only a domain reviewer catches it.
+- Generated drafts can invent unsupported EQL syntax (the `customers matching` trap, `diagnostic.md` L35) — only a domain reviewer catches it.
 - Automated prompt optimization (APE/DSPy/OPRO) is the next step but presupposes the eval harness (→ 05) that does not exist yet.
 
 ---
@@ -340,7 +342,7 @@ with evals → automated optimization (score candidates) — APE/DSPy/OPRO
 - `lib/agents/prompts/diagnostic.md` — hand-written 85-line spec; the anatomy a meta-prompt must encode.
 - `lib/agents/diagnostic.ts` L13 — `readFileSync` of the static prompt; runtime never generates.
 - `lib/agents/prompts/monitoring.md` L31 — "Never report a change derived from an empty window": the absolute a draft would soften.
-- `lib/agents/prompts/diagnostic.md` L33 — unsupported `customers matching`: the domain content only a reviewer catches.
+- `lib/agents/prompts/diagnostic.md` L35 — unsupported `customers matching`: the domain content only a reviewer catches.
 - Zhou et al. 2022 (APE); DSPy / OPRO — automated optimization, presupposes evals.
 
 ---
@@ -361,8 +363,12 @@ Scenario: you meta-prompt a new "page-performance" agent prompt and the draft sa
 
 ### Level 4 — Defend
 
-A reviewer says: "Just have the model generate all our prompts going forward." State where generation saves time (complex first drafts) versus where it's overhead (tweaks, hourly eval-driven prompts), name the hedging-drift failure mode and the EQL-invention risk (`diagnostic.md` L33), and explain why human review stays in the critical path until an eval harness (→ 05) can score candidates instead.
+A reviewer says: "Just have the model generate all our prompts going forward." State where generation saves time (complex first drafts) versus where it's overhead (tweaks, hourly eval-driven prompts), name the hedging-drift failure mode and the EQL-invention risk (`diagnostic.md` L35), and explain why human review stays in the critical path until an eval harness (→ 05) can score candidates instead.
 
 ### Quick check — code reference test
 
 If a meta-prompting helper produced a new agent prompt, what would have to be true about its placeholders for the existing loader to use it unchanged? (Answer: it must contain the `{schema}` and `{project_id}` placeholders the loader replaces — e.g. `lib/agents/diagnostic.ts` L45–48 does `PROMPT.replace('{schema}', …).replace(/\{project_id\}/g, …)` — plus any agent-specific placeholder like `{anomaly}`; without them the replace calls leave literal placeholder text in the system prompt.)
+
+---
+Updated: 2026-05-29 — Added a note distinguishing the new `{categories}` injection (dynamic prompt assembly / template interpolation, → 03-prompts-as-code.md) from meta-prompting; Case B verdict unchanged.
+Updated: 2026-05-29 — Resynced the stale `diagnostic.md` "customers matching" ban ref L33→L35 (pre-existing drift) across all three citations.

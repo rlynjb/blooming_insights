@@ -3,7 +3,7 @@
 **Industry name(s):** chain-of-thought, CoT prompting, step-by-step reasoning, reasoning-before-answer
 **Type:** Industry standard · Language-agnostic
 
-> diagnostic.md tells the model to "generate 2–3 hypotheses before your first tool call" (L20) and then requires that reasoning back as a *structured* field — `hypothesesConsidered[].reasoning` (L54–L60) — so CoT here is captured in a typed thinking field, not free-form prose; sonnet-4-6 reasons internally regardless, so the scaffolding earns its place by shaping OUTPUT STRUCTURE, not by eliciting hidden reasoning.
+> diagnostic.md tells the model to "generate 2–3 hypotheses before your first tool call" (L20) and then requires that reasoning back as a *structured* field — `hypothesesConsidered[].reasoning` (L69–L75) — so CoT here is captured in a typed thinking field, not free-form prose; sonnet-4-6 reasons internally regardless, so the scaffolding earns its place by shaping OUTPUT STRUCTURE, not by eliciting hidden reasoning.
 
 **See also:** → 08-few-shot.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 04-token-budgeting.md
 
@@ -24,7 +24,7 @@ Before structured CoT:
 
 After:
 - "Generate 2–3 hypotheses before your first tool call" forces breadth before depth (`diagnostic.md` L20)
-- Each hypothesis comes back as `{ hypothesis, supported, reasoning }` — typed, comparable, assertable (`diagnostic.md` L54–L60)
+- Each hypothesis comes back as `{ hypothesis, supported, reasoning }` — typed, comparable, assertable (`diagnostic.md` L69–L75)
 - `isDiagnosis` (`validate.ts`) requires the array, so the reasoning is part of the contract
 
 It is the commit-then-capture discipline, applied to a model whose intermediate reasoning is worth keeping as data, not discarding as prose.
@@ -76,10 +76,10 @@ WITH:    enumerate 2–3 hypotheses → query to falsify each → conclude
 
 ### Capture the reasoning as a typed field — `hypothesesConsidered[]`
 
-The hypotheses do not stay in the model's head; they come back in the output schema. The `## Output` block requires `hypothesesConsidered` as an array of typed objects (`diagnostic.md` L54–L60):
+The hypotheses do not stay in the model's head; they come back in the output schema. The `## Output` block requires `hypothesesConsidered` as an array of typed objects (`diagnostic.md` L69–L75):
 
 ```
-diagnostic.md — structured CoT field   (L54–L60)
+diagnostic.md — structured CoT field   (L69–L75)
 ─────────────────────────────────────────────────────────────
  "hypothesesConsidered": [
    {
@@ -110,7 +110,7 @@ two reasoning artifacts in one diagnostic run
 ─────────────────────────────────────────────────────────────
  PROCESS (ReAct)   onText → reasoning_step   base.ts L108–113
    model's text between tool calls — live, streamed, transient
- OUTPUT  (CoT)     hypothesesConsidered[]    diagnostic.md L54–60
+ OUTPUT  (CoT)     hypothesesConsidered[]    diagnostic.md L69–75
    final typed hypotheses — kept, validated, part of the contract
 ```
 
@@ -139,8 +139,8 @@ This is why the scaffolding sits in the *output schema* (`hypothesesConsidered`)
 
 CoT is not free and not always right. Three places in this codebase deliberately omit it:
 
-- **Monitoring** returns an anomaly array (`monitoring.md` L50–L73) with an `evidence` field but *no* per-item reasoning field. It detects and measures; free-form reasoning would bloat the output without improving the numbers. CoT would be cost without payoff.
-- **Recommendation** returns actions (`recommendation.md` L46–L65) with a `rationale` field — one line per action, not a hypothesis-falsification chain. It reasons *from* the diagnosis, so the heavy CoT already happened upstream; repeating it would duplicate work.
+- **Monitoring** returns an anomaly array (`monitoring.md` L69–L97) with an `evidence` field but *no* per-item reasoning field. It detects and measures; free-form reasoning would bloat the output without improving the numbers. CoT would be cost without payoff.
+- **Recommendation** returns actions (`recommendation.md` L49–L74) with a `rationale` field — one line per action, not a hypothesis-falsification chain. It reasons *from* the diagnosis, so the heavy CoT already happened upstream; repeating it would duplicate work.
 - **The intent classifier** would be *wrecked* by CoT. `classifyIntent` has `max_tokens: 16` (`intent.ts` L20) and demands "ONLY the one word." Tell it to "think step by step" and it spends its 16-token budget on "Let me consider…" and never reaches the label. CoT and a one-word output are directly incompatible.
 
 ```
@@ -184,7 +184,7 @@ This diagram spans the diagnostic flow. The Prompt layer forces hypotheses befor
 └───────────┼────────────────────────────────────────────────────────────┘
             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  OUTPUT LAYER  diagnostic.md L54–60 + validate.ts (isDiagnosis)      │
+│  OUTPUT LAYER  diagnostic.md L69–75 + validate.ts (isDiagnosis)      │
 │                                                                       │
 │  hypothesesConsidered: [ { hypothesis, supported, reasoning } ]      │
 │    ← STRUCTURED CoT: reasoning in a typed field, not free prose      │
@@ -215,7 +215,7 @@ The reasoning is forced up front, externalized live by ReAct, and captured durab
 
 - **File:** `lib/agents/prompts/diagnostic.md` + `lib/mcp/validate.ts`
 - **Function / class:** the `## Output` `hypothesesConsidered` schema; `isDiagnosis` guard
-- **Line range:** `diagnostic.md` L54–L60 (`{ hypothesis, supported, reasoning }`), L71 (field rules); `isDiagnosis` requires `hypothesesConsidered` to be an array (`validate.ts`)
+- **Line range:** `diagnostic.md` L69–L75 (`{ hypothesis, supported, reasoning }`), L90 (field rules); `isDiagnosis` requires `hypothesesConsidered` to be an array (`validate.ts`)
 - **Role:** captures CoT as typed, validated data — the textbook "reasoning in a thinking field, not free prose" — so it is queryable, assertable, and renderable.
 
 ### ReAct externalizes process reasoning
@@ -229,7 +229,7 @@ The reasoning is forced up front, externalized live by ReAct, and captured durab
 
 - **File:** `monitoring.md`, `recommendation.md`, `intent.ts`
 - **Function / class:** the non-diagnostic outputs
-- **Line range:** monitoring output (no reasoning field) `monitoring.md` L50–L73; recommendation `rationale` (one line, not a chain) `recommendation.md` L46–L65; classifier `max_tokens: 16` `intent.ts` L20
+- **Line range:** monitoring output (no reasoning field) `monitoring.md` L69–L97; recommendation `rationale` (one line, not a chain) `recommendation.md` L49–L74; classifier `max_tokens: 16` `intent.ts` L20
 - **Role:** CoT withheld where the output is a measurement, a downstream summary, or a single token — adding it would be cost without payoff, and would break the classifier outright.
 
 ### Why this is a codebase strength
@@ -298,7 +298,7 @@ On a model that already reasons, the marginal value of "reason carefully" is sma
 
 ### structured CoT (`hypothesesConsidered[]`)
 
-- **Codebase uses:** `diagnostic.md` L54–L60 — reasoning captured as typed `{ hypothesis, supported, reasoning }` objects, required by `isDiagnosis`.
+- **Codebase uses:** `diagnostic.md` L69–L75 — reasoning captured as typed `{ hypothesis, supported, reasoning }` objects, required by `isDiagnosis`.
 - **Why it's here:** to make the diagnostic agent's competing-hypothesis reasoning inspectable, testable, and renderable rather than a prose blob.
 - **Leading today:** structured/typed reasoning fields and provider extended-thinking modes lead in 2026 over bare "think step by step."
 - **Why it leads:** on models that reason internally, the value is in capturing the reasoning as data, not eliciting it.
@@ -346,7 +346,7 @@ On a model that already reasons, the marginal value of "reason carefully" is sma
 
 ## Summary
 
-Chain-of-thought on a modern model is not about eliciting hidden reasoning — sonnet-4-6 (`base.ts` L9) reasons internally — it is about forcing that reasoning into a structured, inspectable output. blooming insights' diagnostic agent forces breadth before depth ("generate 2–3 hypotheses before your first tool call," `diagnostic.md` L20) and captures the result as a typed `hypothesesConsidered[]` array of `{ hypothesis, supported, reasoning }` objects (`diagnostic.md` L54–L60), required by `isDiagnosis` — the textbook "reasoning in a thinking field, not free prose." The ReAct loop externalizes process reasoning as a live Thought stream (`base.ts` L108–L113) alongside it. And CoT is withheld exactly where it would hurt: the numeric monitoring output, the downstream recommendation rationale, and the 16-token classifier where step-by-step reasoning would consume the entire budget.
+Chain-of-thought on a modern model is not about eliciting hidden reasoning — sonnet-4-6 (`base.ts` L9) reasons internally — it is about forcing that reasoning into a structured, inspectable output. blooming insights' diagnostic agent forces breadth before depth ("generate 2–3 hypotheses before your first tool call," `diagnostic.md` L20) and captures the result as a typed `hypothesesConsidered[]` array of `{ hypothesis, supported, reasoning }` objects (`diagnostic.md` L69–L75), required by `isDiagnosis` — the textbook "reasoning in a thinking field, not free prose." The ReAct loop externalizes process reasoning as a live Thought stream (`base.ts` L108–L113) alongside it. And CoT is withheld exactly where it would hurt: the numeric monitoring output, the downstream recommendation rationale, and the 16-token classifier where step-by-step reasoning would consume the entire budget.
 
 **Key points:**
 - On frontier models, CoT's value migrated from *eliciting* reasoning to *shaping and capturing* it as structure.
@@ -367,7 +367,7 @@ Chain-of-thought on a modern model is not about eliciting hidden reasoning — s
 
 **[mid] "How does the diagnostic agent reason before it concludes?"**
 
-It is told to generate 2–3 competing hypotheses *before its first tool call* (`diagnostic.md` L20), then design queries to falsify each (L21–L24), then conclude. The hypotheses come back as a typed `hypothesesConsidered` array (L54–L60), each with a `reasoning` string and a `supported` boolean — so the reasoning is captured as data, not prose.
+It is told to generate 2–3 competing hypotheses *before its first tool call* (`diagnostic.md` L20), then design queries to falsify each (L21–L24), then conclude. The hypotheses come back as a typed `hypothesesConsidered` array (L69–L75), each with a `reasoning` string and a `supported` boolean — so the reasoning is captured as data, not prose.
 
 ```
 enumerate 2–3 hypotheses → falsify each via queries → conclude
@@ -398,7 +398,7 @@ classifier: max_tokens 16 + "one word" + "think step by step" → budget gone, n
 ### One-line anchors
 
 - `diagnostic.md` L20 — "generate 2–3 hypotheses before your first tool call": breadth before depth.
-- `diagnostic.md` L54–L60 — `hypothesesConsidered[{ hypothesis, supported, reasoning }]`: structured CoT.
+- `diagnostic.md` L69–L75 — `hypothesesConsidered[{ hypothesis, supported, reasoning }]`: structured CoT.
 - `lib/agents/base.ts` L108–L113 — `onText` → `reasoning_step`: ReAct externalizes process reasoning.
 - `lib/agents/base.ts` L9 — `claude-sonnet-4-6`: reasons internally, so CoT shapes output.
 - `lib/agents/intent.ts` L20 — `max_tokens: 16`: where CoT would consume the whole budget.
@@ -417,7 +417,7 @@ Out loud: why does CoT's value on sonnet-4-6 (`base.ts` L9) come from output str
 
 ### Level 3 — Apply
 
-Scenario: a teammate wants to add "think step by step" to the intent classifier to improve accuracy. Open `intent.ts` L20 (`max_tokens: 16`) and L21–L23 ("ONLY the one word"), and explain exactly what breaks. Then state where structured CoT *does* belong and why (`diagnostic.md` L54–L60).
+Scenario: a teammate wants to add "think step by step" to the intent classifier to improve accuracy. Open `intent.ts` L20 (`max_tokens: 16`) and L21–L23 ("ONLY the one word"), and explain exactly what breaks. Then state where structured CoT *does* belong and why (`diagnostic.md` L69–L75).
 
 ### Level 4 — Defend
 
@@ -425,4 +425,7 @@ A reviewer says: "Add a reasoning field to every agent's output for transparency
 
 ### Quick check — code reference test
 
-In which output field does the diagnostic agent capture its chain-of-thought, and what does each element contain? (Answer: `hypothesesConsidered`, an array of `{ hypothesis, supported, reasoning }` objects — `diagnostic.md` L54–L60, required by `isDiagnosis` in `validate.ts`.)
+In which output field does the diagnostic agent capture its chain-of-thought, and what does each element contain? (Answer: `hypothesesConsidered`, an array of `{ hypothesis, supported, reasoning }` objects — `diagnostic.md` L69–L75, required by `isDiagnosis` in `validate.ts`.)
+
+---
+Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md `hypothesesConsidered` shape L54–60→L69–75, field-rules ref L71→L90, monitoring output L50–73→L69–97, recommendation output L46–65→L49–74. (`diagnostic.md` L20 "generate 2–3 hypotheses" verified still correct — left unchanged.)
