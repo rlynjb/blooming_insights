@@ -8,7 +8,7 @@
 
 [] is it possible they limit access to hackathon participants in list_cloud_organizations → Unauthorized mcp tool?
 
-[] move the dev capture this button to the top right corner of header maybe
+[] add skeleton loader in investigate and decision pages
 
 in hackathons, it seems like the major or common problem is getting through authentication and getting data. in this project, i would like to delve deep into that topic. i feel like that is something that will always come up with any problems i come across in engineering field.
 
