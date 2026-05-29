@@ -140,19 +140,39 @@ export default function RecommendationCard({ recommendation }: RecommendationCar
         </ol>
       )}
 
-      {/* footer: estimated impact */}
-      <p
-        className="lowercase"
+      {/* footer: expected impact — highlighted as the payoff of acting */}
+      <div
         style={{
-          color: 'var(--text-tertiary)',
-          fontFamily: 'var(--font-mono), monospace',
-          fontSize: '0.72rem',
-          lineHeight: 1.4,
-          margin: 0,
+          marginTop: 4,
+          background: 'var(--bg-elevated)',
+          border: '1px solid var(--accent-teal)',
+          borderRadius: 4,
+          padding: '8px 12px',
         }}
       >
-        expected impact: <span style={{ textTransform: 'none' }}>{estimatedImpact}</span>
-      </p>
+        <div
+          className="lowercase"
+          style={{
+            color: 'var(--accent-teal)',
+            fontFamily: 'var(--font-mono), monospace',
+            fontSize: '0.6rem',
+            letterSpacing: '0.08em',
+            marginBottom: 3,
+          }}
+        >
+          expected impact
+        </div>
+        <p
+          style={{
+            color: 'var(--text-primary)',
+            fontSize: '0.82rem',
+            lineHeight: 1.45,
+            margin: 0,
+          }}
+        >
+          {estimatedImpact}
+        </p>
+      </div>
     </div>
   );
 }
