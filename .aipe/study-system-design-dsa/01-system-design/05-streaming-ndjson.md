@@ -342,6 +342,106 @@ Second, the route takes a `step` query param (L117–L118): `'diagnose' | 'recom
 └─────────────────────────────────────────┴─────────────────────────────────────────┘
 ```
 
+---
+
+### Briefing coverage events
+
+`/api/agent` is not the only NDJSON surface. `app/api/briefing/route.ts` streams the morning briefing — the monitoring scan plus the 10-category coverage grid — over the same wire format, with the same `JSON.stringify(e) + '\n'` encoding and the same consumer-side `buf.split('\n')` loop (the feed's own copy at `app/page.tsx` L268–L419). What differs is the event vocabulary: the briefing needs to stream a workspace summary and per-category coverage tiles, neither of which the investigation view ever sees.
+
+Rather than widen the shared `AgentEvent` union in `lib/mcp/events.ts` (which would force the agent route and the investigation view to handle event types they never receive), the briefing route defines a **local superset** type (L54–L58):
+
+```
+BriefingEvent =
+  | AgentEvent                                        // reuse every investigation variant
+  | { type: 'workspace';     workspace: BriefingWorkspace }
+  | { type: 'coverage_item'; item: CoverageItem }     // one tile, streamed per-category
+  | { type: 'coverage';      coverage: CoverageReport }  // bulk form, plain-JSON fallback
+```
+
+`BriefingEvent` is `AgentEvent | …three briefing-only variants`. The comment block (L49–L53) states the rule out loud: kept local so the shared `AgentEvent` contract used by `/api/agent` + the investigation view is untouched. The consumer's `switch(e.type)` on the feed side simply has extra cases (`app/page.tsx` L333–L341) that the investigation hook does not.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Two NDJSON surfaces, one wire format, two event vocabularies            │
+│                                                                          │
+│  lib/mcp/events.ts                                                       │
+│    AgentEvent  ◄───────────────┐                                         │
+│        │                       │ (extended locally, NOT widened)         │
+│        │                       │                                         │
+│  ┌─────┴──────────┐     ┌───────┴───────────────────────────────┐        │
+│  │ /api/agent     │     │ /api/briefing  (route.ts L54–58)       │        │
+│  │ emits          │     │ BriefingEvent = AgentEvent             │        │
+│  │ AgentEvent     │     │   | {type:'workspace'}                 │        │
+│  │ only           │     │   | {type:'coverage_item'; item}       │        │
+│  │                │     │   | {type:'coverage'; coverage}        │        │
+│  └─────┬──────────┘     └───────┬───────────────────────────────┘        │
+│        │                        │                                        │
+│        ▼                        ▼                                        │
+│  useInvestigation.ts       app/page.tsx feed loop (L268–419)             │
+│  switch(e.type):           switch(e.type): + workspace                   │
+│    reasoning_step…             + coverage_item (L333–339)                │
+│    diagnosis, done             + coverage     (L339–341)                 │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Demo mode: the paced replay
+
+Like the agent route, the briefing route serves a creds-free demo replay of a captured snapshot (`?demo=cached`, L84). The replay is **paced**: `const REPLAY_DELAY_MS = 140` (L23) sleeps between events so the snapshot reveals at a readable cadence rather than arriving in one chunk. The `emit` helper (L99–L102) enqueues the encoded event then `await`s a `setTimeout(r, REPLAY_DELAY_MS)`.
+
+This 140ms is **independent** of the agent route's `REPLAY_DELAY_MS = 180` (`app/api/agent/route.ts` L105). Two routes, two constants, two cadences — the briefing reveals slightly faster than an investigation replay. Neither imports the other's value.
+
+The demo replay mirrors the **live** event order exactly, so the consumer cannot tell live from replay:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Briefing event sequence (live AND demo replay — identical order)        │
+│                                                                          │
+│  workspace                          ← project name + customer/event count │
+│       │                               (live L190–197 · demo L108)        │
+│  reasoning_step ('matching schema…')← checklist header                   │
+│       │                               (live L207 · demo L110)            │
+│       ├─ reasoning_step  ┐                                               │
+│       └─ coverage_item   ┘─ one PAIR per category                        │
+│       │                    (live L209–212 · demo L114–118)               │
+│       │                    log line + its tile resolve together          │
+│       │                                                                  │
+│       ├─ tool_call_start  ┐                                              │
+│       └─ tool_call_end    ┘─ recorded EQL trace (the real queries)       │
+│       │                      (live via agent.scan hooks · demo L121–136) │
+│       │                                                                  │
+│  insight (×N)                       ← the anomaly cards                  │
+│       │                               (live L244 · demo L137)            │
+│  done                               ← stream close                       │
+│       │                               (live L246 · demo L138)            │
+│  finally: controller.close()                                             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Why `coverage_item` is emitted one-per-category
+
+The coverage grid (`components/feed/CoverageGrid.tsx`) is a 10-tile checklist. Emitting a single bulk `coverage` event would pop all ten tiles in at once. Instead the route emits one `coverage_item` per category (live L209–212, demo L114–118), each paired with the matching checklist `reasoning_step` log line, so the **grid fills tile-by-tile in step with the status log** — the user watches each category resolve as its line is written.
+
+The client accumulates them (`app/page.tsx` L333–L339): the `coverage_item` case appends the tile to the `coverage` state array, de-duplicating by `category`, so the grid grows one tile per event:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  coverage_item accumulation  (app/page.tsx L333–339)                     │
+│                                                                          │
+│  case 'coverage_item':                                                   │
+│    setCoverage(prev =>                                                    │
+│      prev.some(c => c.category === evt.item.category)                    │
+│        ? prev                          ← already have it → no-op          │
+│        : [...prev, evt.item])          ← append one tile                  │
+│                                                                          │
+│  grid:  [▢▢▢▢▢▢▢▢▢▢] → [■▢▢▢…] → [■■▢…] → … → [■■■■■■■■■■]              │
+│         tick by tick, in step with each checklist log line               │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The bulk `{type:'coverage'}` variant still exists (L58) for the plain-JSON fallback path the feed uses when a response is not NDJSON (`app/page.tsx` L317, L339–341) — but the streaming path never emits it.
+
+---
+
 ### The principle
 
 Decouple producer cadence from consumer render via a stream and a shared event contract. The producer writes when it has something to write. The consumer reads when chunks arrive. Neither side waits for the other to finish. The contract (the `AgentEvent` union) is the only coupling.
@@ -748,3 +848,6 @@ An interviewer asks: "you're manually line-buffering in the browser — isn't th
 
 ---
 Updated: 2026-05-28 — maxDuration 300; reader loop moved to useInvestigation.ts; schema bootstrap now emitted inside the stream; documented the `step`-filtered cached replay + pre-stream try/catch.
+
+---
+Updated: 2026-05-29 — documented the briefing route as a second NDJSON surface (local `BriefingEvent` superset L54–58, paced demo replay REPLAY_DELAY_MS=140 L23, per-category `coverage_item` tile-by-tile fill L209–212 / client accumulate app/page.tsx L333–339).

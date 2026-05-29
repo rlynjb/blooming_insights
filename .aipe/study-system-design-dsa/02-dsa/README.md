@@ -10,6 +10,7 @@ The concrete operations this codebase performs, one file per operation. Each fil
 - **[04-json-from-prose.md](04-json-from-prose.md)** — lenient extraction of JSON from LLM prose (fenced block → bare parse → substring scan) followed by structural type-guard validation.
 - **[05-severity-sort.md](05-severity-sort.md)** — a rank-table comparator sort (`SEV_RANK[b] - SEV_RANK[a]`) + top-N truncation, and a `new Set([...a,...b,...c])` union that dedups overlapping tool subsets.
 - **[06-enrichment-derivation.md](06-enrichment-derivation.md)** — deriving business-owner display fields from held evidence: a find-first numeric-pair scan, the funnel leak via `reduce` min-by-key (`argmin`), confidence bucketing from hypotheses-tested counts, and `typeof` normalization of a string-or-object impact union.
+- **[07-coverage-gate.md](07-coverage-gate.md)** — capability gating by set membership: flatten the schema into a `Set` of capability tokens once, then classify each of the 10 registry categories by testing `requires`/`enriches` against it (`every` short-circuit) — full / limited / unavailable.
 
 ## Complexity cheat sheet
 
@@ -29,6 +30,9 @@ The concrete operations this codebase performs, one file per operation. Each fil
 | Funnel leak (argmin reduce) | 06 | O(n) over funnel stages (n = 4) | O(1) |
 | Confidence bucketing | 06 | O(n) over hypotheses (filter/length counts) | O(1) |
 | Impact union normalize | 06 | O(1) (`typeof` branch) | O(1) |
+| Schema → capability set | 07 | O(events + properties + catalogs) | O(capability tokens) |
+| Coverage classify (per category) | 07 | O(deps) `has()` + short-circuit `every` | O(1) |
+| Coverage report (10 categories) | 07 | O(schema) + O(Σ deps), tiny | O(10) report |
 
 ## Flagged: an O(n) win left on the table
 
@@ -38,3 +42,4 @@ No operation here is accidentally O(n²) where O(n) is easy — the sort is the 
 
 ---
 Updated: 2026-05-28 — added `06-enrichment-derivation.md` (find-first scan, funnel-leak argmin reduce, confidence bucketing, impact union normalize) to the operations list and the complexity cheat-sheet (all O(n) over tiny n / O(1))
+Updated: 2026-05-29 — added `07-coverage-gate.md` (flatten schema → capability `Set`; per-category `requires`/`enriches` membership test → full/limited/unavailable) to the operations list and the complexity cheat-sheet

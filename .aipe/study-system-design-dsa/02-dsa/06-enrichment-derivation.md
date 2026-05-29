@@ -71,10 +71,10 @@ It is `Array.prototype.find` written as a `for` loop so the type narrowing (`typ
 
 ### (b) the funnel leak point — min-by-key reduce (`argmin`)
 
-In `components/feed/InsightCard.tsx` the funnel object `{ view, cart, checkout, purchase }` (each a signed % change vs prior) is first projected into an array of `{ k, v }` pairs (L155–L157), then reduced to the single pair with the smallest `v`:
+In `components/feed/InsightCard.tsx` the funnel object `{ view, cart, checkout, purchase }` (each a signed % change vs prior) is first projected into an array of `{ k, v }` pairs (L156–L158), then reduced to the single pair with the smallest `v`:
 
 ```ts
-// components/feed/InsightCard.tsx  L154–L160
+// components/feed/InsightCard.tsx  L155–L161
 const funnel = insight.funnel;
 const funnelStages = funnel
   ? (['view', 'cart', 'checkout', 'purchase'] as const).map((k) => ({ k, v: funnel[k] }))
@@ -182,10 +182,10 @@ The diagram stands alone: four inputs, four pure operations (scan, argmin-reduce
 
 **File:** `components/feed/InsightCard.tsx`
 **Function / class:** `InsightCard` — the impact tiles and the funnel-leak chip
-**Line range:** L132–L160
+**Line range:** L132–L161
 
 - **`revenueImpact` tile** — consumes the derived field, L133–L139.
-- **funnel projection + leak reduce** — L154–L160 (`funnelStages` map L155–L157, `leakKey` argmin L158–L160).
+- **funnel projection + leak reduce** — L155–L161 (`funnelStages` map L156–L158, `leakKey` argmin L159–L161).
 - **leak chip render** — `▼ leak at {leakKey}` at L314; per-stage highlight `isLeak = s.k === leakKey` at L318.
 
 **Where the derivations are consumed (grepped):**
@@ -200,7 +200,7 @@ The diagram stands alone: four inputs, four pure operations (scan, argmin-reduce
 - `lib/insights/derive.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts
 - `findCurrentPrior` (L12–L20): https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts#L12-L20
 - `diagnosisConfidence` (L54–L62): https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts#L54-L62
-- funnel leak reduce (`InsightCard.tsx` L154–L160): https://github.com/rlynjb/blooming_insights/blob/main/components/feed/InsightCard.tsx#L154-L160
+- funnel leak reduce (`InsightCard.tsx` L155–L161): https://github.com/rlynjb/blooming_insights/blob/main/components/feed/InsightCard.tsx#L155-L161
 
 ---
 
@@ -210,7 +210,7 @@ The diagram stands alone: four inputs, four pure operations (scan, argmin-reduce
 
 Input funnel (signed % change vs prior): `{ view: -2, cart: -5, checkout: -31, purchase: -12 }`.
 
-**Step 0 — projection (L155–L157).** Map the four fixed keys into `{k, v}` pairs:
+**Step 0 — projection (L156–L158).** Map the four fixed keys into `{k, v}` pairs:
 ```
 funnelStages = [
   { k: 'view',     v: -2  },
@@ -404,7 +404,7 @@ Contrast — if all three had non-empty reasoning, `tested = 3 = total`, and Ste
 **Part 2 — key points.**
 
 - `findCurrentPrior` is find-first: O(n), stops on the first numeric `{current, prior}` pair, returns `null` if none — `lib/insights/derive.ts` L12–L20.
-- The leak point is min-by-key (`argmin`): `reduce((a,b)=> b.v<a.v ? b : a).k`, guarded by `funnelStages.length` because seedless `reduce([])` throws — `components/feed/InsightCard.tsx` L158–L160.
+- The leak point is min-by-key (`argmin`): `reduce((a,b)=> b.v<a.v ? b : a).k`, guarded by `funnelStages.length` because seedless `reduce([])` throws — `components/feed/InsightCard.tsx` L159–L161.
 - `diagnosisConfidence` is an ordered threshold ladder: agent-set wins, then `supported>=1 && tested===total → high`, `supported>=1 → medium`, else `low` — `derive.ts` L54–L62.
 - "Tested" is proxied by non-empty `reasoning`; an untested hypothesis is the agent's tool-call budget running out — `hypothesesTested` L42–L48.
 - `impactRange`/`impactAssumption` collapse a `string | object` union with `typeof`, so no caller branches on the type — L4–L9.
@@ -456,7 +456,7 @@ Honest answer: yes, behaviorally it is `evidence.find(e => typeof e.result?.curr
 ### Anchors
 
 - `lib/insights/derive.ts` L12–L20 — `findCurrentPrior`, the find-first scan
-- `components/feed/InsightCard.tsx` L158–L160 — the leak `argmin` reduce
+- `components/feed/InsightCard.tsx` L159–L161 — the leak `argmin` reduce
 - `lib/insights/derive.ts` L54–L62 — `diagnosisConfidence` threshold ladder
 - `lib/insights/derive.ts` L42–L48 — `hypothesesTested` (the "tested" proxy)
 - `lib/insights/derive.ts` L4–L9 — `impactRange`/`impactAssumption` union narrowing
@@ -475,7 +475,7 @@ Open `lib/insights/derive.ts`. Explain why `deriveInsightFields` returns `Partia
 
 ### Level 3 — apply
 
-Scenario: a funnel arrives as `{ view: -8, cart: -8, checkout: -3, purchase: -1 }` — view and cart tie at the minimum `-8`. Trace `funnelStages.reduce((a,b)=> b.v<a.v ? b : a)` step by step and state which stage `leakKey` ends up as and why (strict `<` vs `<=`). Cite `components/feed/InsightCard.tsx` L158–L160. Then state what renders at L314.
+Scenario: a funnel arrives as `{ view: -8, cart: -8, checkout: -3, purchase: -1 }` — view and cart tie at the minimum `-8`. Trace `funnelStages.reduce((a,b)=> b.v<a.v ? b : a)` step by step and state which stage `leakKey` ends up as and why (strict `<` vs `<=`). Cite `components/feed/InsightCard.tsx` L159–L161. Then state what renders at L314.
 
 ### Level 4 — defend
 
@@ -488,3 +488,6 @@ A reviewer says: "Move `diagnosisConfidence` into the agent prompt — let the m
 - What does `diagnosisConfidence` return for a diagnosis with one supported hypothesis but one untested one? (`'medium'` — supported ≥ 1 but `tested !== total`; L60–L61.)
 - What does `impactAssumption` return for the bare-string arm of `EstimatedImpact`? (`null` — `derive.ts` L8.)
 - Where is `deriveInsightFields` actually called, and is it per-render or once? (`lib/state/insights.ts` L25 — once, at insight-build time.)
+
+---
+Updated: 2026-05-29 — funnel-leak reduce refreshed to current lines (block L155–L161, `funnelStages` map L156–L158, `leakKey` argmin L159–L161); verified `anomalyToInsight` copies `category` at `lib/state/insights.ts` L25 and `derive.ts` refs unchanged.

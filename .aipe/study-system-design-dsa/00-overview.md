@@ -45,11 +45,13 @@
 - **app/investigate/[id]/page.tsx** — step 2 (the diagnosis). Calls `useInvestigation(id, 'diagnose')` → `/api/agent?…&step=diagnose`; renders the reasoning trace + diagnosis, then a "see recommendations →" link. → `/api/agent`, `useInvestigation`.
 - **app/investigate/[id]/recommend/page.tsx** — step 3 (the decision). `useInvestigation(id, 'recommend')` → `/api/agent?…&step=recommend`, using the diagnosis handed over from step 2 via `sessionStorage`. → `/api/agent`.
 - **QueryBox / StreamingResponse** — free-form question box + its streamed answer. → `/api/agent?q=`.
-- **/api/briefing** — runs the monitoring agent and returns insights (or a cached snapshot on `?demo=cached`). → `connectMcp`, `bootstrapSchema`, `MonitoringAgent`, `lib/state/insights`.
+- **/api/briefing** — bootstraps the schema, **gates the 10-category anomaly checklist against it** (`coverage`), runs the monitoring agent on only the runnable categories, and streams insights — or, on `?demo=cached`, **replays** the committed snapshot as a paced NDJSON stream (no longer one JSON blob). Streams the coverage verdict one tile at a time (`coverage_item`). → `connectMcp`, `bootstrapSchema`, `lib/agents/categories`, `MonitoringAgent`, `lib/state/insights`.
 - **/api/agent** — NDJSON stream with a `step` param: `diagnose` / `recommend` each run ONE agent (the step-split investigation); `step=null` is the combined run used only by the dev demo-capture (and `saveInvestigation`s). Demo replays a cached investigation filtered to the step (`filterByStep`); schema bootstrap is emitted inside the stream. Also serves `?q=` queries. → `runAgentLoop`, `lib/state/investigations`.
 - **/api/mcp/\*** — OAuth callback, the `/debug` tool caller, `listTools`, and the dev fixture/investigation capture. → `connectMcp`, `auth.ts`.
 - **lib/agents/base.ts `runAgentLoop`** — the one Claude+MCP tool-use loop all four agents share. Bounded by `maxToolCalls`; forces a final synthesis turn. → Anthropic SDK, `McpClient`.
 - **monitoring / diagnostic / recommendation / query agents** — each is a prompt + a tool subset + an output validator + (diagnostic/recommendation) a dedicated synthesis call. → `runAgentLoop`, `lib/mcp/validate`.
+- **lib/agents/categories.ts (coverage gate)** — the fixed 10-category anomaly checklist (`CATEGORIES`) + a pure schema-capability gate (`schemaCapabilities` → `coverageReport` / `runnableCategories`) that classifies each category full / limited / unavailable against the live schema *before* the monitoring agent spends any budget. → `bootstrapSchema`, `MonitoringAgent.scan`, `components/feed/CoverageGrid`.
+- **components/feed/CoverageGrid.tsx** — renders the 10-category coverage grid on the feed: clear / amber-limited / firing / dashed "no data source" ghost tiles, plus pending "checking…" skeletons while the verdict streams in (`coverage_item`). → consumes the gate's `CoverageReport`.
 - **lib/mcp/client.ts `McpClient`** — the single MCP choke-point: TTL cache, ~1.1s inter-call spacing, bounded exponential-backoff retry on rate limits, no-cache-on-error. → `McpTransport`.
 - **lib/mcp/transport.ts** — `McpTransport` interface + `SdkTransport` (wraps the SDK `Client`); the injectable seam tests fake. → MCP SDK.
 - **lib/mcp/connect.ts** — `connectMcp(sessionId)` (build transport + provider, connect, capture authorize URL on failure) and `completeAuth(code)`. → `auth.ts`, MCP SDK.
@@ -60,8 +62,9 @@
 
 ## Sections
 
-- **[01-system-design/](01-system-design/README.md)** — request flow, OAuth boundary, provider/transport abstraction, caching + rate-limiting, NDJSON streaming, multi-agent orchestration, client stream + cross-step handoff.
-- **[02-dsa/](02-dsa/README.md)** — TTL cache, rate-limit spacing + retry, NDJSON line-buffering, JSON-from-prose extraction, rank-mapped sort + set union, enrichment derivation.
+- **[01-system-design/](01-system-design/README.md)** — request flow, OAuth boundary, provider/transport abstraction, caching + rate-limiting, NDJSON streaming, multi-agent orchestration, client stream + cross-step handoff, schema-gated coverage.
+- **[02-dsa/](02-dsa/README.md)** — TTL cache, rate-limit spacing + retry, NDJSON line-buffering, JSON-from-prose extraction, rank-mapped sort + set union, enrichment derivation, the coverage gate (set-membership classification).
 
 ---
 Updated: 2026-05-28 — maxDuration 60→300; /api/agent step-split (diagnose/recommend/combined) + filterByStep replay; prod encrypted-cookie auth; added the step-3 recommend route and the two new concept files (07-client-stream-handoff, 06-enrichment-derivation).
+Updated: 2026-05-29 — added the anomaly-coverage schema gate (lib/agents/categories.ts + CoverageGrid) to the legend; /api/briefing now gates the 10-category checklist, streams the verdict tile-by-tile (coverage_item), and replays the demo snapshot as a paced NDJSON stream; added concept files 01-system-design/08-schema-gated-coverage and 02-dsa/07-coverage-gate.

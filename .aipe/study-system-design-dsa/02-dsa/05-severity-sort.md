@@ -255,18 +255,18 @@ The primary recap: both operations together.
 
 **File:** `lib/agents/monitoring.ts`
 **Function / class:** `SEV_RANK` constant + `MonitoringAgent.scan`
-**Line range:** L50 (rank table) · L102 (sort + slice)
+**Line range:** L51 (rank table) · L119 (sort + slice)
 
 ```typescript
-// lib/agents/monitoring.ts L50
+// lib/agents/monitoring.ts L51
 const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
 
-// lib/agents/monitoring.ts L102
+// lib/agents/monitoring.ts L119
 return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L50
-GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L102
+GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L51
+GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L119
 
 ---
 
@@ -377,7 +377,7 @@ GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/tools.ts#L
 
 **[mid] "How does the sort in `MonitoringAgent.scan` work? Walk me through it."**
 
-The sort uses a rank table `SEV_RANK` declared at `lib/agents/monitoring.ts L50`. Each `Severity` string maps to an integer: critical=3, warning=2, info=1, positive=0. The comparator `SEV_RANK[b.severity] - SEV_RANK[a.severity]` subtracts `a`'s rank from `b`'s rank. When the result is positive, `b` sorts before `a` — that is the descending direction. After the sort, `.slice(0, 10)` caps the array at ten elements.
+The sort uses a rank table `SEV_RANK` declared at `lib/agents/monitoring.ts L51`. Each `Severity` string maps to an integer: critical=3, warning=2, info=1, positive=0. The comparator `SEV_RANK[b.severity] - SEV_RANK[a.severity]` subtracts `a`'s rank from `b`'s rank. When the result is positive, `b` sorts before `a` — that is the descending direction. After the sort, `.slice(0, 10)` caps the array at ten elements.
 
 ```
   comparator(a="info", b="critical"):
@@ -408,7 +408,7 @@ The SEV_RANK table is the more trustworthy option specifically because anomaly d
 
 **[arch] "If a new severity level is introduced — say `'urgent'` between `critical` and `warning` — what breaks and what is the blast radius?"**
 
-Two things need updating: the `Severity` type union in `lib/mcp/types.ts`, and `SEV_RANK` in `lib/agents/monitoring.ts L50`. Because `SEV_RANK` is typed `Record<Severity, number>`, adding `'urgent'` to the union without adding it to the table is a compile-time error — `tsc` fails the build. The blast radius is controlled: the type system surfaces the gap before runtime.
+Two things need updating: the `Severity` type union in `lib/mcp/types.ts`, and `SEV_RANK` in `lib/agents/monitoring.ts L51`. Because `SEV_RANK` is typed `Record<Severity, number>`, adding `'urgent'` to the union without adding it to the table is a compile-time error — `tsc` fails the build. The blast radius is controlled: the type system surfaces the gap before runtime.
 
 The Set union in `queryTools` (`lib/mcp/tools.ts L38–L40`) is unaffected — it operates on tool names, not severities. The `.slice(0, 10)` cap is unaffected. The only runtime risk is the window between deploying new model prompts (that now emit `'urgent'`) and deploying the updated `SEV_RANK` — in that window, `SEV_RANK['urgent']` is `undefined`, the comparator returns NaN for any pair involving `'urgent'`, and those anomalies float to an unpredictable position. The mitigation is a fallback in the comparator: `(SEV_RANK[b.severity] ?? -1) - (SEV_RANK[a.severity] ?? -1)`, which sends unknown severities to the bottom.
 
@@ -416,8 +416,8 @@ The Set union in `queryTools` (`lib/mcp/tools.ts L38–L40`) is unaffected — i
 
 **Anchors.**
 
-- `lib/agents/monitoring.ts L50` — `SEV_RANK` definition
-- `lib/agents/monitoring.ts L102` — sort + slice on the returned anomaly array
+- `lib/agents/monitoring.ts L51` — `SEV_RANK` definition
+- `lib/agents/monitoring.ts L119` — sort + slice on the returned anomaly array
 - `lib/mcp/tools.ts L38–L40` — `queryTools` Set-union dedup
 - `lib/mcp/tools.ts L5–L13` / `L15–L25` / `L27–L34` — the three source tool arrays whose overlaps the Set collapses
 
@@ -425,13 +425,13 @@ The Set union in `queryTools` (`lib/mcp/tools.ts L38–L40`) is unaffected — i
 
 ## Validate your understanding
 
-**Level 1 — reconstruct.** Without looking at the file: write the `SEV_RANK` constant and the sort + slice expression from memory. Then open `lib/agents/monitoring.ts L50` and `L102` and compare. The types, the order of subtraction (`b - a` not `a - b`), and the slice bound (`10`) are the three things most often misremembered.
+**Level 1 — reconstruct.** Without looking at the file: write the `SEV_RANK` constant and the sort + slice expression from memory. Then open `lib/agents/monitoring.ts L51` and `L119` and compare. The types, the order of subtraction (`b - a` not `a - b`), and the slice bound (`10`) are the three things most often misremembered.
 
-**Level 2 — explain.** Open `lib/agents/monitoring.ts`. The `scan` method at L68 calls `runAgentLoop`, gets `finalText`, parses it, validates it, and then applies the sort at L102. Explain to a colleague why `[...parsed]` is needed before `.sort(...)` — what would happen if `sort` were called directly on `parsed`? Then explain why `.slice(0, 10)` appears after sort rather than before.
+**Level 2 — explain.** Open `lib/agents/monitoring.ts`. The `scan` method at L69 calls `runAgentLoop`, gets `finalText`, parses it, validates it, and then applies the sort at L119. Explain to a colleague why `[...parsed]` is needed before `.sort(...)` — what would happen if `sort` were called directly on `parsed`? Then explain why `.slice(0, 10)` appears after sort rather than before.
 
 **Level 3 — apply.** Two scenarios anchored to the real files:
 
-Scenario A: An agent returns an anomaly with `severity: "urgent"` — a value not in `SEV_RANK` (`lib/agents/monitoring.ts L50`). What does `SEV_RANK["urgent"]` evaluate to? What does `undefined - 2` evaluate to? What does `Array.prototype.sort` do when the comparator returns `NaN`? Where in the sorted array does the `"urgent"` anomaly end up — and is that the right behavior?
+Scenario A: An agent returns an anomaly with `severity: "urgent"` — a value not in `SEV_RANK` (`lib/agents/monitoring.ts L51`). What does `SEV_RANK["urgent"]` evaluate to? What does `undefined - 2` evaluate to? What does `Array.prototype.sort` do when the comparator returns `NaN`? Where in the sorted array does the `"urgent"` anomaly end up — and is that the right behavior?
 
 Scenario B: `monitoringTools` and `diagnosticTools` both contain `"execute_analytics"` (`lib/mcp/tools.ts L11` and `L16`). Trace through `new Set([...monitoringTools, ...diagnosticTools, ...recommendationTools])` at `lib/mcp/tools.ts L39`. At what position in the iteration does the second `"execute_analytics"` appear? Does the Set insert it? What is the length of `queryTools` vs the sum of the three source array lengths? Does the Set preserve the order of first occurrence?
 
@@ -447,3 +447,6 @@ Scenario B: `monitoringTools` and `diagnosticTools` both contain `"execute_analy
 
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers (sort + slice moved L92 → L102; `SEV_RANK` and `queryTools` refs unchanged)
+
+---
+Updated: 2026-05-29 — sort + slice moved L102 → L119; `SEV_RANK` now L51 (was cited L50); `scan` method L69 (was L68); `queryTools` refs unchanged.

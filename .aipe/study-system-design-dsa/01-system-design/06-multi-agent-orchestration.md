@@ -168,8 +168,10 @@ The reason for a dedicated call rather than extending the loop is that the loop'
 Each specialist agent is a class that builds a system prompt, selects a subset of MCP tool schemas via `filterToolSchemas`, and delegates to `runAgentLoop`. The only differences between agents are the prompt, the tool subset, the validator (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`), and the budget numbers.
 
 ```
-MonitoringAgent.scan()
-  system = monitoring.md + schema summary
+MonitoringAgent.scan(hooks, categories)
+  system = monitoring.md + schema summary + per-category checklist
+           (checklist built from the passed `categories` — the
+            route's runnable set; empty array → "scan for any change")
   tools  = monitoringTools subset
   budget = maxTurns:8, maxToolCalls:6
   valid  = isAnomalyArray → sort by severity → slice(0,10)
@@ -200,6 +202,30 @@ QueryAgent.answer()
 ```
 
 All four share the same `runAgentLoop` with no special-casing inside the loop itself. The loop is "dumb" — it executes tool calls and accumulates messages. The agents are where the domain logic lives.
+
+---
+
+### The schema gate — bounding monitoring to runnable categories
+
+`MonitoringAgent.scan` is now `async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]>` (`lib/agents/monitoring.ts` L69). The second argument is the list of anomaly categories the agent should actually check — and it does NOT decide that list itself. The briefing route gates it **upstream of `runAgentLoop`**: before constructing the agent it runs `schemaCapabilities(schema)` then `runnableCategories(capabilities)` (`lib/agents/categories.ts`) and passes the result into `scan`. A category is "runnable" only when the live workspace emits the events (and, for `enriches`, the properties/catalogs) it needs — `runnableCategories` keeps the `full` + `limited` ones and drops the `unavailable` ones.
+
+Inside `scan` (L73–86), the passed `categories` are turned into a per-category checklist string — one bullet per category with its `whyItMatters`, suggested EQL recipe, and threshold gates — which is substituted into the `{categories}` placeholder of the monitoring prompt (L86). An empty array falls back to `'(no checklist provided — scan for any significant recent change)'` (L81). The agent then runs its normal `runAgentLoop` against that prompt. The gate changes WHAT the agent is told to look for; it does not touch the loop mechanics.
+
+```
+schema  (bootstrapSchema, in the route)
+  │
+  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }   (categories.ts L116)
+  │
+  └─ runnableCategories(caps)     → AnomalyCategory[] (full + limited only)   (categories.ts L158)
+        │
+        └─► MonitoringAgent.scan(hooks, runnable)                             (monitoring.ts L69)
+                │
+                ├─ build per-category checklist from `runnable`              (L73–81)
+                ├─ inject into prompt at {categories}                         (L86)
+                └─ runAgentLoop(...)   ← UNCHANGED; gate is upstream of the loop
+```
+
+The consequence: the monitoring agent never spends its `maxToolCalls: 6` EQL budget probing a category this workspace can't support (e.g. no `return` event → the return-spike category is dropped before the loop ever runs). `runAgentLoop` (`lib/agents/base.ts` L48–L176) is identical for all four agents — the gating happens entirely in the route + `scan`'s prompt assembly, never inside the shared loop.
 
 ---
 
@@ -290,10 +316,14 @@ The diagram below shows the full service layer. `runAgentLoop` sits at the cente
 │  Agent layer   lib/agents/                                          │
 │                                                                     │
 │  MonitoringAgent    DiagnosticAgent    RecommendationAgent          │
-│  .scan()            .investigate()     .propose()                   │
-│  prompt: monitoring prompt: diagnostic prompt: recommendation       │
-│  tools: monitoring  tools: diagnostic  tools: recommendation        │
-│  subset             subset             subset                       │
+│  .scan(hooks,       .investigate()     .propose()                   │
+│   runnable)         prompt: diagnostic prompt: recommendation       │
+│  prompt: monitoring tools: diagnostic  tools: recommendation        │
+│   + runnable        subset             subset                       │
+│   checklist                                                         │
+│  tools: monitoring                                                  │
+│  subset                                                             │
+│  (briefing route gates runnable categories upstream — categories.ts)│
 │         │                  │                   │                    │
 │         └──────────────────┼───────────────────┘                   │
 │                            │ all call                               │
@@ -349,7 +379,8 @@ Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation
 | `lib/agents/diagnostic.ts` | `FALLBACK` | L16–L20 | Last-resort `Diagnosis` with empty evidence |
 | `lib/agents/recommendation.ts` | `RecommendationAgent.propose` | L36–L77 | Same loop + fallback chain pattern; assigns `id`s after validation |
 | `lib/agents/recommendation.ts` | `RecommendationAgent.synthesize` | L82–L132 | Same as diagnostic synthesize; emits effort/time/prereqs/successMetric/rangeUsd |
-| `lib/agents/monitoring.ts` | `MonitoringAgent.scan` | L68–L103 | Calls `runAgentLoop`; degrades to `[]` on any parse failure |
+| `lib/agents/monitoring.ts` | `MonitoringAgent.scan` | L69–L120 | `scan(hooks?, categories=[])`; builds a per-category checklist from `categories` (L73–86), calls `runAgentLoop`; degrades to `[]` on any parse failure |
+| `lib/agents/categories.ts` | `schemaCapabilities` / `runnableCategories` | L116–127 / L158–160 | The upstream schema gate; the route passes `runnableCategories(caps)` into `scan` |
 | `app/api/agent/route.ts` | `maxDuration = 300` | L20 | Vercel Pro ceiling; the step-split keeps each request well under it |
 | `app/api/agent/route.ts` | `step` query param | L117–L118 | `'diagnose' \| 'recommend' \| null`; selects which agent runs |
 | `app/api/agent/route.ts` | `GET` (stream + orchestration) | L112–L268 | Bootstrap inside stream → branch on step → one agent per request |
@@ -408,6 +439,7 @@ return { ...diag, confidence: confidence === 'high' && hadErrors ? 'medium' : co
 - `lib/agents/diagnostic.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/diagnostic.ts
 - `lib/agents/recommendation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/recommendation.ts
 - `lib/agents/monitoring.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts
+- `lib/agents/categories.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/categories.ts
 - `lib/insights/derive.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts
 - `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts
 - `app/api/agent/route.ts`: https://github.com/rlynjb/blooming_insights/blob/main/app/api/agent/route.ts
@@ -519,6 +551,7 @@ Key takeaways:
 - cost and latency compound per agent; splitting into two requests (`step=diagnose`, `step=recommend`) keeps each one under the `maxDuration = 300` ceiling (`6. Scale concerns`)
 - the `synthesize()` call is justified by the failure mode it prevents — a hollow `FALLBACK` diagnosis that produces zero recommendations — not by speculative quality improvements (`6. Scale concerns`)
 - four agents share one loop because the loop is domain-agnostic; domain logic lives in the prompts, tool subsets, and validators, not in the loop itself (`2. Request-response flow`)
+- `MonitoringAgent.scan(hooks, categories)` is gated upstream: the briefing route passes `runnableCategories(schemaCapabilities(schema))` so the agent only checks categories the live schema supports; the runnable set becomes the per-category checklist injected into the prompt, and `runAgentLoop` is untouched (`2. Request-response flow`)
 
 ---
 
@@ -662,7 +695,7 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 
 - What is the value of `AGENT_MODEL`? (Answer: `'claude-sonnet-4-6'`, `lib/agents/base.ts` L9)
 - What does `runAgentLoop` return when `maxTurns` is exhausted? (Answer: `{ finalText: '', toolCalls }`, L175)
-- What is the `maxToolCalls` budget for `DiagnosticAgent`? (Answer: `6`, `lib/agents/diagnostic.ts` L61)
+- What is the `maxToolCalls` budget for `DiagnosticAgent`? (Answer: `6`, `lib/agents/diagnostic.ts` L62)
 - What is the `maxToolCalls` budget for `RecommendationAgent`? (Answer: `4`, `lib/agents/recommendation.ts` L57)
 - In the fallback chain at `diagnostic.ts` L74–L75, what does `synthesize()` receive as its second argument? (Answer: `toolCalls` — the full array of every tool call the loop made)
 - How does step 3 (`/investigate/[id]/recommend`) get the diagnosis from step 2? (Answer: via `sessionStorage` key `bi:diag:<id>`, written on step 2's `done` event and read by `useInvestigation`; passed as `&diagnosis=` in live mode)
@@ -671,3 +704,6 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 
 ---
 Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.
+
+---
+Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `scan(hooks?, categories: AnomalyCategory[] = [])` and described the per-category checklist injection; added a "schema gate" sub-section with an ASCII diagram showing schema → capabilities → runnable categories → scan(hooks, runnable), noting the gate is upstream of the unchanged `runAgentLoop`; corrected the `scan` line range (L68–L103 → L69–L120) and the `DiagnosticAgent` `maxToolCalls` ref (L61 → L62); verified `runAgentLoop` (L48–L176) and `DiagnosticAgent.investigate` (L45–L83) against current code.

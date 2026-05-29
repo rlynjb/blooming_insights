@@ -11,6 +11,7 @@ The architectural patterns this codebase actually uses, one file per pattern. Ea
 - **[05-streaming-ndjson.md](05-streaming-ndjson.md)** — `/api/agent` streams `AgentEvent`s as NDJSON over a `ReadableStream`; the browser consumes them with a `fetch` reader (not `EventSource`); cache-replay reuses the same wire format.
 - **[06-multi-agent-orchestration.md](06-multi-agent-orchestration.md)** — one shared `runAgentLoop` powering four agents; a `maxToolCalls` budget + forced-final turn + a dedicated synthesis call that guarantees structured output.
 - **[07-client-stream-handoff.md](07-client-stream-handoff.md)** — the `useInvestigation` client hook: a started-guard + no-cancel-on-cleanup `fetch` reader that runs once under StrictMode, plus `sessionStorage` handoffs (`bi:insight:`, `bi:inv:*`, `bi:diag:`) that carry state across route changes and Vercel instances.
+- **[08-schema-gated-coverage.md](08-schema-gated-coverage.md)** — gate the 10-category anomaly checklist against the live workspace schema *before* spending the monitoring budget, run only the runnable categories, and stream the per-category verdict (`coverage_item`) so the feed grid fills tile-by-tile with honest "no data source" ghosts for what the schema can't support.
 
 ## The 6-step system-design checklist
 
@@ -34,8 +35,10 @@ A mental walk for any system. Each pattern above is tagged with the step(s) it l
 | 05 streaming-ndjson | **2** request/response flow · **5** failure handling |
 | 06 multi-agent-orchestration | **2** request/response flow · **5** failure handling · **6** scale concerns |
 | 07 client-stream-handoff | **4** state ownership · **2** request/response flow |
+| 08 schema-gated-coverage | **2** request/response flow · **6** scale concerns · **5** failure handling |
 
 > Note: there is no classic relational **data model** (step 1) here — state is in-memory maps + committed JSON snapshots, no DB. That absence is itself a design decision; see `04-caching-and-rate-limiting.md` and `02-oauth-boundary.md` for where state lives and what that costs at scale.
 
 ---
 Updated: 2026-05-28 — added `07-client-stream-handoff.md` (the `useInvestigation` started-guard + sessionStorage handoff pattern) to the pattern list and the checklist-step table (steps 4 + 2)
+Updated: 2026-05-29 — added `08-schema-gated-coverage.md` (gate the anomaly checklist against the live schema before spending budget; stream the verdict tile-by-tile) to the pattern list and the checklist-step table (steps 2 + 6 + 5)

@@ -53,7 +53,7 @@ The route is the controller. `bootstrapSchema` + `connectMcp` are the service la
 
 **Hop 1 — The page fetch**
 
-A `useEffect` keyed on `[mode, ready]` (`app/page.tsx` L248–455) fires once the persisted demo/live mode resolves — the same pattern as any data-fetching component. The runtime demo/live toggle picks the URL: `isDemo` (from `localStorage` `bi:mode`, resolved in the L119–129 effect) appends `?demo=cached`, live uses no suffix (L252). It builds the URL (L263) and calls `fetch(url)`. State starts at `'loading'` (L88). The concrete consequence: the browser holds an open HTTP connection until the route resolves — up to 300 seconds (`maxDuration = 300`, `route.ts` L16).
+A `useEffect` keyed on `[mode, ready]` (`app/page.tsx` L248–455) fires once the persisted demo/live mode resolves — the same pattern as any data-fetching component. The runtime demo/live toggle picks the URL: `isDemo` (from `localStorage` `bi:mode`, resolved in the L119–129 effect) appends `?demo=cached`, live uses no suffix (L252). It builds the URL (L263) and calls `fetch(url)`. State starts at `'loading'` (L88). The concrete consequence: the browser holds an open HTTP connection until the route resolves — up to 300 seconds (`maxDuration = 300`, `route.ts` L17).
 
 ```
 useEffect fires (mode resolved)
@@ -65,15 +65,20 @@ useEffect fires (mode resolved)
        └─ fetch(url) ──────────────────► route handler
 ```
 
-**Hop 2 — Demo short-circuit**
+**Hop 2 — Demo short-circuit (paced NDJSON replay)**
 
-The route checks `?demo=cached` before any network call (L42–52). If the flag is set and `lib/state/demo-insights.json` exists, it reads the file synchronously and returns `NextResponse.json({...snapshot, demo: true})`. No session, no MCP, no agent. The consequence: a public demo works with zero credentials.
+The route checks `?demo=cached` before any network call (L76, L84). If the flag is set and `lib/state/demo-insights.json` exists, it reads the file synchronously, then *replays the snapshot as a paced NDJSON stream* — it does NOT return a single JSON blob. The replay (L97–149) mirrors the live event order exactly: `workspace` → the coverage checklist + `coverage_item` tiles → the recorded EQL `tool_call_*` trace → `insight` cards → `done`, each event spaced by `REPLAY_DELAY_MS = 140` (L23). No session, no MCP, no agent. The consequence: a public demo works with zero credentials AND reveals progressively — the feed animates identically to a live run.
 
 ```
 GET /api/briefing?demo=cached
   │
-  ├─ demo=cached AND file exists?
-  │     └─ readFileSync(DEMO_FILE) → NextResponse.json  ──► browser
+  ├─ demo=cached AND file exists? (L84)
+  │     └─ readFileSync(DEMO_FILE) → ReadableStream (NDJSON, 140ms/event):
+  │          {workspace}
+  │          {step "matching…checklist"} → per category: {step}+{coverage_item}
+  │          recorded trace: {tool_call_start}{tool_call_end}…
+  │          {insight}…
+  │          {done}                                     ──► browser
   │
   └─ else → live path (hops 3–7)
 ```
@@ -91,7 +96,7 @@ cookies().get('bi_session')
 
 **Hop 4 — MCP connection and OAuth gate**
 
-`connectMcp(sid)` (`lib/mcp/connect.ts` L59–64) is now `async` and wraps `connectMcpInner` (L66–107) in `withAuthCookies` — in prod that seeds the encrypted-cookie auth store from the request and flushes it once (see 02-oauth-boundary.md); in dev/test it is a passthrough. `connectMcpInner` derives `redirectUri()` (async, host-based, L31–52) for the provider, builds a `BloomreachAuthProvider` keyed to the session id, attaches it to a `StreamableHTTPClientTransport`, and calls `client.connect(transport)`. If the session has valid tokens, `client.connect` succeeds and the function returns `{ok: true, mcp: McpClient}`. If not, the SDK fires the OAuth `redirectToAuthorization` callback, the auth provider captures the URL, and the function returns `{ok: false, authUrl}`. The route runs `getOrCreateSessionId` + `connectMcp` inside a try/catch (L62–72) so a setup throw — a missing `AUTH_SECRET` breaking cookie encryption in prod — returns the real error message instead of a bare 500; it then checks `conn.ok` (L73–75) and returns a 401 with `{needsAuth: true, authUrl}`. The page (`app/page.tsx` L272–277) checks `res.status === 401 && body.needsAuth` and redirects the browser to `body.authUrl`.
+`connectMcp(sid)` (`lib/mcp/connect.ts` L59–64) is now `async` and wraps `connectMcpInner` (L66–107) in `withAuthCookies` — in prod that seeds the encrypted-cookie auth store from the request and flushes it once (see 02-oauth-boundary.md); in dev/test it is a passthrough. `connectMcpInner` derives `redirectUri()` (async, host-based, L31–52) for the provider, builds a `BloomreachAuthProvider` keyed to the session id, attaches it to a `StreamableHTTPClientTransport`, and calls `client.connect(transport)`. If the session has valid tokens, `client.connect` succeeds and the function returns `{ok: true, mcp: McpClient}`. If not, the SDK fires the OAuth `redirectToAuthorization` callback, the auth provider captures the URL, and the function returns `{ok: false, authUrl}`. The route runs `getOrCreateSessionId` + `connectMcp` inside a try/catch (`route.ts` L161–171) so a setup throw — a missing `AUTH_SECRET` breaking cookie encryption in prod — returns the real error message instead of a bare 500; it then checks `conn.ok` (L172–174) and returns a 401 with `{needsAuth: true, authUrl}`. The page (`app/page.tsx` L272–277) checks `res.status === 401 && body.needsAuth` and redirects the browser to `body.authUrl`.
 
 ```
 connectMcp(sid)
@@ -119,14 +124,32 @@ bootstrapSchema(mcp)
         └─ parseWorkspaceSchema → cached = result → return
 ```
 
-**Hop 6 — Agent run**
+**Hop 5.5 — Coverage gate**
 
-`new MonitoringAgent(anthropic, mcp, schema, allTools).scan(hooks)` (`lib/agents/monitoring.ts` L60–104) runs an agentic loop: sends a system prompt containing a token-bounded schema summary plus a user prompt to Claude, receives tool-call requests, executes them against the live MCP server (up to 6 calls — `maxToolCalls` L84 — and 8 turns), parses the final assistant message as a JSON anomaly array, sorts by severity, and returns at most 10 `Anomaly` objects. Instead of a `trace` array, `scan` takes a `MonitorHooks` object (`onToolCall`/`onToolResult`/`onText`); the route's hooks (L109–126) emit NDJSON `BriefingEvent`s into the stream — `describeToolCall(tc)` (L28–33) for the live status line and `trunc(tc.result)` (L36–39) for the gathered trace. The concrete consequence: this is where most of the 300-second budget is spent.
+Between schema bootstrap and the agent run the route gates the fixed 10-category anomaly checklist against the live schema (`route.ts` L199–212). It runs three pure functions from `lib/agents/categories.ts`: `schemaCapabilities(schema)` (L116–127) flattens the schema into a `Set` of event names plus `event.property` and `catalog:<name>` strings; `coverageReport(capabilities)` (L144–155) classifies every category as `full`/`limited`/`unavailable`; `runnableCategories(capabilities)` (L158–160) keeps only the `full` + `limited` ones. The route then narrates the gate as a per-category checklist — it emits a step (`'matching the workspace schema to the 10-category anomaly checklist…'`, L207), then per category a reasoning `step` line plus a `coverage_item` event (L209–212) so the UI grid fills tile-by-tile. Finally `agent.scan({...hooks}, runnable)` (L223–240) is gated to only the runnable categories. The concrete consequence: the agent never spends its 6-call EQL budget probing a category this workspace's events can't support (no `return` event → no return-spike category), and the user watches the coverage grid resolve before the agent starts.
 
 ```
-MonitoringAgent.scan()
+schema (from hop 5)
   │
-  ├─ build system prompt (PROMPT + schemaSummary)
+  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }   (categories.ts L116)
+  │
+  ├─ coverageReport(capabilities) → 10 × {category, coverage: full|limited|unavailable}  (L144)
+  │     └─ step "matching…checklist…" + per category: step + {coverage_item}  (route.ts L207–212)
+  │
+  └─ runnableCategories(capabilities) → AnomalyCategory[] (full + limited only)  (L158)
+        │
+        └─► agent.scan(hooks, runnable)   ← agent gated to runnable categories (hop 6)
+```
+
+**Hop 6 — Agent run (gated to runnable categories)**
+
+`new MonitoringAgent(anthropic, mcp, schema, allTools).scan(hooks, runnable)` (`lib/agents/monitoring.ts` L69–120) runs an agentic loop. The signature is now `scan(hooks?, categories: AnomalyCategory[] = [])` (L69) — the second argument is the `runnable` list produced by hop 5.5's coverage gate, so the agent only checks categories the live schema can support. `scan` builds a per-category checklist string from `categories` and injects it into the system prompt (L73–86) alongside the token-bounded schema summary, sends it plus a user prompt to Claude, receives tool-call requests, executes them against the live MCP server (up to 6 calls — `maxToolCalls` L101 — and 8 turns), parses the final assistant message as a JSON anomaly array, sorts by severity, and returns at most 10 `Anomaly` objects. Instead of a `trace` array, `scan` takes a `MonitorHooks` object (`onToolCall`/`onToolResult`/`onText`); the route's hooks (L223–240) emit NDJSON `BriefingEvent`s into the stream — `describeToolCall(tc)` (L62–67) for the live status line and `trunc(tc.result)` (L70–73) for the gathered trace. The concrete consequence: this is where most of the 300-second budget is spent.
+
+```
+MonitoringAgent.scan(hooks, runnable)
+  │
+  ├─ build per-category checklist from `runnable` → inject into prompt
+  ├─ build system prompt (PROMPT + schemaSummary + checklist)
   ├─ runAgentLoop (up to 8 turns, 6 tool calls)
   │     ├─ Claude → tool_use request
   │     ├─ mcp.callTool(name, args) → result → hooks → BriefingEvent
@@ -159,25 +182,28 @@ The demo/live choice is a **runtime toggle**, not a build flag: `app/page.tsx` r
 |------|-----------------------------------|------------------------------|
 | Auth | Session cookie + OAuth flow (prod: encrypted-cookie store) | None |
 | Data source | MCP server (network) | `lib/state/demo-insights.json` (disk) |
-| Agent run | Yes — up to 300 s | No |
-| Response shape | NDJSON stream: `workspace` → `tool_call_*` → `insight` → `done` | `{...snapshot, demo: true}` (plain JSON) |
-| Failure modes | 401 (pre-stream), 500 (setup throw), `error` event mid-stream, empty | Only file-read error (falls through to live) |
+| Agent run | Yes — up to 300 s | No — replays a captured snapshot |
+| Response shape | NDJSON stream: `workspace` → `coverage_item` tiles → `tool_call_*` → `insight` → `done` | Same NDJSON event order, replayed at `REPLAY_DELAY_MS = 140`/event (`route.ts` L23, L97–149) |
+| Failure modes | 401 (pre-stream), 500 (setup throw), `error` event mid-stream, empty | Only file parse error (falls through to live) |
+
+Both paths now emit the SAME NDJSON event sequence — demo just replays a recorded snapshot at a fixed pace instead of computing it live.
 
 ```
          live                          cached demo
 fetch('/api/briefing')         fetch('/api/briefing?demo=cached')
          │                                  │
-    session check                    file exists?
+    session check                    file exists? (L84)
          │                             yes │  no
     MCP connect ◄────────────────────────  │  └── falls through to live
          │                                 │
-    bootstrapSchema               readFileSync
+    bootstrapSchema               readFileSync + JSON.parse
          │                                 │
-    agent.scan                    NextResponse.json(snapshot)
-         │
+    coverage gate                 ReadableStream replay (140ms/event):
+    agent.scan                      {workspace}→{coverage_item}…
+         │                          →recorded {tool_call_*}…→{insight}…→{done}
     anomalyToInsight
          │
-    NDJSON: {insight}…{done}
+    NDJSON: {workspace}→{coverage_item}…{insight}…{done}
 ```
 
 ### Move 3 — The generalizing principle
@@ -232,8 +258,14 @@ Route / Service layer (Next.js App Router)
 │  └──────────────────────────────┬──────────────────────────────┘   │
 │                                 │ schema                           │
 │  ┌──────────────────────────────▼──────────────────────────────┐   │
+│  │ Coverage gate  (lib/agents/categories.ts)                   │   │
+│  │ schemaCapabilities → coverageReport → runnableCategories    │   │
+│  │ per category: step + {coverage_item}  (grid fills tile-wise)│   │
+│  └──────────────────────────────┬──────────────────────────────┘   │
+│                                 │ runnable: AnomalyCategory[]      │
+│  ┌──────────────────────────────▼──────────────────────────────┐   │
 │  │ Agent layer  (lib/agents/monitoring.ts)                     │   │
-│  │ MonitoringAgent.scan() → Anomaly[]  (≤6 MCP calls)         │   │
+│  │ MonitoringAgent.scan(hooks, runnable) → Anomaly[] (≤6 calls)│   │
 │  └──────────────────────────────┬──────────────────────────────┘   │
 │                                 │ anomalies                        │
 │  ┌──────────────────────────────▼──────────────────────────────┐   │
@@ -241,7 +273,7 @@ Route / Service layer (Next.js App Router)
 │  │ anomalyToInsight → putInsights → listInsights               │   │
 │  └──────────────────────────────┬──────────────────────────────┘   │
 │                                 │                                  │
-│  ReadableStream NDJSON: {workspace}…{insight}…{done} | {error}     │
+│  ReadableStream NDJSON: {workspace}…{coverage_item}…{insight}…{done} | {error} │
 └───────────────────────────────┬────────────────────────────────────┘
                                 │ HTTP 200 (x-ndjson)
                     ────────────▼──────────────
@@ -272,15 +304,21 @@ MCP / Provider layer
 ---
 
 **File:** `app/api/briefing/route.ts`
-**Function / class:** `GET` (named export); `describeToolCall`; `trunc`; `maxDuration = 300`
-**Line range:** L41–151
-**Role:** The full pipeline: demo short-circuit (L42–52), API-key guard (L54–56), session + connect wrapped in try/catch (L62–72), 401 gate (L73–75), then an NDJSON `ReadableStream` (L79–143): bootstrap (L90), agent.scan with streaming hooks (L106–126), mapping + `insight`/`done` events (L128–132), `error` event on throw (L133–138).
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/api/briefing/route.ts#L41-L151
+**Function / class:** `GET` (named export); `describeToolCall`; `trunc`; `coverageChecklistSteps`; `maxDuration = 300`; `REPLAY_DELAY_MS = 140`
+**Line range:** L75–265
+**Role:** The full pipeline: demo short-circuit that now *replays* the snapshot as a paced NDJSON stream (L76–151, `existsSync(DEMO_FILE)` L84, replay loop L97–149 at `REPLAY_DELAY_MS = 140`), API-key guard (L153–155), session + connect wrapped in try/catch (L161–171), 401 gate (L172–174), then a live NDJSON `ReadableStream` (L178–264): bootstrap (L189) + `workspace` event (L190–197), coverage gate `schemaCapabilities`/`coverageReport`/`runnableCategories` + per-category `step`/`coverage_item` (L199–212), `agent.scan(hooks, runnable)` (L223–240), mapping + `insight`/`done` events (L242–246), `error` event on throw (L247–252).
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/api/briefing/route.ts#L75-L265
 
 **Briefing route happy path (pseudocode):**
 ```
 GET /api/briefing
-  if ?demo=cached && file exists → return snapshot
+  if ?demo=cached && file exists →            // paced NDJSON replay, not a JSON blob
+    snapshot = JSON.parse(readFileSync(DEMO_FILE))
+    return ReadableStream(NDJSON, REPLAY_DELAY_MS=140 per event):
+      send {workspace}
+      send {step "matching…checklist"}; for each coverage row: send {step}+{coverage_item}
+      for each recorded trace item: send {tool_call_start}/{tool_call_end} | {step}
+      for each insight: send {insight}; send {done}
   if !ANTHROPIC_API_KEY → 500 { error }
 
   try:                                         // setup throw → real error, not bare 500
@@ -292,9 +330,15 @@ GET /api/briefing
   return ReadableStream(NDJSON):
     schema    = await bootstrapSchema(mcp)     // module-cached after first call
     send { workspace }
+    // coverage gate: match the live schema to the 10-category checklist
+    capabilities = schemaCapabilities(schema)
+    coverage     = coverageReport(capabilities)     // full | limited | unavailable
+    runnable     = runnableCategories(capabilities) // full + limited only
+    step('matching…checklist…')
+    for each item of coverage: step(line); send { coverage_item: item }
     allTools  = await mcp.listTools()
     agent     = new MonitoringAgent(anthropic, mcp, schema, allTools)
-    anomalies = await agent.scan({ onToolCall, onToolResult, onText })  // each → BriefingEvent
+    anomalies = await agent.scan({ onToolCall, onToolResult, onText }, runnable)  // gated; each → BriefingEvent
     insights  = anomalies.map(anomalyToInsight)
     putInsights(insights, anomalies)
     for insight of listInsights(): send { insight }
@@ -329,9 +373,17 @@ GET /api/briefing
 
 **File:** `lib/agents/monitoring.ts`
 **Function / class:** `MonitoringAgent`; `MonitoringAgent.scan`
-**Line range:** L60–104 (`scan` L68–103, `maxToolCalls` L84)
-**Role:** Runs the agentic Claude loop against MCP tools; `scan` takes a `MonitorHooks` object and returns sorted `Anomaly[]`.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L60-L104
+**Line range:** L61–121 (`scan` L69–120, `maxToolCalls` L101)
+**Role:** Runs the agentic Claude loop against MCP tools. `scan(hooks?, categories: AnomalyCategory[] = [])` (L69) builds a per-category checklist from the passed `categories` (the runnable set from the route's coverage gate) and injects it into the prompt (L73–86), then returns sorted `Anomaly[]`.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L61-L121
+
+---
+
+**File:** `lib/agents/categories.ts`
+**Function / class:** `schemaCapabilities`; `coverageReport`; `runnableCategories`; `CATEGORIES`
+**Line range:** L116–160 (`schemaCapabilities` L116–127, `coverageReport` L144–155, `runnableCategories` L158–160; `CATEGORIES` registry L19–112)
+**Role:** The coverage gate (hop 5.5). `schemaCapabilities` flattens the schema into a capability `Set`; `coverageReport` classifies each of the 10 `CATEGORIES` as `full`/`limited`/`unavailable`; `runnableCategories` returns the `full` + `limited` ones that the route hands to `MonitoringAgent.scan`.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/categories.ts#L116-L160
 
 ---
 
@@ -368,7 +420,7 @@ Every gate that short-circuits means the layers below never execute. This is the
 ### Where this breaks down
 
 - **Serverless function lifetime.** The module-level `cached` in `schema.ts` (L131) and the in-process `Map`s in `insights.ts` (L4–6) are process-scoped. On Vercel, each function invocation may land on a different cold container. Two users may each pay the full schema bootstrap cost, and `listInsights()` returns only the insights from the current invocation — not a shared store.
-- **The 300-second ceiling.** `maxDuration = 300` (route.ts L16) is Vercel Pro's hard function limit (Hobby is 60 s). At ~1 req/s MCP rate and 4 schema calls + up to 6 agent calls + 8 Claude turns, the budget is comfortable but finite. A slow network or a verbose Claude response eats into it.
+- **The 300-second ceiling.** `maxDuration = 300` (route.ts L17) is Vercel Pro's hard function limit (Hobby is 60 s). At ~1 req/s MCP rate and 4 schema calls + up to 6 agent calls + 8 Claude turns, the budget is comfortable but finite. A slow network or a verbose Claude response eats into it.
 - **OAuth state across invocations.** The PKCE verifier and client info written during `connectMcp` live in the `BloomreachAuthProvider`'s in-memory store. If the OAuth callback lands on a different Vercel function instance, the verifier is gone and `completeAuth` fails.
 
 ### What to explore next
@@ -395,11 +447,11 @@ Failure surface       User-visible timeout/error       Background failure, silen
 
 ### Sub-block 1 — what we gave up
 
-A per-request agent run means every page load pays the full MCP + Claude latency. At ~1 req/s MCP rate, 4 sequential schema calls alone take ~4.4 seconds minimum. Add 6 agent tool calls and 8 Claude turns and a cold start can easily hit 20–40 seconds. The `maxDuration = 300` ceiling (`route.ts` L16, Vercel Pro) is the hard wall. Users who land on the page while the agent is still running see the spinner (`status === 'loading'`) for the entire duration.
+A per-request agent run means every page load pays the full MCP + Claude latency. At ~1 req/s MCP rate, 4 sequential schema calls alone take ~4.4 seconds minimum. Add 6 agent tool calls and 8 Claude turns and a cold start can easily hit 20–40 seconds. The `maxDuration = 300` ceiling (`route.ts` L17, Vercel Pro) is the hard wall. Users who land on the page while the agent is still running see the spinner (`status === 'loading'`) for the entire duration.
 
 ### Sub-block 2 — what the alternative would have cost
 
-A precomputed feed (cron job writes `lib/state/demo-insights.json` on a schedule, route always reads the file) would reduce page-load latency to milliseconds and eliminate the per-user auth dependency. The cost: the feed is stale. A metric spike at 2:47 AM is invisible until the next cron tick. The cron job needs its own auth token, its own error alerting, and a way to surface "last updated at" so users know when the data is from. The cached demo path (the `?demo=cached` short-circuit, `route.ts` L42–52) is exactly this pattern — a committed snapshot serving as the cron output.
+A precomputed feed (cron job writes `lib/state/demo-insights.json` on a schedule, route always reads the file) would reduce page-load latency to milliseconds and eliminate the per-user auth dependency. The cost: the feed is stale. A metric spike at 2:47 AM is invisible until the next cron tick. The cron job needs its own auth token, its own error alerting, and a way to surface "last updated at" so users know when the data is from. The cached demo path (the `?demo=cached` short-circuit, `route.ts` L76–151) is exactly this pattern — a committed snapshot serving as the cron output, now replayed as a paced NDJSON stream rather than returned as one JSON body.
 
 ### Sub-block 3 — the breakpoint
 
@@ -437,7 +489,7 @@ The per-request model holds at low traffic. The breakpoint is the intersection o
 
 ## Summary
 
-The request flow for `/api/briefing` is a six-hop pipeline: the browser's `useEffect` fetch → a demo short-circuit gate → session cookie resolution → OAuth-gated MCP connection → workspace schema bootstrap → an AI agent run → `Anomaly`-to-`Insight` mapping → NDJSON stream → card render. The constraint that forced this shape is the MCP server's ~1 req/s rate limit and the requirement that insights be live at page load time — the agent must run synchronously in the request, which pushes the function toward the 300-second `maxDuration` ceiling (Vercel Pro). The cost is latency: every page load pays the full agent round-trip, and the in-process state stores (`Map` in `insights.ts`, module-level `cached` in `schema.ts`) are process-scoped, which breaks under multi-instance serverless deployment.
+The request flow for `/api/briefing` is a multi-hop pipeline: the browser's `useEffect` fetch → a demo short-circuit gate (now a paced NDJSON replay, not a JSON blob) → session cookie resolution → OAuth-gated MCP connection → workspace schema bootstrap → a coverage gate that matches the schema to the 10-category checklist and runs only the runnable categories → an AI agent run gated to those categories → `Anomaly`-to-`Insight` mapping → NDJSON stream → card render. The constraint that forced this shape is the MCP server's ~1 req/s rate limit and the requirement that insights be live at page load time — the agent must run synchronously in the request, which pushes the function toward the 300-second `maxDuration` ceiling (Vercel Pro). The cost is latency: every page load pays the full agent round-trip, and the in-process state stores (`Map` in `insights.ts`, module-level `cached` in `schema.ts`) are process-scoped, which breaks under multi-instance serverless deployment.
 
 - **Shape:** A strict sequential pipeline where each `await` is a layer boundary and a failure domain; short-circuit at any gate returns a distinct JSON error shape.
 - **Rule:** The demo `?demo=cached` path is a structural short-circuit, not a feature flag — it bypasses every layer after the file-existence check.
@@ -523,7 +575,7 @@ no extra infra               cron + durable store + TTL
 - `getOrCreateSessionId` makes the cookie on first visit; `connectMcp` makes it meaningful by binding OAuth tokens to it.
 - `bootstrapSchema`'s `cached` variable is process-scoped state — it does not survive a cold start.
 - The 401 response with `{needsAuth, authUrl}` is a structured gate, not an error — the page uses it to redirect rather than display an error message.
-- The demo short-circuit at L42–52 of `route.ts` is structurally identical to what a precomputed-feed architecture would look like at the route level.
+- The demo short-circuit at L76–151 of `route.ts` is structurally identical to what a precomputed-feed architecture would look like at the route level — it replays a committed snapshot as NDJSON instead of computing it live.
 
 ---
 
@@ -538,16 +590,16 @@ Close this file. Draw the full pipeline from `useEffect` to card render as a ver
 Work through these checkpoints without looking at the file:
 
 - [ ] What state value does `HomePage` start with, and what triggers the `fetch`? (`app/page.tsx` L88, L248)
-- [ ] What are the three possible outcomes of `connectMcp`, and what does the route do for each? (`app/api/briefing/route.ts` L62–75, `lib/mcp/connect.ts` L89–106)
+- [ ] What are the three possible outcomes of `connectMcp`, and what does the route do for each? (`app/api/briefing/route.ts` L161–174, `lib/mcp/connect.ts` L89–106)
 - [ ] What does `bootstrapSchema` return on a warm function, and what does it call on a cold start? (`lib/mcp/schema.ts` L170–192)
-- [ ] What is the maximum number of MCP tool calls the agent will make, and where is that limit set? (`lib/agents/monitoring.ts` L84)
-- [ ] What does the route return when the agent produces no parseable anomaly array? (`lib/agents/monitoring.ts` L95–101, `lib/state/insights.ts` L51–53)
+- [ ] What is the maximum number of MCP tool calls the agent will make, and where is that limit set? (`lib/agents/monitoring.ts` L101)
+- [ ] What does the route return when the agent produces no parseable anomaly array? (`lib/agents/monitoring.ts` L112–119, `lib/state/insights.ts` L51–53)
 
 ### Level 3 — Apply it to a new scenario
 
 Scenario: You add a second agent that runs after `MonitoringAgent.scan` and calls three more MCP tools. Estimate whether it fits within the existing `maxDuration = 300` budget.
 
-Check your reasoning against `app/api/briefing/route.ts` L16 for the budget and `lib/mcp/connect.ts` L81–95 for the rate-limit spacing. Three additional MCP calls at 1100 ms each = 3.3 seconds minimum added to the pipeline. If the monitoring agent already uses 6 calls (6 × 1.1 s = 6.6 s) plus schema (4 × 1.1 s = 4.4 s) plus Claude latency (estimate 5–15 s per turn × up to 8 turns), the budget is already tight. The second agent's 3 calls add 3.3 s plus its own Claude turns. You need to reduce `maxToolCalls` or `maxTurns` on one of the agents, or run them concurrently (requires careful MCP rate-limit coordination), or move one to a separate route.
+Check your reasoning against `app/api/briefing/route.ts` L17 for the budget and `lib/mcp/connect.ts` L81–95 for the rate-limit spacing. Three additional MCP calls at 1100 ms each = 3.3 seconds minimum added to the pipeline. If the monitoring agent already uses 6 calls (6 × 1.1 s = 6.6 s) plus schema (4 × 1.1 s = 4.4 s) plus Claude latency (estimate 5–15 s per turn × up to 8 turns), the budget is already tight. The second agent's 3 calls add 3.3 s plus its own Claude turns. You need to reduce `maxToolCalls` or `maxTurns` on one of the agents, or run them concurrently (requires careful MCP rate-limit coordination), or move one to a separate route.
 
 ### Level 4 — Defend the decision you'd change
 
@@ -558,10 +610,13 @@ The in-process `Map`s in `lib/state/insights.ts` (L4–6) are not shared across 
 Without reading the file, answer:
 
 1. What is the exact cookie name used by `getOrCreateSessionId`? (Check: `lib/mcp/session.ts` L3)
-2. What HTTP status does the route return when `conn.ok` is false? (Check: `app/api/briefing/route.ts` L73–75)
-3. What is the hard limit on MCP tool calls inside `MonitoringAgent.scan`? (Check: `lib/agents/monitoring.ts` L84)
-4. What does the route export to tell Vercel the function timeout? (Check: `app/api/briefing/route.ts` L16)
-5. What file does the demo path read from, and where is the path constructed? (Check: `app/api/briefing/route.ts` L18, L45–48)
+2. What HTTP status does the route return when `conn.ok` is false? (Check: `app/api/briefing/route.ts` L172–174)
+3. What is the hard limit on MCP tool calls inside `MonitoringAgent.scan`? (Check: `lib/agents/monitoring.ts` L101)
+4. What does the route export to tell Vercel the function timeout? (Check: `app/api/briefing/route.ts` L17)
+5. What file does the demo path read from, and where is the path constructed? (Check: `app/api/briefing/route.ts` L19 (`DEMO_FILE`), L84–87)
 
 ---
 Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now streams NDJSON (`describeToolCall`/`trunc`, no `summarizeTrace`) with `maxDuration = 300`; `connectMcp` is async and wrapped in `withAuthCookies`; setup is in a try/catch returning the real error; noted the runtime `localStorage` `bi:mode` demo/live toggle and `anomalyToInsight`'s `impact`/`history`/`deriveInsightFields`.
+
+---
+Updated: 2026-05-29 — added Hop 5.5 coverage gate (`schemaCapabilities`/`coverageReport`/`runnableCategories`, `categories.ts`) with ASCII diagram + folded it into the primary diagram, pseudocode, and Summary; documented the demo path as a paced NDJSON replay (`REPLAY_DELAY_MS = 140`) instead of a plain-JSON blob; updated `MonitoringAgent.scan(hooks, runnable)` to its gated 2-arg signature; re-derived all `route.ts` (now L75–265) and `monitoring.ts` (now L61–121) line refs against the grown files.
