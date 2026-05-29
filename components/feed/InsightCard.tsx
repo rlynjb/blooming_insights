@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { Insight } from '@/lib/mcp/types';
 import SeverityBadge from './SeverityBadge';
 import Sparkline from '@/components/shared/Sparkline';
+import { CATEGORIES } from '@/lib/agents/categories';
 
 interface InsightCardProps {
   insight: Insight;
@@ -198,6 +199,23 @@ export default function InsightCard({ insight }: InsightCardProps) {
           >
             {insight.severity}
           </span>
+          {/* coverage-grid category chip — reconciles the firing tile with this card */}
+          {insight.category && (
+            <span
+              className="lowercase"
+              style={{
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.62rem',
+                color: 'var(--text-secondary)',
+                background: 'var(--bg-elevated)',
+                border: '1px solid var(--border)',
+                borderRadius: 999,
+                padding: '2px 8px',
+              }}
+            >
+              {CATEGORIES.find((c) => c.id === insight.category)?.label ?? insight.category}
+            </span>
+          )}
           {days != null && (
             <>
               <span style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>·</span>

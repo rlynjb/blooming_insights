@@ -22,6 +22,7 @@ export function anomalyToInsight(a: Anomaly): Insight {
     evidence: a.evidence, // tool(s) + result that produced this insight
     impact: a.impact, // agent's one-sentence business impact (why it matters)
     history: a.history, // weekly series for the sparkline (when the agent emitted one)
+    category: a.category, // coverage-grid category this anomaly fired (when stamped)
     ...deriveInsightFields(a), // business-owner fields derived from the evidence
   };
 }

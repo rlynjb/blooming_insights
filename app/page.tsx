@@ -1,12 +1,17 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { Insight } from '@/lib/mcp/types';
+import type { Insight, CoverageReport } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
+import CoverageGrid from '@/components/feed/CoverageGrid';
 import Skeleton from '@/components/shared/Skeleton';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import StreamingResponse from '@/components/chat/StreamingResponse';
+import QueryBox from '@/components/chat/QueryBox';
+
+// the free-form "ask anything" box is hidden for now — flip to show it again.
+const SHOW_QUERY_BOX = false;
 
 interface BriefingResponse {
   insights: Insight[];
@@ -16,11 +21,14 @@ interface BriefingResponse {
   };
   // present when a cached snapshot bundles the gathering trace (forward-compat)
   trace?: TraceItem[];
+  // the anomaly-coverage grid summary (optional — old snapshots lack it)
+  coverage?: CoverageReport;
 }
 
 // The live briefing streams these NDJSON events (see app/api/briefing/route.ts).
 type BriefingEvent =
   | { type: 'workspace'; workspace: BriefingResponse['workspace'] }
+  | { type: 'coverage'; coverage: CoverageReport }
   | { type: 'tool_call_start'; toolName: string; agent: string }
   | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; result?: unknown; error?: string }
   | { type: 'reasoning_step'; step: { id?: string; kind?: string; content?: string } }
@@ -96,6 +104,8 @@ export default function HomePage() {
   const [queryCount, setQueryCount] = useState(0);
   // the monitoring agent's gathering trace (tool calls + thoughts) for provenance
   const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
+  // the 10-category anomaly-coverage summary (drives the coverage grid)
+  const [coverage, setCoverage] = useState<CoverageReport>([]);
   // true briefly while auto-reconnecting after the alpha server revokes the token
   const [reconnecting, setReconnecting] = useState(false);
   // dev-only single-click demo capture progress (briefing → investigations → bundle)
@@ -258,6 +268,7 @@ export default function HomePage() {
     setStepStatus('');
     setQueryCount(0);
     setTraceItems([]);
+    setCoverage([]);
 
     const url = `/api/briefing${search}`;
     let cancelled = false;
@@ -302,6 +313,7 @@ export default function HomePage() {
           setInsights(list);
           stashInsights(list);
           if (Array.isArray(data?.trace)) setTraceItems(data.trace);
+          if (Array.isArray(data?.coverage)) setCoverage(data.coverage);
           setStatus(list.length === 0 ? 'empty' : 'loaded');
           return;
         }
@@ -316,6 +328,9 @@ export default function HomePage() {
           switch (evt.type) {
             case 'workspace':
               setWorkspace(evt.workspace);
+              break;
+            case 'coverage':
+              setCoverage(evt.coverage);
               break;
             case 'tool_call_start':
               setQueryCount((n) => n + 1);
@@ -596,6 +611,8 @@ export default function HomePage() {
       <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
         {/* ── col 1 — the feed (anomaly items) ───────────────────────────── */}
         <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {/* anomaly coverage grid — the category checklist, above the cards */}
+      <CoverageGrid coverage={coverage} insights={insights} />
       {/* loading */}
       {status === 'loading' && !reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -782,10 +799,10 @@ export default function HomePage() {
         </aside>
       </div>
 
-      {/* the free-form "ask anything" query box is hidden for now. The QueryBox /
-          StreamingResponse components, the `?q=` flow in /api/agent, and the
-          query agent remain wired up — re-render <QueryBox onSubmit={setActiveQuery} />
-          here to bring it back. */}
+      {/* free-form "ask anything" box — hidden behind a flag for now. The
+          QueryBox / StreamingResponse components and the /api/agent ?q= flow
+          stay wired up; flip SHOW_QUERY_BOX to bring it back. */}
+      {SHOW_QUERY_BOX && <QueryBox onSubmit={(q) => setActiveQuery(q)} disabled={isDemo} />}
     </main>
   );
 }

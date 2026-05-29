@@ -5,6 +5,7 @@ import type { McpCaller } from './base';
 import { runAgentLoop } from './base';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { monitoringTools } from '../mcp/tools';
+import type { AnomalyCategory } from './categories';
 import { parseAgentJson, isAnomalyArray } from '../mcp/validate';
 import type { Anomaly, Severity, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
@@ -65,17 +66,33 @@ export class MonitoringAgent {
     private allTools: McpToolDef[],
   ) {}
 
-  async scan(hooks?: MonitorHooks): Promise<Anomaly[]> {
+  async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
+    // Build the runnable-category checklist injected into the prompt. The route
+    // gates out unsupported categories first, so the agent never spends EQL
+    // budget on a category this workspace's events can't support.
+    const checklist = categories.length
+      ? categories
+          .map(
+            (c) =>
+              `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} recipe: \`${c.eql(this.schema.projectId)}\`. ` +
+              `flag when |Δ| ≥ ${c.thresholds.warning}% (critical ≥ ${c.thresholds.critical}%).`,
+          )
+          .join('\n')
+      : '(no checklist provided — scan for any significant recent change)';
+
     const system = PROMPT
       .replace('{schema}', schemaSummary(this.schema))
-      .replace(/\{project_id\}/g, this.schema.projectId);
+      .replace(/\{project_id\}/g, this.schema.projectId)
+      .replace('{categories}', checklist);
 
     const { finalText } = await runAgentLoop({
       anthropic: this.anthropic,
       mcp: this.mcp,
       agent: 'monitoring',
       system,
-      userPrompt: 'Scan the workspace for significant recent changes and return the anomaly JSON array.',
+      userPrompt:
+        'Work through your category checklist (each as 90d vs prior 90d) and return the anomaly ' +
+        'JSON array — stamp each flagged anomaly with its `category`.',
       toolSchemas: filterToolSchemas(this.allTools, monitoringTools),
       onToolCall: hooks?.onToolCall,
       onToolResult: hooks?.onToolResult,

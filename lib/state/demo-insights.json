@@ -594,5 +594,72 @@
       "stepKind": "thought",
       "content": "The counts are **identical** across all windows (90d, 180d, 365d, 730d). This means the entire dataset exists in a single epoch — there is no prior comparable period to diff against. The one anomaly I can report is the **extremely high checkout-to-purchase conversion** observable from the funnel data itself (not period-over-period), but since there is no prior window with a different baseline, I cannot compute a meaningful period-over-period change.\n\nHowever, one notable observation stands out from the absolute funnel numbers within the only available period: the revenue figure differs significantly between the 90d query (2,122,105) and the 365d query (22,578,926) — a **10x difference** — even though purchase **count** is identical (21,570). This means the same 21,570 purchases have wildly different `total_price` sums depending on the query window, which indicates a data integrity issue (likely duplicate or inflated price values in the wider window). That is a genuine anomaly worth flagging.\n\nLet me also compute the key funnel conversion rates from the single available data window to surface any structural anomalies:\n\n- **view_item → cart_update**: 30,372 / 71,317 = **42.6%** (unusually high)\n- **cart_update → checkout**: 24,036 / 30,372 = **79.2%** (extremely high)\n- **checkout → purchase**: 21,570 / 24,036 = **89.7%** (very high — near-perfect)\n- **session_start → purchase**: 21,570 / 10,296 = **2.09 purchases per session** (impossible, sessions < purchases — anomaly!)\n\nThe fact that `session_start` (10,296) is **far lower** than `purchase` (21,570) is a genuine structural anomaly — purchases outnumber sessions by 2:1, which is impossible in a normal funnel and signals either missing session tracking or data integrity issues.\n\n```json\n[\n  {\n    \"metric\": \"purchases_exceed_sessions\",\n    \"scope\": [\"global\"],\n    \"change\": { \"value\": 109.5, \"direction\": \"up\", \"baseline\": \"90d\" },\n    \"severity\": \"critical\",\n    \"impact\": \"There are 21,570 purchases but only 10,296 session_start events — purchases outnumber sessions by 2:1, which is impossible in a valid funnel and indicates broken session tracking or missing session data that will corrupt all conversion-rate and attribution reporting.\",\n    \"evidence\": [\n      {\n        \"tool\": \"execute_analytics_eql\",\n        \"result\": { \"current_purchases\": 21570, \"current_session_starts\": 10296, \"ratio_purchases_per_session\": 2.09 }\n      }\n    ]\n  },\n  {\n    \"metric\": \"purchase_revenue_data_integrity\",\n    \"scope\": [\"global\"],\n    \"change\": { \"value\": 963.0, \"direction\": \"up\", \"baseline\": \"90d\" },\n    \"severity\": \"critical\",\n    \"impact\": \"The same 21,570 purchases sum to $2.1M over 90 days but $22.6M over 365 days — a 10× discrepancy for an identical transaction count — indicating severe duplicate or inflated total_price values in the event stream that make revenue reporting unreliable.\",\n    \"evidence\": [\n      {\n        \"tool\": \"execute_analytics_eql\",\n        \"result\": { \"purchase_count_90d\": 21570, \"revenue_sum_90d\": 2122105, \"purchase_count_365d\": 21570, \"revenue_sum_365d\": 22578926 }\n      }\n    ]\n  },\n  {\n    \"metric\": \"checkout_to_purchase_rate\",\n    \"scope\": [\"global\"],\n    \"change\": { \"value\": 89.7, \"direction\": \"up\", \"baseline\": \"90d\" },\n    \"severity\": \"warning\",\n    \"impact\": \"89.7% of checkout events convert to a purchase — an unusually high rate that may indicate checkout and purchase events are being double-fired or that abandoned checkouts are not being tracked, overstating conversion quality.\",\n    \"evidence\": [\n      {\n        \"tool\": \"execute_analytics_eql\",\n        \"result\": { \"checkout_events\": 24036, \"purchase_events\": 21570, \"conversion_rate_pct\": 89.7 }\n      }\n    ]\n  },\n  {\n    \"metric\": \"cart_to_checkout_rate\",\n    \"scope\": [\"global\"],\n    \"change\": { \"value\": 79.2, \"direction\": \"up\", \"baseline\": \"90d\" },\n    \"severity\": \"info\",\n    \"impact\": \"79.2% of cart_update events proceed to checkout — unusually high for ecommerce (industry norm is ~25–40%), suggesting cart abandonment events may not be captured, which would skew retargeting audiences and cart-recovery campaign triggers.\",\n    \"evidence\": [\n      {\n        \"tool\": \"execute_analytics_eql\",\n        \"result\": { \"cart_update_events\": 30372, \"checkout_events\": 24036, \"cart_to_checkout_rate_pct\": 79.2 }\n      }\n    ]\n  },\n  {\n    \"metric\": \"no_comparable_prior_period\",\n    \"scope\": [\"global\"],\n    \"change\": { \"value\": 0, \"direction\": \"up\", \"baseline\": \"730d\" },\n    \"severity\": \"info\",\n    \"impact\": \"All 21,570 purchases and all funnel events fall within a single concentrated window — identical counts are returned for 90d, 180d, 365d, and 730d queries — meaning there is no prior baseline to compute period-over-period trend analysis, limiting the value of future scheduled reports.\",\n    \"evidence\": [\n      {\n        \"tool\": \"execute_analytics_eql\",\n        \"result\": { \"purchase_count_90d\": 21570, \"purchase_count_180d\": 21570, \"purchase_count_365d\": 21570, \"purchase_count_730d\": 21570 }\n      }\n    ]\n  }\n]\n```"
     }
+  ],
+  "coverage": [
+    {
+      "category": "conversion_drop",
+      "label": "conversion rate drop",
+      "coverage": "full"
+    },
+    {
+      "category": "cart_abandonment",
+      "label": "cart abandonment",
+      "coverage": "full"
+    },
+    {
+      "category": "product_demand",
+      "label": "product demand spike",
+      "coverage": "full"
+    },
+    {
+      "category": "revenue_drop",
+      "label": "revenue drop",
+      "coverage": "full"
+    },
+    {
+      "category": "customer_churn",
+      "label": "customer churn",
+      "coverage": "full"
+    },
+    {
+      "category": "inventory",
+      "label": "inventory problems",
+      "coverage": "limited",
+      "missing": [
+        "catalog:inventory_level"
+      ]
+    },
+    {
+      "category": "campaign_perf",
+      "label": "campaign performance",
+      "coverage": "limited",
+      "missing": [
+        "session_start.utm_source"
+      ]
+    },
+    {
+      "category": "search_failure",
+      "label": "search failure",
+      "coverage": "unavailable",
+      "missing": [
+        "search"
+      ]
+    },
+    {
+      "category": "return_spike",
+      "label": "product return spike",
+      "coverage": "unavailable",
+      "missing": [
+        "return"
+      ]
+    },
+    {
+      "category": "fraud",
+      "label": "fraud detection",
+      "coverage": "unavailable",
+      "missing": [
+        "payment_failure"
+      ]
+    }
   ]
 }

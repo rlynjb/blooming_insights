@@ -4,6 +4,32 @@ export type Severity = 'critical' | 'warning' | 'info' | 'positive';
 
 export type AgentName = 'coordinator' | 'monitoring' | 'diagnostic' | 'recommendation';
 
+// The fixed checklist of ecommerce anomaly categories the monitoring agent runs.
+export type CategoryId =
+  | 'conversion_drop'
+  | 'cart_abandonment'
+  | 'product_demand'
+  | 'revenue_drop'
+  | 'customer_churn'
+  | 'inventory'
+  | 'campaign_perf'
+  | 'search_failure'
+  | 'return_spike'
+  | 'fraud';
+
+// full = required + enriching signals present; limited = required present but a
+// soft/enriching signal missing; unavailable = a required signal isn't emitted.
+export type CategoryCoverage = 'full' | 'limited' | 'unavailable';
+
+// Per-briefing summary of which categories were checkable against this
+// workspace's event schema (drives the coverage grid's tiles + note).
+export type CoverageReport = {
+  category: CategoryId;
+  label: string;
+  coverage: CategoryCoverage;
+  missing?: string[]; // required/enriching signals that were absent
+}[];
+
 export interface Insight {
   id: string;
   timestamp: string;
@@ -29,6 +55,7 @@ export interface Insight {
   affectedCustomers?: number; // denormalized from Diagnosis.affectedCustomers.count
   history?: number[]; // 12 weekly values, oldest first (Tier 2 sparkline)
   downstreamReady?: { diagnosis: boolean; recommendations: number }; // pre-computed stages
+  category?: CategoryId; // which coverage-grid category this insight fired (optional)
 }
 
 export interface ToolCall {
@@ -58,6 +85,7 @@ export interface Anomaly {
   evidence: { tool: string; result: unknown }[];
   impact?: string;                          // one-sentence business impact (agent-written)
   history?: number[];                       // 12 weekly values for the sparkline (agent-emitted)
+  category?: CategoryId;                    // the coverage-grid category this anomaly belongs to
 }
 
 // Diagnostic agent output (from spec "diagnostic agent" section)

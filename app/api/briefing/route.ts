@@ -6,9 +6,10 @@ import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
 import { bootstrapSchema } from '@/lib/mcp/schema';
 import { MonitoringAgent } from '@/lib/agents/monitoring';
+import { schemaCapabilities, coverageReport, runnableCategories } from '@/lib/agents/categories';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { anomalyToInsight, putInsights, listInsights } from '@/lib/state/insights';
-import type { ToolCall } from '@/lib/mcp/types';
+import type { CoverageReport, ToolCall } from '@/lib/mcp/types';
 import type { AgentEvent } from '@/lib/mcp/events';
 
 // 300s = Vercel Pro's max. The monitoring agent + ~1 req/s MCP spacing can run
@@ -18,10 +19,13 @@ export const maxDuration = 300;
 const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 
 type BriefingWorkspace = { projectName: string; totalCustomers: number; totalEvents: number };
-// Reuse the AgentEvent variants for live activity; add a briefing-only
-// `workspace` event for the header. Kept local so the shared AgentEvent
-// contract (used by /api/agent + the investigation view) is untouched.
-type BriefingEvent = AgentEvent | { type: 'workspace'; workspace: BriefingWorkspace };
+// Reuse the AgentEvent variants for live activity; add briefing-only `workspace`
+// and `coverage` events. Kept local so the shared AgentEvent contract (used by
+// /api/agent + the investigation view) is untouched.
+type BriefingEvent =
+  | AgentEvent
+  | { type: 'workspace'; workspace: BriefingWorkspace }
+  | { type: 'coverage'; coverage: CoverageReport };
 
 /** Human-readable label for a monitoring tool call — prefers the real EQL/query
  *  text the agent actually ran, falling back to the tool name. */
@@ -97,6 +101,14 @@ export async function GET(req: NextRequest) {
           },
         });
 
+        // Gate the 10-category checklist against the live schema; surface the
+        // coverage (runnable + skipped) and run only the runnable categories so
+        // monitoring never spends EQL budget on unsupported ones.
+        const capabilities = schemaCapabilities(schema);
+        const coverage = coverageReport(capabilities);
+        const runnable = runnableCategories(capabilities);
+        send({ type: 'coverage', coverage });
+
         const raw = await mcp.listTools();
         const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
           ? (raw as { tools: McpToolDef[] }).tools
@@ -105,7 +117,7 @@ export async function GET(req: NextRequest) {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const agent = new MonitoringAgent(anthropic, mcp, schema, allTools);
 
-        step('scanning the workspace for significant recent changes…');
+        step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
         const anomalies = await agent.scan({
           onToolCall: (tc) => {
             send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'monitoring' });
@@ -123,7 +135,7 @@ export async function GET(req: NextRequest) {
           onText: (t) => {
             if (t.trim()) step(t.trim());
           },
-        });
+        }, runnable);
 
         const insights = anomalies.map(anomalyToInsight);
         putInsights(insights, anomalies);
