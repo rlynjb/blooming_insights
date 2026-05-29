@@ -2,6 +2,7 @@
 
 import type { Diagnosis } from '@/lib/mcp/types';
 import Skeleton from '@/components/shared/Skeleton';
+import GapChart from '@/components/investigation/GapChart';
 import { diagnosisConfidence, hypothesesTested } from '@/lib/insights/derive';
 
 interface EvidencePanelProps {
@@ -146,6 +147,29 @@ export default function EvidencePanel({ diagnosis, loading }: EvidencePanelProps
           {diagnosis.conclusion}
         </p>
       </div>
+
+      {/* "where the gap landed" — daily series when the diagnostic captured it */}
+      {diagnosis.timeSeries && diagnosis.timeSeries.length >= 2 && (
+        <div style={{ marginBottom: 18 }}>
+          <div
+            className="lowercase"
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '0.62rem',
+              letterSpacing: '0.06em',
+              color: 'var(--text-tertiary)',
+              marginBottom: 8,
+            }}
+          >
+            <span>where the gap landed</span>
+            <span>{diagnosis.timeSeries.length}-day window</span>
+          </div>
+          <GapChart data={diagnosis.timeSeries} />
+        </div>
+      )}
 
       {/* hypotheses — always-visible chips; click a row for the reasoning */}
       {diagnosis.hypothesesConsidered.length > 0 && (

@@ -84,6 +84,7 @@ Field rules:
 - `severity` — `"critical"` (>20% on revenue/conversion), `"warning"` (10–20% on a key metric), `"info"` (smaller but notable), `"positive"` (a genuine improvement).
 - `impact` — ONE plain-language sentence on the **business impact**: what this change means for the business and why the user should care. Be specific to this metric and magnitude (translate to revenue/customers/funnel consequences using the `current`/`prior` values where useful), and where it matters note the downstream effect if the trend continues. Do NOT just restate the percentage. ≤ ~40 words.
 - `evidence` — cite the tool calls with the `current` and `prior` values you computed.
+- `history` — OPTIONAL array of ~12 weekly values for this metric (oldest first), for a trend sparkline. Only include it if you have a spare tool call and ran `select count event <metric> by week in last 84 days` (or the sum for revenue). Omit entirely if you used your budget on the windows above — never fabricate it.
 
 If nothing meaningful is found, return `[]`.
 

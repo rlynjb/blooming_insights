@@ -74,7 +74,11 @@ Return ONLY a JSON object (in a ```json fenced block) of exactly this shape:
   "affectedCustomers": {
     "count": 0,
     "segmentDescription": "string — optional; include only if you can quantify affected customers"
-  }
+  },
+  "timeSeries": [
+    { "day": "d-13", "value": 0 },
+    { "day": "today", "value": 51 }
+  ]
 }
 ```
 
@@ -83,6 +87,7 @@ Field rules:
 - `evidence` — one string per data point you actually observed (real query results). Never invent evidence.
 - `hypothesesConsidered` — include all 2–3 hypotheses you tested. `supported: true` means this hypothesis best explains the data.
 - `affectedCustomers` — omit if you could not quantify customer impact.
+- `timeSeries` — OPTIONAL daily values (oldest first, ~14 points) for the anomalous metric, used to chart "where the gap landed". Include only if you ran a `... by day in last 14 days` query and have the real per-day counts (`day` like `d-13`…`today`). Omit entirely otherwise — never fabricate it.
 
 If you cannot determine a cause, return:
 ```json

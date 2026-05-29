@@ -57,6 +57,7 @@ export interface Anomaly {
   severity: Severity;
   evidence: { tool: string; result: unknown }[];
   impact?: string;                          // one-sentence business impact (agent-written)
+  history?: number[];                       // 12 weekly values for the sparkline (agent-emitted)
 }
 
 // Diagnostic agent output (from spec "diagnostic agent" section)

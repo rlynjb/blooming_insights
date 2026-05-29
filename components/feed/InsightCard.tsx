@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import type { Insight } from '@/lib/mcp/types';
 import SeverityBadge from './SeverityBadge';
+import Sparkline from '@/components/shared/Sparkline';
 
 interface InsightCardProps {
   insight: Insight;
@@ -249,6 +250,19 @@ export default function InsightCard({ insight }: InsightCardProps) {
                 )}
               </div>
             ))}
+          </div>
+        )}
+
+        {/* 12-week trend sparkline (when the agent captured a weekly series) */}
+        {insight.history && insight.history.length >= 2 && (
+          <div style={{ margin: '0 0 12px' }}>
+            <div
+              className="lowercase"
+              style={{ fontSize: '0.62rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono), monospace', marginBottom: 4 }}
+            >
+              12-week trend
+            </div>
+            <Sparkline data={insight.history} color={dirColor} width={220} height={32} />
           </div>
         )}
 
