@@ -82,13 +82,13 @@ The cache is a `Map<string, { result: unknown; expiresAt: number }>` on the `Mcp
 └──────────────────────────────────────────────────────────┘
 ```
 
-On a cache check (`lib/mcp/client.ts` L38–L43): if `cached.expiresAt > Date.now()`, return the stored result immediately with `fromCache: true` and `durationMs: 0`. The default TTL is `60_000` ms (60 seconds); callers pass `cacheTtlMs` to override. `skipCache: true` bypasses the read but still writes a fresh entry on success — the `/debug` "force refresh" path relies on this write-through behavior.
+On a cache check (`lib/mcp/client.ts` L105–L110): if `cached.expiresAt > Date.now()`, return the stored result immediately with `fromCache: true` and `durationMs: 0`. The default TTL is `60_000` ms (60 seconds); callers pass `cacheTtlMs` to override. `skipCache: true` bypasses the read but still writes a fresh entry on success — the `/debug` "force refresh" path relies on this write-through behavior.
 
 React Query parallel: this is `staleTime` on a query. Within the stale window, the cached data is returned synchronously without hitting the network.
 
 ### Inter-call spacing (`liveCall`)
 
-`liveCall` (`lib/mcp/client.ts` L69–L77) is the only place the transport is called. Before calling the transport it computes `elapsed = Date.now() - this.lastCallAt` and waits `minIntervalMs - elapsed` milliseconds if the minimum interval has not yet passed.
+`liveCall` (`lib/mcp/client.ts` L148–L163) is the only place the transport is called. Before calling the transport it computes `elapsed = Date.now() - this.lastCallAt` and waits `minIntervalMs - elapsed` milliseconds if the minimum interval has not yet passed.
 
 ```
 time ──────────────────────────────────────────────────────────▶
@@ -109,7 +109,7 @@ time ─────────────────────────
 
 ### Retry on rate-limit
 
-After the first live call, `callTool` checks `isRateLimited(result)` (`lib/mcp/client.ts` L7–L11). `isRateLimited` returns `true` when the result has `isError: true` and its JSON representation matches `/rate limit|too many requests/i`. The retry loop (`lib/mcp/client.ts` L48–L53) re-enters `liveCall` (which itself enforces the spacing gap again) up to `maxRetries` times with `retryDelayMs` sleeps between attempts. Default values: `maxRetries = 3`, `retryDelayMs = 1200` ms.
+After the first live call, `callTool` checks `isRateLimited(result)` (`lib/mcp/client.ts` L18–L22). `isRateLimited` returns `true` when the result has `isError: true` and its JSON representation matches `/rate limit|too many requests/i`. The retry loop (`lib/mcp/client.ts` L121–L132) re-enters `liveCall` (which itself enforces the spacing gap again) up to `maxRetries` times. Each wait honors a window parsed out of the error text (`parseRetryAfterMs`, `lib/mcp/client.ts` L31–L38) when present, else exponential backoff off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), with every wait capped at `retryCeilingMs`. Default values: `maxRetries = 3`, `retryDelayMs = 10_000` ms, `retryCeilingMs = 20_000` ms.
 
 ```
   liveCall → result
@@ -130,7 +130,7 @@ After the first live call, `callTool` checks `isRateLimited(result)` (`lib/mcp/c
 
 ### No-cache-on-error
 
-`lib/mcp/client.ts` L58–L60: when `result.isError === true` the function returns immediately without writing to the cache. This covers all errors, not only rate-limit errors. Caching a 429 for 60 seconds would mean the next 60 seconds of calls return the error from cache without ever retrying the network — the briefing stays broken for a full minute with no way to recover short of a restart. Error results must always be live-retried by the next caller.
+`lib/mcp/client.ts` L137–L139: when `result.isError === true` the function returns immediately without writing to the cache. This covers all errors, not only rate-limit errors. Caching a 429 for 60 seconds would mean the next 60 seconds of calls return the error from cache without ever retrying the network — the briefing stays broken for a full minute with no way to recover short of a restart. Error results must always be live-retried by the next caller.
 
 ### The principle
 
@@ -207,33 +207,38 @@ The spacing gate and the retry loop both live inside the Service layer, so Bloom
 
 | Symbol | File | Lines |
 |---|---|---|
-| `isRateLimited` | `lib/mcp/client.ts` | L7–L11 |
-| `sleep` | `lib/mcp/client.ts` | L13–L15 |
-| `ClientOpts` interface | `lib/mcp/client.ts` | L5 |
-| `McpClient` cache field | `lib/mcp/client.ts` | L18 |
-| `McpClient` constructor | `lib/mcp/client.ts` | L24–L28 |
-| `callTool` — cache check | `lib/mcp/client.ts` | L38–L43 |
-| `callTool` — retry loop | `lib/mcp/client.ts` | L48–L53 |
-| `callTool` — no-cache-on-error | `lib/mcp/client.ts` | L58–L60 |
-| `callTool` — cache write | `lib/mcp/client.ts` | L64–L65 |
-| `liveCall` | `lib/mcp/client.ts` | L69–L77 |
-| `listTools` | `lib/mcp/client.ts` | L83–L85 |
-| `connectMcp` — 1100 ms construction | `lib/mcp/connect.ts` | L56–L58 |
+| `isRateLimited` | `lib/mcp/client.ts` | L18–L22 |
+| `parseRetryAfterMs` | `lib/mcp/client.ts` | L31–L38 |
+| `sleep` | `lib/mcp/client.ts` | L40–L42 |
+| `ClientOpts` interface | `lib/mcp/client.ts` | L5–L12 |
+| `McpClient` cache field | `lib/mcp/client.ts` | L80 |
+| `McpClient` constructor | `lib/mcp/client.ts` | L87–L95 |
+| `callTool` — cache check | `lib/mcp/client.ts` | L105–L110 |
+| `callTool` — retry loop | `lib/mcp/client.ts` | L121–L132 |
+| `callTool` — no-cache-on-error | `lib/mcp/client.ts` | L137–L139 |
+| `callTool` — cache write | `lib/mcp/client.ts` | L143–L144 |
+| `liveCall` | `lib/mcp/client.ts` | L148–L163 |
+| `listTools` | `lib/mcp/client.ts` | L169–L171 |
+| `connectMcp` — 1100 ms construction | `lib/mcp/connect.ts` | L91–L96 |
 
 ### Test coverage (`test/mcp/client.test.ts`)
 
 | Test | Lines | What it exercises |
 |---|---|---|
-| cache miss, `fromCache: false` | L15–L22 | basic transport delegation |
-| cache hit within TTL | L24–L31 | `fromCache: true`, 1 transport call |
-| per-`name+args` keying | L33–L39 | different args → different entries |
-| `skipCache` bypass | L41–L47 | read skip, write-through confirmed |
-| TTL expiry | L49–L58 | `vi.advanceTimersByTime(1001)` |
-| `minIntervalMs` spacing | L60–L78 | 199 ms → still waiting; 200 ms → done |
-| `listTools` delegation | L80–L87 | transport passthrough |
-| no-cache-on-error | L89–L99 | error result not served from cache |
-| retry then succeed | L101–L108 | 2 rate-limit responses, 3rd succeeds |
-| exhaust `maxRetries` | L110–L117 | returns final error after `maxRetries+1` calls |
+| cache miss, `fromCache: false` | L15–L23 | basic transport delegation |
+| cache hit within TTL | L24–L32 | `fromCache: true`, 1 transport call |
+| per-`name+args` keying | L33–L40 | different args → different entries |
+| `skipCache` bypass | L41–L48 | read skip, write-through confirmed |
+| TTL expiry | L49–L59 | `vi.advanceTimersByTime(1001)` |
+| `minIntervalMs` spacing | L60–L79 | 199 ms → still waiting; 200 ms → done |
+| `listTools` delegation | L80–L88 | transport passthrough |
+| no-cache-on-error | L89–L100 | error result not served from cache |
+| retry then succeed | L101–L110 | rate-limit response, then succeeds |
+| parsed retry-after window | L111–L141 | waits the "(1 per 10 second)" window, then caches |
+| explicit "Retry after ~N seconds" hint | L142–L168 | parsed hint preferred over backoff base |
+| exhaust `maxRetries` | L169–L177 | returns final error after `maxRetries+1` calls |
+| wraps transport throw as `McpToolError` | L178–L189 | tagged with tool name + detail |
+| includes thrown `error.cause` in detail | L190–L197 | nested cause surfaced |
 
 ### Pseudocode of `callTool` flow
 
@@ -268,10 +273,10 @@ callTool(name, args, options):
 ### GitHub links
 
 - `lib/mcp/client.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts
-- `callTool` (L30–L67): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L30-L67
-- `liveCall` (L69–L77): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L69-L77
-- `isRateLimited` (L7–L11): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L7-L11
-- `connect.ts` 1100 ms construction (L56–L58): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L56-L58
+- `callTool` (L97–L146): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L97-L146
+- `liveCall` (L148–L163): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L148-L163
+- `isRateLimited` (L18–L22): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L18-L22
+- `connect.ts` 1100 ms construction (L91–L96): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L91-L96
 - `test/mcp/client.test.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/test/mcp/client.test.ts
 
 ---
@@ -284,7 +289,7 @@ callTool(name, args, options):
 
 **Client-side rate limiting / request throttling** enforces a minimum interval between outbound calls at the caller side, before a server-side 429 ever fires. This is different from a token-bucket limiter (which allows short bursts) or a leaky-bucket limiter (which smooths a burst over time). A fixed minimum interval is a strict throttle: at most one call per `minIntervalMs`.
 
-**Retry-with-backoff** is the standard error-recovery pattern for transient failures. Bounded retries prevent infinite loops; a delay between retries gives the remote server time to recover. The variant here uses a fixed `retryDelayMs` rather than exponential backoff; the comment in `connect.ts` L53–L55 marks exponential backoff as a "Phase 2 hardening follow-up."
+**Retry-with-backoff** is the standard error-recovery pattern for transient failures. Bounded retries prevent infinite loops; a delay between retries gives the remote server time to recover. The variant here prefers a wait window parsed out of the Bloomreach error text (`parseRetryAfterMs`, `client.ts` L31–L38) and otherwise uses exponential backoff off `retryDelayMs` capped at `retryCeilingMs`; the rationale is documented in the comment block at `client.ts` L115–L120.
 
 ### The deeper principle
 
@@ -306,7 +311,7 @@ Every call through `McpClient` is a read of Bloomreach analytics data. The same 
 
 2. **Per-process spacing does not coordinate across instances.** `lastCallAt` is an instance field. If two serverless function instances run concurrently — both serving different users or different requests — each instance has its own `lastCallAt`. Both can call Bloomreach simultaneously, sending 2 req/sec even though each instance thinks it is compliant with 1 req/sec. Bloomreach counts requests per user globally; the per-process spacing breaks under horizontal scaling.
 
-3. **`retryDelayMs` is fixed, not exponential.** A single retry storm from multiple callers all sleeping for the same 1200 ms then waking simultaneously still sends a burst. Exponential backoff with jitter is the industry standard for avoiding thundering herd.
+3. **Backoff has no jitter.** Retries use exponential backoff off `retryDelayMs` (or a parsed retry-after window) capped at `retryCeilingMs`, but no random jitter is added. Multiple callers that all receive a 429 at the same instant compute the same wait and wake together — a synchronized burst. Full jitter (`random(0, delay)`) is the industry standard for avoiding the thundering herd.
 
 ### What to explore next
 
@@ -402,7 +407,7 @@ This design is correct and sufficient for one process serving one user at ~1 req
 
 **[senior] When does `callTool` NOT write to the cache, and why?**
 
-When `result.isError === true` (`lib/mcp/client.ts` L58–L60). Any error result — rate limit, bad query, server error — is returned directly without a cache write. Caching an error would cause the next 60 seconds of callers to receive the cached failure without ever retrying the network. The briefing would stay broken for a full minute.
+When `result.isError === true` (`lib/mcp/client.ts` L137–L139). Any error result — rate limit, bad query, server error — is returned directly without a cache write. Caching an error would cause the next 60 seconds of callers to receive the cached failure without ever retrying the network. The briefing would stay broken for a full minute.
 
 ```
   result arrives
@@ -433,7 +438,7 @@ The fix: a shared distributed limiter (Upstash sliding window, Redis `SET NX PX`
 
 Honest answer: it is the simplest thing that works for one process. A token bucket allows a burst of accumulated credit; a fixed interval never does. For a single serverless function handling one user at a time, a token bucket and a fixed delay are functionally identical — the user never accumulates credit because calls arrive spread across a briefing run, not in bursts.
 
-The trade-off is that a token bucket (`Bottleneck`, `p-throttle`) handles bursty patterns better without violating the rate limit, at the cost of a dependency and more configuration. The comment in `connect.ts` L53–L55 explicitly marks this as a "Phase 2 hardening follow-up."
+The trade-off is that a token bucket (`Bottleneck`, `p-throttle`) handles bursty patterns better without violating the rate limit, at the cost of a dependency and more configuration. The comment block in `connect.ts` L81–L88 explicitly explains why proactive spacing stays at ~1.1 s instead of the full observed 10 s window.
 
 ```
   Fixed delay (current):
@@ -452,11 +457,11 @@ Both respect the average rate limit. The token bucket is better under load varia
 
 ### Anchors
 
-- `lib/mcp/client.ts` L69–L77 — `liveCall`, the spacing gate
-- `lib/mcp/client.ts` L48–L53 — retry loop
-- `lib/mcp/client.ts` L58–L60 — no-cache-on-error guard
-- `lib/mcp/connect.ts` L56–L58 — `minIntervalMs: 1100` with rate-limit comment
-- `test/mcp/client.test.ts` L60–L78, L89–L99, L101–L108 — spacing, no-cache-error, retry tests
+- `lib/mcp/client.ts` L148–L163 — `liveCall`, the spacing gate
+- `lib/mcp/client.ts` L121–L132 — retry loop
+- `lib/mcp/client.ts` L137–L139 — no-cache-on-error guard
+- `lib/mcp/connect.ts` L91–L96 — `minIntervalMs: 1100` (and `retryDelayMs`/`retryCeilingMs`) with rate-limit comment
+- `test/mcp/client.test.ts` L60–L79, L89–L100, L101–L110 — spacing, no-cache-error, retry tests
 
 ---
 
@@ -468,15 +473,15 @@ Without looking at the code, write out the four stages every `callTool` call pas
 
 ### Level 2 — explain
 
-Open `lib/mcp/client.ts`. Explain what `skipCache: true` does on both the read path (L38–L43) and the write path (L64–L65). Why does a `skipCache` call still write to the cache? Which use-case does this serve?
+Open `lib/mcp/client.ts`. Explain what `skipCache: true` does on both the read path (L105–L110) and the write path (L143–L144). Why does a `skipCache` call still write to the cache? Which use-case does this serve?
 
 ### Level 3 — apply
 
 Scenario: two briefings run in the same process at the same time. User A's briefing calls `callTool("search_content", { eql: "top keywords" })`. One millisecond later, User B's briefing calls `callTool("search_content", { eql: "top keywords" })`.
 
-- Does User B get a cache hit? Why or why not? (Cite `lib/mcp/client.ts` L18 — is the cache shared or per-instance?)
-- Does the 1100 ms spacing still protect Bloomreach? If User A and User B share the same `McpClient` instance, yes. If they have separate instances (one per `connectMcp` call), cite `lib/mcp/connect.ts` L40–L58 to show each call to `connectMcp` creates a new `McpClient`. What does that mean for the spacing guarantee?
-- Now extend the scenario: two serverless function instances each handle one of these briefings. Does the 1100 ms spacing protect Bloomreach? Cite `lib/mcp/client.ts` L19 (`private lastCallAt = 0`) and explain why.
+- Does User B get a cache hit? Why or why not? (Cite `lib/mcp/client.ts` L80 — is the cache shared or per-instance?)
+- Does the 1100 ms spacing still protect Bloomreach? If User A and User B share the same `McpClient` instance, yes. If they have separate instances (one per `connectMcp` call), cite `lib/mcp/connect.ts` L91–L96 to show each call to `connectMcp` creates a new `McpClient`. What does that mean for the spacing guarantee?
+- Now extend the scenario: two serverless function instances each handle one of these briefings. Does the 1100 ms spacing protect Bloomreach? Cite `lib/mcp/client.ts` L81 (`private lastCallAt = 0`) and explain why.
 
 ### Level 4 — defend
 
@@ -484,7 +489,10 @@ A colleague argues: "We should remove the in-memory cache because it makes debug
 
 ### Quick check
 
-- What does `isRateLimited` test for? (Name the two conditions — `lib/mcp/client.ts` L8–L10.)
+- What does `isRateLimited` test for? (Name the two conditions — `lib/mcp/client.ts` L19–L21.)
 - What is the default TTL? (Cite the line.)
 - How many total transport calls does `maxRetries: 2` allow? (Initial call + 2 retries = 3.)
-- Does `listTools` use the cache? (Cite `lib/mcp/client.ts` L83–L85 and explain why not.)
+- Does `listTools` use the cache? (Cite `lib/mcp/client.ts` L169–L171 and explain why not.)
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers; retry now uses a parsed retry-after window / exponential backoff (default `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)

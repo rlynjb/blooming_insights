@@ -227,15 +227,15 @@ The Map is the single shared store for the `McpClient` instance. Every `callTool
 
 **File:** `lib/mcp/client.ts`
 **Function / class:** `McpClient.callTool`
-**Line range:** L18 (cache field), L35–L43 (cache read), L58–L66 (cache write)
+**Line range:** L80 (cache field), L102–L110 (cache read), L137–L144 (cache write)
 
-Cache field declaration (L18):
+Cache field declaration (L80):
 
 ```ts
 private cache = new Map<string, { result: unknown; expiresAt: number }>();
 ```
 
-Cache read — hit path (L35–L43):
+Cache read — hit path (L102–L110):
 
 ```ts
 const cacheKey = `${name}:${JSON.stringify(args)}`;
@@ -249,7 +249,7 @@ if (!options.skipCache) {
 }
 ```
 
-Cache write — success guard (L58–L66):
+Cache write — success guard (L137–L144):
 
 ```ts
 if ((result as any)?.isError === true) {
@@ -261,7 +261,7 @@ this.cache.set(cacheKey, { result, expiresAt: now + ttl });
 return { result: result as T, durationMs, fromCache: false };
 ```
 
-GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L35-L66
+GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L102-L144
 
 ---
 
@@ -438,11 +438,11 @@ The fix is to replace the native `Map` with an LRU-capped structure (e.g., `lru-
 
 **Anchors (cite these in your answer)**
 
-- `lib/mcp/client.ts` L18: the `cache` field type.
-- `lib/mcp/client.ts` L35–36: key construction and TTL default.
-- `lib/mcp/client.ts` L39–42: the expiry check and hit return.
-- `lib/mcp/client.ts` L58–60: the `isError` guard that prevents poisoning.
-- `lib/mcp/client.ts` L64–65: the write with `expiresAt`.
+- `lib/mcp/client.ts` L80: the `cache` field type.
+- `lib/mcp/client.ts` L102–103: key construction and TTL default.
+- `lib/mcp/client.ts` L107–108: the expiry check and hit return.
+- `lib/mcp/client.ts` L137–139: the `isError` guard that prevents poisoning.
+- `lib/mcp/client.ts` L143–144: the write with `expiresAt`.
 
 ---
 
@@ -450,7 +450,7 @@ The fix is to replace the native `Map` with an LRU-capped structure (e.g., `lru-
 
 ### Level 1 — Reconstruct
 
-Without looking at the code, write the `callTool` cache logic from scratch: build the key, check the entry, return on hit, call live on miss, guard the write. Then compare to `lib/mcp/client.ts` L35–66. Every variable name and comparison operator should match.
+Without looking at the code, write the `callTool` cache logic from scratch: build the key, check the entry, return on hit, call live on miss, guard the write. Then compare to `lib/mcp/client.ts` L102–144. Every variable name and comparison operator should match.
 
 ### Level 2 — Explain
 
@@ -458,7 +458,7 @@ Walk through what happens when `callTool("search", {q:"react"})` is called three
 
 ### Level 3 — Apply
 
-**Scenario:** Two callers pass the same logical arguments to `callTool` but in different key order — caller A uses `{q:"react", limit:10}` and caller B uses `{limit:10, q:"react"}`. Do they share one cache entry or produce two? What does `JSON.stringify` produce for each? Now suppose the live call for caller A returns `{isError: true}`. Is any entry written to the cache? What does caller B observe on its next call? Cite `lib/mcp/client.ts` L35 (key construction) and L58–60 (error guard) in your answer.
+**Scenario:** Two callers pass the same logical arguments to `callTool` but in different key order — caller A uses `{q:"react", limit:10}` and caller B uses `{limit:10, q:"react"}`. Do they share one cache entry or produce two? What does `JSON.stringify` produce for each? Now suppose the live call for caller A returns `{isError: true}`. Is any entry written to the cache? What does caller B observe on its next call? Cite `lib/mcp/client.ts` L102 (key construction) and L137–139 (error guard) in your answer.
 
 ### Level 4 — Defend
 
@@ -466,8 +466,11 @@ Your tech lead says: "Expired entries stay in the Map forever — this leaks mem
 
 ### Quick check
 
-- What is the default TTL in milliseconds, and which line sets it? `lib/mcp/client.ts` L__.
+- What is the default TTL in milliseconds, and which line sets it? `lib/mcp/client.ts` L103.
 - What does `fromCache: true` imply about `durationMs`?
 - Why does `skipCache: true` still perform a cache write?
 - Name one scenario where two logically identical calls produce different cache keys.
 - What is the space complexity of the current implementation?
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers

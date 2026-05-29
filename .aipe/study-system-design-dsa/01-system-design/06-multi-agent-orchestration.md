@@ -15,7 +15,7 @@ You have called an API in a `while` loop before: fetch a paginated list, check i
 
 The question this file answers is: how does an LLM agent run a bounded tool-use loop and reliably end with structured JSON a downstream function can parse?
 
-**The stakes are concrete.** Without a turn budget the agent runs until the `maxDuration = 60` route limit kills the request mid-stream; the client receives a truncated NDJSON stream and the UI never gets a `done` event. Without a forced synthesis turn the loop exhausts its budget and returns `finalText: ''` — `tryParseDiagnosis('')` returns `null`, `synthesize()` is the last line of defense, but if the tool calls themselves contained nothing useful, the investigation ends with `FALLBACK: { conclusion: 'Insufficient data…', evidence: [] }` and the recommendation step has nothing actionable to build on.
+**The stakes are concrete.** Without a turn budget the agent runs until the `maxDuration = 300` route limit kills the request mid-stream; the client receives a truncated NDJSON stream and the UI never gets a `done` event. Without a forced synthesis turn the loop exhausts its budget and returns `finalText: ''` — `tryParseDiagnosis('')` returns `null`, `synthesize()` is the last line of defense, but if the tool calls themselves contained nothing useful, the investigation ends with `FALLBACK: { conclusion: 'Insufficient data…', evidence: [] }` and the recommendation step has nothing actionable to build on.
 
 Before the budget + synthesis pass:
 - `finalText` is empty or mid-thought prose when the budget ran out
@@ -140,13 +140,15 @@ The model sometimes emits partial JSON, reasoning prose, or a hybrid on the `for
 
 `DiagnosticAgent.synthesize()` (L82–L121 of `diagnostic.ts`) is a completely separate `anthropic.messages.create` call — not part of `runAgentLoop`. It takes the `toolCalls` array (the complete log), formats each as `Query N: toolName args\nResult: payload`, and sends a single-turn prompt to the model with the instruction to emit ONLY the structured JSON. There is no conversation history from the loop — no tool definitions, no accumulated messages. The model sees the gathered evidence as plain text and is asked for exactly one thing.
 
-The fallback chain in `DiagnosticAgent.investigate` (L73–L77) is:
+The fallback chain in `DiagnosticAgent.investigate` (L74–L75) is:
 
 ```
 tryParseDiagnosis(finalText)   ← loop produced valid JSON?
   ?? (await this.synthesize(anomaly, toolCalls))  ← dedicated call
   ?? FALLBACK                  ← { conclusion: 'Insufficient data…', evidence: [] }
 ```
+
+After the chain resolves a `Diagnosis`, the agent **derives a confidence** before returning (L80–L82): `diagnosisConfidence(diag)` (`lib/insights/derive.ts` L54–L63) reads `hypothesesConsidered` — `'high'` when at least one hypothesis is supported AND every hypothesis was tested, `'medium'` when at least one is supported, `'low'` otherwise. It then downgrades a `'high'` to `'medium'` if any tool call errored (`toolCalls.some((tc) => tc.error)`, L81) so the surfaced confidence reflects the data actually gathered (rate-limited queries shouldn't read as high confidence).
 
 `RecommendationAgent.propose` (L69–L71 of `recommendation.ts`) uses the same chain:
 
@@ -155,7 +157,7 @@ tryParseRecommendations(finalText)
   ?? (await this.synthesize(anomaly, diagnosis, toolCalls))
 ```
 
-with `[]` as the final fallback (L73). This is a three-tier reliability guarantee: the loop's nudged final turn, the dedicated synthesis call, and the safe empty-array fallback.
+with `[]` as the final fallback (L73). This is a three-tier reliability guarantee: the loop's nudged final turn, the dedicated synthesis call, and the safe empty-array fallback. The recommendation shape the agent emits is now richer than `{ title, rationale, steps }`: each recommendation also carries `effort` (`'low'|'medium'|'high'`), `timeToSetUpMinutes`, `readResultInDays`, `prerequisites` (`{ label, satisfied }[]`), `successMetric`, and an `estimatedImpact` with a dollar `rangeUsd: { low, high }` computed from affected-customer count × AOV × a reactivation % range (the synthesis prompt spells this out at `recommendation.ts` L109–L119).
 
 The reason for a dedicated call rather than extending the loop is that the loop's message history contains partial reasoning and tool_use/tool_result pairs. The model "knows" it was in investigation mode and tends to continue that mode. A fresh single-turn call with no prior context and no tool definitions breaks the mode — the model sees only evidence + instruction and reliably produces JSON.
 
@@ -177,7 +179,7 @@ DiagnosticAgent.investigate()
   system = diagnostic.md + schema + anomaly JSON
   tools  = diagnosticTools subset
   budget = maxTurns:8, maxToolCalls:6
-  valid  = isDiagnosis → return
+  valid  = isDiagnosis → derive confidence → return
   fallback chain: tryParse ?? synthesize() ?? FALLBACK
 
 RecommendationAgent.propose()
@@ -185,6 +187,9 @@ RecommendationAgent.propose()
   tools  = recommendationTools subset
   budget = maxTurns:6, maxToolCalls:4
   valid  = isRecommendationArray → assign ids → slice(0,3)
+  emits  = title, rationale, bloomreachFeature, steps,
+           effort, timeToSetUpMinutes, readResultInDays,
+           prerequisites, successMetric, estimatedImpact(rangeUsd)
   fallback chain: tryParse ?? synthesize() ?? []
 
 QueryAgent.answer()
@@ -198,26 +203,62 @@ All four share the same `runAgentLoop` with no special-casing inside the loop it
 
 ---
 
-### The route orchestration
+### The route orchestration — two steps, not one run
 
-`app/api/agent/route.ts` (L52–L177) is the controller that runs the diagnostic→recommendation sequence and streams each agent's reasoning as NDJSON events.
+`app/api/agent/route.ts` (L112–L268) is the controller. The investigation is no longer one combined diagnostic→recommendation run; it is **two separate requests**, keyed by a `step` query param (`'diagnose' | 'recommend' | null`, parsed at L117–L118). Each request runs exactly one agent and streams its reasoning as NDJSON. The `null` step is the legacy *combined* run, kept only for the dev demo-capture path (it runs both agents and `saveInvestigation`s the snapshot, L254).
 
-The orchestration sequence (L133–L162):
+The orchestration body (L196–L254, inside the stream):
 
 ```
+send(reasoning_step 'reading the workspace schema…')   ← bootstrap inside stream
+schema = await bootstrapSchema(conn.mcp)               (L201–L202)
+
 if (q && !insightId)
-  └── QueryAgent.answer()           ← free-form query, single agent
+  └── QueryAgent.answer()              ← free-form query, single agent
       send({ type:'done' })
 
-if (insightId)
-  └── DiagnosticAgent.investigate() ← runs runAgentLoop internally
-      send({ type:'diagnosis', diagnosis })
-      └── RecommendationAgent.propose(inv, diagnosis)
-          for each r: send({ type:'recommendation', recommendation:r })
-          send({ type:'done' })
+else  // investigation
+  ├── if (step === 'recommend')        ← STEP 3
+  │     diagnosis = parseDiagnosis(diagnosisParam)   ← handed over from step 2
+  │     if (!diagnosis) throw 'no diagnosis was handed over'   (L228–229)
+  │
+  └── else                             ← STEP 2 (diagnose) or combined
+        DiagnosticAgent.investigate()  ← runs runAgentLoop internally
+        send({ type:'diagnosis', diagnosis })          (L231–239)
+
+  if (step !== 'diagnose')             ← STEP 3 or combined
+    RecommendationAgent.propose(inv, diagnosis!)       (L244–248)
+    for each r: send({ type:'recommendation', recommendation:r })
+
+  send({ type:'done' })
+  if (step == null) saveInvestigation(insightId!, collected)   ← combined run only
 ```
 
-The diagnosis result is passed directly into `propose()` — the route is the only place that sequences agents, and it does so with plain sequential `await` calls, not a framework or graph. The `hooksFor(agent)` factory (L117–L132) wires each agent's `onText`, `onToolCall`, and `onToolResult` callbacks to `send()` calls that push NDJSON events to the client with the agent name attached — so the UI knows whether a `reasoning_step` came from the diagnostic or recommendation agent.
+The key structural change: on `step === 'diagnose'` the recommendation agent is **never reached** (the `if (step !== 'diagnose')` guard at L244 skips it) — the decision is not run yet. On `step === 'recommend'` the diagnostic agent is **never reached**; instead the diagnosis arrives as a `&diagnosis=` query param (`parseDiagnosis`, L86–L97, L227) handed over from step 2.
+
+The handoff lives client-side in `lib/hooks/useInvestigation.ts`. Step 2 (`/investigate/[id]` → `useInvestigation(id, 'diagnose')`) writes the diagnosis to `sessionStorage` under `bi:diag:<id>` when it sees the `done` event (L138–L140). Step 3 (`/investigate/[id]/recommend` → `useInvestigation(id, 'recommend')`) reads it back (L72–L84) and, in live mode, appends it to the request URL as `&diagnosis=` (L162–L164). Each step also stashes its own result under `bi:inv:<step>:<id>` (L130–L136) so re-visits and back-nav hydrate instantly (L50–L60) without re-running the agents.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Two-request investigation + diagnosis handoff                            │
+│                                                                            │
+│  STEP 2  /investigate/[id]                                                │
+│  useInvestigation(id,'diagnose') → GET /api/agent?...&step=diagnose       │
+│        └── DiagnosticAgent.investigate()  (recommendation NOT run)        │
+│        on done: stash bi:inv:diagnose:<id>                                │
+│                 + hand off bi:diag:<id> = { diagnosis }   ◀──┐            │
+│                                                              │ sessionStorage│
+│  STEP 3  /investigate/[id]/recommend                         │            │
+│  useInvestigation(id,'recommend') ── reads bi:diag:<id> ─────┘            │
+│        → GET /api/agent?...&step=recommend&diagnosis=<json>  (live mode)  │
+│        └── RecommendationAgent.propose(inv, diagnosis)  (diagnostic NOT run)│
+│        on done: stash bi:inv:recommend:<id>                               │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The route still sequences agents with plain `await`, not a framework or graph — but the sequencing is now split across two HTTP requests with the diagnosis carried between them by the client. The `hooksFor(agent)` factory (L181–L195) wires each agent's `onText`, `onToolCall`, and `onToolResult` callbacks to `send()` calls that push NDJSON events to the client with the agent name attached — so the UI knows whether a `reasoning_step` came from the diagnostic or recommendation agent.
+
+In demo (cached) mode there is no live agent at all: the route replays the combined snapshot through `filterByStep(cached, step)` (`route.ts` L66–L84, L129) to show only the requested step's events — see 05-streaming-ndjson.md.
 
 ---
 
@@ -233,15 +274,18 @@ The diagram below shows the full service layer. `runAgentLoop` sits at the cente
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Route layer   app/api/agent/route.ts                               │
+│  Route layer   app/api/agent/route.ts  (?step=diagnose|recommend|∅) │
 │                                                                     │
-│  GET /api/agent                                                     │
-│  ├── free-form q: QueryAgent.answer()                               │
-│  └── insightId : DiagnosticAgent.investigate()                      │
-│                   └── RecommendationAgent.propose(diagnosis)        │
+│  GET /api/agent  → bootstrap inside stream → branch on step:        │
+│  ├── free-form q       : QueryAgent.answer()                        │
+│  ├── step=diagnose     : DiagnosticAgent.investigate()  (rec NOT run)│
+│  │                        send(diagnosis) → client stashes bi:diag  │
+│  ├── step=recommend    : RecommendationAgent.propose(handed diagnosis)│
+│  │                        (diagnostic NOT run; diagnosis via &diagnosis=)│
+│  └── step=∅ (combined) : both agents + saveInvestigation (demo only)│
 │  hooksFor(agent) → NDJSON stream to client                          │
 └──────────────────────────┬──────────────────────────────────────────┘
-                           │ await (sequential)
+                           │ await (sequential, one agent per request)
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │  Agent layer   lib/agents/                                          │
 │                                                                     │
@@ -268,13 +312,14 @@ The diagram below shows the full service layer. `runAgentLoop` sits at the cente
 │                └───────────────────────┘                           │
 │                            │                                        │
 │  Synthesis/validation step (per agent):                             │
-│  tryParse(finalText) ──── valid? ──→ return typed output            │
-│       │ null                                                        │
-│       ▼                                                             │
-│  synthesize(toolCalls) ── valid? ──→ return typed output            │
-│       │ null                                                        │
-│       ▼                                                             │
-│  FALLBACK / []                                                      │
+│  tryParse(finalText) ──── valid? ──→ typed output ──┐               │
+│       │ null                                        │               │
+│       ▼                                             ▼               │
+│  synthesize(toolCalls) ── valid? ──→ typed output → diagnostic:     │
+│       │ null                          diagnosisConfidence(diag),    │
+│       ▼                               downgrade high→med if errors  │
+│  FALLBACK / []                        recommendation: assign ids,   │
+│                                       slice(0,3)                    │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │ callTool()
 ┌──────────────────────────▼──────────────────────────────────────────┐
@@ -297,14 +342,25 @@ Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation
 |------|----------|-------|------|
 | `lib/agents/base.ts` | `runAgentLoop` | L48–L176 | The shared loop: turn iteration, forceFinal logic, tool execution, message accumulation |
 | `lib/agents/base.ts` | `AGENT_MODEL` | L9 | `'claude-sonnet-4-6'` — single constant used by all agents and the synthesize calls |
-| `lib/agents/diagnostic.ts` | `DiagnosticAgent.investigate` | L44–L78 | Calls `runAgentLoop`, then the fallback chain |
-| `lib/agents/diagnostic.ts` | `DiagnosticAgent.synthesize` | L82–L121 | Dedicated tool-less synthesis call; formats `toolCalls` as evidence text |
-| `lib/agents/diagnostic.ts` | `FALLBACK` | L15–L19 | Last-resort `Diagnosis` with empty evidence |
+| `lib/agents/diagnostic.ts` | `DiagnosticAgent.investigate` | L45–L83 | Calls `runAgentLoop`, the fallback chain, then derives `confidence` |
+| `lib/agents/diagnostic.ts` | confidence derivation | L80–L82 | `diagnosisConfidence(diag)`; downgrade high→medium if any tool call errored |
+| `lib/insights/derive.ts` | `diagnosisConfidence` | L54–L63 | high/medium/low from supported & tested hypotheses |
+| `lib/agents/diagnostic.ts` | `DiagnosticAgent.synthesize` | L87–L126 | Dedicated tool-less synthesis call; formats `toolCalls` as evidence text |
+| `lib/agents/diagnostic.ts` | `FALLBACK` | L16–L20 | Last-resort `Diagnosis` with empty evidence |
 | `lib/agents/recommendation.ts` | `RecommendationAgent.propose` | L36–L77 | Same loop + fallback chain pattern; assigns `id`s after validation |
-| `lib/agents/recommendation.ts` | `RecommendationAgent.synthesize` | L82–L127 | Same as diagnostic synthesize, includes diagnosis in prompt |
-| `lib/agents/monitoring.ts` | `MonitoringAgent.scan` | L60–L93 | Calls `runAgentLoop`; degrades to `[]` on any parse failure |
-| `app/api/agent/route.ts` | `GET` | L52–L177 | Route orchestration: diagnostic → recommendation, NDJSON streaming |
-| `app/api/agent/route.ts` | `hooksFor` | L117–L132 | Wires `onText`/`onToolCall`/`onToolResult` to `send()` per agent |
+| `lib/agents/recommendation.ts` | `RecommendationAgent.synthesize` | L82–L132 | Same as diagnostic synthesize; emits effort/time/prereqs/successMetric/rangeUsd |
+| `lib/agents/monitoring.ts` | `MonitoringAgent.scan` | L68–L103 | Calls `runAgentLoop`; degrades to `[]` on any parse failure |
+| `app/api/agent/route.ts` | `maxDuration = 300` | L20 | Vercel Pro ceiling; the step-split keeps each request well under it |
+| `app/api/agent/route.ts` | `step` query param | L117–L118 | `'diagnose' \| 'recommend' \| null`; selects which agent runs |
+| `app/api/agent/route.ts` | `GET` (stream + orchestration) | L112–L268 | Bootstrap inside stream → branch on step → one agent per request |
+| `app/api/agent/route.ts` | step-split run (diagnose / recommend / combined) | L220–L254 | `step==='recommend'` parses handed diagnosis; `step!=='diagnose'` runs propose |
+| `app/api/agent/route.ts` | `parseDiagnosis` (handoff in) | L86–L97 | Parses the `&diagnosis=` query param for step 3 |
+| `app/api/agent/route.ts` | `hooksFor` | L181–L195 | Wires `onText`/`onToolCall`/`onToolResult` to `send()` per agent |
+| `lib/hooks/useInvestigation.ts` | step orchestration + diagnosis handoff | L37–L213 | Runs one step; stashes `bi:inv:<step>:<id>`; hands off `bi:diag:<id>` |
+| `lib/hooks/useInvestigation.ts` | `done` → stash + handoff | L130–L144 | Writes step result; writes `bi:diag:<id>` on diagnose |
+| `lib/hooks/useInvestigation.ts` | read handoff + `&diagnosis=` | L72–L84, L162–L164 | Step 3 reads diagnosis, appends to URL in live mode |
+| `app/investigate/[id]/page.tsx` | step 2 | L38 | `useInvestigation(id, 'diagnose')` |
+| `app/investigate/[id]/recommend/page.tsx` | step 3 | L36 | `useInvestigation(id, 'recommend')` |
 
 **Pseudocode: the loop core** (`lib/agents/base.ts` L85–L175):
 
@@ -334,14 +390,17 @@ for (let turn = 0; turn < maxTurns; turn++) {
 return { finalText: '', toolCalls };  // maxTurns exhausted            // L175
 ```
 
-**Pseudocode: the fallback chain** (`lib/agents/diagnostic.ts` L73–L77):
+**Pseudocode: the fallback chain + confidence derivation** (`lib/agents/diagnostic.ts` L74–L82):
 
 ```typescript
-return (
-  tryParseDiagnosis(finalText)              // L74
+const diag =
+  tryParseDiagnosis(finalText)                    // L74
   ?? (await this.synthesize(anomaly, toolCalls))  // L75
-  ?? FALLBACK                               // L76
-);
+  ?? FALLBACK;                                    // L75
+
+const confidence = diagnosisConfidence(diag);     // L80 — derive.ts L54–L63
+const hadErrors = toolCalls.some((tc) => tc.error);                 // L81
+return { ...diag, confidence: confidence === 'high' && hadErrors ? 'medium' : confidence };  // L82
 ```
 
 **GitHub links:**
@@ -349,6 +408,8 @@ return (
 - `lib/agents/diagnostic.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/diagnostic.ts
 - `lib/agents/recommendation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/recommendation.ts
 - `lib/agents/monitoring.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts
+- `lib/insights/derive.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts
+- `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts
 - `app/api/agent/route.ts`: https://github.com/rlynjb/blooming_insights/blob/main/app/api/agent/route.ts
 
 ---
@@ -381,7 +442,7 @@ The loop runs in exploration mode. `synthesize()` runs in synthesis mode. Keepin
 
 **Deep multi-step chains.** A 2-step diagnose→recommend chain works well with sequential `await`. A 5-step chain with branching (e.g., diagnose → split on hypothesis → two parallel sub-investigations → merge → recommend) breaks this pattern. Sequential `await` cannot express branching, and the combined latency compounds per step.
 
-**Cost and latency compound.** Each agent runs up to `maxToolCalls` round-trips plus one `synthesize()` call. With 3 agents in sequence at `maxToolCalls: 6` each, plus the route's own overhead, you approach the `maxDuration: 60` ceiling on a slow connection. Adding a fourth agent in sequence is risky without reducing per-agent budgets.
+**Cost and latency compound.** Each agent runs up to `maxToolCalls` round-trips plus one `synthesize()` call. The investigation is split so each request runs one agent under the `maxDuration: 300` ceiling; collapsing back to a combined run (the `step=null` demo-capture path) runs both agents (~100–115s) and would not fit Hobby's 60s. Stacking more agents into a single request is risky without reducing per-agent budgets.
 
 **No inter-agent memory beyond the route.** Agents share data only through the route's `await` chain (`diagnosis` is passed to `propose()`). There is no shared context store, no vector memory, no cross-agent message history. If two agents need to discuss a finding, the route has to explicitly pass that finding as a constructor argument or prompt variable.
 
@@ -407,7 +468,7 @@ The loop runs in exploration mode. `synthesize()` runs in synthesis mode. Keepin
 
 **What this approach gave up.** Each diagnostic or recommendation agent that fails `tryParse` pays an extra synthesis call: one additional `anthropic.messages.create` with up to 2048 tokens. In a run where the loop's `forceFinal` turn produces valid JSON, `synthesize()` is never called and the cost is zero. In the worst case (loop fails, synthesize succeeds) you pay ~2× tokens for that agent. That is the price of reliability.
 
-**What the alternatives cost.** Without a budget, the loop runs until the 60-second `maxDuration` kills the request. The client receives a partial NDJSON stream — some tool-call events but no `diagnosis` or `done` event — and the UI hangs. Without `synthesize()`, any run where the `forceFinal` turn produces prose instead of JSON silently degrades to `FALLBACK`, which means the recommendation step receives a hollow diagnosis and returns `[]`. The user sees "Insufficient data" even though the agent ran 6 successful queries and has evidence.
+**What the alternatives cost.** Without a budget, the loop runs until the `maxDuration = 300` cap kills the request. The client receives a partial NDJSON stream — some tool-call events but no `diagnosis` or `done` event — and the UI hangs. Without `synthesize()`, any run where the `forceFinal` turn produces prose instead of JSON silently degrades to `FALLBACK`, which means the recommendation step (step 3) receives a hollow handed-over diagnosis and returns `[]`. The user sees "Insufficient data" even though the agent ran 6 successful queries and has evidence.
 
 **The breakpoint.** The sequential `await` orchestration in the route is fine for a 2-step diagnose→recommend chain. It becomes a liability when chains get deep (>3 steps) or need to branch — for example, running two diagnostic hypotheses in parallel or conditionally skipping the recommendation step if the diagnosis confidence is `low`. At that point the route's `if/await/if/await` structure becomes a hand-rolled state machine and should be replaced with a proper agent graph (LangGraph or equivalent).
 
@@ -449,13 +510,13 @@ The `synthesize()` method is an instance of the "extract from evidence" pattern 
 
 ## Summary
 
-`runAgentLoop` is a shared `while` loop that drives a multi-turn Claude conversation: ask the model, execute any tool calls, feed results back, repeat until no more tool calls or budget exhausted. On the forced-final turn, tools are withheld and a `synthesisInstruction` is appended to the system prompt, compelling the model to emit its structured answer. If the loop's final text still does not parse, a dedicated tool-less `synthesize()` call receives the gathered evidence and requests only the JSON. Four specialist agents (monitoring, diagnostic, recommendation, query) each call `runAgentLoop` with their own prompt and tool subset; the route sequences diagnostic → recommendation and streams each agent's reasoning as NDJSON.
+`runAgentLoop` is a shared `while` loop that drives a multi-turn Claude conversation: ask the model, execute any tool calls, feed results back, repeat until no more tool calls or budget exhausted. On the forced-final turn, tools are withheld and a `synthesisInstruction` is appended to the system prompt, compelling the model to emit its structured answer. If the loop's final text still does not parse, a dedicated tool-less `synthesize()` call receives the gathered evidence and requests only the JSON. The diagnostic agent then derives a `confidence` from its hypotheses (downgraded to `medium` if any tool call errored); the recommendation agent emits richer per-recommendation fields (effort, time-to-set-up, prerequisites, success metric, dollar-range impact). Four specialist agents (monitoring, diagnostic, recommendation, query) each call `runAgentLoop` with their own prompt and tool subset. The investigation is now **two requests**: step 2 (`step=diagnose`) runs only the diagnostic agent, step 3 (`step=recommend`) runs only the recommendation agent with the diagnosis handed over from step 2 via `sessionStorage`. Each step streams its agent's reasoning as NDJSON.
 
 Key takeaways:
 - `forceFinal` (L91 of `base.ts`) is the mechanism that converts an exploration loop into a synthesis step — it is the equivalent of removing the "next page" parameter so the loop must stop (`2. Request-response flow`)
-- without `maxToolCalls`, the loop runs to the `maxDuration: 60` route limit; the client receives a truncated stream and no `done` event (`5. Failure handling`)
+- without `maxToolCalls`, the loop runs to the `maxDuration = 300` route limit; the client receives a truncated stream and no `done` event (`5. Failure handling`)
 - the fallback chain `tryParse ?? synthesize() ?? FALLBACK` is a three-tier reliability guarantee; each tier handles a different failure mode; the `FALLBACK` ensures the route always emits a valid `diagnosis` event (`5. Failure handling`)
-- cost and latency compound per agent in the sequential chain; the 60-second route budget is the hard ceiling (`6. Scale concerns`)
+- cost and latency compound per agent; splitting into two requests (`step=diagnose`, `step=recommend`) keeps each one under the `maxDuration = 300` ceiling (`6. Scale concerns`)
 - the `synthesize()` call is justified by the failure mode it prevents — a hollow `FALLBACK` diagnosis that produces zero recommendations — not by speculative quality improvements (`6. Scale concerns`)
 - four agents share one loop because the loop is domain-agnostic; domain logic lives in the prompts, tool subsets, and validators, not in the loop itself (`2. Request-response flow`)
 
@@ -510,23 +571,23 @@ Loop context (exploration mode)       Synthesize context (synthesis mode)
 
 **[arch] "This is a 2-agent sequential chain. How would you extend it to a branching graph?"**
 
-With sequential `await`, branching requires `if/else` in the route. For a 3-way branch (e.g., low-confidence diagnosis → re-investigate with a different tool subset, medium → skip recommendation, high → proceed) the route becomes a hand-rolled state machine. At that point, replace the route's control flow with LangGraph: define nodes for each agent and conditional edges based on typed state (e.g., `diagnosis.confidence`). LangGraph handles the branching, provides checkpoints for debugging mid-graph failures, and can parallelize independent branches. The agents themselves (`runAgentLoop` calls) do not change — only the orchestration layer changes.
+Today the two steps are sequenced across two HTTP requests, with the diagnosis handed between them by the client (`sessionStorage`). Branching would require `if/else` either in the route or in the client. The hook gives us a head start: the diagnostic agent already derives `diagnosis.confidence` (`high`/`medium`/`low`), so a real branch is available — e.g., low-confidence diagnosis → re-investigate with a different tool subset, medium → skip recommendation, high → proceed. Expressed in `if/else` this becomes a hand-rolled state machine spread across route + client. At that point, replace the control flow with LangGraph: define nodes for each agent and conditional edges based on typed state (`diagnosis.confidence`). LangGraph handles the branching, provides checkpoints for debugging mid-graph failures, and can parallelize independent branches. The agents themselves (`runAgentLoop` calls) do not change — only the orchestration layer changes.
 
 ```
-Current (sequential await):           LangGraph equivalent:
-────────────────────────────────       ────────────────────────────────────
-investigate()                          diagnose_node
-  ↓ await                                    │
-propose(diagnosis)                     ┌─────┴────────────────┐
-  ↓ await                              ▼                       ▼
-done                              high/med confidence     low confidence
-                                  │                       │
-                                  ▼                       ▼
-                              recommend_node         reinvestigate_node
-                                  │                       │
-                                  └───────────┬───────────┘
-                                              ▼
-                                           done_node
+Current (2 requests + client handoff):  LangGraph equivalent:
+────────────────────────────────────    ────────────────────────────────────
+step 2: investigate()                    diagnose_node
+  → diagnosis stashed (bi:diag:<id>)           │
+step 3: propose(handed diagnosis)        ┌─────┴────────────────┐
+  → recommendations                      ▼                       ▼
+done                                 high/med confidence     low confidence
+                                     │                       │
+                                     ▼                       ▼
+                                 recommend_node         reinvestigate_node
+                                     │                       │
+                                     └───────────┬───────────┘
+                                                 ▼
+                                              done_node
 ```
 
 ---
@@ -557,9 +618,11 @@ Second line: synthesize(anomaly, toolCalls)
 
 - `lib/agents/base.ts` L91 — `forceFinal = turn === maxTurns - 1 || budgetSpent`; the single line that converts an exploration loop into a synthesis step
 - `lib/agents/base.ts` L101 — `if (!forceFinal) params.tools = toolSchemas`; omitting tools is what forces the model to produce text
-- `lib/agents/diagnostic.ts` L73–L77 — the three-tier fallback chain; cite this when asked "what happens when the model fails to produce JSON?"
-- `lib/agents/diagnostic.ts` L82–L121 — `synthesize()`: a completely separate API call with no loop history; cite this when asked about the dedicated synthesis call
-- `app/api/agent/route.ts` L152–L162 — the sequential `await` orchestration; cite this when asked how agents are sequenced
+- `lib/agents/diagnostic.ts` L74–L75 — the three-tier fallback chain; cite this when asked "what happens when the model fails to produce JSON?"
+- `lib/agents/diagnostic.ts` L80–L82 — confidence derivation (`diagnosisConfidence` + error downgrade); cite when asked how confidence is set
+- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`: a completely separate API call with no loop history; cite this when asked about the dedicated synthesis call
+- `app/api/agent/route.ts` L220–L254 — the step-split orchestration (one agent per request); cite this when asked how agents are sequenced
+- `lib/hooks/useInvestigation.ts` L130–L144, L72–L84 — the client-side diagnosis handoff (`bi:diag:<id>`); cite when asked how step 3 gets the diagnosis
 
 ---
 
@@ -581,9 +644,9 @@ The follow-up question: what would break if you sent only the latest tool result
 
 Scenario: an investigation returns the `FALLBACK` `{ conclusion: 'Insufficient data…', evidence: [] }` even though the tool calls all succeeded and returned data. Where do you look and what is the fix?
 
-Start at `lib/agents/diagnostic.ts` L73–L77: `tryParseDiagnosis(finalText)` returned `null` AND `synthesize()` returned `null`. Work backwards:
+Start at `lib/agents/diagnostic.ts` L74–L75: `tryParseDiagnosis(finalText)` returned `null` AND `synthesize()` returned `null` (so `?? FALLBACK` won). Work backwards:
 
-1. Was `finalText` non-empty prose? If yes, `synthesisInstruction` did not produce JSON on the forced-final turn. Look at `lib/agents/base.ts` L98: did `synthesisInstruction` get appended? Check that `synthesisInstruction` is set in the `runAgentLoop` call at `lib/agents/diagnostic.ts` L62–L67.
+1. Was `finalText` non-empty prose? If yes, `synthesisInstruction` did not produce JSON on the forced-final turn. Look at `lib/agents/base.ts` L98: did `synthesisInstruction` get appended? Check that `synthesisInstruction` is set in the `runAgentLoop` call at `lib/agents/diagnostic.ts` L63–L67.
 
 2. Was `finalText` empty (`''`)? If yes, the loop exhausted `maxTurns` without a clean break (`lib/agents/base.ts` L175). Either `maxTurns` is too low for the number of tool calls, or `forceFinal` was hit but the model still emitted `tool_use` blocks (impossible after L101 — if tools are not sent, `tool_use` blocks cannot appear). Check that `maxToolCalls` is set correctly.
 
@@ -601,5 +664,10 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 - What does `runAgentLoop` return when `maxTurns` is exhausted? (Answer: `{ finalText: '', toolCalls }`, L175)
 - What is the `maxToolCalls` budget for `DiagnosticAgent`? (Answer: `6`, `lib/agents/diagnostic.ts` L61)
 - What is the `maxToolCalls` budget for `RecommendationAgent`? (Answer: `4`, `lib/agents/recommendation.ts` L57)
-- In the fallback chain at `diagnostic.ts` L73–L77, what does `synthesize()` receive as its second argument? (Answer: `toolCalls` — the full array of every tool call the loop made)
+- In the fallback chain at `diagnostic.ts` L74–L75, what does `synthesize()` receive as its second argument? (Answer: `toolCalls` — the full array of every tool call the loop made)
+- How does step 3 (`/investigate/[id]/recommend`) get the diagnosis from step 2? (Answer: via `sessionStorage` key `bi:diag:<id>`, written on step 2's `done` event and read by `useInvestigation`; passed as `&diagnosis=` in live mode)
+- How is a diagnosis's `confidence` set? (Answer: `diagnosisConfidence(diag)` from supported/tested hypotheses, `derive.ts` L54–L63, downgraded high→medium if any tool call errored, `diagnostic.ts` L80–L82)
 - Which line in `base.ts` feeds tool results back to the model as the next user turn? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`)
+
+---
+Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.

@@ -69,7 +69,7 @@ The interface sits between the caller and the vendor. Tests plug in the right br
 
 ### The McpTransport interface
 
-`McpTransport` is the two-method surface defined in `lib/mcp/transport.ts` L6–L9:
+`McpTransport` is the two-method surface defined in `lib/mcp/transport.ts` L7–L10:
 
 ```typescript
 export interface McpTransport {
@@ -93,7 +93,7 @@ McpTransport interface
 
 ### SdkTransport, the real implementation
 
-`SdkTransport` (`lib/mcp/transport.ts` L12–L21) holds a `Client` from the MCP SDK and delegates:
+`SdkTransport` (`lib/mcp/transport.ts` L41–L74) holds a `Client` from the MCP SDK and delegates. Its constructor also accepts an optional `httpErrors?: HttpErrorHolder` (L42–L45): the transport pairs with a capturing fetch (`makeCapturingFetch`, L24–L36) that records the body of any non-OK HTTP response into the holder, so a failed tool call can throw the *real* server error text instead of a generic "Unauthorized":
 
 ```typescript
 export class SdkTransport implements McpTransport {
@@ -186,7 +186,7 @@ function buildFakeMcp(impl: (name: string, args: Record<string, unknown>) => Pro
 
 `runAgentLoop` takes `anthropic: Anthropic` as a named parameter (`lib/agents/base.ts` L48–L62). There is no singleton import, no module-level `new Anthropic()`. The parameter type is the SDK's own `Anthropic` class — but TypeScript structural typing means tests can pass any object that satisfies the shape the loop actually uses.
 
-`test/agents/base.test.ts` L16–L55 builds a scripted fake and casts it:
+`test/agents/base.test.ts` L16–L56 builds a scripted fake and casts it:
 
 ```typescript
 const anthropic = {
@@ -253,13 +253,14 @@ The two interface boundaries are the seam. Everything above the seam is testable
 
 ### lib/mcp/transport.ts
 
-**Interface** (L6–L9): `McpTransport` — the two-method contract callers depend on.
-**Real impl** (L12–L21): `SdkTransport` — wraps `Client` from `@modelcontextprotocol/sdk`. The only file that imports the SDK client class.
+**Interface** (L7–L10): `McpTransport` — the two-method contract callers depend on.
+**Capturing-fetch error seam** (`HttpErrorHolder` L15–L17, `makeCapturingFetch` L24–L36): a `fetch` wrapper that stashes the body of any non-OK response so transport errors carry the real server text.
+**Real impl** (L41–L74): `SdkTransport` — wraps `Client` from `@modelcontextprotocol/sdk` (and an optional `HttpErrorHolder`, L42–L45). The only file that imports the SDK client class.
 
 GitHub: `lib/mcp/transport.ts`
 
 ```typescript
-// L6–L9
+// L7–L10
 export interface McpTransport {
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
   listTools(): Promise<unknown>;
@@ -268,18 +269,19 @@ export interface McpTransport {
 
 ### lib/mcp/client.ts
 
-**Constructor** (L24–L28): `McpClient` receives `private transport: McpTransport`. Imports only the interface, never `SdkTransport` or the MCP SDK.
+**Constructor** (L87–L95): `McpClient` receives `private transport: McpTransport`. Imports only the interface, never `SdkTransport` or the MCP SDK.
 
 ```typescript
-// L24–L28
+// L87–L95
 constructor(private transport: McpTransport, opts: ClientOpts = {}) {
   this.minIntervalMs = opts.minIntervalMs ?? 200;
-  this.maxRetries    = opts.maxRetries    ?? 3;
-  this.retryDelayMs  = opts.retryDelayMs  ?? 1200;
+  this.maxRetries = opts.maxRetries ?? 3;
+  this.retryDelayMs = opts.retryDelayMs ?? 10_000;
+  this.retryCeilingMs = opts.retryCeilingMs ?? 20_000;
 }
 ```
 
-**Live call** (L69–L77): `liveCall` delegates to `this.transport.callTool` — the only place the transport is actually called.
+**Live call** (L148–L163): `liveCall` delegates to `this.transport.callTool` — the only place the transport is actually called. A thrown transport error is re-tagged as a `McpToolError` (`lib/mcp/client.ts` L68–L77) carrying the tool name and the captured server detail.
 
 GitHub: `lib/mcp/client.ts`
 
@@ -303,11 +305,11 @@ GitHub: `lib/agents/base.ts`
 
 ### test/mcp/client.test.ts
 
-**fakeTransport** (L5–L12): plain object satisfying `McpTransport`, counting calls. Every one of the 11 tests in this file passes a `fakeTransport` to `new McpClient(t)` — no real MCP connection required.
+**fakeTransport** (L5–L12): plain object satisfying `McpTransport`, counting calls. Every one of the 14 tests in this file passes a `fakeTransport` to `new McpClient(t)` — no real MCP connection required.
 
 ### test/agents/base.test.ts
 
-**buildFakeAnthropic** (L16–L55): constructs a `{ messages: { create: vi.fn() } }` object with scripted response sequences, cast `as unknown as Anthropic`.
+**buildFakeAnthropic** (L16–L56): constructs a `{ messages: { create: vi.fn() } }` object with scripted response sequences, cast `as unknown as Anthropic` at the call site.
 **buildFakeMcp** (L76–L83): plain object satisfying `McpCaller`.
 
 Both fakes are passed directly into `runAgentLoop` at test call sites (e.g., L127–L135).
@@ -397,7 +399,7 @@ A second failure mode: the interface hides capability. `SdkTransport.callTool` c
 
 - TypeScript checks compatibility by shape, not by name. An object `{ callTool: async fn, listTools: async fn }` satisfies `McpTransport` without `implements McpTransport`.
 - `McpClient` satisfies `McpCaller` because its `callTool` signature is a superset of `McpCaller.callTool` — `McpClient` accepts an extra optional `opts` parameter.
-- The `as unknown as Anthropic` double cast (`base.test.ts` L129) is a TypeScript pattern for injecting a narrow fake of a complex type when the narrow slice is all the code under test actually uses.
+- The `as unknown as Anthropic` double cast (`base.test.ts` L128) is a TypeScript pattern for injecting a narrow fake of a complex type when the narrow slice is all the code under test actually uses.
 - `implements McpTransport` on `SdkTransport` is documentation; the compiler would also accept a structurally-matching class without the keyword.
 - TypeScript's structural typing is the mechanism that makes the pattern lightweight: no registration, no decorator, no DI container — just the right shape.
 
@@ -411,7 +413,7 @@ A second failure mode: the interface hides capability. `SdkTransport.callTool` c
 - TypeScript structural typing is the mechanism — no DI framework or decorator needed.
 - The seam is the same thing as passing a data-fetcher as a prop to `<UserList />` — same idea, same motivation, backend spelling.
 - Tag `2. Request-response flow` — the seam sits directly in the path of every tool call from agent → MCP server; understanding it is prerequisite to following the request flow end-to-end.
-- Tag `5. Failure handling` — because the transport is injectable, error scenarios (transport throws, rate-limit payload returned) are injected via fakes in `client.test.ts` L89–L117; the seam is what makes failure-path testing deterministic.
+- Tag `5. Failure handling` — because the transport is injectable, error scenarios (transport throws, rate-limit payload returned) are injected via fakes in `client.test.ts` L89–L198; the seam is what makes failure-path testing deterministic.
 - This is primarily a `4. State ownership` / architecture boundary: the service layer owns its interface; the provider layer owns the SDK coupling.
 
 ---
@@ -484,10 +486,10 @@ Without the seam         With the seam
 ---
 
 **Anchors:**
-- `lib/mcp/transport.ts` L6–L9: the two-method interface that is the seam
-- `lib/mcp/client.ts` L24: constructor injection — `private transport: McpTransport`
+- `lib/mcp/transport.ts` L7–L10: the two-method interface that is the seam
+- `lib/mcp/client.ts` L87: constructor injection — `private transport: McpTransport`
 - `lib/agents/base.ts` L16–L22: `McpCaller`, the one-method surface for agents
-- `lib/agents/base.ts` L48–L49: `runAgentLoop` opts — `anthropic: Anthropic; mcp: McpCaller`
+- `lib/agents/base.ts` L49–L50: `runAgentLoop` opts — `anthropic: Anthropic; mcp: McpCaller`
 - `test/mcp/client.test.ts` L5–L12: `fakeTransport` — the plain object that proves the seam works
 
 ---
@@ -500,7 +502,7 @@ Without looking at the code, draw the three-layer structure: service layer, inte
 
 ### Level 2 — Explain
 
-Open `lib/mcp/transport.ts`. Read L6–L9 (`McpTransport`) and L12–L21 (`SdkTransport`). Explain in one sentence why `McpClient` imports `McpTransport` but not `SdkTransport` or `Client`. Then explain what would break in `test/mcp/client.test.ts` if `McpClient` constructed `SdkTransport` internally instead of receiving a transport.
+Open `lib/mcp/transport.ts`. Read L7–L10 (`McpTransport`) and L41–L74 (`SdkTransport`). Explain in one sentence why `McpClient` imports `McpTransport` but not `SdkTransport` or `Client`. Then explain what would break in `test/mcp/client.test.ts` if `McpClient` constructed `SdkTransport` internally instead of receiving a transport.
 
 ### Level 3 — Apply
 
@@ -509,10 +511,10 @@ Scenario: you need to add request logging to every MCP tool call — log the too
 Where does the logging code go? The options are `SdkTransport.callTool` (provider layer), `McpClient.liveCall` (service layer), or a new `LoggingTransport` that wraps `SdkTransport`.
 
 Cite:
-- `lib/mcp/client.ts` L69–L77 (`liveCall`) — this is where `durationMs` is naturally computed.
-- `lib/mcp/transport.ts` L14–L16 — this is where the raw SDK call happens.
+- `lib/mcp/client.ts` L148–L163 (`liveCall`) — this is where the spacing gate runs and the transport is called.
+- `lib/mcp/transport.ts` L47–L59 — this is where the raw SDK call happens.
 
-Answer: logging belongs in `McpClient.liveCall` (L69–L77) if you want it co-located with duration tracking and rate-limit enforcement. It belongs in a wrapping `LoggingTransport` if you want the transport layer to be independently observable without touching `McpClient`. Both work. What stays untouched in either case: `SdkTransport`, all test fakes (they satisfy `McpTransport` and do not need to log), and `runAgentLoop`.
+Answer: logging belongs in `McpClient.liveCall` (L148–L163) if you want it co-located with rate-limit enforcement. It belongs in a wrapping `LoggingTransport` if you want the transport layer to be independently observable without touching `McpClient`. Both work. What stays untouched in either case: `SdkTransport`, all test fakes (they satisfy `McpTransport` and do not need to log), and `runAgentLoop`.
 
 ### Level 4 — Defend
 
@@ -525,3 +527,6 @@ A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is 
 - Why does `buildFakeAnthropic` use `as unknown as Anthropic` rather than constructing a real `Anthropic` instance?
 - Name one thing `fakeTransport` tracks that lets tests verify caching behaviour.
 - In `runAgentLoop`, what is the parameter type of `mcp` and why is it not `McpClient`?
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers; added a note on the capturing-fetch error seam (`HttpErrorHolder`/`makeCapturingFetch`) and `McpToolError`

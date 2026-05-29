@@ -255,18 +255,18 @@ The primary recap: both operations together.
 
 **File:** `lib/agents/monitoring.ts`
 **Function / class:** `SEV_RANK` constant + `MonitoringAgent.scan`
-**Line range:** L50 (rank table) · L92 (sort + slice)
+**Line range:** L50 (rank table) · L102 (sort + slice)
 
 ```typescript
 // lib/agents/monitoring.ts L50
 const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
 
-// lib/agents/monitoring.ts L92
+// lib/agents/monitoring.ts L102
 return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
 GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L50
-GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L92
+GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L102
 
 ---
 
@@ -417,7 +417,7 @@ The Set union in `queryTools` (`lib/mcp/tools.ts L38–L40`) is unaffected — i
 **Anchors.**
 
 - `lib/agents/monitoring.ts L50` — `SEV_RANK` definition
-- `lib/agents/monitoring.ts L92` — sort + slice on the returned anomaly array
+- `lib/agents/monitoring.ts L102` — sort + slice on the returned anomaly array
 - `lib/mcp/tools.ts L38–L40` — `queryTools` Set-union dedup
 - `lib/mcp/tools.ts L5–L13` / `L15–L25` / `L27–L34` — the three source tool arrays whose overlaps the Set collapses
 
@@ -425,9 +425,9 @@ The Set union in `queryTools` (`lib/mcp/tools.ts L38–L40`) is unaffected — i
 
 ## Validate your understanding
 
-**Level 1 — reconstruct.** Without looking at the file: write the `SEV_RANK` constant and the sort + slice expression from memory. Then open `lib/agents/monitoring.ts L50` and `L92` and compare. The types, the order of subtraction (`b - a` not `a - b`), and the slice bound (`10`) are the three things most often misremembered.
+**Level 1 — reconstruct.** Without looking at the file: write the `SEV_RANK` constant and the sort + slice expression from memory. Then open `lib/agents/monitoring.ts L50` and `L102` and compare. The types, the order of subtraction (`b - a` not `a - b`), and the slice bound (`10`) are the three things most often misremembered.
 
-**Level 2 — explain.** Open `lib/agents/monitoring.ts`. The `scan` method at L60 calls `runAgentLoop`, gets `finalText`, parses it, validates it, and then applies the sort at L92. Explain to a colleague why `[...parsed]` is needed before `.sort(...)` — what would happen if `sort` were called directly on `parsed`? Then explain why `.slice(0, 10)` appears after sort rather than before.
+**Level 2 — explain.** Open `lib/agents/monitoring.ts`. The `scan` method at L68 calls `runAgentLoop`, gets `finalText`, parses it, validates it, and then applies the sort at L102. Explain to a colleague why `[...parsed]` is needed before `.sort(...)` — what would happen if `sort` were called directly on `parsed`? Then explain why `.slice(0, 10)` appears after sort rather than before.
 
 **Level 3 — apply.** Two scenarios anchored to the real files:
 
@@ -444,3 +444,6 @@ Scenario B: `monitoringTools` and `diagnosticTools` both contain `"execute_analy
 - If `sort` is stable and two anomalies share `severity: "info"`, which appears first in the output?
 - What TypeScript type on `SEV_RANK` ensures every `Severity` member has an entry?
 - What does `.slice(0, 10)` return if the sorted array has only 3 elements?
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers (sort + slice moved L92 → L102; `SEV_RANK` and `queryTools` refs unchanged)

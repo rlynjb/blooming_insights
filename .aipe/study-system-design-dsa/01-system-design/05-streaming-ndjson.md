@@ -53,7 +53,7 @@ A producer writes complete JSON objects, one per line, into a stream. The networ
                              │  Content-Type: application/x-ndjson
                              ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Consumer (React page)                                                  │
+│  Consumer (useInvestigation hook)                                       │
 │                                                                         │
 │  res.body.getReader()                                                   │
 │       │                                                                 │
@@ -61,8 +61,8 @@ A producer writes complete JSON objects, one per line, into a stream. The networ
 │                                                                         │
 │  buf.split('\n') → keep trailing partial → parse each complete line    │
 │       │                                                                 │
-│       └→ handleEvent(e) → switch(e.type) → setState(...)               │
-│                                           → React re-renders           │
+│       └→ handle(e) → switch(e.type) → setState(...)                    │
+│                                       → React re-renders               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -107,7 +107,7 @@ The discriminated union means the consumer can `switch(e.type)` without type nar
 
 ### encodeEvent / the producer
 
-`app/api/agent/route.ts` L105–L169 constructs a `ReadableStream<Uint8Array>` and passes it directly to the `Response` constructor. The producer lives entirely in the `start(controller)` callback.
+`app/api/agent/route.ts` L168–L267 constructs a `ReadableStream<Uint8Array>` and passes it directly to the `Response` constructor. The producer lives entirely in the `start(controller)` callback.
 
 ```
 ReadableStream<Uint8Array>({
@@ -116,20 +116,30 @@ ReadableStream<Uint8Array>({
       collected.push(e);                           // accumulate for cache
       controller.enqueue(encoder.encode(encodeEvent(e)));  // push to wire
     };
-    // ...investigation logic...
-    controller.close();   // signals EOF to the consumer
+    try {
+      stepFor(leadAgent, 'thought', 'reading the workspace schema…');  // L201
+      const schema = await bootstrapSchema(conn.mcp);  // bootstrap INSIDE the stream
+      // ...investigation logic...
+    } catch (e) {
+      send({ type: 'error', message: `/api/agent · ${...}` });  // L257
+    } finally {
+      controller.close();   // signals EOF to the consumer (always)
+    }
   }
 })
 ```
 
-`send` does two things: it enqueues the encoded event bytes so the network layer flushes them immediately, and it pushes to `collected` so the full sequence can be saved for cache replay (L107–L110).
+`send` does two things: it enqueues the encoded event bytes so the network layer flushes them immediately, and it pushes to `collected` so the full sequence can be saved for cache replay (L171–L175). The entire investigation body runs inside a `try/catch/finally` (L196–L263): a throw becomes an `error` NDJSON event, and `controller.close()` always fires.
 
-The live investigation flow (L145–L162) produces events in this order:
+The live investigation flow (L196–L254) produces events in this order:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Live investigation event sequence                               │
+│  Live investigation event sequence (step=diagnose)               │
 │                                                                  │
+│  reasoning_step ('reading the workspace schema…')  ← FIRST line  │
+│       │  (emitted before bootstrapSchema runs — L201)            │
+│       │                                                          │
 │  reasoning_step (diagnostic · thought)      ← investigation start│
 │       │                                                          │
 │       ├─ tool_call_start  ┐                                      │
@@ -138,51 +148,47 @@ The live investigation flow (L145–L162) produces events in this order:
 │       │                                                          │
 │  diagnosis                                  ← DiagnosticAgent done│
 │       │                                                          │
-│  reasoning_step (recommendation · thought)                       │
-│       │                                                          │
-│       ├─ tool_call_start  ┐                                      │
-│       ├─ reasoning_step   ├─ repeated per tool call              │
-│       └─ tool_call_end    ┘                                      │
-│       │                                                          │
-│  recommendation (×N)                        ← one per proposal   │
-│       │                                                          │
 │  done                                       ← stream close       │
+│                                                                  │
+│  (step=recommend is a separate request: bootstrap line →         │
+│   recommendation reasoning/tools → recommendation (×N) → done)   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-The `hooksFor(agent)` helper (L117–L131) bridges the agent callbacks (`onText`, `onToolCall`, `onToolResult`) to `send`, so each agent's internal events flow out as NDJSON lines automatically.
+The `hooksFor(agent)` helper (L181–L195) bridges the agent callbacks (`onText`, `onToolCall`, `onToolResult`) to `send`, so each agent's internal events flow out as NDJSON lines automatically. Note the schema-bootstrap `reasoning_step` is the very first line on the wire — see the bootstrap-inside-the-stream sub-section below.
 
 ---
 
 ### The consumer loop
 
-`app/investigate/[id]/page.tsx` L125–L172 is the entire consumer. It is a plain async IIFE inside `useEffect`:
+The reader loop no longer lives in the page. It moved into the `lib/hooks/useInvestigation.ts` hook (L153–L212) — `app/investigate/[id]/page.tsx` (L38) and `app/investigate/[id]/recommend/page.tsx` (L36) now just call `useInvestigation(id, 'diagnose' | 'recommend')` and render the returned state. (The feed `app/page.tsx` keeps its own copy of the same loop at L268–L419 for the briefing stream.) The hook's loop is a plain async IIFE inside `useEffect`:
 
 ```
-const res = await fetch(`/api/agent?insightId=${id}`);   // L127
+const res = await fetch(url);   // L170 — url = `/api/agent?insightId=${id}&step=${step}` (+&live=1, &insight=, &diagnosis= in live mode)
 
-// 401 → redirect to OAuth (L129–135)
+// 401 → redirect to OAuth (L171–177)
+// !res.ok → read { error } JSON, setError (L178–182)
 
-const reader = res.body.getReader();   // L143
-const dec = new TextDecoder();         // L144
-let buf = '';                          // L145
+const reader = res.body.getReader();   // L184
+const dec = new TextDecoder();         // L185
+let buf = '';                          // L186
 
 for (;;) {
-  const { done, value } = await reader.read();   // L147
-  if (done) break;                               // L148
-  buf += dec.decode(value, { stream: true });    // L149
-  const lines = buf.split('\n');                 // L150
-  buf = lines.pop() ?? '';                       // L151 — keep trailing partial
+  const { done, value } = await reader.read();   // L188
+  if (done) break;                               // L189
+  buf += dec.decode(value, { stream: true });    // L190
+  const lines = buf.split('\n');                 // L191
+  buf = lines.pop() ?? '';                       // L192 — keep trailing partial
   for (const line of lines) {
-    if (!line.trim()) continue;                  // L153
-    handleEvent(JSON.parse(line) as AgentEvent); // L155
+    if (!line.trim()) continue;                  // L194
+    try { handle(JSON.parse(line) as AgentEvent); } catch { /* ignore */ }  // L195–199
   }
 }
-// flush trailing buffer after stream closes (L162–168)
-if (buf.trim()) handleEvent(JSON.parse(buf) as AgentEvent);
+// flush trailing buffer after stream closes (L202–208)
+if (buf.trim()) { try { handle(JSON.parse(buf) as AgentEvent); } catch {} }
 ```
 
-The key mechanic at L150–L151: `split('\n')` produces N+1 parts for N newlines. The last part is the incomplete line that hasn't been terminated yet. `lines.pop()` pulls it out and puts it back in `buf` for the next iteration. Every element remaining in `lines` is a complete, parseable JSON object.
+The key mechanic at L191–L192: `split('\n')` produces N+1 parts for N newlines. The last part is the incomplete line that hasn't been terminated yet. `lines.pop()` pulls it out and puts it back in `buf` for the next iteration. Every element remaining in `lines` is a complete, parseable JSON object. The wire format (`AgentEvent` NDJSON) is unchanged from when the loop lived in the page — only its location moved.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -202,9 +208,9 @@ The key mechanic at L150–L151: `split('\n')` produces N+1 parts for N newlines
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-`TextDecoder` is constructed with no arguments, defaulting to UTF-8. The `{ stream: true }` option (L149) tells it not to flush multi-byte character sequences at chunk boundaries — without it, a UTF-8 character split across two chunks would produce the Unicode replacement character.
+`TextDecoder` is constructed with no arguments, defaulting to UTF-8. The `{ stream: true }` option (L190) tells it not to flush multi-byte character sequences at chunk boundaries — without it, a UTF-8 character split across two chunks would produce the Unicode replacement character.
 
-`handleEvent` (L60–L123) is a `switch(e.type)` that calls the appropriate `setState` updater for each event type.
+`handle` (`useInvestigation.ts` L97–L151) is a `switch(e.type)` that calls the appropriate `setState` updater for each event type. On `done` (L130–L144) it stashes this step's result in `sessionStorage` (`bi:inv:<step>:<id>`) and — on the diagnose step — hands the diagnosis to step 3 under `bi:diag:<id>`.
 
 ---
 
@@ -247,26 +253,29 @@ The auto-reconnect is the disqualifier. When `EventSource` loses the connection 
 │           ←── stream ────────────────────────────────────              │
 │  connection drops                                                        │
 │  reader.read() rejects with a network error                              │
-│  catch block sets error state (L169–171)                                 │
+│  catch block sets error state (useInvestigation.ts L209–211)             │
 │  No retry. User sees the error. User decides.                            │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-The `startedRef` guard (L42–L48) handles the other source of duplicate runs: React StrictMode in development double-invokes `useEffect` callbacks. `startedRef.current` flips to `true` on first invocation; the second invocation returns immediately.
+The `startedRef` guard (`useInvestigation.ts` L43, L47–L48) handles the other source of duplicate runs: React StrictMode in development double-invokes `useEffect` callbacks. `startedRef.current` flips to `true` on first invocation; the second invocation returns immediately. The hook deliberately does NOT cancel the fetch on cleanup (L32–L36): cancelling on StrictMode's first cleanup, while the guard blocks the re-mount, aborted the stream and left the logs empty — so the in-flight run is allowed to complete and the late `setState` is a safe no-op.
 
 ---
 
 ### The cache replay path
 
-When `getCachedInvestigation(insightId)` returns a stored event sequence (L63), the handler skips the live agent run and replays the stored events with `REPLAY_DELAY_MS = 180` ms between each (L50, L64–81). No Anthropic API key is needed.
+When `getCachedInvestigation(insightId)` returns a stored event sequence (L127), the handler skips the live agent run and replays the stored events with `REPLAY_DELAY_MS = 180` ms between each (L105, L128–141). No Anthropic API key is needed. The cached snapshot is the *combined* diagnose+recommend stream (written only by the dev demo-capture path), so the replay first runs it through `filterByStep(cached, step)` (L66–L84, L129) to show only the events belonging to the requested step.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Cache replay (route.ts L64–81)                                     │
+│  Cache replay (route.ts L128–141)                                   │
 │                                                                      │
-│  cached = [ event1, event2, ..., done ]                             │
+│  cached = [ diag events…, diagnosis, recommendation×N, done ]       │
 │       │                                                             │
-│       └─ for (const e of cached) {                                  │
+│       ▼  events = step ? filterByStep(cached, step) : cached  (L129)│
+│       │  ('diagnose' → drop recommendation activity;                │
+│       │   'recommend' → drop diagnosis + diagnostic-agent activity) │
+│       └─ for (const e of events) {                                  │
 │               controller.enqueue(encoder.encode(encodeEvent(e)));   │
 │               await sleep(REPLAY_DELAY_MS);   // 180 ms             │
 │          }                                                          │
@@ -281,6 +290,40 @@ The consumer loop is unaware of the difference. It reads NDJSON lines the same w
 
 ---
 
+### Bootstrap inside the stream + the step-filtered replay
+
+Two structural changes shape what reaches the wire. First, schema bootstrap moved *inside* the `ReadableStream`. The route still connects MCP before constructing the stream (L156–L166, so a connect failure returns a real error JSON, not a stream), but the schema read (`bootstrapSchema(conn.mcp)`, L202) now happens in `start(controller)` — *after* the producer has already emitted a `reasoning_step` saying "reading the workspace schema…" (L201). The user sees that first log line immediately instead of staring at a silent ~1–2s gap while the schema loads.
+
+Second, the route takes a `step` query param (L117–L118): `'diagnose' | 'recommend' | null`. The two non-null values run only that phase's agent (live), and select that phase's events from the cached snapshot (replay). `null` is the combined run, used only by the dev demo-capture path — it runs both agents and `saveInvestigation`s the result (L254).
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Old: bootstrap BEFORE the stream            New: bootstrap INSIDE        │
+│  ─────────────────────────────────────       ──────────────────────────  │
+│  connect MCP                                  connect MCP (L156–166)      │
+│  bootstrapSchema()      ← silent ~1–2s        new ReadableStream(...)      │
+│  new ReadableStream()                           start(controller):        │
+│    enqueue first event                            send('reading schema…') │← first line
+│                                                   bootstrapSchema()  L202  │  appears NOW
+│                                                   …run agent…             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│  step query param  (route.ts L117–118)                                    │
+│                                                                            │
+│  step=diagnose  → live: run DiagnosticAgent only      (L231–240)          │
+│                   replay: filterByStep(cached,'diagnose')                  │
+│  step=recommend → live: run RecommendationAgent only  (L244–249)          │
+│                   replay: filterByStep(cached,'recommend')                 │
+│  step=null      → combined run + saveInvestigation    (L254)              │
+│                   (dev demo-capture only)                                  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+`filterByStep` (L66–L84) reads each event's owning agent (`reasoning_step.step.agent`, or the `agent` field on `tool_call_start`/`tool_call_end`) and keeps or drops it: the `diagnose` step drops `recommendation` events and any recommendation-agent activity; the `recommend` step drops the `diagnosis` event and any non-recommendation-agent activity. `done` survives both. The replay consumer never knows it received a slice — it is the same NDJSON, just fewer lines.
+
+---
+
 ### Live-run vs cache-replay side-by-side
 
 ```
@@ -292,7 +335,8 @@ The consumer loop is unaware of the difference. It reads NDJSON lines the same w
 │  ~115s wall-clock time                  │  events.length × 180ms                  │
 │  events are non-deterministic           │  events are identical each replay       │
 │  events are written to collected[]      │  events are read from cached[]          │
-│  saved to cache on done (L162)          │  served from cache on hit (L63–81)      │
+│  saved on the combined run only (L254)  │  served from cache on hit (L127–141)    │
+│  one agent per request (step-split)     │  filterByStep(cached, step) (L129)      │
 │  same wire format                       │  same wire format                       │
 │  same consumer loop                     │  same consumer loop                     │
 └─────────────────────────────────────────┴─────────────────────────────────────────┘
@@ -308,20 +352,21 @@ Decouple producer cadence from consumer render via a stream and a shared event c
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (app/api/agent/route.ts)                                         │
+│  SERVICE LAYER  (app/api/agent/route.ts · ?step=diagnose | recommend)            │
 │                                                                                  │
 │  ReadableStream<Uint8Array>                                                      │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  start(controller)                                                       │    │
+│  │  start(controller)  — try/catch/finally                                  │    │
 │  │                                                                          │    │
-│  │  DiagnosticAgent ──→ send(reasoning_step) ──→ controller.enqueue(bytes) │    │
-│  │                  ──→ send(tool_call_start) ─→ controller.enqueue(bytes) │    │
-│  │                  ──→ send(tool_call_end)  ──→ controller.enqueue(bytes) │    │
-│  │                  ──→ send(diagnosis)      ──→ controller.enqueue(bytes) │    │
+│  │  send(reasoning_step 'reading the workspace schema…')  ← FIRST (L201)   │    │
+│  │  schema = await bootstrapSchema(conn.mcp)              ← inside stream  │    │
 │  │                                                                          │    │
-│  │  RecommendationAgent ─→ send(recommendation) → controller.enqueue(...) │    │
+│  │  step=diagnose → DiagnosticAgent ─→ send(reasoning_step/tool_*)         │    │
+│  │                                  ─→ send(diagnosis)   ──→ enqueue(bytes)│    │
+│  │  step=recommend→ RecommendationAgent ─→ send(reasoning_step/tool_*)     │    │
+│  │   (diagnosis handed in via &diagnosis=) ─→ send(recommendation ×N)     │    │
 │  │                                                                          │    │
-│  │  send(done) → controller.close()                                        │    │
+│  │  send(done)  →  finally: controller.close()                             │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                  │
 │  Response({ body: stream, headers: { 'Content-Type': 'application/x-ndjson' }}) │
@@ -333,9 +378,9 @@ Decouple producer cadence from consumer render via a stream and a shared event c
                                          │
                                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│  UI LAYER  (app/investigate/[id]/page.tsx)                                       │
+│  UI LAYER  (lib/hooks/useInvestigation.ts ← page.tsx + recommend/page.tsx)       │
 │                                                                                  │
-│  fetch('/api/agent?insightId=...')                                               │
+│  fetch('/api/agent?insightId=...&step=...')                                      │
 │       │                                                                          │
 │       ▼                                                                          │
 │  res.body.getReader()                                                            │
@@ -351,13 +396,16 @@ Decouple producer cadence from consumer render via a stream and a shared event c
 │                       for line of lines: JSON.parse(line) as AgentEvent         │
 │                               │                                                  │
 │                               ▼                                                  │
-│                       handleEvent(e) ──→ switch(e.type)                          │
+│                       handle(e) ──→ switch(e.type)                               │
 │                               │                                                  │
 │              ┌────────────────┼────────────────┬──────────────────┐             │
 │              ▼                ▼                ▼                  ▼             │
 │        setItems(...)    setDiagnosis(...)  setRecommendations(...)  setComplete  │
 │              │                │                │                  │             │
 │              └────────────────┴────────────────┴──────────────────┘             │
+│                                       │                                          │
+│                       on 'done': stash bi:inv:<step>:<id>                        │
+│                       + (diagnose) hand off bi:diag:<id>                         │
 │                                       │                                          │
 │                               React re-renders                                   │
 │                               ReasoningTrace · EvidencePanel · RecommendationCard│
@@ -375,22 +423,32 @@ The service layer produces. The network carries. The UI layer consumes. Nothing 
 | `lib/mcp/events.ts` | `AgentEvent` union (wire format) | L4–L12 |
 | `lib/mcp/events.ts` | `encodeEvent` | L15–L17 |
 | `lib/mcp/events.ts` | `decodeEvent` | L20–L22 |
-| `app/api/agent/route.ts` | `REPLAY_DELAY_MS` constant | L50 |
-| `app/api/agent/route.ts` | Cache-first replay block | L61–L81 |
-| `app/api/agent/route.ts` | Live `ReadableStream` + `send` | L104–L169 |
-| `app/api/agent/route.ts` | `hooksFor` bridge | L117–L131 |
-| `app/api/agent/route.ts` | Investigation sequence (diagnosis→recommendation→done) | L145–L162 |
-| `app/api/agent/route.ts` | `saveInvestigation` call | L162 |
-| `app/investigate/[id]/page.tsx` | `startedRef` StrictMode guard | L42–L48 |
-| `app/investigate/[id]/page.tsx` | `handleEvent` switch | L60–L123 |
-| `app/investigate/[id]/page.tsx` | `fetch` + reader loop | L125–L172 |
-| `app/investigate/[id]/page.tsx` | `buf.split('\n')` + `lines.pop()` | L150–L151 |
-| `app/investigate/[id]/page.tsx` | 401 → authUrl redirect | L129–L135 |
+| `app/api/agent/route.ts` | `maxDuration = 300` | L20 |
+| `app/api/agent/route.ts` | `REPLAY_DELAY_MS` constant | L105 |
+| `app/api/agent/route.ts` | `step` query param parse | L117–L118 |
+| `app/api/agent/route.ts` | `filterByStep` (step-sliced replay) | L66–L84 |
+| `app/api/agent/route.ts` | Cache-first replay block | L127–L141 |
+| `app/api/agent/route.ts` | MCP connect (pre-stream, try/catch → error JSON) | L156–L166 |
+| `app/api/agent/route.ts` | Live `ReadableStream` + `send` | L168–L267 |
+| `app/api/agent/route.ts` | Bootstrap-inside-stream (`reasoning_step` then schema read) | L196–L202 |
+| `app/api/agent/route.ts` | `hooksFor` bridge | L181–L195 |
+| `app/api/agent/route.ts` | Step-split run (diagnose / recommend / combined) | L220–L254 |
+| `app/api/agent/route.ts` | `saveInvestigation` (combined run only) | L254 |
+| `lib/hooks/useInvestigation.ts` | `startedRef` StrictMode guard + no-cancel note | L32–L36, L43, L47–L48 |
+| `lib/hooks/useInvestigation.ts` | hydrate-from-stash / diagnosis handoff load | L50–L84 |
+| `lib/hooks/useInvestigation.ts` | `handle` switch | L97–L151 |
+| `lib/hooks/useInvestigation.ts` | `fetch` + reader loop | L153–L212 |
+| `lib/hooks/useInvestigation.ts` | `buf.split('\n')` + `lines.pop()` | L191–L192 |
+| `lib/hooks/useInvestigation.ts` | 401 → authUrl redirect | L171–L177 |
+| `lib/hooks/useInvestigation.ts` | `done` → stash + `bi:diag:<id>` handoff | L130–L144 |
+| `app/investigate/[id]/page.tsx` | step-2 consumer: `useInvestigation(id,'diagnose')` | L38 |
+| `app/investigate/[id]/recommend/page.tsx` | step-3 consumer: `useInvestigation(id,'recommend')` | L36 |
+| `app/page.tsx` | feed's own reader loop (briefing stream) | L268–L419 |
 
 **Consumer loop (trimmed pseudocode):**
 
 ```typescript
-// app/investigate/[id]/page.tsx L143–L168
+// lib/hooks/useInvestigation.ts L184–L208
 const reader = res.body.getReader();
 const dec = new TextDecoder();
 let buf = '';
@@ -402,35 +460,48 @@ for (;;) {
   buf = lines.pop() ?? '';           // trailing partial stays in buf
   for (const line of lines) {
     if (!line.trim()) continue;
-    handleEvent(JSON.parse(line) as AgentEvent);
+    try { handle(JSON.parse(line) as AgentEvent); } catch { /* ignore malformed line */ }
   }
 }
-if (buf.trim()) handleEvent(JSON.parse(buf) as AgentEvent);
+if (buf.trim()) { try { handle(JSON.parse(buf) as AgentEvent); } catch {} }
 ```
 
 **Producer send sequence (trimmed pseudocode):**
 
 ```typescript
-// app/api/agent/route.ts L107–L162
+// app/api/agent/route.ts L170–L254
 const send = (e: AgentEvent) => {
   collected.push(e);
   controller.enqueue(encoder.encode(encodeEvent(e)));
 };
-// investigation flow:
-stepFor('diagnostic', 'thought', '...');
-const diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-send({ type: 'diagnosis', diagnosis });
-stepFor('recommendation', 'thought', '...');
-const recommendations = await recAgent.propose(inv, diagnosis, hooksFor('recommendation'));
-for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
-send({ type: 'done' });
-saveInvestigation(insightId!, collected);
+try {
+  stepFor(leadAgent, 'thought', 'reading the workspace schema…');  // FIRST line on the wire
+  const schema = await bootstrapSchema(conn.mcp);                  // bootstrap INSIDE the stream
+  // step=diagnose (or combined): run the diagnostic agent
+  if (step !== 'recommend') {
+    const diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+    send({ type: 'diagnosis', diagnosis });
+  }
+  // step=recommend (or combined): run the recommendation agent (diagnosis handed in via ?diagnosis=)
+  if (step !== 'diagnose') {
+    const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+    for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+  }
+  send({ type: 'done' });
+  if (step == null) saveInvestigation(insightId!, collected);     // combined (demo-capture) run only
+} catch (e) {
+  send({ type: 'error', message: `/api/agent · ${...}` });
+} finally {
+  controller.close();
+}
 ```
 
 GitHub:
 - [`lib/mcp/events.ts`](https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/events.ts)
 - [`app/api/agent/route.ts`](https://github.com/rlynjb/blooming_insights/blob/main/app/api/agent/route.ts)
+- [`lib/hooks/useInvestigation.ts`](https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts)
 - [`app/investigate/[id]/page.tsx`](https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/page.tsx)
+- [`app/investigate/[id]/recommend/page.tsx`](https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/recommend/page.tsx)
 
 ---
 
@@ -467,7 +538,7 @@ The stream is the buffer between them. `ReadableStream` in the browser and Node 
 
 **No built-in reconnect or resume.** If the TCP connection drops mid-stream — a mobile device going under a tunnel, a serverless function timing out — the consumer's `reader.read()` rejects and the stream is gone. There is no cursor, no event ID, no way to resume from where it stopped. The investigation must be re-run (or served from cache if one was saved before the disconnect).
 
-**The 60s serverless cap.** `route.ts` L18 sets `export const maxDuration = 60`. Vercel's free tier allows up to 60s for function execution. A live investigation runs ~115s. If the environment enforces this limit, the stream will be cut off before `done` is emitted. The cache replay path is unaffected (it replays fast).
+**The serverless duration cap.** `route.ts` L20 sets `export const maxDuration = 300` (Vercel Pro's max). The combined diagnose+recommend run is ~100–115s under the ~1 req/s MCP limit; the Hobby tier's 60s cannot fit it, which is part of why the investigation is split into two requests (`step=diagnose`, `step=recommend`) — each step runs only one agent and stays well under any cap. If the environment enforces a lower limit and a step exceeds it, the stream is cut off before `done`. The cache replay path is unaffected (it replays fast).
 
 **Line-buffering complexity.** The consumer must implement `buf.split('\n')` + `lines.pop()` correctly. Getting this wrong (e.g., not keeping the trailing partial) produces sporadic JSON parse errors that are hard to reproduce because they depend on TCP chunk boundaries.
 
@@ -524,7 +595,7 @@ NDJSON (Newline Delimited JSON) is a convention: one valid JSON value per line, 
 
 - **encodeEvent:** `JSON.stringify(e) + '\n'` — the complete encoding. No length prefix, no envelope.
 - **decodeEvent:** `JSON.parse(line)` — the complete decoding. Safe only after line is extracted.
-- **`Content-Type: application/x-ndjson`:** The MIME type used in this codebase (L77). `application/x-ndjson` is informal; `application/jsonl` and `application/x-jsonlines` are also used in the wild.
+- **`Content-Type: application/x-ndjson`:** The MIME type used in this codebase (L108, the `NDJSON_HEADERS` constant). `application/x-ndjson` is informal; `application/jsonl` and `application/x-jsonlines` are also used in the wild.
 - **Line-buffering invariant:** You must never call `JSON.parse` on a partial line. The `buf.split('\n')` + `pop()` pattern maintains this invariant across chunk boundaries.
 - **Runner-up — SSE:** `text/event-stream` with `data:` field wrapping JSON. More overhead but gives `id:` and `retry:` fields for free. Common in LLM streaming APIs (OpenAI, Anthropic).
 
@@ -532,25 +603,27 @@ NDJSON (Newline Delimited JSON) is a convention: one valid JSON value per line, 
 
 Next.js App Router route handlers (files named `route.ts`) can return a `Response` with a `ReadableStream` body. The Edge and Node runtimes both support this.
 
-- **`export const maxDuration = 60`** (L18): Vercel-specific export that sets the maximum function execution time in seconds. Does not extend beyond the platform limit.
+- **`export const maxDuration = 300`** (L20): Vercel-specific export that sets the maximum function execution time in seconds (300 = Vercel Pro's max). Does not extend beyond the platform limit.
 - **`new Response(stream, { headers })`:** Standard `Response` constructor with a `ReadableStream` body. Next.js passes this through to the underlying runtime's HTTP layer.
-- **`Cache-Control: no-cache, no-transform`** (L78): Tells CDN layers not to buffer the response before forwarding — essential for streaming. Without it, a proxy might wait for the full body before sending.
-- **`Content-Type: application/x-ndjson; charset=utf-8`** (L77): Signals to the client that the body is NDJSON. Not strictly required for `fetch` (the consumer reads bytes regardless) but useful for debugging and for intermediaries.
+- **`Cache-Control: no-cache, no-transform`** (L109): Tells CDN layers not to buffer the response before forwarding — essential for streaming. Without it, a proxy might wait for the full body before sending.
+- **`Content-Type: application/x-ndjson; charset=utf-8`** (L108): Signals to the client that the body is NDJSON. Not strictly required for `fetch` (the consumer reads bytes regardless) but useful for debugging and for intermediaries.
+- **Pre-stream try/catch:** the MCP connect setup (L156–L166) and `/api/briefing` are wrapped so a setup throw returns a real error JSON (e.g. the missing-secret message) instead of a bare unhandled 500.
 - **Runner-up — `NextResponse.json`:** For non-streaming responses. Buffers the complete body before sending. Not usable here.
 
 ---
 
 ## Summary
 
-`app/api/agent/route.ts` wraps an AI investigation pipeline in a `ReadableStream` producer that encodes each `AgentEvent` as a single NDJSON line (`JSON.stringify(e) + '\n'`) and enqueues it immediately as it is produced. `app/investigate/[id]/page.tsx` consumes that stream with `fetch` + `getReader()` + a `TextDecoder`, accumulates bytes into a string buffer, splits on `'\n'`, keeps the trailing partial for the next chunk, and dispatches each complete line to `handleEvent` which updates React state. A cache-hit path replays stored events with 180ms inter-event delay so the UI animates without a live run.
+`app/api/agent/route.ts` wraps an AI investigation pipeline in a `ReadableStream` producer that encodes each `AgentEvent` as a single NDJSON line (`JSON.stringify(e) + '\n'`) and enqueues it immediately as it is produced; the schema bootstrap now runs *inside* the stream so the first log line ("reading the workspace schema…") appears immediately. The investigation is split into two requests by a `step` query param (`diagnose` / `recommend`); each runs only its agent. `lib/hooks/useInvestigation.ts` consumes the stream with `fetch` + `getReader()` + a `TextDecoder`, accumulates bytes into a string buffer, splits on `'\n'`, keeps the trailing partial for the next chunk, and dispatches each complete line to `handle` which updates React state — `app/investigate/[id]/page.tsx` and `.../recommend/page.tsx` just call the hook. A cache-hit path replays stored events (filtered to the step via `filterByStep`) with 180ms inter-event delay so the UI animates without a live run.
 
 Key points:
-- `AgentEvent` is a discriminated union (`lib/mcp/events.ts` L4–L12); the `type` field determines the shape; `switch(e.type)` in `handleEvent` is type-safe without narrowing boilerplate. `[checklist: 2. Request-response flow]`
-- `fetch`-stream was chosen over `EventSource` specifically because `EventSource` auto-reconnects, which would re-fire the ~115s agent run. `[checklist: 5. Failure handling]`
+- `AgentEvent` is a discriminated union (`lib/mcp/events.ts` L4–L12); the `type` field determines the shape; `switch(e.type)` in `handle` is type-safe without narrowing boilerplate. `[checklist: 2. Request-response flow]`
+- `fetch`-stream was chosen over `EventSource` specifically because `EventSource` auto-reconnects, which would re-fire the agent run. `[checklist: 5. Failure handling]`
+- Bootstrap moved inside the `ReadableStream`: the producer emits a `reasoning_step` (L201) *before* `bootstrapSchema` (L202), so progress shows immediately instead of a silent ~1–2s wait.
 - `buf.split('\n')` + `lines.pop()` is the canonical line-buffering pattern for NDJSON over streaming `fetch`; getting this wrong causes silent parse errors that depend on TCP chunk boundaries.
 - `{ stream: true }` on `TextDecoder.decode` is required for correct UTF-8 across chunk boundaries.
-- The `startedRef` guard prevents React StrictMode's double-invocation from firing two agent runs in development.
-- The cache replay path (`REPLAY_DELAY_MS = 180`, `route.ts` L50, L64–81) uses the same wire format and same consumer loop as a live run — the consumer cannot distinguish them.
+- The `startedRef` guard (`useInvestigation.ts` L43, L47–L48) prevents React StrictMode's double-invocation from firing two agent runs in development; the hook does NOT cancel on cleanup (L32–L36).
+- The cache replay path (`REPLAY_DELAY_MS = 180`, `route.ts` L105, L127–141) uses the same wire format and same consumer loop as a live run — and `filterByStep` (L66–L84) slices the combined snapshot down to the requested step. The consumer cannot distinguish replay from live.
 
 ---
 
@@ -564,7 +637,7 @@ When an interviewer asks about streaming in this codebase they want to know: do 
 
 ### [mid] "Walk me through how the browser reads the NDJSON stream."
 
-`res.body.getReader()` locks the stream to one reader. Each `reader.read()` call resolves when the next chunk of bytes arrives — or with `done: true` when the server closes the stream. The bytes are decoded to a string with `TextDecoder` (with `{ stream: true }` to handle multi-byte chars at boundaries), appended to a buffer, split on `'\n'`, and the trailing incomplete fragment is popped off and held for the next chunk. Every complete line is `JSON.parse`d and dispatched to `handleEvent`. This is the loop at `app/investigate/[id]/page.tsx` L146–L160.
+`res.body.getReader()` locks the stream to one reader. Each `reader.read()` call resolves when the next chunk of bytes arrives — or with `done: true` when the server closes the stream. The bytes are decoded to a string with `TextDecoder` (with `{ stream: true }` to handle multi-byte chars at boundaries), appended to a buffer, split on `'\n'`, and the trailing incomplete fragment is popped off and held for the next chunk. Every complete line is `JSON.parse`d and dispatched to `handle`. This is the loop at `lib/hooks/useInvestigation.ts` L184–L201.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -575,7 +648,7 @@ When an interviewer asks about streaming in this codebase they want to know: do 
 │  buf.split('\n') → [ line1, line2, ..., partial ]            │
 │  buf = partial                                                │
 │                                                               │
-│  for line1, line2, ...: JSON.parse → handleEvent → setState  │
+│  for line1, line2, ...: JSON.parse → handle → setState       │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -603,13 +676,13 @@ Additionally, `EventSource` requires SSE framing (`data:`, `event:`, `id:` field
 
 ---
 
-### [arch] "The maxDuration is 60 seconds but the live run takes ~115 seconds. What breaks and what doesn't?"
+### [arch] "`maxDuration` is 300s and the full investigation takes ~100–115s. Why split it into two requests anyway?"
 
-The serverless function is killed at 60s. The stream closes without emitting `done`. The consumer's `reader.read()` will return `{ done: true }` (clean close from the platform) or reject (connection reset). Either way `complete` stays `false`. The UI shows "analyzing…" and never transitions to "complete." The diagnosis may or may not have been emitted before the cutoff, depending on when in the run the function was killed.
+`route.ts` L20 sets `maxDuration = 300` (Vercel Pro's max), and a combined diagnose+recommend run is ~100–115s — so duration alone is not the forcing function on Pro. The split exists for two reasons: it keeps each individual request comfortably under any cap (Hobby's 60s could not fit the combined run), and it matches the product's two-page flow — step 2 (`/investigate/[id]`) runs only the diagnostic agent, step 3 (`/investigate/[id]/recommend`) runs only the recommendation agent with the diagnosis handed over via `sessionStorage`. If a single step ever exceeds the cap, the stream closes without emitting `done`: the consumer's `reader.read()` returns `{ done: true }` (clean platform close) or rejects, `complete` stays `false`, and the UI shows "analyzing…" forever.
 
-The cache replay path is unaffected — it replays a stored sequence in `events.length × 180ms` total time, well under 60s for any realistic investigation.
+The cache replay path is unaffected — it replays a step-filtered stored sequence in `events.length × 180ms` total time, well under any cap.
 
-The fix is to increase `maxDuration` on a paid Vercel plan (up to 300s) or to move the agent run to a background queue (e.g., a Vercel Cron + database polling) and have the consumer poll for the cached result rather than stream from the live run.
+The mitigation if a step grows too long is to lower per-agent budgets, or move the agent run to a background queue (e.g., a Vercel Cron + database polling) and have the consumer poll for the cached result rather than stream from the live run.
 
 ---
 
@@ -634,10 +707,12 @@ Honest answer: SSE/`EventSource` is the standard for server push when you want r
 ### Anchors
 
 - `lib/mcp/events.ts` L4–L12 — the `AgentEvent` union is the complete wire contract
-- `app/api/agent/route.ts` L50 — `REPLAY_DELAY_MS = 180`
-- `app/api/agent/route.ts` L105–L169 — the `ReadableStream` producer (live run)
-- `app/investigate/[id]/page.tsx` L143–L168 — the `fetch` consumer loop
-- `app/investigate/[id]/page.tsx` L42–L48 — StrictMode `startedRef` guard
+- `app/api/agent/route.ts` L20 — `maxDuration = 300`
+- `app/api/agent/route.ts` L105 — `REPLAY_DELAY_MS = 180`
+- `app/api/agent/route.ts` L66–L84 — `filterByStep` (step-sliced replay)
+- `app/api/agent/route.ts` L168–L267 — the `ReadableStream` producer (live run); bootstrap inside at L196–L202
+- `lib/hooks/useInvestigation.ts` L184–L201 — the `fetch` consumer loop
+- `lib/hooks/useInvestigation.ts` L43, L47–L48 — StrictMode `startedRef` guard
 
 ---
 
@@ -645,19 +720,19 @@ Honest answer: SSE/`EventSource` is the standard for server push when you want r
 
 ### Level 1 — Reconstruct
 
-Without looking at the code, write the producer side: a Next.js route handler that creates a `ReadableStream`, encodes events as NDJSON lines, and returns them with `Content-Type: application/x-ndjson`. Then write the consumer side: a `useEffect` that reads the stream, buffers chunks, splits on newline, and calls a handler per line. Compare to `route.ts` L104–L177 and `page.tsx` L125–L172.
+Without looking at the code, write the producer side: a Next.js route handler that creates a `ReadableStream`, encodes events as NDJSON lines, and returns them with `Content-Type: application/x-ndjson`. Then write the consumer side: a `useEffect` that reads the stream, buffers chunks, splits on newline, and calls a handler per line. Compare to `route.ts` L168–L267 and `lib/hooks/useInvestigation.ts` L153–L212.
 
 ### Level 2 — Explain
 
-Open `app/investigate/[id]/page.tsx`. At L149, `dec.decode(value, { stream: true })` is called. What does the `{ stream: true }` option do? What would go wrong if you omitted it and the server sent a string containing a multi-byte UTF-8 character (e.g., "—") that was split across two TCP chunks? Then explain why L151 (`buf = lines.pop() ?? ''`) is the critical line in the consumer loop. What invariant does it maintain?
+Open `lib/hooks/useInvestigation.ts`. At L190, `dec.decode(value, { stream: true })` is called. What does the `{ stream: true }` option do? What would go wrong if you omitted it and the server sent a string containing a multi-byte UTF-8 character (e.g., "—") that was split across two TCP chunks? Then explain why L192 (`buf = lines.pop() ?? ''`) is the critical line in the consumer loop. What invariant does it maintain?
 
 ### Level 3 — Apply
 
 **Scenario:** A user reports that the trace shows 3 tool calls but the diagnosis panel never renders. The stream eventually closes. Where in the consumer loop do you look?
 
-Start at `handleEvent` in `page.tsx` L60–L123. Check the `case 'diagnosis':` branch (L108–L110) — it sets `diagnosis` state. If `diagnosis` is never set, either: (a) the `diagnosis` event was never emitted by the producer (check `route.ts` L154), (b) the line containing the `diagnosis` event was malformed and fell into the `catch` block at L156–L158 (silently ignored), or (c) the line containing the `diagnosis` event was split across two chunks and the partial was lost.
+Start at `handle` in `useInvestigation.ts` L97–L151. Check the `case 'diagnosis':` branch (L122–L125) — it sets `diagnosis` state. If `diagnosis` is never set, either: (a) the `diagnosis` event was never emitted by the producer (check `route.ts` L239 — note the diagnose step is the only one that emits it), (b) the line containing the `diagnosis` event was malformed and fell into the per-line `catch` block at L195–L199 (silently ignored), or (c) the line containing the `diagnosis` event was split across two chunks and the partial was lost.
 
-For case (c) — a line split across two chunks: the `buf.split('\n')` + `lines.pop()` pattern handles this correctly. `buf` accumulates the partial line until the next chunk completes it. If `{ stream: true }` was missing from `TextDecoder` (L149), a multi-byte character in the diagnosis JSON could produce the replacement character `�`, making `JSON.parse` throw and landing in the silent catch at L156–L158. Check `lib/mcp/events.ts` L4–L12 for the `diagnosis` event shape — the `diagnosis` field must be present or the switch falls through to `default` (L120–L122) silently.
+For case (c) — a line split across two chunks: the `buf.split('\n')` + `lines.pop()` pattern handles this correctly. `buf` accumulates the partial line until the next chunk completes it. If `{ stream: true }` was missing from `TextDecoder` (L190), a multi-byte character in the diagnosis JSON could produce the replacement character `�`, making `JSON.parse` throw and landing in the silent catch at L195–L199. Check `lib/mcp/events.ts` L4–L12 for the `diagnosis` event shape — the `diagnosis` field must be present or the switch falls through to `default` (L148–L149) silently.
 
 ### Level 4 — Defend
 
@@ -670,3 +745,6 @@ An interviewer asks: "you're manually line-buffering in the browser — isn't th
 - What is `REPLAY_DELAY_MS` and where is it defined?
 - Why does the `startedRef` guard exist in development but matter less in production?
 - What HTTP header signals to CDN proxies that this response should not be buffered?
+
+---
+Updated: 2026-05-28 — maxDuration 300; reader loop moved to useInvestigation.ts; schema bootstrap now emitted inside the stream; documented the `step`-filtered cached replay + pre-stream try/catch.

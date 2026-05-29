@@ -132,7 +132,7 @@ export function isAnomalyArray(v: unknown): v is Anomaly[] {
 
 The guard is a chain of `&&` predicates. The moment any predicate is false, JavaScript short-circuits and returns `false` without evaluating the rest — no try/catch needed.
 
-`isDiagnosis` checks three fields: `conclusion` is a string, `evidence` is an array, `hypothesesConsidered` is an array. `isRecommendationArray` checks six fields per element including enum membership via `Array.includes`.
+`isDiagnosis` (`lib/mcp/validate.ts` L29–L35) checks three fields: `conclusion` is a string, `evidence` is an array, `hypothesesConsidered` is an array. `isRecommendationArray` (`lib/mcp/validate.ts` L42–L57) checks six fields per element including enum membership via `Array.includes`. One field, `estimatedImpact`, accepts a union shape: an `impactOk` check (L46–L48) admits the value when it is EITHER a plain string (the legacy form) OR an object whose `range` is a string (the richer `{ range, rangeUsd?, assumption }` form) — so both encodings pass the guard.
 
 ### Step-by-step execution trace
 
@@ -304,10 +304,10 @@ The diagram in the next section is the primary recap.
 
 **File:** `lib/mcp/validate.ts`
 **Function / class:** `parseAgentJson` + `isAnomalyArray` + `isDiagnosis` + `isRecommendationArray`
-**Line range:** L2–L53
+**Line range:** L3–L57
 
 ```ts
-// lib/mcp/validate.ts  L2–L13
+// lib/mcp/validate.ts  L3–L13
 export function parseAgentJson(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = (fence ? fence[1] : text).trim();
@@ -554,3 +554,7 @@ A teammate argues: "We should replace `parseAgentJson` with Zod's `z.array(Anoma
 - If `fence` is non-null, what is `fence[1]`? What is `fence[0]`?
 - `candidate.search(/[[{]/)` returns `-1` if there is no bracket. What does the guard `start >= 0 && end > start` prevent?
 - An `is` predicate returns `boolean`. What does the `: v is Anomaly[]` annotation add over just returning `boolean`?
+- `isRecommendationArray` accepts `estimatedImpact` in two shapes. Name both. (Cite `lib/mcp/validate.ts` L46–L48.)
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers; noted that `isRecommendationArray` now accepts `estimatedImpact` as either a string or a `{ range, ... }` object (the `impactOk` union check)

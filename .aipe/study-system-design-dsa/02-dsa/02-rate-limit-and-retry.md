@@ -50,7 +50,7 @@ The retry loop re-enters the spacing gate, so every retry also waits the minimum
 
 ### The spacing gate (`liveCall`)
 
-`liveCall` (`lib/mcp/client.ts` L69–L77) is the only place the transport is called. It reads `elapsed = Date.now() - this.lastCallAt`. If `elapsed < minIntervalMs`, it sleeps the difference. Then it calls the transport and sets `lastCallAt = Date.now()`.
+`liveCall` (`lib/mcp/client.ts` L148–L163) is the only place the transport is called. It reads `elapsed = Date.now() - this.lastCallAt`. If `elapsed < minIntervalMs`, it sleeps the difference. Then it calls the transport and sets `lastCallAt = Date.now()`.
 
 Three calls arriving faster than 1100 ms apart are forced into a single-file queue:
 
@@ -79,17 +79,17 @@ Three calls arriving faster than 1100 ms apart are forced into a single-file que
 
 ### `lastCallAt` as the only state
 
-`lastCallAt` is a single `number` field initialized to `0` (`lib/mcp/client.ts` L19). When `lastCallAt = 0`, `Date.now() - 0` is large, so the first call never waits. After that, every call updates `lastCallAt` to the moment the transport returned — NOT the moment the call started — which means the gap is measured from the end of the previous network round trip, not from when it was scheduled.
+`lastCallAt` is a single `number` field initialized to `0` (`lib/mcp/client.ts` L81). When `lastCallAt = 0`, `Date.now() - 0` is large, so the first call never waits. After that, every call updates `lastCallAt` to the moment the transport returned — NOT the moment the call started — which means the gap is measured from the end of the previous network round trip, not from when it was scheduled.
 
 ### The retry loop
 
-After `liveCall` returns, `callTool` calls `isRateLimited(result)` (`lib/mcp/client.ts` L49`). If true and `retries < maxRetries`, it increments `retries`, sleeps `retryDelayMs`, then calls `liveCall` again. Defaults: `maxRetries = 3`, `retryDelayMs = 1200` ms (`lib/mcp/client.ts` L26–L27).
+After `liveCall` returns, `callTool` calls `isRateLimited(result)` (`lib/mcp/client.ts` L122). If true and `retries < maxRetries`, it increments `retries`, sleeps, then calls `liveCall` again. The sleep prefers a window parsed out of the Bloomreach error text (`parseRetryAfterMs`, L31–L38) and otherwise uses exponential backoff off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), with every wait capped at `retryCeilingMs` (`lib/mcp/client.ts` L122–L132). Defaults: `maxRetries = 3`, `retryDelayMs = 10_000` ms, `retryCeilingMs = 20_000` ms (`lib/mcp/client.ts` L88–L94).
 
 The loop counter is `retries`, not "attempts". A `maxRetries = 3` allows the original call plus up to 3 retries — 4 transport calls total.
 
 ### Detection (`isRateLimited`)
 
-`isRateLimited` (`lib/mcp/client.ts` L7–L11) inspects the RESULT object, not a thrown exception. The transport does not throw on 429; it returns a structured result. The check requires two conditions:
+`isRateLimited` (`lib/mcp/client.ts` L18–L22) inspects the RESULT object, not a thrown exception. The transport does not throw on 429; it returns a structured result. The check requires two conditions:
 
 1. `result.isError === true`
 2. `JSON.stringify(result.content ?? result)` matches `/rate limit|too many requests/i`
@@ -192,7 +192,7 @@ Full path from `callTool` entry to result. Stands alone.
   │  │  │ yes     │ no                                           │   │
   │  │  ▼         ▼                                              │   │
   │  │  retries++ return result                                  │   │
-  │  │  sleep(retryDelayMs = 1200 ms)                            │   │
+  │  │  sleep(parsed hint, else retryDelayMs*2^(n-1), capped)    │   │
   │  │  → back to liveCall (spacing gate runs again)             │   │
   │  └────────────────────────────────────────────────────────────┘   │
   └──────────────────────────────────────────────────────────────────┘
@@ -205,47 +205,63 @@ Full path from `callTool` entry to result. Stands alone.
 ## In this codebase
 
 **File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool` + `liveCall` + `isRateLimited`
-**Line range:** L7–L77
+**Function / class:** `McpClient.callTool` + `liveCall` + `isRateLimited` + `parseRetryAfterMs`
+**Line range:** L18–L163
 
 ```typescript
-// lib/mcp/client.ts  L7–L11 — detection
+// lib/mcp/client.ts  L18–L22 — detection
 function isRateLimited(result: unknown): boolean {
   if (!result || typeof result !== 'object' || (result as any).isError !== true) return false;
   const text = JSON.stringify((result as any).content ?? result);
   return /rate limit|too many requests/i.test(text);
 }
 
-// lib/mcp/client.ts  L69–L77 — spacing gate
+// lib/mcp/client.ts  L148–L163 — spacing gate (with transport-error tagging)
 private async liveCall(name: string, args: Record<string, unknown>): Promise<unknown> {
   const elapsed = Date.now() - this.lastCallAt;
   if (elapsed < this.minIntervalMs) {
     await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
-  const result = await this.transport.callTool(name, args);
-  this.lastCallAt = Date.now();
-  return result;
+  try {
+    const result = await this.transport.callTool(name, args);
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
 }
 
-// lib/mcp/client.ts  L48–L53 — bounded retry loop
+// lib/mcp/client.ts  L121–L132 — bounded retry loop (parsed-hint / exponential backoff, capped)
 let retries = 0;
 while (isRateLimited(result) && retries < this.maxRetries) {
   retries++;
-  await sleep(this.retryDelayMs);
+  const hintMs = parseRetryAfterMs(result);
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+  const waitMs = Math.min(
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+    this.retryCeilingMs,
+  );
+  await sleep(waitMs);
   result = await this.liveCall(name, args);
 }
 ```
 
-The 1100 ms value is set in `lib/mcp/connect.ts` L58:
+The 1100 ms value (and retry tuning) is set in `lib/mcp/connect.ts` L91–L96:
 ```typescript
-mcp: new McpClient(new SdkTransport(client), { minIntervalMs: 1100 }),
+mcp: new McpClient(new SdkTransport(client, httpErrors), {
+  minIntervalMs: 1100,
+  retryDelayMs: 10_000,
+  retryCeilingMs: 20_000,
+  maxRetries: 3,
+}),
 ```
 
 **GitHub links:**
-- `liveCall` (L69–L77): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L69-L77
-- retry loop (L48–L53): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L48-L53
-- `isRateLimited` (L7–L11): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L7-L11
-- `connect.ts` 1100 ms (L58): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L58
+- `liveCall` (L148–L163): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L148-L163
+- retry loop (L121–L132): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L121-L132
+- `isRateLimited` (L18–L22): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L18-L22
+- `connect.ts` 1100 ms (L91–L96): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L91-L96
 
 ---
 
@@ -257,7 +273,7 @@ mcp: new McpClient(new SdkTransport(client), { minIntervalMs: 1100 }),
 
 **Fixed-interval spacing** is the simplest client throttle: no more than one call per `minIntervalMs`. There is no credit accumulation, no bucket, no burst. It is equivalent to a leaky bucket with capacity = 1 where the drain rate is 1/`minIntervalMs`.
 
-**Bounded retry with fixed delay** is the simplest retry policy. The industry standard is exponential backoff with jitter (`delay = base * 2^attempt + random(0, jitter)`), which spreads retry storms across a time window. The codebase uses a fixed `retryDelayMs = 1200` ms — simpler to reason about, sufficient for a single process, but produces a synchronized thundering herd if multiple callers all retry at the same moment.
+**Bounded retry with backoff** is the standard retry policy. The codebase prefers a wait window parsed out of the Bloomreach error text and otherwise applies exponential backoff (`retryDelayMs * 2 ** (retries - 1)`) capped at `retryCeilingMs`. What it omits is jitter (`+ random(0, jitter)`): without it, multiple callers that all retry at the same moment still wake together — a synchronized thundering herd.
 
 ### The deeper principle
 
@@ -283,9 +299,9 @@ The proactive policy handles steady-state. The reactive policy handles edge case
 
 **Fixed delay is not a true token bucket.** A token bucket accumulates credit during idle periods and spends it during bursts. After 5 seconds of silence, a token bucket at 1 req/sec has 5 credits and can legitimately fire 5 calls in quick succession. `liveCall`'s fixed delay never accumulates credit — even after 60 seconds of silence, call 1 goes immediately but call 2 must wait 1100 ms. This is unnecessarily conservative.
 
-**Per-process `lastCallAt` does not coordinate across instances.** `lastCallAt` is a field on `McpClient`. Each call to `connectMcp` (`lib/mcp/connect.ts` L40–L58) creates a new `McpClient` with its own `lastCallAt = 0`. Two concurrent serverless invocations for the same user each see `lastCallAt = 0` and both call the transport simultaneously — 2 req/sec against a 1 req/sec global quota.
+**Per-process `lastCallAt` does not coordinate across instances.** `lastCallAt` is a field on `McpClient`. Each call to `connectMcp` (`lib/mcp/connect.ts` L91–L96) creates a new `McpClient` with its own `lastCallAt = 0`. Two concurrent serverless invocations for the same user each see `lastCallAt = 0` and both call the transport simultaneously — 2 req/sec against a 1 req/sec global quota.
 
-**Fixed `retryDelayMs` is not exponential and has no jitter.** Every retry wakes up after exactly 1200 ms. If 10 callers all receive a 429 at T=0 and all sleep 1200 ms, they all retry at T=1200 — a synchronized burst. Exponential backoff (`1200, 2400, 4800`) with jitter (add `random(0, 600)` ms) spreads them out.
+**Backoff has no jitter.** The wait is exponential off `retryDelayMs` (or a parsed retry-after window), capped at `retryCeilingMs` — but it adds no random jitter. If 10 callers all receive a 429 at T=0, they all compute the same wait and retry at the same instant — a synchronized burst. Full jitter (add `random(0, delay)` ms) spreads them out.
 
 ### What to explore next
 
@@ -297,24 +313,24 @@ The proactive policy handles steady-state. The reactive policy handles edge case
 
 ## Tradeoffs
 
-### Comparison: fixed spacing + fixed-delay bounded retry vs. alternatives
+### Comparison: fixed spacing + jitterless backoff bounded retry vs. alternatives
 
-| Dimension | This codebase (fixed gap + fixed retry) | Token bucket + exp backoff w/ jitter |
+| Dimension | This codebase (fixed gap + exp backoff, no jitter) | Token bucket + exp backoff w/ jitter |
 |---|---|---|
-| Complexity | Zero deps; one timestamp field; one loop counter | `Bottleneck` or custom bucket + random jitter math |
+| Complexity | Zero deps; one timestamp field; one loop counter; backoff + cap math | `Bottleneck` or custom bucket + random jitter math |
 | Burst handling | None — every inter-call gap is ≥ 1100 ms regardless | Allows bursts when credit has accumulated |
-| Thundering herd on retry | Yes — all retries wake at T + 1200 ms simultaneously | No — jitter spreads wakeups across a window |
+| Thundering herd on retry | Yes — all retries compute the same wait and wake simultaneously | No — jitter spreads wakeups across a window |
 | Cross-instance coordination | No — per-process `lastCallAt` only | Still no (needs Redis for distributed coordination) |
 | Correct under single-process steady load | Yes | Yes |
-| State to tune | `minIntervalMs`, `maxRetries`, `retryDelayMs` | Bucket capacity, refill rate, backoff base, jitter cap |
+| State to tune | `minIntervalMs`, `maxRetries`, `retryDelayMs`, `retryCeilingMs` | Bucket capacity, refill rate, backoff base, jitter cap |
 
 **Gave up:**
 - **Burst absorption.** After 10 seconds of silence the client could legitimately fire 10 requests in succession and still average 1/sec. The fixed delay blocks this even when it is safe.
-- **Jitter on retry.** All retries sleep exactly 1200 ms. Under load, multiple concurrent callers produce a synchronized retry wave.
+- **Jitter on retry.** The backoff is deterministic, so concurrent callers that hit a 429 together compute identical waits and produce a synchronized retry wave.
 
 **Alternative's cost:**
 - A real token bucket (`Bottleneck`, `p-throttle`) adds a package dependency and configuration surface (`reservoir`, `reservoirRefreshInterval`, `maxConcurrent`) that is disproportionate to the current single-process, single-user target.
-- Exponential backoff with jitter requires tuning base delay and jitter cap. For three retries at 1200 ms the benefit is minimal — the complexity is not worth it until retry storms are observed.
+- Adding jitter on top of the existing backoff requires tuning a jitter cap; for three retries the benefit is minimal — the complexity is not worth it until retry storms are observed.
 
 **Breakpoint:**
 This design is correct for one process serving one user at a flat ~1 req/sec. It needs a token bucket + distributed coordination the moment multiple concurrent serverless instances share one user's Bloomreach rate-limit quota.
@@ -343,13 +359,13 @@ This design is correct for one process serving one user at a flat ~1 req/sec. It
 
 ## Summary
 
-`McpClient.liveCall` enforces a minimum inter-call gap by computing `elapsed = Date.now() - lastCallAt` and sleeping the deficit before every transport call. `callTool` wraps `liveCall` in a bounded `while (isRateLimited && retries < maxRetries)` loop with a fixed `retryDelayMs` sleep between attempts. Defaults in `lib/mcp/connect.ts`: `minIntervalMs = 1100`, `maxRetries = 3`, `retryDelayMs = 1200`.
+`McpClient.liveCall` enforces a minimum inter-call gap by computing `elapsed = Date.now() - lastCallAt` and sleeping the deficit before every transport call. `callTool` wraps `liveCall` in a bounded `while (isRateLimited && retries < maxRetries)` loop whose sleep is a parsed retry-after window or exponential backoff off `retryDelayMs`, capped at `retryCeilingMs`. Defaults in `lib/mcp/connect.ts`: `minIntervalMs = 1100`, `maxRetries = 3`, `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`.
 
-- `liveCall` (`lib/mcp/client.ts` L69–L77) is the only entry point to the transport; every live call — initial and retry — passes through the spacing gate
-- `lastCallAt` (`lib/mcp/client.ts` L19`) is the only state the spacing gate needs; it is set after the transport returns, measuring gap from end of previous call not start
-- `isRateLimited` (`lib/mcp/client.ts` L7–L11) inspects the result object (not a thrown exception) for `isError === true` plus a text match on `/rate limit|too many requests/i`
-- The retry loop (`lib/mcp/client.ts` L48–L53) caps at `maxRetries` retries; total possible transport calls per `callTool` invocation is `maxRetries + 1`
-- Fixed interval spacing is not a token bucket — no burst credit accumulates; per-process `lastCallAt` breaks under horizontal scaling; fixed `retryDelayMs` produces synchronized retry waves without jitter
+- `liveCall` (`lib/mcp/client.ts` L148–L163) is the only entry point to the transport; every live call — initial and retry — passes through the spacing gate
+- `lastCallAt` (`lib/mcp/client.ts` L81) is the only state the spacing gate needs; it is set after the transport returns, measuring gap from end of previous call not start
+- `isRateLimited` (`lib/mcp/client.ts` L18–L22) inspects the result object (not a thrown exception) for `isError === true` plus a text match on `/rate limit|too many requests/i`
+- The retry loop (`lib/mcp/client.ts` L121–L132) caps at `maxRetries` retries; total possible transport calls per `callTool` invocation is `maxRetries + 1`
+- Fixed interval spacing is not a token bucket — no burst credit accumulates; per-process `lastCallAt` breaks under horizontal scaling; the exponential backoff carries no jitter, so concurrent retries can wake together
 
 ---
 
@@ -379,7 +395,7 @@ It reads `elapsed = Date.now() - this.lastCallAt`. If `elapsed < minIntervalMs`,
 
 **[senior] `isRateLimited` inspects the result, not a caught exception. Why?**
 
-The MCP transport does not throw on a 429; it returns a structured result object with `isError: true`. Relying on a `try/catch` would miss this entirely. The check is on the shape of the returned data: `result.isError === true` AND the serialized content matches `/rate limit|too many requests/i` (`lib/mcp/client.ts` L7–L11). This design means the retry logic is decoupled from exception handling — it works regardless of whether the transport throws or returns structured errors.
+The MCP transport does not throw on a 429; it returns a structured result object with `isError: true`. Relying on a `try/catch` would miss this entirely. The check is on the shape of the returned data: `result.isError === true` AND the serialized content matches `/rate limit|too many requests/i` (`lib/mcp/client.ts` L18–L22). This design means the retry logic is decoupled from exception handling — it works regardless of whether the transport throws or returns structured errors.
 
 ```
   result arrives
@@ -398,7 +414,7 @@ The MCP transport does not throw on a 429; it returns a structured result object
 
 **[arch] Does the 1100 ms spacing guarantee the rate limit across multiple serverless instances?**
 
-No. `lastCallAt` is a field on `McpClient` which is created fresh per `connectMcp` call (`lib/mcp/connect.ts` L58). Two concurrent serverless invocations for the same user each have `lastCallAt = 0`. Both compute `elapsed = Date.now() - 0` = enormous → no wait → both call the transport simultaneously. Bloomreach sees 2 req/sec.
+No. `lastCallAt` is a field on `McpClient` which is created fresh per `connectMcp` call (`lib/mcp/connect.ts` L91–L96). Two concurrent serverless invocations for the same user each have `lastCallAt = 0`. Both compute `elapsed = Date.now() - 0` = enormous → no wait → both call the transport simultaneously. Bloomreach sees 2 req/sec.
 
 ```
   Instance A:  lastCallAt = 0 → liveCall at T=0  ──▶  transport
@@ -413,7 +429,7 @@ Fix: a shared atomic counter in Redis (sliding window or token bucket) that all 
 
 **"Why a fixed 1.1 s gap instead of a token bucket that allows bursts?"**
 
-Honest answer: it is the simplest correct solution for one process. A token bucket accumulates credit during idle periods; a fixed interval does not. For a single serverless function handling sequential briefing calls, there are no idle periods during a run — every 1.1 s gap is real back-pressure, not wasted credit. The token bucket's burst advantage only matters when calls arrive in clusters after silence, which is not the steady-state briefing pattern. The comment in `connect.ts` L53–L55 marks this as deliberate simplicity, not an oversight.
+Honest answer: it is the simplest correct solution for one process. A token bucket accumulates credit during idle periods; a fixed interval does not. For a single serverless function handling sequential briefing calls, there are no idle periods during a run — every 1.1 s gap is real back-pressure, not wasted credit. The token bucket's burst advantage only matters when calls arrive in clusters after silence, which is not the steady-state briefing pattern. The comment block in `connect.ts` L81–L88 explains this deliberate choice — proactive spacing stays at ~1.1 s while the parsed retry window absorbs the full penalty.
 
 ```
   Fixed delay (current):
@@ -432,11 +448,11 @@ Both respect the average rate. The token bucket is better when the call pattern 
 
 ### Anchors
 
-- `lib/mcp/client.ts` L7–L11 — `isRateLimited`: two-condition detection on result, not exception
-- `lib/mcp/client.ts` L19 — `lastCallAt = 0`: per-instance state, the source of multi-instance races
-- `lib/mcp/client.ts` L48–L53 — retry loop: `retries < maxRetries`, re-enters `liveCall`
-- `lib/mcp/client.ts` L69–L77 — `liveCall`: spacing gate, `setTimeout`-promise, `lastCallAt` update
-- `lib/mcp/connect.ts` L58 — `minIntervalMs: 1100` with rate-limit comment explaining the 1 req/sec constraint
+- `lib/mcp/client.ts` L18–L22 — `isRateLimited`: two-condition detection on result, not exception
+- `lib/mcp/client.ts` L81 — `lastCallAt = 0`: per-instance state, the source of multi-instance races
+- `lib/mcp/client.ts` L121–L132 — retry loop: `retries < maxRetries`, parsed-hint / exponential backoff, re-enters `liveCall`
+- `lib/mcp/client.ts` L148–L163 — `liveCall`: spacing gate, `setTimeout`-promise, `lastCallAt` update
+- `lib/mcp/connect.ts` L91–L96 — `minIntervalMs: 1100` (and retry tuning) with rate-limit comment explaining the 1 req/sec constraint
 
 ---
 
@@ -448,29 +464,31 @@ Without looking at the code, write the `liveCall` function from memory. Name the
 
 ### Level 2 — explain (cite `lib/mcp/client.ts`)
 
-Open `lib/mcp/client.ts` L48–L53. The retry loop calls `this.liveCall(name, args)` — not `this.transport.callTool(name, args)` directly. Why? What would break if the retry bypassed `liveCall` and called the transport directly? Cite L69–L77 in your answer.
+Open `lib/mcp/client.ts` L121–L132. The retry loop calls `this.liveCall(name, args)` — not `this.transport.callTool(name, args)` directly. Why? What would break if the retry bypassed `liveCall` and called the transport directly? Cite L148–L163 in your answer.
 
 ### Level 3 — apply
 
 Scenario: calls are still receiving occasional 429s even with 1100 ms spacing. Diagnose.
 
-- First: is the spacing working per-process? How would you verify — what log lines or test would confirm `elapsed` is always ≥ 1100 ms? Cite `lib/mcp/client.ts` L70.
-- Second: does the retry recover the call when a 429 does arrive? Trace the loop at L48–L53 for `maxRetries = 3`: how many transport calls can a single `callTool` invocation make? What is the maximum total wall-clock time those calls can consume (include `retryDelayMs` sleeps and `minIntervalMs` waits)?
-- Third: now add a second process. Both processes share the same Bloomreach user quota. Explain — citing `lib/mcp/client.ts` L19 and `lib/mcp/connect.ts` L58 — why the per-process spacing provides no protection against inter-process collisions. What change to the architecture would fix this?
+- First: is the spacing working per-process? How would you verify — what log lines or test would confirm `elapsed` is always ≥ 1100 ms? Cite `lib/mcp/client.ts` L149.
+- Second: does the retry recover the call when a 429 does arrive? Trace the loop at L121–L132 for `maxRetries = 3`: how many transport calls can a single `callTool` invocation make? What is the maximum total wall-clock time those calls can consume (include the capped backoff sleeps and `minIntervalMs` waits)?
+- Third: now add a second process. Both processes share the same Bloomreach user quota. Explain — citing `lib/mcp/client.ts` L81 and `lib/mcp/connect.ts` L91–L96 — why the per-process spacing provides no protection against inter-process collisions. What change to the architecture would fix this?
 
 ### Level 4 — defend
 
-A teammate proposes: "Replace the fixed `retryDelayMs = 1200` with exponential backoff: `delay = 1200 * 2^(retries-1)`." For `maxRetries = 3`, compare the two delay schedules:
+The retry loop already prefers a parsed retry-after window and otherwise applies exponential backoff (`retryDelayMs * 2 ** (retries - 1)`) capped at `retryCeilingMs` — but it adds no jitter. For `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`, `maxRetries = 3`, write out the (capped) backoff-only schedule:
 
-- Fixed: 1200 ms, 1200 ms, 1200 ms
-- Exponential: 1200 ms, 2400 ms, 4800 ms
+- Backoff (no hint): 10_000 ms, 20_000 ms (capped), 20_000 ms (capped)
 
-Under what conditions does exponential backoff actually help, and under what conditions does it make things worse for a user waiting on a briefing? Is jitter (`delay + random(0, delay/2)`) worth adding here? Anchor your answer to the single-process, single-user deployment target documented in `lib/mcp/connect.ts` L12–L14.
+Under what conditions does the parsed-hint path beat the raw backoff? Is jitter (`delay + random(0, delay/2)`) worth adding here for a single-process, single-user deployment, or only once multiple instances can collide? Anchor your answer to the deployment target documented in `lib/mcp/connect.ts` L12–L14.
 
 ### Quick check
 
 - How many total transport calls does `maxRetries = 3` allow for one `callTool` invocation? (Initial call + 3 retries = 4 total.)
-- `isRateLimited` requires two conditions. Name both. (Cite `lib/mcp/client.ts` L8–L10.)
+- `isRateLimited` requires two conditions. Name both. (Cite `lib/mcp/client.ts` L19–L21.)
 - `lastCallAt` is set AFTER the transport returns, not before. Why does this matter for the gap measurement? (Gap is from end of last network call, not from when the next call was queued.)
-- What is the default `minIntervalMs` on the `McpClient` constructor, and what value does `connect.ts` override it to? (200 ms default per `lib/mcp/client.ts` L25; 1100 ms in `lib/mcp/connect.ts` L58.)
-- Does the retry loop re-enter the spacing gate? (Yes — it calls `liveCall`, not the transport directly; cite `lib/mcp/client.ts` L52.)
+- What is the default `minIntervalMs` on the `McpClient` constructor, and what value does `connect.ts` override it to? (200 ms default per `lib/mcp/client.ts` L88; 1100 ms in `lib/mcp/connect.ts` L92.)
+- Does the retry loop re-enter the spacing gate? (Yes — it calls `liveCall`, not the transport directly; cite `lib/mcp/client.ts` L131.)
+
+---
+Updated: 2026-05-28 — refreshed code references to current line numbers; retry now prefers a parsed retry-after window / exponential backoff capped at `retryCeilingMs` (defaults `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)

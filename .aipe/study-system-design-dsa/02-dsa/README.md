@@ -9,6 +9,7 @@ The concrete operations this codebase performs, one file per operation. Each fil
 - **[03-ndjson-line-buffering.md](03-ndjson-line-buffering.md)** — reassembling complete JSON records from arbitrary network chunks: `split('\n')` + keep the trailing partial line; plus reverse-scan reconciliation of `tool_call_start`/`tool_call_end`.
 - **[04-json-from-prose.md](04-json-from-prose.md)** — lenient extraction of JSON from LLM prose (fenced block → bare parse → substring scan) followed by structural type-guard validation.
 - **[05-severity-sort.md](05-severity-sort.md)** — a rank-table comparator sort (`SEV_RANK[b] - SEV_RANK[a]`) + top-N truncation, and a `new Set([...a,...b,...c])` union that dedups overlapping tool subsets.
+- **[06-enrichment-derivation.md](06-enrichment-derivation.md)** — deriving business-owner display fields from held evidence: a find-first numeric-pair scan, the funnel leak via `reduce` min-by-key (`argmin`), confidence bucketing from hypotheses-tested counts, and `typeof` normalization of a string-or-object impact union.
 
 ## Complexity cheat sheet
 
@@ -24,9 +25,16 @@ The concrete operations this codebase performs, one file per operation. Each fil
 | JSON-from-prose extract | 04 | O(n) over text length (regex + index scan) | O(n) (the sliced candidate) |
 | Anomaly rank sort | 05 | O(n log n) (`Array.sort`) | O(n) |
 | Set-union dedup | 05 | O(m) over total tool names | O(u) unique tools |
+| Find-first numeric pair | 06 | O(n) over evidence entries (stops on first match) | O(1) |
+| Funnel leak (argmin reduce) | 06 | O(n) over funnel stages (n = 4) | O(1) |
+| Confidence bucketing | 06 | O(n) over hypotheses (filter/length counts) | O(1) |
+| Impact union normalize | 06 | O(1) (`typeof` branch) | O(1) |
 
 ## Flagged: an O(n) win left on the table
 
 - **TTL cache has no eviction** (`01-ttl-cache.md`). The `Map` grows with every distinct `(name, args)` pair and is never bounded. At session scale this is harmless (a handful of distinct calls), but it is O(distinct-keys) memory with no cap — an LRU bound is the obvious fix the moment distinct keys grow large or the process is long-lived. This is called out plainly in the file's Tradeoffs.
 
 No operation here is accidentally O(n²) where O(n) is easy — the sort is the only super-linear step, and `O(n log n)` on ≤10 items is irrelevant.
+
+---
+Updated: 2026-05-28 — added `06-enrichment-derivation.md` (find-first scan, funnel-leak argmin reduce, confidence bucketing, impact union normalize) to the operations list and the complexity cheat-sheet (all O(n) over tiny n / O(1))

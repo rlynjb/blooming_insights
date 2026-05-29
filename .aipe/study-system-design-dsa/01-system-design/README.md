@@ -10,6 +10,7 @@ The architectural patterns this codebase actually uses, one file per pattern. Ea
 - **[04-caching-and-rate-limiting.md](04-caching-and-rate-limiting.md)** — the `McpClient` choke-point: TTL cache, ~1.1s inter-call spacing (the server allows ~1 req/s/user), bounded rate-limit retry, no-cache-on-error.
 - **[05-streaming-ndjson.md](05-streaming-ndjson.md)** — `/api/agent` streams `AgentEvent`s as NDJSON over a `ReadableStream`; the browser consumes them with a `fetch` reader (not `EventSource`); cache-replay reuses the same wire format.
 - **[06-multi-agent-orchestration.md](06-multi-agent-orchestration.md)** — one shared `runAgentLoop` powering four agents; a `maxToolCalls` budget + forced-final turn + a dedicated synthesis call that guarantees structured output.
+- **[07-client-stream-handoff.md](07-client-stream-handoff.md)** — the `useInvestigation` client hook: a started-guard + no-cancel-on-cleanup `fetch` reader that runs once under StrictMode, plus `sessionStorage` handoffs (`bi:insight:`, `bi:inv:*`, `bi:diag:`) that carry state across route changes and Vercel instances.
 
 ## The 6-step system-design checklist
 
@@ -32,5 +33,9 @@ A mental walk for any system. Each pattern above is tagged with the step(s) it l
 | 04 caching-and-rate-limiting | **3** caching layers · **5** failure handling · **6** scale concerns |
 | 05 streaming-ndjson | **2** request/response flow · **5** failure handling |
 | 06 multi-agent-orchestration | **2** request/response flow · **5** failure handling · **6** scale concerns |
+| 07 client-stream-handoff | **4** state ownership · **2** request/response flow |
 
 > Note: there is no classic relational **data model** (step 1) here — state is in-memory maps + committed JSON snapshots, no DB. That absence is itself a design decision; see `04-caching-and-rate-limiting.md` and `02-oauth-boundary.md` for where state lives and what that costs at scale.
+
+---
+Updated: 2026-05-28 — added `07-client-stream-handoff.md` (the `useInvestigation` started-guard + sessionStorage handoff pattern) to the pattern list and the checklist-step table (steps 4 + 2)

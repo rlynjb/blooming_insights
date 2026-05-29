@@ -5,7 +5,7 @@
 
 > Read a chunked byte stream where JSON objects may arrive split across network boundaries, reassemble complete newline-delimited records in a string buffer, parse each, and keep state consistent by reconciling paired start/end events in place.
 
-**See also:** → ../01-system-design/05-streaming-ndjson.md
+**See also:** → ../01-system-design/05-streaming-ndjson.md · → ../01-system-design/07-client-stream-handoff.md
 
 ---
 
@@ -273,14 +273,14 @@ The diagram stands alone: a chunk arrives as bytes, gets decoded as text with `{
 
 ## In this codebase
 
-**File:** `app/investigate/[id]/page.tsx`
-**Function / class:** `InvestigatePage` — the `useEffect` reader loop (L143–L168) and `handleEvent` (L60–L123)
-**Line range:** L60–L168
+**File:** `lib/hooks/useInvestigation.ts`
+**Function / class:** `useInvestigation` — the reader loop inside the effect's async IIFE (L184–L208) and `handle` (L97–L151)
+**Line range:** L86–L208
 
 The reader loop:
 
 ```ts
-// app/investigate/[id]/page.tsx  L143–L160
+// lib/hooks/useInvestigation.ts  L184–L208
 const reader = res.body.getReader();
 const dec = new TextDecoder();
 let buf = '';
@@ -293,45 +293,52 @@ for (;;) {
   for (const line of lines) {
     if (!line.trim()) continue;
     try {
-      handleEvent(JSON.parse(line) as AgentEvent);
+      handle(JSON.parse(line) as AgentEvent);
     } catch {
       /* ignore malformed line */
     }
   }
 }
+if (buf.trim()) {
+  try {
+    handle(JSON.parse(buf) as AgentEvent);
+  } catch {
+    /* ignore */
+  }
+}
 ```
 
-The tool-call reconciliation reverse scan inside `handleEvent`:
+The hook deliberately does NOT cancel this in-flight `fetch` on effect cleanup: a `startedRef` guard (L43, L47–L48) makes the effect run its fetch exactly once per mount, so under React StrictMode's mount → cleanup → re-mount cycle, cancelling on the first cleanup — while the guard blocks the re-mount from starting a fresh fetch — left the stream aborted and the logs empty. The in-flight run is allowed to complete instead (a `setState` after unmount is a safe no-op). See the comment at L32–L36.
+
+The tool-call reconciliation reverse scan, factored out as `replaceRunningTool` (L86–L95) and applied in the `tool_call_end` case (L118–L121):
 
 ```ts
-// app/investigate/[id]/page.tsx  L88–L106
-case 'tool_call_end':
-  advancePipeline(e.agent);
-  setItems((prev) => {
-    const next = [...prev];
-    for (let i = next.length - 1; i >= 0; i--) {
-      const it = next[i];
-      if (it.kind === 'tool' && it.toolName === e.toolName && it.status === 'running') {
-        next[i] = {
-          ...it,
-          status: 'done',
-          durationMs: e.durationMs,
-          result: e.result,
-          error: e.error,
-        };
-        break;
-      }
+// lib/hooks/useInvestigation.ts  L86–L95
+const replaceRunningTool = (arr: TraceItem[], e: Extract<AgentEvent, { type: 'tool_call_end' }>) => {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const it = arr[i];
+    if (it.kind === 'tool' && it.toolName === e.toolName && it.status === 'running') {
+      arr[i] = { ...it, status: 'done', durationMs: e.durationMs, result: e.result, error: e.error };
+      break;
     }
-    return next;
-  });
+  }
+  return arr;
+};
+
+// L118–L121
+case 'tool_call_end':
+  replaceRunningTool(cItems, e);                  // mutates the closure mirror for the stash
+  setItems((p) => replaceRunningTool([...p], e)); // reverse-scans a fresh copy for React state
   break;
 ```
 
-**Also:** `components/chat/StreamingResponse.tsx` — identical reader loop at L107–L132, identical reconciliation at L59–L76. `StreamingResponse` is used in the query box flow; `app/investigate/[id]/page.tsx` is used for full investigation runs. Both duplicate the same buffer+reconciliation pattern.
+The reverse scan runs twice per `tool_call_end`: once against `cItems` (the plain-array mirror the hook stashes to sessionStorage on `done`) and once against a fresh `[...p]` copy inside `setItems`. Same algorithm, two targets.
+
+**Also:** `app/page.tsx` — the feed runs its own NDJSON reader loop for the live monitoring stream at L418–L443, with the trailing `if (buf.trim())` flush at L437–L443 and the same reverse-scan reconciliation inline in its `tool_call_end` case at L347–L365. The feed's `runInvestigation` drain helper (L171–L192) uses a different framing variant — `buf.indexOf('\n')` + `buf.slice` in a `while` loop rather than `split('\n')` + `pop()` — but the same buffer-the-boundary invariant. Three reader loops total now share the pattern (the hook, the feed's live stream, the feed's capture-drain).
 
 **GitHub links:**
-- `app/investigate/[id]/page.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/page.tsx#L143-L168
-- `components/chat/StreamingResponse.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/components/chat/StreamingResponse.tsx#L107-L132
+- `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L184-L208
+- `app/page.tsx` (feed live stream): https://github.com/rlynjb/blooming_insights/blob/main/app/page.tsx#L418-L443
 
 ---
 
@@ -380,7 +387,7 @@ case 'tool_call_end':
 | Dependency count | Zero — Web Streams API + `String.prototype.split` | Zero — `EventSource` is a browser built-in | One npm dependency |
 | Auth headers | `fetch` accepts `Authorization` header | `EventSource` cannot send custom headers in the browser (requires a wrapper or query-param token) | Same as fetch — full header control |
 
-**What was given up.** The hand-rolled loop has no backpressure, no max-buffer guard, and no reconnect. If the server drops the connection mid-stream, the investigation stops and the user sees a stale "analyzing…" indicator. Two files (`page.tsx` and `StreamingResponse.tsx`) duplicate the same 25-line pattern rather than sharing a hook.
+**What was given up.** The hand-rolled loop has no backpressure, no max-buffer guard, and no reconnect. If the server drops the connection mid-stream, the investigation stops and the user sees a stale "analyzing…" indicator. The investigation reader was consolidated into the `useInvestigation` hook, but the feed (`app/page.tsx`) still hand-rolls its own copy of the loop — the pattern is shared by convention, not by code.
 
 **What the alternative costs.** SSE (`EventSource`) would remove the manual framing code entirely, but `EventSource` in the browser cannot send `Authorization` headers — the server-side OAuth token that `/api/agent` needs would have to move to a query parameter or cookie, which changes the auth surface. Using `eventsource-parser` as a library adds a dependency and still requires the `fetch`+`getReader()` shell around it; it replaces the `split`/`pop` lines, not the loop structure.
 
@@ -418,7 +425,7 @@ case 'tool_call_end':
 - `{ stream: true }` on `TextDecoder.decode` is required for correctness on non-ASCII content; omitting it produces silent data corruption.
 - The reverse scan for reconciliation is correct under sequential tool dispatch; it mis-pairs if the same tool runs concurrently.
 - No max-buffer guard means a server that never writes `\n` will grow `buf` unbounded.
-- The pattern is duplicated in two files (`app/investigate/[id]/page.tsx` L143–L160 and `components/chat/StreamingResponse.tsx` L107–L124) — a shared hook would be the straightforward consolidation.
+- The reader loop now lives in the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208); the feed (`app/page.tsx` L418–L443) still hand-rolls its own copy — the consolidation is half-done.
 - Zero runtime dependencies: `ReadableStream`, `TextDecoder`, and `String.prototype.split` are all Web Platform APIs available in every modern browser.
 
 ---
@@ -470,17 +477,17 @@ Honest answer: `EventSource` (browser SSE) cannot send custom request headers �
 ```
 
 **Anchors — cite these in your answer.**
-- `app/investigate/[id]/page.tsx` L149: `buf += dec.decode(value, { stream: true })` — the append.
-- `app/investigate/[id]/page.tsx` L150–L151: `const lines = buf.split('\n'); buf = lines.pop() ?? ''` — the invariant.
-- `app/investigate/[id]/page.tsx` L92–L103: the reverse scan in `tool_call_end`.
-- `components/chat/StreamingResponse.tsx` L113–L115: the same three lines in the query-box flow, confirming the pattern is shared across both streaming surfaces.
+- `lib/hooks/useInvestigation.ts` L190: `buf += dec.decode(value, { stream: true })` — the append.
+- `lib/hooks/useInvestigation.ts` L191–L192: `const lines = buf.split('\n'); buf = lines.pop() ?? ''` — the invariant.
+- `lib/hooks/useInvestigation.ts` L86–L95: the reverse scan, factored out as `replaceRunningTool`.
+- `app/page.tsx` L426–L427: the same two lines in the feed's live monitoring stream, confirming the pattern is shared across both streaming surfaces.
 - `TextDecoder` MDN: the `stream` option is documented under `TextDecodeOptions`.
 
 ---
 
 ## Validate your understanding
 
-**Level 1 — reconstruct.** Without looking at the file, write the 6-line buffer loop: declare `buf`, call `reader.read()` in a `for (;;)`, decode with the correct option, split, pop, and loop over the remaining lines calling `JSON.parse`. Then check your version against `app/investigate/[id]/page.tsx` L143–L160.
+**Level 1 — reconstruct.** Without looking at the file, write the 6-line buffer loop: declare `buf`, call `reader.read()` in a `for (;;)`, decode with the correct option, split, pop, and loop over the remaining lines calling `JSON.parse`. Then check your version against `lib/hooks/useInvestigation.ts` L184–L201.
 
 **Level 2 — explain.** At L151, `buf = lines.pop() ?? ''`. What does `lines.pop()` return when the chunk ends with exactly one `\n`? What does it return when the chunk ends with no `\n`? Why is the `?? ''` fallback needed, and when would `pop()` return `undefined`? (Answer: if `buf` were `""` and the decoded chunk were `""`, `"".split('\n')` returns `[""]` and `pop()` returns `""` — not `undefined`. The `?? ''` fallback triggers only if `split` somehow returned an empty array, which cannot happen for a string, so it is a defensive `null`-coalescion for TypeScript's type narrowing.)
 
@@ -492,7 +499,7 @@ chunk B: "diagnostic"}\n{"type":"tool_call_end","toolName":"query_segm
 chunk C: ents","agent":"diagnostic","durationMs":88}\n
 ```
 
-Show every variable at every step: `buf` before and after each chunk, `lines`, `buf = lines.pop()`, which lines get parsed, and what `handleEvent` does. Then identify whether the missing-tool-call bug would appear in this trace or somewhere else. Cite `app/investigate/[id]/page.tsx` L143–L160 and L88–L106.
+Show every variable at every step: `buf` before and after each chunk, `lines`, `buf = lines.pop()`, which lines get parsed, and what `handle` does. Then identify whether the missing-tool-call bug would appear in this trace or somewhere else. Cite `lib/hooks/useInvestigation.ts` L184–L208 and L86–L121.
 
 **Level 4 — defend.** A reviewer says: "this is reinventing SSE; just use `EventSource`." Walk through the auth constraint, the three lines of framing code that would be saved, and the reconnect behavior difference. State your conclusion without hedging.
 
@@ -500,4 +507,7 @@ Show every variable at every step: `buf` before and after each chunk, `lines`, `
 - What is the value of `buf` after `"abc\ndef".split('\n').pop()`? (`"def"`)
 - If `{ stream: true }` is omitted from `TextDecoder.decode`, what breaks and when? (multi-byte sequences split across chunk boundaries produce `U+FFFD` — only visible in non-ASCII content)
 - What is the time complexity of the reverse scan in `tool_call_end`? (O(n) where n = number of items in the trace so far)
-- Name the two files in this codebase that implement the identical buffer loop. (`app/investigate/[id]/page.tsx` and `components/chat/StreamingResponse.tsx`)
+- Name the two files in this codebase that implement the `split('\n')` + `pop()` buffer loop. (`lib/hooks/useInvestigation.ts` and `app/page.tsx`)
+
+---
+Updated: 2026-05-28 — repointed the reader-loop + reverse-scan reconciliation refs from `app/investigate/[id]/page.tsx` (now removed) to the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208, L86–L121) and the feed's own loop (`app/page.tsx` L418–L443); noted the hook's started-guard + no-cancel-on-cleanup StrictMode decision
