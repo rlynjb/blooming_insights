@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import {
   BloomreachAuthProvider,
@@ -110,8 +110,18 @@ describe('consumeState (CSRF)', () => {
 });
 
 describe('auth cookie crypto (production backend)', () => {
+  // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
+  // test and restore the prior environment after. Mutating process.env directly
+  // (as before) leaked the var across files running in parallel workers, which
+  // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
+  beforeEach(() => {
+    vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('round-trips an encrypted store under AUTH_SECRET', () => {
-    process.env.AUTH_SECRET = 'test-secret-please-ignore';
     const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
     const token = _authCookieCrypto.encrypt(store);
     expect(typeof token).toBe('string');
@@ -120,7 +130,6 @@ describe('auth cookie crypto (production backend)', () => {
   });
 
   it('returns an empty store for a tampered/garbage cookie', () => {
-    process.env.AUTH_SECRET = 'test-secret-please-ignore';
     expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
   });
 });
