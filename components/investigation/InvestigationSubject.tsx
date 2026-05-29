@@ -32,18 +32,20 @@ export default function InvestigationSubject({ id }: { id?: string }) {
         padding: '12px 16px',
       }}
     >
+      {/* label on its own line */}
+      <div
+        className="lowercase"
+        style={{
+          color: 'var(--text-tertiary)',
+          fontFamily: 'var(--font-mono), monospace',
+          fontSize: '0.62rem',
+          letterSpacing: '0.06em',
+          marginBottom: 6,
+        }}
+      >
+        investigating
+      </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        <span
-          className="lowercase"
-          style={{
-            color: 'var(--text-tertiary)',
-            fontFamily: 'var(--font-mono), monospace',
-            fontSize: '0.62rem',
-            letterSpacing: '0.06em',
-          }}
-        >
-          investigating
-        </span>
         <SeverityBadge severity={insight.severity} />
         <span
           style={{
