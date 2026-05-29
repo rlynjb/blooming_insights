@@ -1,0 +1,567 @@
+# Tool calling and MCP
+
+**Industry name(s):** Model Context Protocol (MCP), tool calling, function calling, tool gateway, tool registry
+**Type:** Industry standard · Language-agnostic
+
+> The substrate every reasoning pattern runs on — the model emits structured tool calls, your loop executes them, the result feeds the next turn. blooming insights runs it through MCP: one connection to Bloomreach's loomi MCP server, one tool list, sliced per agent so each one only sees the affordances its job needs.
+
+**See also:** → `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md` · → `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
+
+---
+
+## Why care
+
+You've got a React app with a custom hook that wraps `fetch`. Every component that needs data calls `useFetch('/api/projects')` or `useFetch('/api/events')`. The endpoints aren't defined in the components — they're defined once on the server, in routes the components have never seen. The component knows the *shape* of the call (URL + JSON in, JSON out) and the *contract* of the response (the types). It doesn't know — or care — what file handles `/api/projects` on the backend. One endpoint definition, every component reuses it.
+
+Now picture the same shape for an LLM. The model needs to "call tools" — query a database, hit an API, search a catalog — but it doesn't have code, it has tokens. Something has to (1) tell the model which tools exist and what their inputs look like, (2) execute the call when the model emits one, and (3) feed the result back as the next "input" the model reads. And in a system with multiple agents, you don't want to re-define the same tools four times — you want one definition, every agent reuses it, with each agent seeing only the slice of tools its job needs.
+
+That substrate question is what this file answers: **what's the connective tissue under every reasoning pattern that lets the model actually *do* things, and how do you avoid wiring it per-agent?** Not "what's a tool call" (that's mechanics; the AI-eng tool-calling file covers it). The architectural question is **the protocol that standardizes how agents discover, call, and share tools across a system** — which is what MCP, the Model Context Protocol, does.
+
+**Why answering that question matters:** because the cost of wiring tools per agent compounds. Two agents that both need to query analytics quickly become two slightly different `executeAnalytics` definitions, drifting in arg shape, drifting in error handling, drifting in how they handle the workspace's project_id requirement. Multiply by four agents and you've got a per-agent integration tax on every new tool. MCP collapses that: one server defines the tools, all agents discover them via the same protocol, you slice per agent at the boundary.
+
+Without a protocol like MCP:
+- Each agent has its own `tools = [{name: 'execute_eql', input_schema: ...}, ...]` array
+- A schema change in one tool requires editing four files
+- Connection logic (auth, retries, rate limiting) gets re-implemented per agent
+- Tool drift is silent — three agents call slightly different versions of "the same" tool
+
+With MCP:
+- One server (loomi connect) defines the tools
+- One client (`McpClient`) discovers them via `listTools()` and calls them via `callTool()`
+- Per-agent surfaces are a *filter* over the discovered list, not a separate definition
+- Auth (OAuth), rate limiting (~1.1s spacing), caching (60s TTL), and backoff live once, in the client
+
+One-line summary: **MCP is the `/api` boundary for LLMs — one definition on the server, every agent calls it the same way, the per-agent surface is a filter at the boundary, not a fork.** Here's how that plays out in this codebase, including the parts that earn their complexity (OAuth + rate-limit retry + caching) because the tool host imposes them.
+
+---
+
+## How it works
+
+**The mental model: tool calling is brain + hands, MCP is the wiring between them.** The model is the brain — it emits structured tool calls but doesn't execute anything. Your loop is the hands — it runs the call, captures the result, feeds it back. MCP is the contract between them: a JSON-RPC protocol over HTTP that defines how a host (the agent's runtime) discovers what tools a server (Bloomreach's loomi MCP) exposes, calls them, and reads the structured results.
+
+```
+brain / hands / wires — the three layers
+
+   ┌─ brain (the model) ──────────────────────────────┐
+   │   emits tool_use { name, input }                  │
+   │     "execute_analytics_eql with these args"       │
+   └──────────────────────┬───────────────────────────┘
+                          │
+   ┌─ wires (MCP) ────────▼───────────────────────────┐
+   │   transport: StreamableHTTP                        │
+   │   auth:  OAuth (PKCE + DCR)                        │
+   │   client: McpClient — spacing, retry, cache       │
+   └──────────────────────┬───────────────────────────┘
+                          ▼
+   ┌─ hands (the server) ──────────────────────────────┐
+   │   Bloomreach loomi MCP runs the tool, returns     │
+   │   structured result                                │
+   └───────────────────────────────────────────────────┘
+                          │
+                          ▼
+                tool_result fed back to brain
+```
+
+The strategy in plain English: **define tools once at the server, discover them once per connection, call them through one client that handles every cross-cutting concern (auth, spacing, retry, cache), and slice the surface per agent at the boundary.** No agent ever speaks HTTP directly to the MCP server. No agent ever defines its own tools. The route stands the connection up once per request, lists the tools once, hands the list (filtered) to each agent that needs it.
+
+### Move 1 — The tool-call round trip (MCP-shaped)
+
+The technical thing: **the `tool_use` → execute → `tool_result` cycle, with MCP as the protocol that defines how the execute step talks to the tool host.**
+
+If you're coming from frontend, this is the `useFetch` round trip — except the consumer is the LLM, the URL is a tool name, and the protocol is JSON-RPC over an HTTP stream instead of REST.
+
+```
+the round trip — base.ts L102–L171
+
+  turn N:
+  ┌────────────────────────────────────────────────┐
+  │ anthropic.messages.create({ tools, messages }) │  ← model emits
+  │   → res.content includes ToolUseBlock          │     tool_use
+  │     { name: 'execute_analytics_eql', input }   │
+  └─────────────────────┬──────────────────────────┘
+                        ▼
+  ┌────────────────────────────────────────────────┐
+  │ for each tool_use:                              │
+  │   mcp.callTool(name, input)                     │  ← MCP boundary
+  │     → { result, durationMs, fromCache }         │
+  │   resultContent = truncate(JSON.stringify(...)) │
+  └─────────────────────┬──────────────────────────┘
+                        ▼
+  ┌────────────────────────────────────────────────┐
+  │ messages.push({                                 │
+  │   role: 'user',                                 │  ← tool_result
+  │   content: [{ type: 'tool_result', ... }]      │     becomes next
+  │ })                                              │     turn's input
+  └────────────────────────────────────────────────┘
+```
+
+The practical consequence: the model writes the call, your loop executes it, the result becomes the model's *next* observation. The model never executes code — that's the contract — so any guardrail you want lives in the loop's `callTool` step (read-only servers, rate-limit retries, schema-validated args). The model writes; your code dispatches.
+
+The condition under which it works: the model's `tool_use.input` has to match the tool's `input_schema`. Schemas mismatched → tool call fails → loop feeds the error back as a `tool_result` with `is_error: true` (`base.ts` L141–L156), the model adapts on the next turn.
+
+### Move 2 — One discovery, sliced per agent
+
+The technical thing: **the tools come from the server (`listTools()`), and a per-agent filter (`filterToolSchemas`) maps the discovered list to each agent's allowed names.**
+
+If you're coming from frontend, this is the codegen pattern in a typed RPC client — one schema source generates one full client, and each consumer imports only the methods it uses. The methods are shared; the import surface is per-consumer.
+
+```
+discovery + slicing — route.ts L203 + tool-schemas.ts L15
+
+  one listTools() per request
+  ┌─────────────────────────────────────────────────┐
+  │ rawTools = await conn.mcp.listTools()           │  ← from MCP server
+  │   → ~27 tools, with description + inputSchema    │
+  └──────────────────────┬──────────────────────────┘
+                         │ filter at the boundary
+                         ▼
+  filterToolSchemas(allTools, monitoringTools)        ← per-agent slice
+  filterToolSchemas(allTools, diagnosticTools)
+  filterToolSchemas(allTools, recommendationTools)
+  filterToolSchemas(allTools, queryTools)
+                         │
+                         ▼
+  each agent's runAgentLoop receives only its tools
+```
+
+The practical consequence: the monitoring agent sees 13 monitoring-shaped tools (`monitoringTools` in `lib/mcp/tools.ts` L5). The recommendation agent sees 7 propose-shaped tools (`recommendationTools` at L27). When the monitoring agent's loop sends `tools` to Claude, the recommendation tools aren't even in the schema — the model can't choose them, can't hallucinate them. The slice is enforced by absence, not by a prompt instruction asking the model "please don't."
+
+The condition under which it works: the allow-list per agent has to match the agent's actual job. The four lists in `lib/mcp/tools.ts` are hand-curated against the agent prompts in `lib/agents/prompts/`; the day a prompt change adds a job the tool list doesn't support, the model will reason about a tool it doesn't have and either fail gracefully or hallucinate one.
+
+### Move 3 — One client, one connection, one place for cross-cutting concerns
+
+The technical thing: **`McpClient` is the single dispatcher** — it owns auth (via the OAuth provider), proactive spacing (`minIntervalMs = 1100` from `connect.ts` L92), rate-limit retry with parsed hints + exponential backoff (`client.ts` L122–L132), a 60-second TTL response cache (`client.ts` L80, L143), and the no-cache-on-error rule (L137).
+
+If you're coming from frontend, this is the `httpClient` wrapper your team writes once and shares — base URL, auth header, retry interceptor, response cache, all in one place — so individual `useFetch` callers don't each implement them.
+
+```
+one client, all the cross-cutting concerns — client.ts L79–L172
+
+  callTool(name, args)
+      │
+      ├── 1. cache check (60s TTL by key=`${name}:${JSON.stringify(args)}`)
+      │      └── hit → return { result, fromCache: true }                  L105
+      │
+      ├── 2. proactive spacing — sleep if < 1100ms since last live call    L149
+      │
+      ├── 3. liveCall (transport.callTool)
+      │
+      ├── 4. if rate-limited → parse "per N second" hint, sleep, retry     L122
+      │       (capped at maxRetries=3, ceiling=20s per wait)
+      │
+      └── 5. no-cache on error (isError === true) → return uncached        L137
+```
+
+The practical consequence: every agent and every turn benefits from the same retries, the same cache, the same spacing. The monitoring agent's third call to `execute_analytics_eql` with identical args is a 0ms cache hit (`durationMs: 0, fromCache: true`). A 429 on the recommendation agent's `list_scenarios` waits exactly the window Bloomreach told it to wait, then retries automatically — the loop above doesn't know it happened. The agent's only contract with MCP is "I call `mcp.callTool(name, args)` and get back `{ result, durationMs, fromCache }`."
+
+The condition under which it works: the cache key has to match the *intent* of the call. `JSON.stringify(args)` works because the args fully determine the result for read-only tools. If a tool's output depended on time-of-call or external state, the 60s cache would serve stale results — which is why this codebase's MCP tools are all read-only-by-contract (covered in `05-guardrails-and-control.md`).
+
+### Move 4 — Auth as a first-class concern (OAuth PKCE + DCR)
+
+The technical thing: **the MCP transport speaks OAuth — Dynamic Client Registration + PKCE — to acquire and refresh tokens to the Bloomreach host.**
+
+If you're coming from frontend, this is the OAuth dance you do for a "Sign in with X" flow — except the *agent's host* is the client, the *user's session* is the credential store, and the protocol is wired through the MCP SDK rather than your own code.
+
+```
+auth wiring — lib/mcp/connect.ts (BloomreachAuthProvider)
+
+  per request:
+   1. transport = new StreamableHTTPClientTransport(mcpUrl, {authProvider})
+   2. client.connect(transport)
+        │
+        ├── if no token → provider redirects to authorize URL
+        │     → /api/mcp/callback completes the code exchange
+        │     → provider.saveTokens persists to encrypted cookie
+        │
+        └── if token present → JSON-RPC over HTTP, tokens on requests
+```
+
+The practical consequence: the agent never sees credentials. The route opens an authenticated `McpClient`, passes it down to each agent constructor (`new MonitoringAgent(anthropic, mcp, schema, allTools)` at `route.ts`), and the agent just calls `mcp.callTool(...)`. Refresh, code exchange, token persistence, and the one-time auto-reconnect on a revoked token (`app/page.tsx`, guarded by `sessionStorage['bi:reconnecting']`) all live below the agent's contract.
+
+The condition under which it works: the provider's `saveTokens` must persist across requests *for the same session*. That's done via session-cookie-keyed storage (the `withAuthCookies` wrapper, `connect.ts`), so each user's tokens travel with their session, and a serverless instance that gets a different user's request reads that user's tokens — no cross-user leakage.
+
+### Move 5 — The shape MCP buys vs the alternatives
+
+There are three real shapes for "how does the model do things":
+
+```
+                Direct tool defs       MCP                      Tool gateway
+                ───────────────        ──────────               ────────────
+   tools defined per agent             once on the server       once at a gateway
+                in-process             remote, JSON-RPC          remote, HTTP
+   discovery   compile-time            runtime listTools()       runtime list/proxy
+   reuse       copy/paste              one server, many hosts   one gateway, many
+                                                                 model providers
+   auth        per-tool                per-server, OAuth-ready  centralised
+   rate limit  per-tool                per-server (this code)   centralised
+   token cost  full schema in window   full schema in window    full schema in window
+                                                                 (sometimes proxied)
+   tradeoff    fastest to ship for     extra layer worth it     centralisation costs
+                a tiny tool set        when host owns auth +    a coordination point
+                                       rate limits + many tools
+```
+
+The reframe to hand the reader: **MCP earns its layer when the tool host imposes auth and rate limits, when tool surfaces are shared across multiple agents/hosts, and when tool discovery has to be runtime (not compile-time).** All three are true here. Bloomreach's loomi connect MCP owns the auth flow (OAuth, PKCE, DCR), enforces a multi-second rate limit window per user, and exposes ~27 tools that four agents need slices of. Inlining tool defs would mean re-implementing each of those concerns in agent code; a gateway would add an extra hop without a clear payoff against this single host.
+
+### The principle
+
+**Tool calling is a protocol problem, not an integration problem.** The model never executes; your code does. The agent never owns auth or rate limits; the client does. The agent's contract is a four-word call: "call this tool with these args, give me the result." Everything else — discovery, slicing, dispatch, retry, cache, auth — lives in layers below that contract. MCP is the protocol that lets those layers be standardised across hosts (so one server serves any compliant client) and across agents (so one client serves any compliant agent). That's why it's worth the extra layer when the surface is non-trivial.
+
+The full picture is below.
+
+---
+
+## Tool calling and MCP — diagram
+
+```
+The full substrate — what every reasoning pattern stands on
+
+  ┌──────────────────── AGENTS (4 of them) ──────────────────────┐
+  │ monitoring · diagnostic · recommendation · query              │
+  │   all call: runAgentLoop({ anthropic, mcp, toolSchemas, ... })│
+  └────────────┬───────────────────────────────────┬─────────────┘
+               │                                   │
+               ▼                                   ▼
+  ┌─────────────────────────┐         ┌──────────────────────────┐
+  │ filterToolSchemas       │         │ runAgentLoop (base.ts)   │
+  │ (tool-schemas.ts L15)    │         │   model.tool_use   ──┐    │
+  │ per-agent slice:        │         │      ▼               │    │
+  │   monitoringTools (13)   │         │   mcp.callTool ◄────┘    │
+  │   diagnosticTools (17)   │         │      ▼                   │
+  │   recommendationTools (7)│         │   tool_result → messages │
+  │   queryTools (union)    │         └──────────┬────────────────┘
+  └─────────────────────────┘                    │
+                                                  ▼
+                ┌───────────────────────────────────────────────┐
+                │ McpClient (lib/mcp/client.ts)                 │
+                │   60s TTL cache (L80, L143)                    │
+                │   minIntervalMs=1100 spacing (L149)            │
+                │   parsed-hint retry + backoff (L122)           │
+                │   no-cache-on-error (L137)                     │
+                │   McpToolError on transport failure (L68)      │
+                └────────────────────────┬─────────────────────────┘
+                                          │
+                                          ▼
+                ┌───────────────────────────────────────────────┐
+                │ SdkTransport (lib/mcp/transport.ts)            │
+                │   wraps @modelcontextprotocol/sdk's            │
+                │   StreamableHTTPClientTransport                 │
+                └────────────────────────┬─────────────────────────┘
+                                          │
+                                          ▼
+                ┌───────────────────────────────────────────────┐
+                │ BloomreachAuthProvider (lib/mcp/connect.ts)    │
+                │   OAuth: PKCE + Dynamic Client Registration    │
+                │   tokens persisted to encrypted session cookie │
+                └────────────────────────┬─────────────────────────┘
+                                          │  authenticated HTTP
+                                          ▼
+                ┌───────────────────────────────────────────────┐
+                │ Bloomreach loomi connect MCP server            │
+                │   exposes ~27 tools, lists them via JSON-RPC    │
+                │   enforces per-user rate limit (~1 req/N sec)  │
+                └───────────────────────────────────────────────┘
+```
+
+---
+
+## In this codebase
+
+**The loop seam (where MCP is called):**
+**File:** `lib/agents/base.ts`
+**Function:** `runAgentLoop()` — the `mcp.callTool(...)` call inside the tool_use loop
+**Line range:** L143–L150 (call), L161–L171 (tool_result back into messages)
+
+**Per-agent slicing:**
+**File:** `lib/agents/tool-schemas.ts`
+**Function:** `filterToolSchemas()`
+**Line range:** L9–L21
+
+The four allow-lists live in `lib/mcp/tools.ts` L5–L40 (`monitoringTools`, `diagnosticTools`, `recommendationTools`, `queryTools`). Each agent passes one to `filterToolSchemas` at construction (`monitoring.ts` L96, etc.).
+
+**The single client (cross-cutting concerns):**
+**File:** `lib/mcp/client.ts`
+**Function:** `McpClient.callTool()`
+**Line range:** L97–L146 (cache L105, spacing L149 in `liveCall`, retry L122, no-cache-on-error L137)
+
+**The transport (MCP SDK):**
+**File:** `lib/mcp/transport.ts` — `SdkTransport` wraps `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`.
+**File:** `lib/mcp/connect.ts` — `BloomreachAuthProvider` implements OAuth (PKCE + DCR); `connectMcp()` wires the transport with `minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3` (L92–L96).
+
+**The route boundary (one listTools per request, then slice):**
+**File:** `app/api/agent/route.ts`
+**Function:** the `GET` stream `start()` body
+**Line range:** L203–L207 (`rawTools = await conn.mcp.listTools()`), then `new MonitoringAgent(anthropic, conn.mcp, schema, allTools)` constructs each agent with the shared client + raw list.
+
+```
+shape (not full impl):
+  // route.ts — one connect, one listTools, slice per agent at construct
+  conn = await connectMcp(sid);                         // OAuth-aware client
+  const rawTools = await conn.mcp.listTools();          // discover once
+  const agents = {
+    monitoring: new MonitoringAgent(anth, conn.mcp, schema, rawTools.tools),
+    diagnostic: new DiagnosticAgent(anth, conn.mcp, schema, rawTools.tools),
+    recommendation: new RecommendationAgent(anth, conn.mcp, schema, rawTools.tools),
+    query: new QueryAgent(anth, conn.mcp, schema, rawTools.tools),
+  };
+
+  // each agent's loop slices the list per its job
+  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // monitoring.ts L96
+
+  // base.ts — the round trip
+  const { result, durationMs, fromCache } = await mcp.callTool(tu.name, tu.input);
+```
+
+---
+
+## Elaborate
+
+### Where this pattern comes from
+
+Tool calling as a structured-output capability went mainstream with OpenAI's function calling (2023) and Anthropic's tool use (2024) — both replaced the earlier pattern of asking the model to emit JSON in free text and then parsing it. The Model Context Protocol (MCP) followed in late 2024 as an open spec by Anthropic for *how hosts and tool servers talk to each other*, the way HTTP standardised how browsers and web servers talk. Before MCP, every host had its own tool-integration shape; MCP's contribution is the same one HTTP made for web: one client can talk to any compliant server.
+
+### The deeper principle
+
+**Standardise the substrate, vary the surfaces.** When many consumers need to call many providers, the cheapest move is to define the protocol once and let everyone slot in. HTTP did it for web servers. REST did it for APIs. gRPC did it for typed RPC. MCP does it for LLM tools. The principle is the same: the more your system has agents-and-tools as a many-to-many graph, the more value standardisation buys — and the more cost per-agent or per-tool integration costs.
+
+```
+  Without MCP                With MCP
+  ──────────────             ──────────────
+  N agents × M tools         N agents → 1 client → 1 server (M tools)
+  N×M integrations           N + M (and the protocol is the glue)
+  drift per agent            single source of truth
+```
+
+### Where this breaks down
+
+MCP earns its layer when there are *multiple* tool servers or *multiple* agents that need the same tools. With one server and one agent, MCP adds a layer for no payoff. The cost shows up as: the model still has to receive the full tool schemas in its window every turn (token cost), the protocol round trip adds latency over a direct in-process call, and a misbehaving MCP server can wedge the whole agent. The mitigations are caching (60s TTL here), spacing (1.1s), and the no-cache-on-error rule — but they're mitigations, not removals.
+
+### What to explore next
+- Context engineering (`01-context-engineering.md`) → per-agent tool subsets are a context-engineering decision; this file is the substrate
+- Tool calling mechanics (`../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md`) → the brain/hands split, in this codebase
+- Tool routing (`../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`) → how to pick which tool/agent for an incoming query
+- Capability gating (`../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`) → scope before spend; complements per-agent tool slicing
+
+---
+
+## Tradeoffs
+
+The decision here was *to use MCP as the tool substrate* rather than defining tool schemas directly in each agent or running a custom tool gateway between Claude and Bloomreach.
+
+┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
+│ Cost dimension   │ MCP (chosen)                │ Direct tool defs (alternative)│
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Build time       │ adopt SDK, wire OAuth, write│ ~27 tool defs × 4 agents,    │
+│                  │ McpClient (~200 lines)      │ ~1200 lines, drift-prone     │
+│ Token cost/turn  │ full tool schemas (~13 per   │ same (no win — model still   │
+│                  │ agent) in the window         │ needs schemas in window)     │
+│ Latency          │ +1 HTTP round trip per call  │ in-process call, no round    │
+│                  │                              │ trip                          │
+│ Auth surface     │ one place: BloomreachAuth    │ duplicated per agent          │
+│                  │ Provider (PKCE+DCR)          │                              │
+│ Rate-limit logic │ one place: McpClient L122    │ per-agent or none (and pay   │
+│                  │                              │ the 429 storm)                │
+│ Cache scope      │ one 60s TTL across all       │ per-agent (each cache cold   │
+│                  │ agents (cross-agent reuse)   │ on first call)                │
+│ Vendor lock-in   │ MCP spec is open; loomi MCP │ direct = locked to whatever   │
+│                  │ is the host (swappable)      │ shape you coded              │
+│ Discovery        │ runtime listTools()          │ compile-time, drift-prone    │
+│ Debugging        │ tagged McpToolError + the    │ per-agent error shapes       │
+│                  │ trace records every call     │                              │
+│ Hire-ability     │ MCP is the emerging standard│ "we made up our own" — extra │
+│                  │ in 2026 — recognisable       │ ramp for any new contributor │
+└──────────────────┴─────────────────────────────┴─────────────────────────────┘
+
+### What we gave up
+
+We gave up in-process call latency. Every `mcp.callTool` is at minimum a transport round trip — the proactive 1.1s spacing alone serializes calls. For a 6-call investigation, the spacing floor is ~6.6s of wait baked in, before the actual tool execution time. We pay that as the price of staying inside the Bloomreach rate-limit window.
+
+We gave up direct introspection of tool implementations. The model emits a call, we dispatch it, the server runs it — we can't step into the tool's code. Debugging a wrong result means inspecting the trace (`/debug` and the cached investigation events), not setting a breakpoint in the tool.
+
+We gave up the option to inline tool defs. Adopting MCP commits us to the protocol shape: we can't easily add a "tool" that's actually a local function unless we wrap it as an MCP tool. That's mostly fine — every current tool is server-hosted — but a future "local debug tool" would have to either fork the substrate or be wrapped.
+
+### What the alternative would have cost
+
+If we had defined tool schemas directly per agent, we'd be maintaining ~27 schemas × 4 agents × the inevitable drift. Every new Bloomreach tool would mean a coordinated edit across files. The OAuth flow would be re-implemented (or, more likely, replaced with a less-secure API key model). The ~1.1s spacing would either not exist (rate-limit storms) or live in four places (drift in retry behaviour). The 60s cache would either not exist (cold lookups every turn) or be per-agent (cross-agent reuse impossible). We'd be ahead on lines of code in the very short run and behind on every metric that matters by week two.
+
+### The breakpoint
+
+MCP stays the right call until either (a) the tool host adds a feature MCP can't represent (e.g., bidirectional streaming for live data), or (b) the system grows a need for a tool gateway in front of multiple model providers — at which point you'd add the gateway *as an MCP client of its own*, keeping MCP between the host and the gateway and putting a routing layer above for the providers.
+
+### What wasn't actually a tradeoff
+
+An in-process emulation of the Bloomreach API (where we'd implement EQL execution locally) wasn't a real alternative — the data, the catalog, the campaigns all live in Bloomreach's systems. Hitting their HTTP API directly without MCP was technically possible but would mean re-implementing the OAuth + rate-limit story manually. MCP is the protocol Bloomreach exposes; using it is the cheapest path to the data, not a stylistic choice.
+
+---
+
+## Tech reference (industry pairing)
+
+### Model Context Protocol (`@modelcontextprotocol/sdk`)
+
+- **Codebase uses:** `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`, wrapped by `SdkTransport` in `lib/mcp/transport.ts`. The transport is plumbed through `BloomreachAuthProvider` in `lib/mcp/connect.ts`.
+- **Why it's here:** MCP is the protocol Bloomreach's loomi connect server speaks; the SDK gives us a compliant client without re-implementing the JSON-RPC + transport details.
+- **Leading today:** Model Context Protocol — innovation-leading for LLM tool integration, 2026. Backed by Anthropic, adopted by multiple model providers and tool hosts.
+- **Why it leads:** open spec, transport-agnostic (HTTP, stdio, others), first-class auth provider hook, runtime tool discovery — the same instincts HTTP brought to web servers.
+- **Runner-up:** OpenAI Responses API tools — comparable shape, but tied to OpenAI's hosting model; no equivalent open server spec.
+
+### Anthropic `tool_use` content blocks
+
+- **Codebase uses:** `Anthropic.Messages.ToolUseBlock` and `ToolResultBlockParam` in `runAgentLoop` (`base.ts` L116, L161–L167).
+- **Why it's here:** the typed content-block shape is the contract between "what the model emits" and "what the loop dispatches." It's also what makes the streamed reasoning trace possible — the loop can hook every block.
+- **Leading today:** Anthropic Messages API tool use — innovation-leading for agent loops, 2026.
+- **Why it leads:** first-class block types, `is_error` flag for failed results, the round trip is a typed shape your code can pattern-match on.
+- **Runner-up:** OpenAI function calling / Responses API — same logical shape, larger installed base, slightly different content-block layout.
+
+### OAuth 2.1 (PKCE + Dynamic Client Registration)
+
+- **Codebase uses:** `BloomreachAuthProvider` in `lib/mcp/connect.ts`, implementing `OAuthClientProvider` — PKCE for the code exchange, DCR for the client registration without manual app setup.
+- **Why it's here:** Bloomreach's MCP host requires OAuth; PKCE is the modern shape (no client secret needed), DCR lets the host register a client per session without admin pre-registration.
+- **Leading today:** OAuth 2.1 with PKCE — adoption-leading for delegated auth, 2026.
+- **Why it leads:** the security model fits server-to-server-with-a-user-session well; the spec is mature and SDK support is wide.
+- **Runner-up:** API keys with rotation — simpler to build, weaker on revocation and per-user scoping.
+
+---
+
+## Summary
+
+Tool calling is the substrate every reasoning pattern stands on: the model emits structured tool calls, the loop executes them, the result feeds the next turn. blooming insights runs that substrate through MCP — one connection to Bloomreach's loomi MCP server (`lib/mcp/connect.ts`), one discovery (`listTools()` in `route.ts` L203), one client (`McpClient` in `lib/mcp/client.ts`) that owns auth (OAuth PKCE+DCR), proactive spacing (1.1s), rate-limit retry with parsed hints, a 60s TTL cache, and no-cache-on-error. Each agent gets a per-agent slice of the tool list via `filterToolSchemas(tool-schemas.ts L15)` — monitoring sees monitoring-shaped tools, recommendation sees recommendation-shaped tools, drift impossible because the source is one server. The constraint that made this right is a multi-host, multi-agent surface: 27 tools, 4 agents, one rate-limited remote host. The cost is the protocol layer: an extra round trip per call and the 1.1s spacing floor.
+
+- The model writes the call; the loop dispatches it; the result becomes the next observation.
+- MCP standardises the dispatch: one server, many compliant clients; one client, many compliant agents.
+- Per-agent tool slicing happens at the boundary (`filterToolSchemas`), not in each agent.
+- Cross-cutting concerns (auth, spacing, retry, cache) live once in `McpClient`, never in agent code.
+- Worth it because the tool host is non-trivial (OAuth + rate limits + 27 tools); not worth it for a single inlinable function.
+
+---
+
+## Interview defense
+
+### What an interviewer is really asking
+When an interviewer asks "how does your agent call tools," they're testing two things: (1) do you understand the brain/hands split (the model emits, your code dispatches), and (2) did you adopt a standard protocol or invent your own integration shape? The strong signal is naming MCP and the per-agent slicing decision; the weak signal is "we use Anthropic tools."
+
+### Likely questions
+
+[mid] Q: What is MCP and why is it in this codebase?
+
+A: MCP — Model Context Protocol — is an open JSON-RPC-over-HTTP spec for how an LLM host (the thing running the agent loop) talks to a tool server (the thing that owns the tools). In this codebase the tool server is Bloomreach's loomi connect MCP. The route opens one connection per request, calls `listTools()` once to discover the ~27 tools the server exposes, and hands the list (filtered per agent) to each agent's loop. The model emits `tool_use` blocks, my loop calls `mcp.callTool(name, args)`, the result comes back, gets truncated, and gets fed in as the next turn's input. MCP is in here because Bloomreach speaks it and because four agents share the same tool surface — the protocol gives me one client (`McpClient` in `lib/mcp/client.ts`) that owns auth, rate-limit retry, and caching for all of them.
+
+Diagram:
+```
+   agents (×4) ──► filterToolSchemas ──► runAgentLoop
+                                            │
+                                            ▼
+                                       McpClient
+                       ┌────────────────┼────────────────┐
+                       ▼                ▼                ▼
+                    60s cache       1.1s spacing      OAuth (PKCE)
+                       │                ▼
+                       └────────► JSON-RPC ──► Bloomreach MCP server
+```
+
+[senior] Q: Why MCP instead of just defining the tool schemas directly per agent?
+
+A: Three reasons. First, the cross-cutting concerns: Bloomreach's MCP server requires OAuth (PKCE + DCR) and enforces a multi-second per-user rate-limit window. Putting those in the agent code means re-implementing them per agent — drift, bugs, four 429-storm modes. MCP lets me put them once, in `McpClient`. Second, the surface: 27 tools × 4 agents would be 108 schema definitions if hand-coded; with MCP it's one runtime `listTools()` call and a per-agent allow-list of ~13/17/7 names. Third, swappability — MCP is an open spec, so swapping Bloomreach for another MCP-compliant host (or adding a second host) is a wiring change, not a rewrite. The tradeoff is the extra round trip per call and the 1.1s spacing floor that bakes ~6.6s of wait into every 6-call investigation — but the alternative pays that cost in 429 storms instead.
+
+Diagram:
+```
+   Chosen (MCP)                       Alternative (direct tool defs)
+   ┌────────────────────────┐         ┌────────────────────────┐
+   │ 1 McpClient owns:      │         │ each agent owns its    │
+   │   OAuth, retry, cache, │         │ schemas + auth + retry │
+   │   spacing — once       │         │ — drift, bugs, repeats │
+   │                        │         │                        │
+   │ +1 HTTP round trip     │         │ in-process call         │
+   │ per tool call          │         │ (faster, but pays in    │
+   │                        │         │  429 storms otherwise)  │
+   └────────────────────────┘         └────────────────────────┘
+```
+
+[arch] Q: At 10× concurrent users hitting this same MCP server, what breaks first?
+
+A: The Bloomreach rate-limit window is the first thing that gives. It's per-user, so concurrent users don't directly clash, but if user sessions share OAuth scope or the host enforces a global limit, our 1.1s spacing protects each session — not the host's aggregate. The next thing is the 60s response cache: it's per-`McpClient`, and `McpClient` lives in the warm Vercel container — at 10× users on many cold instances, cache hit rate drops because each instance starts cold. Mitigation is a shared cache layer (Redis) in front of `McpClient`, or moving the cache to the MCP server side. The MCP layer itself scales horizontally — each request stands up its own client, the protocol is stateless above auth.
+
+Diagram:
+```
+  ┌ Per-request McpClient instance ── scales horizontally ───┐
+  ┌ 60s TTL cache (per-instance)   ◄── BREAKS first: cache   │
+  │                                   hit rate falls at scale,│
+  │                                   needs shared cache       │
+  ┌ Bloomreach rate limit          ◄── BREAKS second: per-    │
+  │                                   user limits hold; an     │
+  │                                   aggregate limit would    │
+  │                                   force a queue / fewer    │
+  │                                   tool calls per request   │
+  └ OAuth (per session)            ── unchanged ──────────────┘
+```
+
+### The question candidates always dodge
+Q: MCP adds a round trip per tool call. With Bloomreach already speaking HTTP, why not just hit the HTTP API directly and skip the protocol layer?
+
+A: Honest answer: with one host and a single API key, direct HTTP would be a few lines less code. The reasons I didn't go that way are (1) Bloomreach exposes MCP as the supported integration shape — taking the HTTP route means picking a private path that could break unannounced, (2) MCP gave me a standard place for auth, rate-limit retry, and caching that I'd have had to build anyway, and (3) the open MCP spec means a future second tool source (say, Anthropic's own tools, or a custom internal MCP server) plugs in without inventing a second integration shape. The token-cost concern is real — the schemas still go in the model's window every turn — but that's a property of tool calling itself, not of MCP. The thing MCP doesn't *add* is also the thing direct HTTP wouldn't avoid. The thing MCP *does* add (auth + retry + cache shared across agents) is the thing I'd have to build either way.
+
+Diagram:
+```
+   MCP path (chosen)             Direct HTTP (suggested)
+   ┌────────────────────────┐    ┌────────────────────────┐
+   │ + standard protocol     │   │ - fewer lines / call   │
+   │ + auth provider hook    │   │ - no protocol round    │
+   │ + rate-limit retry once │   │   trip                 │
+   │ + cache once            │   │                        │
+   │ + future host swap free │   │ - tied to a private API│
+   │ - 1 round trip / call   │   │   shape (breaks silent)│
+   │ - 1.1s spacing floor    │   │ - re-build auth/retry  │
+   │                         │   │   per integration       │
+   └────────────────────────┘    └────────────────────────┘
+```
+
+### One-line anchors
+- "MCP is the `/api` boundary for LLMs — one definition on the server, every agent calls it the same way."
+- "Per-agent tool slicing happens at the boundary, not in the agent — the wrong tool is never in the window."
+- "Cross-cutting concerns (auth, retry, cache, spacing) live once in `McpClient`."
+- "MCP earns its layer when the tool host owns auth + rate limits + many tools — all three here."
+- "The model writes the call; my loop dispatches it; the result becomes the next observation."
+
+---
+
+## Validate your understanding
+
+### Level 1 — Reconstruct the diagram
+Close this file. Draw the substrate: agents at the top, `filterToolSchemas` slicing the discovered list, `runAgentLoop` calling `mcp.callTool`, `McpClient` with its four labels (cache / spacing / retry / no-cache-on-error), `SdkTransport`, `BloomreachAuthProvider`, the Bloomreach MCP server at the bottom. Label each cross-cutting concern's file and roughly its line.
+
+Open the file. Compare.
+
+✓ Pass: you got the slicing boundary, the single `McpClient`, the four labels, and the OAuth provider, with files for each
+✗ Fail: re-read How it works moves 2–4, wait 10 minutes, try again.
+
+### Level 2 — Explain it out loud
+Explain "how does this agent call tools through MCP" to a colleague who just asked "wait, the model doesn't run the code?" No notes. Under 90 seconds.
+
+Checkpoints — did you:
+- Name the brain/hands split clearly (model emits, loop dispatches)?
+- Name `McpClient` and what cross-cutting concerns it owns?
+- Explain why each agent only sees its allowed tools (and where the slicing happens)?
+- Name the tradeoff vs direct tool defs in one sentence?
+
+If you skipped any: you described it, you didn't understand it.
+
+### Level 3 — Apply it to a new scenario
+A new tool, `predict_churn`, is exposed by the Bloomreach MCP server. The recommendation agent should be able to use it; the monitoring agent shouldn't. Without looking at the file: name the exact files and lines you'd touch to make that change, and explain why no agent code (no schema, no prompt change) is strictly required for the discovery to happen.
+
+Write your answer (3–5 sentences). Then open `lib/mcp/tools.ts` L27 and check whether the recommendation agent's allow-list is where the change lands.
+
+### Level 4 — Defend the decision you'd change
+"If you were starting today with the same Bloomreach host but only ONE agent (no multi-agent split), would you still adopt MCP, or would you skip the protocol layer and call the Bloomreach HTTP API directly? Why? If you'd skip MCP, which file would absorb the OAuth + rate-limit + cache logic that `McpClient` currently owns?"
+
+Reference the code: `lib/mcp/client.ts` L97–L172 for what MCP-via-the-client owns; `lib/mcp/connect.ts` L80–L97 for the OAuth wiring.
+
+### Quick check — code reference test
+Without opening any files:
+- What function does each agent call to get its per-agent slice of tools?
+- What file holds the four per-agent allow-lists?
+- What constant in `lib/mcp/connect.ts` sets the proactive call spacing, and to what value?
+- Roughly what TTL does `McpClient`'s response cache use?
+
+Open and verify. ✓ File + function names matter; line numbers drifting is fine.
+
+---
+Updated: 2026-05-29 — created

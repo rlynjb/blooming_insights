@@ -1,0 +1,631 @@
+# Per-tool circuit breaking
+
+**Industry name(s):** Per-tool circuit breaker, agent-aware fail-fast, observation-as-control, breaker state as agent context
+**Type:** Industry standard · Language-agnostic
+
+> An agent loop can call the same flaky tool on every turn — retrying a dead tool inside a loop multiplies the failure by the iteration count and burns the whole budget. A per-tool circuit breaker scoped to each tool, fed back to the agent as an *observation* the model reads, lets the agent route around the dead tool instead of looping on it. blooming insights has bounded exponential-backoff retry in `McpClient.callTool` (`lib/mcp/client.ts` L122–L132, configured with `retryDelayMs: 10_000` / `retryCeilingMs: 20_000` / `maxRetries: 3` in `connect.ts` L92–L95) but no per-tool circuit breaker — and crucially, no path that feeds open-state back to the agent so it routes around the failing tool.
+
+**See also:** → 01-cross-turn-caching.md · → 02-fan-out-backpressure.md · → single-call retry/breaker: `../../study-ai-engineering/06-production-serving/05-retry-circuit-breaker.md` · → coordination failure modes: `../03-multi-agent-orchestration/09-coordination-failure-modes.md`
+
+---
+
+## Why care
+
+You wrote a page that calls three APIs to render the user's dashboard. One of them — the rarely-used integrations API — is having a bad day. Your code retries on failure: try, wait, try, wait, try, give up. The whole dashboard hangs for 30 seconds before rendering the other two sections. You ship a circuit breaker: after three failures in a row, mark the API "open" for two minutes; fail every call to it instantly during that window; the dashboard renders the broken integrations section as "temporarily unavailable" and the other two sections appear immediately. The user sees a fast page with one degraded panel instead of a slow page with everything stuck behind a sick dependency.
+
+Now picture the same dashboard, but the renderer is a model. Three tools the model can call: `getOrders`, `getInvoices`, `getIntegrations`. The model decides which to call each turn, reads the result, decides what to do next. When `getIntegrations` is sick and you have a circuit breaker on it, the breaker fails the call fast — good. But what does the model *see*? An error result from `getIntegrations`, the same shape as any other failure. So the model thinks "huh, that didn't work, let me try the same call again next turn." The breaker is doing its job (failing fast to protect the upstream), but the agent is still wasting every remaining turn retrying the same dead path.
+
+That's the question this file answers: **when the agent is the caller, what does the circuit breaker have to do *more than* fail fast?** Not "should we have a breaker" — the ai-eng single-call version covers why. The line is at *who reads the breaker's state*. In a service-to-service breaker, the answer is "the code wrapping the call" — fail fast, throw an error, your handler catches it. In an agent loop, the answer needs to include "the model" — the open-state has to be surfaced as an *observation the agent reasons on*, so the agent's next turn picks a different tool instead of the same one.
+
+**Why answering that question matters:** because the failure mode without it is the worst kind of cost blowup — silent, expensive, and productive of nothing. An agent loop with a budget of 6 tool calls, hitting a dead tool, will retry the same tool 6 times (or until retry exhaustion), then synthesize a final answer from no evidence. The user pays for 6 turns of model + 6 retry sequences of HTTP and gets back a diagnosis like "I couldn't determine the cause." The breaker that protects the upstream doesn't change this — the breaker the *agent reads* would. The pattern's whole job is to turn "loop wasted on a dead tool" into "agent routed around the dead tool."
+
+Without a per-tool circuit breaker + agent observation:
+- Diagnostic agent's first EQL hits a rate-limit error from Bloomreach
+- The retry loop in `callTool` runs (10s, 20s, 20s — max 3 retries)
+- After ~50 seconds the call returns an `isError: true` result to the agent
+- The agent's next turn tries... what? Without coverage of which tools are sick, it's a coin flip — likely retries something semantically close
+- 6-call budget gone, ~5 minutes of wall-clock, no diagnosis
+
+With per-tool circuit breaker + agent observation:
+- The first EQL fails; the breaker records one failure for `execute_analytics_eql`
+- N failures in a row → breaker trips OPEN for tool X
+- The next time the agent emits `tool_use` for tool X, the loop intercepts: returns "tool X is currently unavailable" as the `tool_result` without hitting the network
+- The model reads the observation, picks a different tool or abstains
+- 6-call budget intact; the agent at least completes with "I couldn't reach Bloomreach right now" instead of an empty diagnosis
+
+One-line summary: **a per-tool circuit breaker for agents is the same closed/open/half-open shape as a service breaker, plus one critical extra step — feed the open state back to the agent as an observation so the model routes around the dead tool instead of retrying it every turn.** Here's the shape of the pattern, what this codebase has (bounded retry, no breaker), and the specific gap where "feed it to the agent" would slot in.
+
+---
+
+## How it works
+
+**The mental model: closed/open/half-open, one breaker per tool, and the open-state surfaces as an observation.** You know the closed/open/half-open shape from service mesh and resilience libraries (Hystrix, resilience4j, Polly). The agent-specific addition is the *observation feedback* — the breaker isn't just a guard around the call site; it's a fact the agent's reasoning has to know about so the next turn picks a different tool.
+
+```
+Per-tool circuit breaker — three states, one per tool
+
+  ┌───────── per-tool breaker state machine ─────────┐
+  │                                                    │
+  │       ┌─────────┐                                  │
+  │       │ CLOSED  │ ◄──────── success on probe       │
+  │       │ calls   │                                  │
+  │       │ pass    │ ──────► consecutive failures ≥ N │
+  │       │ through │                  │                │
+  │       └─────────┘                  ▼                │
+  │                              ┌─────────┐            │
+  │                              │  OPEN   │            │
+  │                              │ fail    │            │
+  │                              │ fast,   │            │
+  │                              │ no call │            │
+  │                              └────┬────┘            │
+  │                                   │ after cooldown T│
+  │                                   ▼                  │
+  │                            ┌────────────┐            │
+  │                            │ HALF-OPEN  │            │
+  │                            │ try 1 probe│            │
+  │                            └────┬───────┘            │
+  │                  success ◄──────┴────────► failure   │
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
+
+  ONE breaker instance per tool name, not one global breaker.
+  Per-tool because tools can fail independently (Bloomreach is
+  fine but the third-party LLM tool is down).
+```
+
+The strategy in plain English: **three states, scoped to one tool, and the state itself is something the agent can read.** Without the third clause, you have a service breaker bolted onto an agent loop, which is the textbook *single-call* pattern (covered in the ai-eng file). The agent-architecture version names the gap and closes it: the breaker's open state is an input to the agent's next reasoning step.
+
+### The state machine — closed, open, half-open
+
+The technical thing: each tool has its own breaker with three states. **Closed** = calls flow normally; failure counter ticks up on each failure, resets on success. **Open** = next call to this tool fails fast without hitting the upstream; cooldown timer counts down. **Half-open** = after cooldown, the next call is a probe — success closes the breaker, failure re-opens it for another cooldown.
+
+If you're coming from frontend, this is the same shape as a "broken integration" flag in your error boundary. After three failed reloads of the embedded widget, you stop trying for a minute and show "this widget is offline." After the minute, you try once more — if it works, you go back to normal; if not, you wait again. The breaker formalizes the conditions: counter, threshold, cooldown.
+
+```
+The three states, with thresholds named
+
+  CLOSED                                         OPEN
+  ────────────────────────────────────           ─────────────────────────────
+  call passes to upstream                        call fails fast (no upstream)
+  on failure: counter++                          cooldown timer counts down
+  if counter ≥ N (threshold):                    when timer = 0:
+    → OPEN, reset counter, start cooldown          → HALF-OPEN
+  on success: counter = 0
+
+  HALF-OPEN
+  ─────────────────────────────────────────────────
+  next call is a probe (one call allowed)
+  if success: → CLOSED, counter = 0
+  if failure: → OPEN, restart cooldown
+```
+
+The practical consequence: the breaker turns "every call pays the retry tax" into "fail fast during the cooldown window, then try once to recover." Across many callers hitting the same dead tool, the cooldown serializes recovery probes — only one half-open probe at a time, not every caller hammering the recovery point.
+
+The condition under which it works: the failure threshold and cooldown have to match the failure shape. Threshold too low (open on first failure) = false positives on transient blips; too high = breaker never trips and you get the no-breaker behavior. Cooldown too short = repeated open/close churn; too long = the system stays degraded after recovery. Production tuning is workload-specific.
+
+### Per-tool scope — independent breakers for independent dependencies
+
+The technical thing: each tool gets its own breaker instance. The MCP server might be down (so `execute_analytics_eql` is open) while the LLM provider is fine (so `chat.completions` is closed). One global breaker would over-trip on independent failures; one per-tool breaker isolates the blast.
+
+If you're coming from frontend, this is the difference between "one global loading spinner" (everything blocks until everything's ready) and "per-section spinner" (each section reveals when its data lands). The granularity makes the system feel responsive when only part of it is sick.
+
+```
+Why per-tool, not global
+
+  Global breaker:                       Per-tool breakers:
+  ┌──────────────────┐                  ┌──────────────────┐
+  │ any failure ticks │                 │ exec_analytics    │ ── CLOSED
+  │ the global counter│                  │ get_schema        │ ── OPEN
+  │                   │                 │ list_catalogs     │ ── HALF-OPEN
+  │ trips → ALL tools │                  │                   │
+  │ blocked           │                  │ (each independent) │
+  └──────────────────┘                  └──────────────────┘
+   over-trips on            isolates failures to the
+   independent failures     specific tool that's sick
+```
+
+The practical consequence: in a topology where some tools are healthy and some are sick (a multi-source agent — vector store fine, web search down, internal DB fine), the per-tool breaker keeps the healthy paths open and only fails-fast the sick one. Global breaker would degrade the whole agent to "everything off" on any single tool's failure.
+
+The condition under which per-tool is enough: tools fail independently. If two tools share the same backend (two MCP tools both routed through one transport), they share a failure mode — when the transport's down, both should be open, but a per-tool breaker has to discover that independently for each. Mitigation: a layered breaker — per-tool on top, per-transport underneath — so the transport's failure is visible to the layer above.
+
+### The agent-specific extra — feed open state back as an observation
+
+The technical thing — this is what distinguishes the agent-architecture version from the ai-eng single-call version: when a tool's breaker is open and the agent emits a `tool_use` block for it, the loop intercepts the call and returns a *synthetic observation* describing the open state. The model reads that observation on its next turn and routes its reasoning around the dead tool.
+
+If you're coming from frontend, this is the difference between "the API call failed silently" and "the form shows a clear error message naming what's broken." The user (or the model) can only act on what they can see; a fail-fast that's invisible to the agent might as well not exist for routing purposes.
+
+```
+The observation feedback — what the breaker tells the agent
+
+  Without observation feedback (just a service-style breaker):
+    model: tool_use { name: 'execute_analytics_eql', input: {...} }
+       ▼
+    breaker: OPEN → fail fast
+       ▼
+    loop: return error result
+       ▼
+    model: "huh, that didn't work, let me try the same tool again"
+       │   (no signal it should switch)
+       ▼
+    next turn: tool_use { name: 'execute_analytics_eql', input: {...} }
+       (same dead tool, again)
+
+  With observation feedback (the agent-aware breaker):
+    model: tool_use { name: 'execute_analytics_eql', input: {...} }
+       ▼
+    breaker: OPEN
+       ▼
+    loop: return synthetic tool_result {
+            tool_use_id: ...,
+            content: "tool 'execute_analytics_eql' is currently
+                      unavailable (3 failures, cooldown 90s remaining)
+                      — try a different tool or report 'no data'",
+            is_error: true,
+          }
+       ▼
+    model: "okay, that tool is dead — let me try get_schema instead
+            or abstain"
+       ▼
+    next turn: tool_use { name: 'get_schema', ... }
+       (routed around the dead tool)
+```
+
+The practical consequence: the agent's iteration budget gets spent on tools that *can* succeed, not on retries of one that can't. A 6-call budget against one sick tool with no agent observation = 6 wasted turns. The same budget with observation feedback = the agent realizes after turn 1 and uses turns 2–6 on different tools or to synthesize an honest abstention.
+
+The condition under which it works: the model has to understand the synthetic observation. Production prompts include a short "if a tool returns 'unavailable,' do not retry it — choose a different tool or report what you have" instruction so the model's reasoning includes the breaker state. Without that prompt-level guidance, the model might treat the synthetic error the same as a regular error and retry.
+
+### What blooming insights has — bounded exponential-backoff retry, no breaker
+
+The technical thing: `McpClient.callTool` (`lib/mcp/client.ts` L122–L132) retries rate-limited calls up to 3 times with exponential backoff. The wait is computed two ways and the smaller-of-(chosen, ceiling) wins: a parsed `Retry-After` hint from the error text + 500 ms buffer, else `retryDelayMs × 2^(retries-1)` off a 10s base, every wait capped at `retryCeilingMs = 20_000`. Configuration lives in `lib/mcp/connect.ts` L92–L95: `retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`.
+
+If you're coming from frontend, this is `fetch` retry with `Retry-After` honoring — done correctly. It's the right thing for transient blips: one bad call clears on retry, the budget allows for it, the wait honors the server's stated penalty window.
+
+```
+McpClient.callTool — retry shape (no breaker)
+
+  result = liveCall(name, args)                  client.ts L113
+  retries = 0
+  while isRateLimited(result) && retries < 3:    L122
+    retries++                                    L123
+    hintMs   = parseRetryAfterMs(result)         L124
+    backoffMs = retryDelayMs × 2^(retries-1)     L125  (base 10s)
+    waitMs   = min(hintMs+500 ?? backoffMs,
+                   retryCeilingMs=20s)            L126–129
+    await sleep(waitMs)                          L130
+    result = liveCall(name, args)                L131
+
+  After 3 retries: return the error result to the agent.
+  No breaker state. No fail-fast. No agent observation
+  saying "this tool is dead — try something else."
+```
+
+The practical consequence: a transient rate-limit blip clears on retry (typically the second attempt, after a ~10s wait honoring Bloomreach's stated window). A *sustained* Bloomreach outage, on the other hand, means every call from every agent pays the full retry tax — 3 retries × up to 20s each = up to 60s per call — before the failed result reaches the agent. The agent then... tries the same tool again on its next turn, because there's no state telling it not to. The 6-call budget can vanish entirely on a sick tool.
+
+The condition under which this is enough: the failure mode is transient, not sustained. Bloomreach's rate limit is a real failure mode the retry handles correctly (the parsed `Retry-After` is honored, so the retry lands after the penalty clears). The breaker pattern would add value when (a) the failure is sustained (a Bloomreach outage, not a rate limit) or (b) the topology has multiple tools the agent could route between.
+
+### Why the gap matters — what "feed it back to the agent" would unlock
+
+The technical principle: the retry handles "this call failed; try again." The breaker handles "this *tool* is dead; stop trying." The agent-observation extension handles "the agent should *know* this tool is dead so it picks a different one." Each layer covers a failure mode the lower layer doesn't.
+
+```
+Three layers of failure handling — and what each covers
+
+  layer                       failure it handles            in this codebase
+  ──────────────              ──────────────────────────    ─────────────────
+  retry (bounded)             transient blip                BUILT
+                              (rate-limit window, jitter)   client.ts L122–L132
+  circuit breaker             sustained outage              ABSENT
+                              (provider down for minutes)
+  + agent observation         agent retrying a dead tool    ABSENT
+                              every turn (loop blowup)
+```
+
+The practical consequence: today, a sustained outage of Bloomreach means every agent turn pays the full retry tax and the agent has no signal to stop trying. With a per-tool breaker that feeds open-state back as an observation, the first failure trips the counter, the second trips the breaker, the third call (and every subsequent call to that tool) returns "tool unavailable" instantly, AND the model reads it and picks a different tool. In this codebase that "different tool" would be limited (one transport, one server) — the agent might switch from `execute_analytics_eql` to `get_schema` or abstain — but even abstention is better than the current "burn 6 turns retrying."
+
+The principle: **agent loops invert the cost equation.** A service that retries a dead dependency wastes one call's worth of time. An agent that retries a dead dependency wastes a whole *trajectory* — every turn, every model call, every observation in the window. The breaker's job in an agent is to bound the trajectory's blast radius, not just the individual call's.
+
+### Phase A vs Phase B — where the breaker + observation feedback would slot in
+
+Right now there's bounded retry, no breaker, no observation. Naming where they would slot makes the gap concrete.
+
+```
+       Phase A (now — bounded retry only)
+┌────────────────────────────────────────────────────────────┐
+│ agent emits tool_use                                       │
+│   ▼                                                         │
+│ McpClient.callTool                                          │
+│   ├─ cache check (L106–L110)                               │
+│   ├─ liveCall (L113)                                       │
+│   │   on rate-limit error: retry up to 3 times             │
+│   │   (L122–L132, waits 10–20s each)                       │
+│   └─ return result (success or final error)                │
+│   ▼                                                         │
+│ loop feeds tool_result back to agent (base.ts L161–L171)   │
+│   error or success → agent reads, decides next call         │
+│   (no signal "this tool is dead, switch")                   │
+└────────────────────────────────────────────────────────────┘
+
+       Phase B (per-tool breaker + agent observation feedback)
+┌────────────────────────────────────────────────────────────┐
+│ agent emits tool_use                                       │
+│   ▼                                                         │
+│ McpClient.callTool                                          │
+│   ├─ breaker.state(name) ?                                  │ ← NEW
+│   │   ├─ OPEN  → return synthetic "tool unavailable"        │ ← NEW
+│   │   │          observation (no upstream call)             │
+│   │   ├─ HALF-OPEN → allow one probe                        │ ← NEW
+│   │   └─ CLOSED → existing flow                              │
+│   ├─ cache check                                            │
+│   ├─ liveCall                                                │
+│   │   on failure: breaker.recordFailure(name)               │ ← NEW
+│   │   on success: breaker.recordSuccess(name)               │ ← NEW
+│   │   retry as before                                       │
+│   └─ return result                                          │
+│   ▼                                                         │
+│ loop feeds tool_result back to agent (UNCHANGED shape)      │
+│   if synthetic "unavailable" → model picks different tool   │
+└────────────────────────────────────────────────────────────┘
+   the breaker state has to be per-instance lived per           │
+   investigation (matches the cache lifecycle), or shared       │
+   across investigations if outage detection should span         │
+   them (more useful, more ops to maintain)                      │
+```
+
+*Phase A (now):* retry handles transient blips well; sustained outages burn the budget. Acceptable when Bloomreach availability is high and outages are short (the retry covers most of them).
+
+*Phase B (breaker + observation):* the agent learns to route around dead tools mid-trajectory. The cost is one new component (the breaker state, per-tool) plus prompt-level guidance to the agents about how to read the synthetic observation. The win is *bounded* trajectory cost during sustained failure — the budget doesn't vanish into retries.
+
+The takeaway: **the breaker's value in an agent isn't fail-fast for its own sake; it's keeping the iteration budget alive so the agent can finish, even if it has to finish with "I couldn't reach this data."** That's a structurally better failure mode than "the budget burned silently and the answer is empty."
+
+This is what people mean when they say "agent retry is the worst kind of retry." A retry inside a loop amplifies the wait by the loop's iteration count, and the cost is the whole task, not one call. The breaker is the answer; the observation feedback is what makes the breaker actually useful to an agent.
+
+The full picture is below.
+
+---
+
+## Per-tool circuit breaking — diagram
+
+```
+The canonical per-tool circuit breaker — with the agent-observation extension
+
+  agent emits tool_use { name: 'X', input: {...} }
+       │
+       ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │ Per-tool breaker state for 'X'                            │
+  │   CLOSED / OPEN / HALF-OPEN                                │
+  └────────────────────┬───────────────────────────────────────┘
+                       ▼
+       ┌───────────────┼────────────────┐
+       ▼ CLOSED        ▼ HALF-OPEN      ▼ OPEN
+   call passes      probe allowed   FAIL FAST
+       │            (one)              │
+       ▼              │                ▼
+   upstream X     upstream X      ┌────────────────────────────┐
+       │              │            │ SYNTHETIC OBSERVATION:     │
+       ▼              ▼            │  tool_result { is_error: true,
+   success/fail   success/fail     │   content: "tool 'X' is     │
+   record on        record on      │   currently unavailable;    │
+   breaker          breaker        │   try a different tool" }   │ ← THE EXTENSION
+                                    └───────────────┬────────────┘
+                                                    │
+                                                    ▼
+                                       agent reads observation,
+                                       picks a DIFFERENT tool
+                                       (or abstains honestly)
+
+  WHAT THIS CODEBASE HAS:
+   bounded exponential-backoff retry (client.ts L122–L132)
+   ─ honors Retry-After hint from error text
+   ─ retryDelayMs=10_000, retryCeilingMs=20_000, maxRetries=3
+   ─ no breaker state, no fail-fast
+   ─ no agent observation saying "switch tools"
+
+  THE GAP:
+   sustained-outage handling
+   ─ today: every call pays full retry tax (~50s × 6 calls = budget gone)
+   ─ with breaker + observation: first failures trip the breaker, rest
+     return synthetic observations the agent reasons on, budget preserved
+```
+
+---
+
+## In this codebase
+
+**Case B (partial) — bounded exponential-backoff retry exists; per-tool circuit breaker does not.** The honest sentence: the retry layer covers transient blips correctly (Retry-After-honoring, exponential backoff, bounded to 3 retries), but there's no breaker state and no path that feeds an open-state observation back to the agent for routing.
+
+**Bounded retry (built)**
+**File:** `lib/mcp/client.ts`
+**Function / class:** `McpClient.callTool` — the retry while-loop
+**Line range:** L122–L132 (the retry guard at L122; retry counter at L123; wait calculation at L124–L129; sleep at L130; retry call at L131)
+
+The retry loop. `isRateLimited(result)` (L18–L22) decides whether to retry — the test is "is this an `isError: true` result whose text matches `/rate limit|too many requests/i`." `parseRetryAfterMs(result)` (L31–L38) pulls a stated window out of Bloomreach's error text; when present, the retry waits `hintMs + RETRY_BUFFER_MS` (500 ms cushion, L16). When no hint parses, the fallback is exponential backoff `retryDelayMs × 2^(retries-1)` off a 10s base. Every wait is capped at `retryCeilingMs = 20_000`.
+
+**Retry configuration**
+**File:** `lib/mcp/connect.ts`
+**Function / class:** the `McpClient` constructor call
+**Line range:** L89–L96 (the options: `minIntervalMs: 1100`, `retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`)
+
+Where the retry numbers are tuned. The 10s base matches Bloomreach's observed `1 per 10 second` window — a sub-second retry would burn the attempt inside the same window. The 20s ceiling caps a single retry's wait so one retry can't blow the route's 60s investigation budget. `maxRetries: 3` × ~10s each gives a worst case of ~30s on a single call (comment in `client.ts` L118–L120).
+
+**Per-tool circuit breaker (not built)**
+**Honest sentence:** there is no breaker state in `McpClient`. The fields tracking call state (`cache` L80, `lastCallAt` L81) cover memoization and spacing, not failure-counting per tool. There is no `failureCount`, no `openUntil`, no per-tool state machine. Every retry sequence runs to completion regardless of how many recent calls to the same tool have failed.
+
+**Agent observation feedback (not built)**
+**Honest sentence:** `runAgentLoop` (`lib/agents/base.ts` L48–L176) feeds the tool result back to the model unmodified (L161–L171). On a final retry-exhausted error, the model sees an `is_error: true` tool result the same shape as any other failure; nothing tells the model "this tool has been failing for a while — try a different one."
+
+```
+shape (not full impl):
+  // TODAY — bounded retry only (client.ts L122–L132)
+  let retries = 0;
+  while (isRateLimited(result) && retries < this.maxRetries) {
+    retries++;
+    const hintMs = parseRetryAfterMs(result);
+    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+    const waitMs = Math.min(
+      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+      this.retryCeilingMs,
+    );
+    await sleep(waitMs);
+    result = await this.liveCall(name, args);
+  }
+  // result returned to agent; no breaker state, no observation
+
+  // PHASE B — breaker + observation (not here):
+  // class McpClient {
+  //   private breakers = new Map<string, { state, failures, openUntil }>();
+  //   async callTool(name, args) {
+  //     const b = this.breakers.get(name);
+  //     if (b?.state === 'OPEN' && b.openUntil > Date.now()) {
+  //       return { result: syntheticUnavailable(name, b.openUntil), ... };
+  //     }
+  //     // ... existing flow, plus record failure/success on breaker
+  //   }
+  // }
+  // // agent prompt addition:
+  // "if a tool returns 'currently unavailable', do not retry it —
+  //  choose a different tool or report what you have."
+```
+
+---
+
+## Elaborate
+
+### Where this pattern comes from
+
+The circuit breaker pattern came from telephony (Hystrix at Netflix popularized it in microservices, ca. 2012) — a state machine wrapping calls to a dependency, tripping on N failures, cooling down for T, probing once before fully reopening. The pattern's been re-implemented in resilience libraries across every major stack (resilience4j, Polly, Bulkhead, Istio/Envoy circuit breakers). The *agent-specific* twist — feed open-state back to the agent as an observation — got named more recently as multi-agent and multi-tool systems started hitting the loop-blowup failure mode the service-style breaker didn't address.
+
+### The deeper principle
+
+There are three layers of failure handling for any callee, and they cover different failure modes. **Retry** handles transient blips — one call, one wait, one or more attempts. **Circuit breaker** handles sustained outages — many callers, one dead dependency, fail fast across all of them. **Agent observation feedback** handles loop-internal routing — one caller (the agent), one dead tool, switch tools instead of retrying. The first two are universal patterns; the third is what makes them work *inside* an autonomous loop instead of around it.
+
+```
+  layer                  failure mode           who acts on the state
+  ────────────          ─────────────────       ──────────────────────
+  retry                  transient (blip)       the call-site code
+  circuit breaker        sustained (outage)     all callers, including
+                                                  the call-site code
+  + observation          agent retrying a       the AGENT's reasoning
+                         dead tool every turn   (next turn picks differently)
+```
+
+### Where this breaks down
+
+The breaker pattern itself has tuning gaps — threshold too low triggers on noise, cooldown too short churns open/closed. The observation-feedback extension has a deeper problem: the model has to understand the synthetic observation as a routing signal, not as a regular error to retry. Without prompt-level guidance, the model might emit the same `tool_use` on the next turn even after seeing "unavailable." Mitigation is structural: include the prompt instruction, and consider a hard rule in the loop ("if the same tool just returned 'unavailable,' refuse to call it again this turn") as a safety net.
+
+### What to explore next
+- Single-call retry + breaker mechanics: `../../study-ai-engineering/06-production-serving/05-retry-circuit-breaker.md` → the layer this file extends
+- Coordination failure modes: `../03-multi-agent-orchestration/09-coordination-failure-modes.md` → "tool-call cascade" failure mode this breaker pattern bounds
+- Capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` → pre-call routing as a complement to post-call breaker state
+- Fan-out backpressure: `02-fan-out-backpressure.md` → the related serving discipline at the concurrency layer
+
+---
+
+## Tradeoffs
+
+The decision was *how much failure-handling to ship.* This codebase shipped bounded exp-backoff retry; the alternative is to add the per-tool breaker + agent observation feedback.
+
+┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
+│ Cost dimension   │ Retry only (chosen — now)    │ + per-tool breaker +        │
+│                  │                              │ observation (alternative)   │
+├──────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Build cost       │ ~15 lines (client.ts        │ breaker state per tool +    │
+│                  │ L122–L132)                  │ synthetic observation +     │
+│                  │                             │ prompt guidance              │
+│ Transient blip   │ handled — retries clear it  │ same                         │
+│ handling         │                             │                              │
+│ Sustained outage │ every call pays full retry  │ first N failures pay retry; │
+│ handling         │ tax (~30–60s per call)      │ rest fail fast (~0ms);       │
+│                  │ × every call in budget       │ budget preserved             │
+│ Agent routing    │ none — model sees regular   │ model sees "unavailable" obs│
+│ around dead tool │ error, may retry             │ and routes to a different   │
+│                  │                              │ tool                         │
+│ Trajectory cost  │ unbounded on sustained outage│ bounded (N failures, then   │
+│ on outage         │ (whole budget can burn)     │ trajectory continues)        │
+│ Threshold tuning │ N/A — no thresholds          │ trip-threshold N, cooldown  │
+│                  │                              │ T per tool                   │
+│ Observation      │ N/A                          │ prompt addition: "if tool   │
+│ semantics        │                              │ returns 'unavailable' don't │
+│ (prompt work)    │                              │ retry it"                    │
+│ False positive   │ N/A                          │ breaker trips on transient  │
+│ risk             │                              │ noise → unnecessary route-  │
+│                  │                              │ around                       │
+│ Debuggability    │ retry trace is linear         │ trace + breaker state      │
+│                  │                             │ transitions per tool         │
+└──────────────────┴─────────────────────────────┴─────────────────────────────┘
+
+### What we gave up
+
+We gave up trajectory-cost bounds during sustained failure. If Bloomreach has a 10-minute outage, an in-progress diagnostic agent will pay 3 retries × ~20s per call × 6 calls = up to ~6 minutes of waiting, then synthesize from nothing. With a breaker the first ~2–3 failures would burn that retry tax once; subsequent calls within the cooldown would fail fast and let the agent abstain quickly.
+
+We also gave up tool-routing intelligence on the agent's side. Even if the codebase added more tools (a vector store, a web search), the agent today has no signal indicating "this tool is dead, use another one" — it would have to discover the failure on each call independently. The observation-feedback pattern turns that discovery into a structural signal.
+
+### What the alternative would have cost
+
+If we had built the breaker + observation feedback day one, the engineering cost would have been: a per-tool state machine (small — maybe 80 lines), a hook in `callTool` to consult and update breaker state (a handful of lines), synthetic observation shapes that match Anthropic's `tool_result` schema, and a paragraph in each agent's prompt explaining how to interpret the unavailable signal. The ongoing cost is two tunable parameters per tool (threshold, cooldown) — small. The risk is over-tripping on transient noise (a breaker that opens on one bad call and stays open for two minutes denies the agent a path that would have recovered). Mitigation: a high threshold (3–5 failures) and a short cooldown (30–60s) as defaults; tune from production data.
+
+### The breakpoint
+
+This stays the right call (retry only) until two things converge: (a) Bloomreach availability becomes a real failure mode — sustained outages frequent enough that trajectory blowup becomes a recurring cost, AND (b) the codebase has more than one tool the agent could route between (today it's mostly `execute_analytics_eql` against one upstream). Either alone is partial — (a) without (b) gives the agent nowhere to route to (the breaker becomes "abstain faster," which is still better than the current behavior); (b) without (a) is a feature looking for a problem. Both together is the day the breaker + observation pattern earns its build cost.
+
+### What wasn't actually a tradeoff
+
+"Just raise `maxRetries`" was not a real alternative. Raising it makes the bad case worse — every sustained outage burns more time before the agent gives up. The retry's bound is correct as-is; the missing layer isn't more retries, it's a different *kind* of guard (the breaker) for a different failure mode (sustained outage). Throwing more retries at a sustained outage is the wrong shape of fix.
+
+---
+
+## Tech reference
+
+### Bounded retry (the layer that exists)
+
+- **Codebase uses:** the retry while-loop in `McpClient.callTool` (`lib/mcp/client.ts` L122–L132), configured via `connect.ts` L92–L95 (`retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`); `parseRetryAfterMs` (L31–L38) pulls a hint from Bloomreach's error text.
+- **Why it's here:** correct for the transient-blip failure mode (rate-limit windows), respects Bloomreach's stated penalty.
+- **Leading today:** Retry-After-honoring exponential backoff — adoption-leading for rate-limited APIs, 2026.
+- **Why it leads:** honoring the server's stated window means the retry lands exactly when the penalty clears, instead of guessing.
+- **Runner-up:** fixed-interval retry — simpler, ignores the server's hint, retries inside the same penalty window.
+
+### Circuit breaker libraries (the named pattern, not used here)
+
+- **Codebase uses:** none.
+- **Why it's here:** the canonical implementation of closed/open/half-open state machines; named for the pattern this file teaches.
+- **Leading today:** Polly (.NET), resilience4j (JVM), opossum (Node.js) — adoption-leading for service-to-service breakers, 2026.
+- **Why it leads:** battle-tested in production, well-documented thresholds and metrics, integrate with most observability stacks.
+- **Runner-up:** custom per-app implementation — less surface area, less testing, no shared metrics.
+
+### Anthropic tool_result schema (the channel for synthetic observations)
+
+- **Codebase uses:** `runAgentLoop` constructs `tool_result` blocks at `lib/agents/base.ts` L161–L167 (the existing shape: `type: 'tool_result', tool_use_id, content, is_error`).
+- **Why it's here:** the synthetic "tool unavailable" observation would use this same shape — the model already knows how to read it; the loop just needs to construct it without hitting the upstream.
+- **Leading today:** Anthropic / OpenAI tool_result schemas — adoption-leading for structured tool feedback, 2026.
+- **Why it leads:** typed tool feedback makes synthetic observations indistinguishable to the model from real ones, so the routing signal is naturally readable.
+- **Runner-up:** unstructured text errors — model has to parse them, fragile, easier to mis-handle.
+
+---
+
+## Summary
+
+A per-tool circuit breaker for agents is the closed/open/half-open state machine scoped to each tool, with one extension that distinguishes it from the service-style version: feed the open state back to the agent as a `tool_result` observation so the model routes around the dead tool on its next turn instead of retrying it. blooming insights has bounded exponential-backoff retry (`McpClient.callTool` L122–L132, configured 10s base / 20s ceiling / 3 max in `connect.ts` L92–L95) — correct for transient rate-limit blips — but no breaker state and no observation-feedback path. The gap matters during sustained Bloomreach outages, where every agent turn pays the full retry tax (~30–60s per call × 6 budget) and burns the whole trajectory; with the breaker + observation pattern, the first failures trip the breaker, subsequent calls return "unavailable" synthetic observations instantly, and the agent's reasoning routes around the dead tool — preserving the iteration budget for whatever the agent *can* answer.
+
+- Three layers cover three failure modes: retry (transient blip), breaker (sustained outage), observation feedback (agent looping on a dead tool).
+- This codebase has the first; the second and third are the gap.
+- Per-tool scope, not global — tools fail independently, so breakers should too.
+- The agent-specific extension is the synthetic observation: open-state has to be readable by the model, not just by the call-site code.
+- Earns its place when (a) sustained outages become a real failure mode AND (b) the agent has more than one tool to route to.
+
+---
+
+## Interview defense
+
+### What an interviewer is really asking
+When an interviewer asks "what happens when a tool keeps failing," they're testing whether you can distinguish three different failure modes (blip, outage, agent-loop blowup) and name which of them your code handles. The strong signal is naming all three and being honest about which you cover. The weak signal is saying "we have retry" and stopping.
+
+### Likely questions
+
+[mid] Q: What happens when a tool call to Bloomreach fails?
+
+A: There's bounded exponential-backoff retry in `McpClient.callTool` (`lib/mcp/client.ts` L122–L132). On a rate-limit error, it retries up to 3 times. The wait honors a `Retry-After` window parsed from the error text (plus a 500 ms cushion), else falls back to exponential backoff off a 10s base, capped at 20s per wait. So a transient blip — a single 429 because the spacing window was unlucky — clears on the next attempt. Configuration is in `lib/mcp/connect.ts` L92–L95.
+
+Diagram:
+```
+  result = liveCall(...)
+  while isRateLimited(result) && retries < 3:
+    wait = min(parsedRetryAfter+500ms ?? 10s·2^n, 20s)
+    sleep(wait)
+    result = liveCall(...)
+```
+
+[senior] Q: What happens when Bloomreach is *down* for an hour?
+
+A: That's where the gap is. The retry handles transient blips well; it doesn't handle a sustained outage. During an hour-long Bloomreach outage, every agent call pays the full retry sequence — up to 60s per call — before returning an error to the agent. And the agent has no signal saying "this tool is dead, try a different one" — it sees an error result the same shape as any other failure and may retry on its next turn. So a 6-call budget can burn through 3-5 minutes of wall clock on retries and finish with no diagnosis. The fix is a per-tool circuit breaker that trips on N consecutive failures and feeds the open state back to the agent as a synthetic `tool_result` saying "tool unavailable" — the model reads that observation and routes around the dead tool or abstains honestly.
+
+Diagram:
+```
+  today (retry only)               with breaker + observation
+  ──────────────────              ────────────────────────────
+  call 1: retry 3× → fail (~60s)   call 1: retry 3× → fail; breaker counts
+  call 2: retry 3× → fail (~60s)   call 2: retry 3× → fail; trips OPEN
+  ...                              call 3: synthetic "unavailable" → 0ms
+  budget burned, no diagnosis      agent abstains or routes around
+```
+
+[arch] Q: If you added the breaker tomorrow, where exactly would it sit and what would the agent see?
+
+A: The state would live on `McpClient` — a `Map<string, BreakerState>` keyed on tool name, lifecycle matching the existing cache (per-investigation, so the breaker resets each run unless we want it cross-investigation, which is a separate decision). The hook is in `callTool` at the top: check `breakers.get(name)?.state` and if it's `OPEN`, return a synthetic `tool_result` with `is_error: true` and `content: "tool '<name>' is currently unavailable — try a different tool"` *without* calling `liveCall`. Record success/failure on the breaker after a real call returns. The prompt change is one line in each agent's system prompt — "if a tool returns 'currently unavailable,' do not retry it; choose a different tool or report what you have." The model sees a regular-shaped tool_result it already knows how to read.
+
+Diagram:
+```
+  callTool(name, args):
+    if breaker(name).state === OPEN:
+      return { result: { is_error: true, content: "tool unavailable" }, ... }
+    // existing flow
+    result = await liveCall(...)
+    if isError: breaker(name).recordFailure()
+    else: breaker(name).recordSuccess()
+    return result
+```
+
+### The question candidates always dodge
+Q: You're describing the breaker pattern but you said tools fail independently. In this codebase there's basically *one* tool (`execute_analytics_eql`) against one upstream — what does "route around" even mean here?
+
+A: Honest answer: not much, today. The codebase has a handful of MCP tools (the EQL one, schema introspection, catalog list) but they're all routed through the same MCP transport against the same Bloomreach backend — they share a failure mode. So when Bloomreach is down, every tool is sick at once and "route around" effectively means "abstain." Even that's a real win compared to the current behavior (burn the budget on retries, then abstain anyway), because the abstention happens in seconds instead of minutes. The full value of per-tool breaker + observation feedback only shows up when the topology has independently-failing tools — a vector store *and* a live API, say, where the agent can switch from "the live numbers are unreachable" to "let me check what we know from past investigations." So my honest framing: today the breaker buys *fast abstention*; the day a second source ships it buys *routing around* in the literal sense. Both are improvements over the current "loop on a dead tool until the budget's gone" behavior; the second is the larger win.
+
+Diagram:
+```
+   today (one effective source)            tomorrow (multi-source)
+   ────────────────────────────            ──────────────────────────────
+   breaker buys: FAST ABSTENTION           breaker buys: ROUTING AROUND
+   (~50s saved per outage call)            (the agent switches tools)
+   agent says "I couldn't reach            agent says "the live data is
+   Bloomreach right now"                    unreachable, but here's what
+   in seconds instead of minutes            past investigations show"
+```
+
+### One-line anchors
+- "Three layers of failure handling: retry (transient), breaker (outage), observation feedback (agent loop)."
+- "This codebase has retry; breaker + observation feedback are the gap."
+- "Per-tool scope — tools fail independently, so breakers should too."
+- "The agent-specific extension is the synthetic observation — open-state has to be readable by the model, not just by the call-site code."
+
+---
+
+## Validate your understanding
+
+### Level 1 — Reconstruct the diagram
+Close this file. Draw the three breaker states (closed, open, half-open) with the transition triggers (N consecutive failures → OPEN; cooldown T elapses → HALF-OPEN; success → CLOSED; failure → OPEN). Then draw the agent-observation extension: open-state intercepts the `tool_use` and returns a synthetic `tool_result` the model reads on its next turn.
+
+Open the file. Compare.
+
+✓ Pass: you drew the three states with named triggers, drew the per-tool scope (one state machine per tool name), and drew the synthetic observation feeding back to the agent
+✗ Fail: re-read How it works, wait 10 minutes, try again
+
+### Level 2 — Explain it out loud
+A colleague asks "why isn't your retry loop enough? You have exponential backoff, you have Retry-After honoring, what's missing?" No notes. Under 90 seconds.
+
+Checkpoints — did you:
+- Distinguish transient blip (retry handles) from sustained outage (breaker handles) from agent-loop-on-dead-tool (observation feedback handles)?
+- Name the worst-case budget burn during a sustained outage (3 retries × up to 20s × N calls)?
+- Explain why a service-style breaker isn't enough (agent has no signal to route around)?
+- Name the synthetic `tool_result` observation as the specific agent-architecture extension?
+
+If you skipped any: you described it, you didn't understand it.
+
+### Level 3 — Apply it to a new scenario
+A new feature ships: a vector store over past investigations is added beside the MCP-EQL tool. The agent can now retrieve from either source. Without opening the code: how would the per-tool breaker pattern apply, and what does "route around" look like if the vector store goes down but Bloomreach is fine?
+
+Write your answer (4–6 sentences). Then open `lib/mcp/client.ts` L79–L95 to see where per-tool state would slot in, and `runAgentLoop` (`base.ts` L143–L171) for the result-handling block where the synthetic observation would be constructed.
+
+### Level 4 — Defend the decision you'd change
+"You said the breaker is worth building when sustained outages become a real failure mode. If Bloomreach had a known 30-minute outage scheduled for tomorrow and you had two hours to ship a fix, would you (a) add the breaker, (b) increase `maxRetries`, or (c) put up a banner and disable investigations during the window? Walk the cost of each — what does it buy, what's left exposed?"
+
+Reference the code: point to `McpClient`'s retry loop (`client.ts` L122–L132) and configuration (`connect.ts` L92–L95) for what's tunable today.
+
+### Quick check — code reference test
+Without opening any files:
+- What file holds the retry loop and what line range?
+- What three retry parameters are configured in `connect.ts` and what are their values?
+- What's the agent-architecture extension that makes the breaker different from a service-style breaker?
+
+Open and verify. ✓ File + function names matter; line numbers drifting is fine.
+
+---
+Updated: 2026-05-29 — created
