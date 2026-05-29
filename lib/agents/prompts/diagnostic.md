@@ -21,7 +21,8 @@ Investigate WHY a specific anomaly occurred. You are given one anomaly; your job
 2. **Design queries to falsify each hypothesis**:
    - Segment the metric by the most likely discriminating dimension first (`by customer.device_type`, `by customer.country`, `by event.category`, etc.).
    - Compare a period that shows the anomaly against a baseline period using `execute_analytics_eql`.
-3. **Conclude** once you have data supporting or ruling out each hypothesis. State which hypothesis best fits the evidence, or honestly say no clear cause was found.
+3. **Locate WHEN the change happened — spend one of your calls on this; it sharpens the diagnosis AND powers the timeline chart.** Run a time-series of the anomalous metric over the recent window: `select count event <metric> by day in last 14 days` (use `by week` over a longer window if the daily series is empty/sparse). The shape is diagnostic: a sudden cliff to ~0 points to a tracking/pipeline gap or outage; a gradual slide points to demand/seasonality; a spike points to a one-off. Capture the per-period values for `timeSeries` (see Output).
+4. **Conclude** once you have data supporting or ruling out each hypothesis. State which hypothesis best fits the evidence, or honestly say no clear cause was found.
 
 ## EQL reminders
 
@@ -30,6 +31,7 @@ Investigate WHY a specific anomaly occurred. You are given one anomaly; your job
 - Segment by dimension: `select count event purchase by customer.country grouping top 5 in last 7 days`
 - Segment by device: `select count event purchase by customer.device_type grouping top 5 in last 7 days`
 - Multiple metrics: `select count event view_item, count event cart_update, count event purchase in last 7 days`
+- Time series (locate WHEN a change began): `select count event purchase by day in last 14 days` — one value per day; use `by week` over a longer window (e.g. `in last 84 days`) when the daily series is empty/sparse.
 - **Do NOT use a `customers matching ...` clause — it is NOT supported in this EQL flavor and wastes a call.** Segment with `by <attribute>` instead.
 - Funnels require a trailing `end`: `funnel view_item followed by purchase in last 7 days end`.
 
@@ -87,7 +89,7 @@ Field rules:
 - `evidence` — one string per data point you actually observed (real query results). Never invent evidence.
 - `hypothesesConsidered` — include all 2–3 hypotheses you tested. `supported: true` means this hypothesis best explains the data.
 - `affectedCustomers` — omit if you could not quantify customer impact.
-- `timeSeries` — OPTIONAL daily values (oldest first, ~14 points) for the anomalous metric, used to chart "where the gap landed". Include only if you ran a `... by day in last 14 days` query and have the real per-day counts (`day` like `d-13`…`today`). Omit entirely otherwise — never fabricate it.
+- `timeSeries` — the per-period values (oldest first) of the anomalous metric from your time-series query in step 3. **Strongly preferred — emit it whenever you ran that query (you should).** Use `day` labels like `d-13`…`today` for a daily series, or `w-11`…`this week` for a weekly one. Provide the REAL counts you observed; omit the field only if you genuinely could not run a time-series query, and never fabricate the values.
 
 If you cannot determine a cause, return:
 ```json
