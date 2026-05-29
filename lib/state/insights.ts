@@ -20,6 +20,7 @@ export function anomalyToInsight(a: Anomaly): Insight {
     source: 'monitoring',
     evidence: a.evidence, // tool(s) + result that produced this insight
     impact: a.impact, // agent's one-sentence business impact (why it matters)
+    outlook: a.outlook, // agent's one-sentence forward-looking outlook
   };
 }
 
