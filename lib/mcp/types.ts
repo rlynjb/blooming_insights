@@ -21,14 +21,17 @@ export type CategoryId =
 // soft/enriching signal missing; unavailable = a required signal isn't emitted.
 export type CategoryCoverage = 'full' | 'limited' | 'unavailable';
 
-// Per-briefing summary of which categories were checkable against this
-// workspace's event schema (drives the coverage grid's tiles + note).
-export type CoverageReport = {
+// One category's coverage result — drives a single coverage-grid tile.
+export type CoverageItem = {
   category: CategoryId;
   label: string;
   coverage: CategoryCoverage;
   missing?: string[]; // required/enriching signals that were absent
-}[];
+};
+
+// Per-briefing summary of which categories were checkable against this
+// workspace's event schema (drives the coverage grid's tiles + note).
+export type CoverageReport = CoverageItem[];
 
 export interface Insight {
   id: string;

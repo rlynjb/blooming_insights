@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { Insight, CoverageReport } from '@/lib/mcp/types';
+import type { Insight, CoverageItem, CoverageReport } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import CoverageGrid from '@/components/feed/CoverageGrid';
 import Skeleton from '@/components/shared/Skeleton';
@@ -28,6 +28,7 @@ interface BriefingResponse {
 // The live briefing streams these NDJSON events (see app/api/briefing/route.ts).
 type BriefingEvent =
   | { type: 'workspace'; workspace: BriefingResponse['workspace'] }
+  | { type: 'coverage_item'; item: CoverageItem }
   | { type: 'coverage'; coverage: CoverageReport }
   | { type: 'tool_call_start'; toolName: string; agent: string }
   | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; result?: unknown; error?: string }
@@ -329,6 +330,12 @@ export default function HomePage() {
             case 'workspace':
               setWorkspace(evt.workspace);
               break;
+            case 'coverage_item':
+              // accumulate one tile at a time → the grid fills progressively
+              setCoverage((prev) =>
+                prev.some((c) => c.category === evt.item.category) ? prev : [...prev, evt.item],
+              );
+              break;
             case 'coverage':
               setCoverage(evt.coverage);
               break;
@@ -611,8 +618,10 @@ export default function HomePage() {
       <div className="grid grid-cols-1 lg:grid-cols-3" style={{ gap: 24, alignItems: 'start' }}>
         {/* ── col 1 — the feed (anomaly items) ───────────────────────────── */}
         <div className="lg:col-span-2" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      {/* anomaly coverage grid — the category checklist, above the cards */}
-      <CoverageGrid coverage={coverage} insights={insights} />
+      {/* anomaly coverage grid — the category checklist, above the cards. Tiles
+          stream in one at a time as the gate reports each category; while
+          loading, the not-yet-reported tiles render as pending skeletons. */}
+      <CoverageGrid coverage={coverage} insights={insights} loading={status === 'loading' && !reconnecting} />
       {/* loading */}
       {status === 'loading' && !reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>

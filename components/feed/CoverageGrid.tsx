@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import Skeleton from '@/components/shared/Skeleton';
 import {
   TrendingDown,
   ShoppingCart,
@@ -43,6 +44,7 @@ function sevColor(s: Severity): string {
 interface CoverageGridProps {
   coverage: CoverageReport;
   insights: Insight[];
+  loading?: boolean; // briefing still streaming — render not-yet-reported tiles as pending
 }
 
 const labelMono: React.CSSProperties = {
@@ -56,16 +58,20 @@ const microMono: React.CSSProperties = {
   letterSpacing: '0.04em',
 };
 
-export default function CoverageGrid({ coverage, insights }: CoverageGridProps) {
-  if (!coverage || coverage.length === 0) return null;
+export default function CoverageGrid({ coverage, insights, loading = false }: CoverageGridProps) {
+  // nothing to show yet and not loading → render nothing (idle/empty/error states).
+  if ((!coverage || coverage.length === 0) && !loading) return null;
 
   const byCat = new Map(coverage.map((c) => [c.category, c]));
   const insightByCat = new Map<CategoryId, Insight>();
   for (const i of insights) if (i.category && !insightByCat.has(i.category)) insightByCat.set(i.category, i);
 
+  // counts reflect what's been reported so far — they tick up as tiles stream in.
+  const checked = coverage.length;
   const monitored = coverage.filter((c) => c.coverage !== 'unavailable').length;
   const firing = CATEGORIES.filter((c) => insightByCat.has(c.id)).length;
   const skipped = coverage.filter((c) => c.coverage === 'unavailable');
+  const settling = loading && checked < CATEGORIES.length;
 
   return (
     <div className="bi-fade-up">
@@ -88,6 +94,11 @@ export default function CoverageGrid({ coverage, insights }: CoverageGridProps) 
             10 categories · <span style={{ color: 'var(--accent-teal)' }}>{monitored} monitored</span> ·{' '}
             <span style={{ color: 'var(--accent-coral)' }}>{firing} firing</span> ·{' '}
             <span style={{ color: 'var(--text-tertiary)' }}>{skipped.length} no data</span>
+            {settling && (
+              <span className="animate-pulse" style={{ color: 'var(--text-tertiary)' }}>
+                {' '}· checking {checked}/10…
+              </span>
+            )}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 12, ...microMono, color: 'var(--text-tertiary)' }}>
@@ -108,6 +119,38 @@ export default function CoverageGrid({ coverage, insights }: CoverageGridProps) 
           const Icon = ICONS[cat.id];
           const coverageState = report?.coverage ?? 'unavailable';
           const insight = insightByCat.get(cat.id);
+
+          // ── pending tile — gate hasn't reported this category yet ──
+          if (!report && loading) {
+            return (
+              <div
+                key={cat.id}
+                className="animate-pulse"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  padding: 13,
+                  borderRadius: 8,
+                  minHeight: 96,
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border)',
+                  opacity: 0.5,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ display: 'grid', placeItems: 'center', width: 26, height: 26, borderRadius: 6, border: '1px solid var(--border)' }}>
+                    <Icon size={13} color="var(--text-tertiary)" />
+                  </span>
+                  <span style={{ ...microMono, color: 'var(--text-tertiary)' }}>checking…</span>
+                </div>
+                <div style={{ ...labelMono, color: 'var(--text-tertiary)' }}>{cat.label}</div>
+                <div style={{ marginTop: 'auto' }}>
+                  <Skeleton height={9} width="80%" />
+                </div>
+              </div>
+            );
+          }
 
           // ── ghost / planned tile ──
           if (coverageState === 'unavailable') {
@@ -241,8 +284,8 @@ export default function CoverageGrid({ coverage, insights }: CoverageGridProps) 
         })}
       </div>
 
-      {/* coverage note — only when categories were skipped */}
-      {skipped.length > 0 && (
+      {/* coverage note — once the gate has finished, when categories were skipped */}
+      {!settling && skipped.length > 0 && (
         <div
           style={{
             marginTop: 12,

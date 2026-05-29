@@ -9,7 +9,7 @@ import { MonitoringAgent } from '@/lib/agents/monitoring';
 import { schemaCapabilities, coverageReport, runnableCategories } from '@/lib/agents/categories';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { anomalyToInsight, putInsights, listInsights } from '@/lib/state/insights';
-import type { CoverageReport, ToolCall } from '@/lib/mcp/types';
+import type { CoverageItem, CoverageReport, Insight, ToolCall } from '@/lib/mcp/types';
 import type { AgentEvent } from '@/lib/mcp/events';
 
 // 300s = Vercel Pro's max. The monitoring agent + ~1 req/s MCP spacing can run
@@ -18,13 +18,43 @@ export const maxDuration = 300;
 
 const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 
+// Pause between replayed demo events, so the snapshot reveals at a readable
+// pace instead of all at once (matches the agent route's investigation replay).
+const REPLAY_DELAY_MS = 140;
+
+// Shape of the captured demo snapshot we replay (a superset of BriefingResponse).
+type DemoTraceItem =
+  | { kind: 'step'; content?: string }
+  | { kind: 'tool'; toolName?: string; result?: unknown; durationMs?: number; error?: string };
+type DemoSnapshot = {
+  workspace?: BriefingWorkspace;
+  coverage?: CoverageReport;
+  trace?: DemoTraceItem[];
+  insights?: Insight[];
+};
+
+/** Narrate the schema-gate decision as a per-category checklist for the status
+ *  panel — one honest line per category, derived from the real CoverageReport. */
+function coverageChecklistSteps(coverage: CoverageReport): string[] {
+  return coverage.map((c) => {
+    if (c.coverage === 'full') return `${c.label} · monitored`;
+    if (c.coverage === 'limited') {
+      return `${c.label} · limited${c.missing?.length ? ` — missing ${c.missing.join(', ')}` : ''}`;
+    }
+    return `${c.label} · no data source${c.missing?.length ? ` — needs ${c.missing.join(', ')}` : ''}`;
+  });
+}
+
 type BriefingWorkspace = { projectName: string; totalCustomers: number; totalEvents: number };
 // Reuse the AgentEvent variants for live activity; add briefing-only `workspace`
-// and `coverage` events. Kept local so the shared AgentEvent contract (used by
-// /api/agent + the investigation view) is untouched.
+// and coverage events. `coverage_item` streams one category's result at a time
+// so the grid fills tile-by-tile in step with the checklist log; `coverage` is
+// the bulk form kept for the plain-JSON fallback. Kept local so the shared
+// AgentEvent contract (used by /api/agent + the investigation view) is untouched.
 type BriefingEvent =
   | AgentEvent
   | { type: 'workspace'; workspace: BriefingWorkspace }
+  | { type: 'coverage_item'; item: CoverageItem }
   | { type: 'coverage'; coverage: CoverageReport };
 
 /** Human-readable label for a monitoring tool call — prefers the real EQL/query
@@ -45,13 +75,78 @@ function trunc(v: unknown): unknown {
 export async function GET(req: NextRequest) {
   const demo = req.nextUrl.searchParams.get('demo') === 'cached';
 
-  // Demo mode: serve the pre-captured snapshot as plain JSON (creds-free).
+  // Demo mode: replay the pre-captured snapshot as an NDJSON stream (creds-free),
+  // mirroring the live event order so the feed reveals progressively — the
+  // coverage checklist narrates into the status panel, the grid resolves, then
+  // the recorded EQL trace and the insight cards stream in (the agent route
+  // replays investigations the same way). The client routes any non-NDJSON
+  // response down a plain-JSON fallback, so a malformed file still degrades.
   if (demo && existsSync(DEMO_FILE)) {
+    let snapshot: DemoSnapshot | null = null;
     try {
-      const snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8'));
-      return NextResponse.json({ ...snapshot, demo: true });
+      snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as DemoSnapshot;
     } catch {
-      /* fall through to live */
+      snapshot = null;
+    }
+    if (snapshot) {
+      const snap = snapshot;
+      const encoder = new TextEncoder();
+      const coverage = Array.isArray(snap.coverage) ? snap.coverage : [];
+      const trace = Array.isArray(snap.trace) ? snap.trace : [];
+      const insights = Array.isArray(snap.insights) ? snap.insights : [];
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const emit = async (e: BriefingEvent) => {
+            controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
+            await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+          };
+          const stepEvt = (content: string): BriefingEvent => ({
+            type: 'reasoning_step',
+            step: { id: crypto.randomUUID(), agent: 'monitoring', kind: 'thought', content },
+          });
+          try {
+            if (snap.workspace) await emit({ type: 'workspace', workspace: snap.workspace });
+            if (coverage.length > 0) {
+              await emit(stepEvt('matching the workspace schema to the 10-category anomaly checklist…'));
+              // one category per tick: log line + its tile resolve together, so
+              // the grid fills in step with the checklist instead of all at once.
+              const lines = coverageChecklistSteps(coverage);
+              for (let i = 0; i < coverage.length; i++) {
+                controller.enqueue(encoder.encode(JSON.stringify(stepEvt(lines[i])) + '\n'));
+                controller.enqueue(encoder.encode(JSON.stringify({ type: 'coverage_item', item: coverage[i] }) + '\n'));
+                await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+              }
+            }
+            // replay the recorded monitoring trace (the agent's real EQL queries)
+            for (const t of trace) {
+              if (t.kind === 'tool') {
+                const toolName = t.toolName ?? 'execute_analytics_eql';
+                await emit({ type: 'tool_call_start', toolName, agent: 'monitoring' });
+                await emit({
+                  type: 'tool_call_end',
+                  toolName,
+                  agent: 'monitoring',
+                  durationMs: t.durationMs ?? 0,
+                  result: t.result,
+                  error: t.error,
+                });
+              } else if (t.content) {
+                await emit(stepEvt(t.content));
+              }
+            }
+            for (const insight of insights) await emit({ type: 'insight', insight });
+            await emit({ type: 'done' });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          'content-type': 'application/x-ndjson; charset=utf-8',
+          'cache-control': 'no-store, no-transform',
+        },
+      });
     }
   }
 
@@ -107,7 +202,14 @@ export async function GET(req: NextRequest) {
         const capabilities = schemaCapabilities(schema);
         const coverage = coverageReport(capabilities);
         const runnable = runnableCategories(capabilities);
-        send({ type: 'coverage', coverage });
+        // narrate the gate as a per-category checklist, resolving each tile as
+        // its line is logged (the grid fills in step with the checklist).
+        step('matching the workspace schema to the 10-category anomaly checklist…');
+        const coverageLines = coverageChecklistSteps(coverage);
+        coverage.forEach((item, i) => {
+          step(coverageLines[i]);
+          send({ type: 'coverage_item', item });
+        });
 
         const raw = await mcp.listTools();
         const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
