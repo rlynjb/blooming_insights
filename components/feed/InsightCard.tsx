@@ -7,14 +7,6 @@ interface InsightCardProps {
   insight: Insight;
 }
 
-function formatTimestamp(ts: string): string {
-  try {
-    return new Date(ts).toLocaleString().toLowerCase();
-  } catch {
-    return ts.toLowerCase();
-  }
-}
-
 function fmtNum(n: number): string {
   return n.toLocaleString();
 }
@@ -167,6 +159,16 @@ export default function InsightCard({ insight }: InsightCardProps) {
     ? funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k
     : null;
 
+  const sevColor =
+    insight.severity === 'critical'
+      ? 'var(--accent-coral)'
+      : insight.severity === 'warning'
+        ? 'var(--accent-amber)'
+        : insight.severity === 'positive'
+          ? 'var(--accent-teal)'
+          : 'var(--text-tertiary)';
+  const viaTool = prov.tools.length > 0 ? prov.tools.join(', ') : null;
+
   return (
     <Link
       href={`/investigate/${insight.id}`}
@@ -181,20 +183,33 @@ export default function InsightCard({ insight }: InsightCardProps) {
           padding: '16px 20px',
         }}
       >
-        {/* top row: badge + headline + time-since */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+        {/* severity row: status · started ~N days ago · via tool */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
           <SeverityBadge severity={insight.severity} />
           <span
+            className="uppercase"
             style={{
-              color: 'var(--text-primary)',
               fontFamily: 'var(--font-mono), monospace',
-              fontSize: '0.95rem',
-              lineHeight: 1.3,
+              fontSize: '0.66rem',
+              fontWeight: 600,
+              letterSpacing: '0.06em',
+              color: sevColor,
             }}
           >
-            {insight.headline.toLowerCase()}
+            {insight.severity}
           </span>
           {days != null && (
+            <>
+              <span style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>·</span>
+              <span
+                className="lowercase"
+                style={{ fontFamily: 'var(--font-mono), monospace', fontSize: '0.68rem', color: 'var(--text-tertiary)' }}
+              >
+                started ~{days} {days === 1 ? 'day' : 'days'} ago
+              </span>
+            </>
+          )}
+          {viaTool && (
             <span
               className="lowercase"
               style={{
@@ -205,9 +220,23 @@ export default function InsightCard({ insight }: InsightCardProps) {
                 color: 'var(--text-tertiary)',
               }}
             >
-              started ~{days} {days === 1 ? 'day' : 'days'} ago
+              via {viaTool}
             </span>
           )}
+        </div>
+
+        {/* headline */}
+        <div style={{ marginBottom: 4 }}>
+          <span
+            style={{
+              color: 'var(--text-primary)',
+              fontFamily: 'var(--font-mono), monospace',
+              fontSize: '1.02rem',
+              lineHeight: 1.3,
+            }}
+          >
+            {insight.headline.toLowerCase()}
+          </span>
         </div>
 
         {/* summary — the agent's one-line statement of what changed */}
@@ -315,154 +344,112 @@ export default function InsightCard({ insight }: InsightCardProps) {
           </div>
         )}
 
-        {/* the so-what: why this matters, and why it's scoped the way it is */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, margin: '0 0 12px' }}>
-          {[
-            // prefer the agent's business-impact sentence; fall back to the
-            // derived explanation for demo / older snapshots that lack it.
-            { label: 'why it matters', text: insight.impact?.trim() || whyItMatters(insight) },
-            { label: 'scope', text: scopeExplain(insight) },
-          ].map((d) => (
-            <div key={d.label} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
-              <span
-                style={{
-                  flexShrink: 0,
-                  width: 100,
-                  fontFamily: 'var(--font-mono), monospace',
-                  fontSize: '0.62rem',
-                  letterSpacing: '0.04em',
-                  color: 'var(--text-tertiary)',
-                  paddingTop: 1,
-                }}
-              >
-                {d.label}
-              </span>
-              <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', lineHeight: 1.45 }}>
-                {d.text}
-              </span>
+        {/* prior → now comparison — fallback when there's no funnel chip
+            (e.g. the demo's data-integrity insights), so the card always shows
+            what changed. Absolute values when evidence carries them, else
+            indexed from the real % change. */}
+        {!funnel && (
+          <div style={{ paddingTop: 12, margin: '0 0 12px', borderTop: '1px solid var(--border)' }}>
+            <div
+              className="lowercase"
+              style={{
+                fontFamily: 'var(--font-mono), monospace',
+                fontSize: '0.65rem',
+                letterSpacing: '0.04em',
+                color: 'var(--text-tertiary)',
+                marginBottom: 8,
+              }}
+            >
+              {insight.metric} · {arrow} {abs}% vs prior {humanizeBaseline(insight.change.baseline)}
+              {!hasComparison && ' (relative)'}
             </div>
-          ))}
-        </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {compareRows.map((row) => (
+                <div key={row.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span
+                    className="lowercase"
+                    style={{ width: 38, flexShrink: 0, fontFamily: 'var(--font-mono), monospace', fontSize: '0.68rem', color: 'var(--text-tertiary)' }}
+                  >
+                    {row.label}
+                  </span>
+                  <div style={{ flex: 1, height: 10, background: 'var(--bg-elevated)', borderRadius: 2, overflow: 'hidden' }}>
+                    <div
+                      style={{
+                        width: `${Math.max((row.bar / barMax) * 100, 2)}%`,
+                        height: '100%',
+                        background: row.label === 'now' ? dirColor : 'var(--text-tertiary)',
+                        borderRadius: 2,
+                      }}
+                    />
+                  </div>
+                  <span
+                    style={{
+                      width: 92,
+                      flexShrink: 0,
+                      textAlign: 'right',
+                      fontFamily: 'var(--font-mono), monospace',
+                      fontSize: '0.7rem',
+                      color: row.label === 'now' ? dirColor : 'var(--text-secondary)',
+                    }}
+                  >
+                    {row.right}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
-        {/* meta row */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            flexWrap: 'wrap',
-          }}
-        >
+        {/* scope chips (hover for how the scope was determined) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', margin: '0 0 12px' }}>
+          <span className="lowercase" style={{ fontFamily: 'var(--font-mono), monospace', fontSize: '0.62rem', color: 'var(--text-tertiary)' }}>
+            scope
+          </span>
           {insight.scope.map((tag) => (
             <span
               key={tag}
-              title={
-                tag.toLowerCase() === 'global'
-                  ? 'measured across the whole workspace'
-                  : `change localized to the ${tag.toLowerCase()} segment`
-              }
+              title={scopeExplain(insight)}
+              className="lowercase"
               style={{
                 background: 'var(--bg-elevated)',
-                color: 'var(--text-tertiary)',
+                color: 'var(--text-secondary)',
                 border: '1px solid var(--border)',
-                borderRadius: 4,
-                padding: '1px 6px',
-                fontSize: '0.75rem',
+                borderRadius: 999,
+                padding: '1px 8px',
+                fontSize: '0.7rem',
                 fontFamily: 'var(--font-mono), monospace',
               }}
             >
               {tag.toLowerCase()}
             </span>
           ))}
-
-          <span
-            style={{
-              color: 'var(--text-tertiary)',
-              fontSize: '0.75rem',
-              fontFamily: 'var(--font-mono), monospace',
-              marginLeft: 'auto',
-            }}
-          >
-            {formatTimestamp(insight.timestamp)}
-          </span>
         </div>
 
-        {/* provenance: how this item came about — a prior → now comparison and
-            the tool(s) used. Absolute values when the evidence carries them
-            (live / captured); otherwise indexed from the real % change (demo). */}
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+        {/* why it matters — amber callout (the agent's business impact) */}
+        <div
+          style={{
+            background: 'var(--bg-elevated)',
+            borderLeft: '2px solid var(--accent-amber)',
+            borderRadius: 4,
+            padding: '10px 12px',
+            marginBottom: 14,
+          }}
+        >
           <div
             className="lowercase"
             style={{
               fontFamily: 'var(--font-mono), monospace',
-              fontSize: '0.65rem',
+              fontSize: '0.62rem',
               letterSpacing: '0.04em',
-              color: 'var(--text-tertiary)',
-              marginBottom: 8,
+              color: 'var(--accent-amber)',
+              marginBottom: 3,
             }}
           >
-            {insight.metric} · {arrow} {abs}% vs prior {humanizeBaseline(insight.change.baseline)}
-            {!hasComparison && ' (relative)'}
+            ⚠ why it matters
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
-            {compareRows.map((row) => (
-              <div key={row.label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span
-                  className="lowercase"
-                  style={{
-                    width: 38,
-                    flexShrink: 0,
-                    fontFamily: 'var(--font-mono), monospace',
-                    fontSize: '0.68rem',
-                    color: 'var(--text-tertiary)',
-                  }}
-                >
-                  {row.label}
-                </span>
-                <div
-                  style={{
-                    flex: 1,
-                    height: 10,
-                    background: 'var(--bg-elevated)',
-                    borderRadius: 2,
-                    overflow: 'hidden',
-                  }}
-                >
-                  <div
-                    style={{
-                      width: `${Math.max((row.bar / barMax) * 100, 2)}%`,
-                      height: '100%',
-                      background: row.label === 'now' ? dirColor : 'var(--text-tertiary)',
-                      borderRadius: 2,
-                    }}
-                  />
-                </div>
-                <span
-                  style={{
-                    width: 92,
-                    flexShrink: 0,
-                    textAlign: 'right',
-                    fontFamily: 'var(--font-mono), monospace',
-                    fontSize: '0.7rem',
-                    color: row.label === 'now' ? dirColor : 'var(--text-secondary)',
-                  }}
-                >
-                  {row.right}
-                </span>
-              </div>
-            ))}
-          </div>
-          {/* always shown so the "gathered via" label is visible in both modes */}
-          <div
-            className="lowercase"
-            style={{
-              fontFamily: 'var(--font-mono), monospace',
-              fontSize: '0.68rem',
-              color: 'var(--text-tertiary)',
-            }}
-          >
-            via {prov.tools.length > 0 ? prov.tools.join(', ') : '--'}
-          </div>
+          <p style={{ color: 'var(--text-primary)', fontSize: '0.82rem', lineHeight: 1.5, margin: 0 }}>
+            {insight.impact?.trim() || whyItMatters(insight)}
+          </p>
         </div>
 
         {/* investigate affordance + downstream-ready status */}
