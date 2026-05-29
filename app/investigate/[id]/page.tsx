@@ -39,17 +39,18 @@ export default function InvestigatePage() {
   const recsReady = complete && !error; // recs are produced during this run
   const recommendHref = `/investigate/${id}/recommend`;
 
-  const diagState: StepState = error && !diagnosis ? 'error' : diagnosis ? 'complete' : 'active';
-  const diagSub = diagState === 'error' ? 'failed' : diagState === 'complete' ? 'cause identified' : 'testing hypotheses…';
-  const recState: StepState = error && diagnosis && !complete ? 'error' : complete ? 'complete' : diagnosis ? 'active' : 'pending';
-  const recSub =
-    recState === 'error'
-      ? 'failed'
-      : recState === 'complete'
-        ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'} ready`
-        : recState === 'active'
-          ? 'preparing…'
-          : 'awaiting diagnosis';
+  // the user is ON the diagnosis step — keep it the current (active) step, never
+  // ✓, while they're still here. The check appears once they move to step 3.
+  const diagState: StepState = error && !diagnosis ? 'error' : 'active';
+  const diagSub = diagState === 'error' ? 'failed' : diagnosis ? 'cause identified' : 'testing hypotheses…';
+  // recommendation is the next (future) step from here — pending, but jumpable
+  // once it's ready.
+  const recState: StepState = 'pending';
+  const recSub = recsReady
+    ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'} ready`
+    : diagnosis
+      ? 'preparing…'
+      : 'awaiting diagnosis';
 
   const canExport = (complete || diagnosis !== null) && !error;
 
@@ -110,14 +111,14 @@ export default function InvestigatePage() {
         </p>
       </div>
 
-      {/* which feed item this investigation is about */}
-      <InvestigationSubject id={id} />
-
       <ProcessStepper
         monitoring={{ state: 'complete', sub: 'change detected', href: '/' }}
         diagnostic={{ state: diagState, sub: diagSub }}
         recommendation={{ state: recState, sub: recSub, href: recsReady ? recommendHref : undefined }}
       />
+
+      {/* which feed item this investigation is about — directly above the diagnosis */}
+      <InvestigationSubject id={id} />
 
       {error ? (
         <div

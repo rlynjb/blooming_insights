@@ -36,11 +36,13 @@ export default function RecommendPage() {
 
   const streaming = !complete && !error;
   const diagnosisHref = `/investigate/${id}`;
-  const recState: StepState = error ? 'error' : recommendations.length > 0 ? 'complete' : 'active';
+  // the user is ON the recommendation step — keep it the current (active) step,
+  // never ✓, while they're still here.
+  const recState: StepState = error ? 'error' : 'active';
   const recSub =
     recState === 'error'
       ? 'failed'
-      : recState === 'complete'
+      : recommendations.length > 0
         ? `${recommendations.length} action${recommendations.length === 1 ? '' : 's'}`
         : diagnosis
           ? 'proposing actions…'
@@ -105,14 +107,14 @@ export default function RecommendPage() {
         </p>
       </div>
 
-      {/* which feed item this investigation is about */}
-      <InvestigationSubject id={id} />
-
       <ProcessStepper
         monitoring={{ state: 'complete', sub: 'change detected', href: '/' }}
         diagnostic={{ state: 'complete', sub: 'cause identified', href: diagnosisHref }}
         recommendation={{ state: recState, sub: recSub }}
       />
+
+      {/* which feed item this investigation is about — directly above the recommendations */}
+      <InvestigationSubject id={id} />
 
       {error ? (
         <div
