@@ -8,28 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've written this in React without thinking about it: a `useEffect` that fires a `fetch`, reads the response, and decides what to render or fetch next. The first request returns a user, you check `user.isPremium`, then you fire a second request for billing data, then you check whether the bill is overdue and maybe fire a third for the payment history. You did not predeclare "this view runs three fetches in this order" — each fetch's result decided whether the next one even happened.
+**Zoom out — the bigger picture.** ReAct sits in the Shared agent loop band, one level below the Pipeline coordinator that fires it. The Pipeline picks which agent runs (monitoring → diagnostic → recommendation); each of those agents enters `runAgentLoop` and the model takes over the per-turn decisions. One loop, four callers — the per-agent differences are knobs (system prompt, tool subset, `maxToolCalls`, `synthesisInstruction`) that get passed in. The escalations covered in this folder (plan-and-execute, reflexion, tree-of-thoughts) all sit at this same band; they're alternative loops that would replace this one.
 
-Now picture handing that decision to the model. The model emits a "call this tool with these args" block. Your code runs the tool. You feed the result back. The model looks at the result and either calls the next tool or stops and writes the answer. Same shape as your effect — read result, decide next call — except *the model is writing the chain at runtime.*
+```
+  Zoom out — where ReAct lives
 
-That shape has a name and it is the question this file answers: **what is the default single-agent loop, and when do you escalate past it?** Not "what is ReAct mechanically" — that's already covered in `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`. This file places ReAct in the family of reasoning patterns: ReAct is the baseline, plan-and-execute / reflexion / Tree-of-Thoughts are escalations from it, and the strong prior is to *start at ReAct and only move when a measured failure justifies it.*
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  lib/agents/pipeline.ts (picks which agent runs) │
+  └─────────────────────────┬────────────────────────┘
+                            │  per-agent invocation
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring.ts | diagnostic.ts | recommendation  │
+  │    (system prompt + tool set + handoff schema)   │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here
+  │  ★ runAgentLoop (lib/agents/loop.ts) ★           │
+  │  for turn: model.create → tool_use? → execute    │
+  │  → push result → repeat (the ReAct cycle)        │
+  └─────────────────────────┬────────────────────────┘
+                            │  every model call
+  ┌─ Provider wrappers ─────▼────────────────────────┐
+  │  cache · rate limit · retry · anthropic SDK      │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because every agent project drifts toward something fancier than it needs. A team measures one failure ("the agent retries the same dead query"), reaches for multi-agent or self-critique because the names sound more capable, and pays the 2–5x cost for a fix a tighter ReAct prompt would have delivered. Naming where you sit on the escalation ladder is how you stop paying for capability you didn't measure a need for.
-
-Without the ladder named:
-- A diagnostic comes back shallow
-- "Let's add a critic" / "let's add a planner" — code grows
-- The shallowness was actually the prompt not naming the period-over-period method strictly enough
-- You shipped a critic loop that runs every time and burns 2x tokens on a fix one prompt line would have made
-
-With the ladder named:
-- A diagnostic comes back shallow
-- Did the model pick wrong tools (ReAct prompt issue) or did it never plan past one query (plan-and-execute might earn its keep)?
-- Most of the time the answer is "tighten the prompt and you're done"
-
-One-line summary: **ReAct is a `useEffect` whose `fetch` calls and stopping condition are decided by the model — and `runAgentLoop` is the one such loop blooming insights re-runs under four different prompts.** Here's how that loop sits as the baseline and what the escalations are.
+**Zoom in — narrow to the concept.** The question is: what's the cheapest agent loop that does real work, and what does it look like in code? ReAct answers with one bounded `for` loop, one model call per turn, one tool-call budget, and one stopping condition (no `tool_use` blocks → done). Everything fancier in this folder is a structural addition on top of this kernel — pay for one only when a measured failure justifies it. Below, you'll see the four pieces of the kernel and what breaks when each one is removed.
 
 ---
 
@@ -413,3 +419,4 @@ Open and verify. ✓ File + function + the two budgets matter; line numbers drif
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

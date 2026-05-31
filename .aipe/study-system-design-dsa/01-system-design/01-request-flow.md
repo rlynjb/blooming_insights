@@ -8,18 +8,43 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a component. It calls `fetch('/api/briefing')` inside a `useEffect`. It shows a spinner while `status === 'loading'`. When the promise resolves it either renders cards or redirects to an auth URL. That is the entire visible behavior — but five distinct subsystems execute between the `fetch` call leaving the browser and the JSON arriving back.
+**Zoom out — the bigger picture.** Request flow is the spine — it spans every band in the blooming insights stack, from the `useEffect` in `app/page.tsx` to the Bloomreach MCP server over HTTPS. The other concepts in this guide each live in one band (TTL cache sits inside Provider wrappers, OAuth sits at the connect boundary, etc.); this one is the road they all travel down in order. Once you can name every `await` in `app/api/briefing/route.ts` and the band it crosses, every other concept slots into a place you already know.
 
-The question this pattern answers: what actually happens between the moment `fetch` fires and the moment `.map((insight) => <InsightCard>)` runs?
+```
+Zoom out — where request flow lives        ← we are here (every band)
 
-**Every layer is a failure domain.** If you do not know the layers, you cannot tell whether a blank feed is a network error, a cookie miss, an OAuth rejection, an MCP rate limit, an agent parse failure, or genuinely zero anomalies. In this codebase the route returns a distinct shape for each case — `{needsAuth, authUrl}` at 401, `{error}` at 500 (pre-stream) or an NDJSON `error` event (mid-stream), `done` with no `insight` events for a clean empty run — and the page branches on all of them (`app/page.tsx` L272–447).
+┌─ UI ───────────────────────────────────────────┐
+│  app/page.tsx · fetch('/api/briefing')         │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Route handler ─────▼──────────────────────────┐
+│  app/api/briefing/route.ts (NDJSON stream)     │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Session + OAuth gate ─────────────────────────┐
+│  lib/mcp/session.ts · lib/mcp/connect.ts       │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Schema + coverage gate ───────────────────────┐
+│  lib/mcp/schema.ts · lib/agents/categories.ts  │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Agent (MonitoringAgent.scan) ─────────────────┐
+│  lib/agents/monitoring.ts → runAgentLoop       │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Provider wrappers + MCP transport ────────────┐
+│  lib/mcp/client.ts (cache · spacing · retry)   │ ★ SPANS ★
+└─────────────────────┬──────────────────────────┘
+                      │  HTTPS
+┌─ External ─────────────────────────────────────┐
+│  Bloomreach MCP server                         │ ★ SPANS ★
+└────────────────────────────────────────────────┘
+```
 
-- Before: one undifferentiated `catch` block, every failure looks the same
-- After: each layer owns its error shape; the client can route to the right recovery
-
-This is the request/response flow pattern: a layered pipeline where each hop transforms the request, and each layer's output is the next layer's input — the same shape as a middleware stack, a Redux action moving through reducers, or a `Promise` chain.
+**Zoom in — narrow to the concept.** The question is: what happens between `fetch('/api/briefing')` firing and `.map((insight) => <InsightCard>)` running? Request flow names every layer-crossing `await` in that path and what owns each one. Every band is also a failure domain with its own error shape — 401 `{needsAuth, authUrl}`, a 500 setup throw, an NDJSON `error` event mid-stream, or a clean `done` with no insights — and the page branches on all of them. Below, you'll walk hop by hop with the file path and line range that owns each transition.
 
 ---
 
@@ -555,3 +580,4 @@ Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now s
 ---
 Updated: 2026-05-29 — added Hop 5.5 coverage gate (`schemaCapabilities`/`coverageReport`/`runnableCategories`, `categories.ts`) with ASCII diagram + folded it into the primary diagram, pseudocode, and Summary; documented the demo path as a paced NDJSON replay (`REPLAY_DELAY_MS = 140`) instead of a plain-JSON blob; updated `MonitoringAgent.scan(hooks, runnable)` to its gated 2-arg signature; re-derived all `route.ts` (now L75–265) and `monitoring.ts` (now L61–121) line refs against the grown files.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

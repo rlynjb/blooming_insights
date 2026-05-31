@@ -8,25 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a multi-step form where the wizard makes the user commit to a choice *before* showing the next step — pick a plan, then see add-ons; pick a region, then see availability. You did not let them jump straight to "submit" because the early commitment shapes everything downstream and gives you something to inspect when the final selection looks wrong. That intuition — force the intermediate step, then capture it — is what chain-of-thought does for a model.
+**Zoom out — the bigger picture.** Chain-of-thought spans three sites in the diagnostic flow. The forcing instruction ("Generate 2–3 hypotheses before your first tool call") lives in the Per-agent definitions band, inside `diagnostic.md`'s method section. The live Thought stream is externalized by the Shared agent loop's `onText` hook, surfaced as `reasoning_step` events. The structured capture — the `hypothesesConsidered[]` array — sits back in the prompt's `## Output` block AND in the validator's `isDiagnosis` guard, so the reasoning is part of the contract, not free prose. CoT is everywhere reasoning gets shaped, surfaced, and pinned down.
 
-An agent that diagnoses a metric drop faces the same risk as a user who jumps straight to "submit": it can leap to a conclusion without working the alternatives. The question this file answers: how does blooming insights make the model reason through competing explanations before concluding, and where does it *capture* that reasoning so it can be inspected?
+```
+  Zoom out — where chain-of-thought lives
 
-**The pivot: chain-of-thought's value here is not eliciting hidden reasoning — sonnet-4-6 already reasons internally — it is forcing the reasoning into a structured, inspectable output.** I have shipped diagnosis features where "show your work" was a free-text field, and it became a dumping ground: three paragraphs of plausible prose, impossible to compare across runs, impossible to assert on in a test. The fix was not more CoT — it was *typed* CoT: a `hypothesesConsidered` array with one `reasoning` string per hypothesis. The reasoning became data. That is what diagnostic.md does, and it is the modern shape of CoT.
+  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here
+  │  ★ diagnostic.md L20: "2–3 hypotheses BEFORE     │
+  │       first tool call" ★                         │
+  │  ★ diagnostic.md L69–75: hypothesesConsidered    │
+  │       { hypothesis, supported, reasoning } ★     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← also here
+  │  ★ onText → reasoning_step  base.ts L108–113 ★   │
+  │  (transient live Thought stream, ReAct externalizes)│
+  └─────────────────────────┬────────────────────────┘
+                            │ finalText
+  ┌─ Output contract ───────▼────────────────────────┐
+  │  ★ isDiagnosis requires hypothesesConsidered ★   │
+  │  validate.ts → CoT is part of the typed shape    │
+  │  durable, queryable, assertable                  │
+  └──────────────────────────────────────────────────┘
+```
 
-Before structured CoT:
-- The model concludes "mobile checkout bug" with no visible alternatives — you cannot tell what it ruled out
-- "Show your reasoning" produces free prose that no test can assert on and no UI can render as distinct hypotheses
-- A second run reasons differently and you cannot diff the two
-
-After:
-- "Generate 2–3 hypotheses before your first tool call" forces breadth before depth (`diagnostic.md` L20)
-- Each hypothesis comes back as `{ hypothesis, supported, reasoning }` — typed, comparable, assertable (`diagnostic.md` L69–L75)
-- `isDiagnosis` (`validate.ts`) requires the array, so the reasoning is part of the contract
-
-It is the commit-then-capture discipline, applied to a model whose intermediate reasoning is worth keeping as data, not discarding as prose.
+**Zoom in — narrow to the concept.** The question this file answers: how does blooming insights make the model reason through competing explanations before concluding, and where does it *capture* that reasoning so it can be inspected? CoT's modern value is not eliciting hidden reasoning — sonnet-4-6 reasons internally regardless — it is forcing the reasoning into a structured, inspectable output. The diagnostic agent gets a typed `hypothesesConsidered[]` array (each entry a `{ hypothesis, supported, reasoning }` triple); the other three agents correctly omit CoT (the monitoring output is numeric, the recommendation reasons from the diagnosis upstream, and the 16-token classifier would have its entire budget eaten by "Let me think…"). Below, you'll see why structured CoT beats prose CoT in 2026, and why "think step by step" is precisely wrong for the intent classifier.
 
 ---
 
@@ -371,3 +379,4 @@ In which output field does the diagnostic agent capture its chain-of-thought, an
 ---
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md `hypothesesConsidered` shape L54–60→L69–75, field-rules ref L71→L90, monitoring output L50–73→L69–97, recommendation output L46–65→L49–74. (`diagnostic.md` L20 "generate 2–3 hypotheses" verified still correct — left unchanged.)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

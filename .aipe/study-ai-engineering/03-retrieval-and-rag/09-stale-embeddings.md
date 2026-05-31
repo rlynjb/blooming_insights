@@ -8,25 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-`McpClient` already solves the staleness problem — for tool results, not embeddings. Every cached result carries `expiresAt: Date.now() + 60_000` (`lib/mcp/client.ts` L65), and the read path serves the cached value only while `cached.expiresAt > Date.now()` (L40). After 60 seconds the entry is stale and the next call goes live. Critically, error results are *never* cached (L58–L60), so a transient failure cannot poison the cache. That is a complete freshness policy: a TTL on every entry plus a no-cache-on-error rule. An embedding index needs the identical thinking — because an embedding is a cached snapshot too, just of a document instead of a tool result.
+**Zoom out — the bigger picture.** Stale embeddings is a *freshness policy* on the Vector store, parallel to the TTL policy `McpClient` already enforces on tool results (`expiresAt` check at `lib/mcp/client.ts` L40, set at L65, no-cache-on-error at L58–L60). An embedding is a cache of a document's meaning at embed-time, so the same instinct applies — it goes stale when the source changes. blooming insights has no vector store and so no staleness problem, but the *pattern* it would use is already in the codebase, applied to a different payload.
 
-The question stale embeddings raise is: an embedding was computed from a document at one instant; when the document changes, how does the index avoid serving the now-wrong vector?
+```
+  Zoom out — where staleness sits (WOULD BE; parallel to TTL cache)
 
-**The pivot: an embedding is a cache of a document's meaning at embed-time, and like any cache it goes stale when its source changes — but unlike a TTL cache, nothing *expires* an embedding automatically, so a changed document silently keeps returning its old vector forever.** When a past investigation is re-run with new data, its old embedding still points at the old conclusion. A query retrieves the stale vector, the model reads the outdated document, and the answer is confidently wrong with no error anywhere. The fix is the same shape as `McpClient`'s `expiresAt`: a freshness marker (`embedding_stale_at`) that says "this vector no longer matches its source, re-embed before trusting it."
+  ┌─ Source document ────────────────────────────────┐
+  │  e.g. past investigation, re-run with new data    │
+  └─────────────────────────┬────────────────────────┘
+                            │  changes
+  ┌─ Vector store ──────────▼────────────────────────┐  ← we are here
+  │  ★ embedding_stale_at? / source_version match? ★  │
+  │  parallel to McpClient's expiresAt > Date.now()   │
+  │  parallel to no-cache-on-error                    │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Retriever ─────────────▼────────────────────────┐
+  │  stale? → re-embed or skip                        │
+  │  fresh? → return                                  │
+  └──────────────────────────────────────────────────┘
 
-Before a freshness policy:
-- A document changes; its embedding is never recomputed
-- Retrieval keeps returning the stale vector indefinitely
-- The model reads outdated content and answers wrong — silently
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead. The same freshness shape IS in the codebase for
+  TTL caching (lib/mcp/client.ts L40, L65) — different payload.
+```
 
-After:
-- Each vector carries a freshness marker tied to its source version
-- A changed source marks its vector stale (the `embedding_stale_at` ↔ `expiresAt` parallel)
-- Stale vectors are re-embedded before they are trusted, or skipped
-
-It is `McpClient`'s `expiresAt > Date.now()` check, moved from tool-result caching to vector freshness.
+**Zoom in — narrow to the concept.** The question is: an embedding was computed from a document at one instant — when the document changes, how does the index avoid serving the now-wrong vector? Unlike a TTL cache, nothing expires an embedding automatically, so a changed document silently keeps returning its old vector forever. The model reads outdated content and answers confidently wrong with no error anywhere. How it works walks the three freshness signals (TTL, source-version hash, change-feed invalidation), why no-cache-on-error transfers directly, and the rule that "fresh enough" is a policy decision, not a constant.
 
 ---
 
@@ -271,3 +281,4 @@ What freshness/staleness mechanism does blooming insights already implement, and
 
 → 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

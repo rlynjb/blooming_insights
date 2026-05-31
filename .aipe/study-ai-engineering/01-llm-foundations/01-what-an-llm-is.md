@@ -8,25 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You call `JSON.parse(await res.text())` on a response from a backend you do not control. You wrap it in `try/catch` because the backend can return a 500 HTML page, a truncated body, or a perfectly-shaped object — and your code has to survive all three without crashing the render. You do not assume the bytes are valid; you assume they are bytes, and you prove they are valid before you trust them.
+**Zoom out — the bigger picture.** The "LLM" in this system is the single call site `anthropic.messages.create` inside `runAgentLoop` (`lib/agents/base.ts` L102), sitting in the Provider band. Everything above it — the route, the pipeline, the per-agent definitions — exists to construct the input; everything below it (the SDK over HTTPS) is the model. The output crosses back up as a `string`, and the trust boundary where that string becomes a typed value lives one layer up in the per-agent code.
 
-The question an LLM forces on you is the same: when the thing on the other end of the call is a probabilistic text generator, what is the type of its output, and what must you do before you let that output into your typed program?
+```
+  Zoom out — where "an LLM" lives
 
-**The answer that determines whether your system is reliable: an LLM call returns a `string`, not a `Diagnosis`.** The model emits one token at a time, each sampled from a probability distribution conditioned on everything before it. Nothing in that mechanism guarantees the result parses as JSON, matches your schema, or is even non-empty. If you write code that assumes `anthropic.messages.create(...)` returns structured data, that code is wrong; it works in the demo and breaks in production the first time the model wraps its JSON in a sentence of prose.
+  ┌─ Pipeline ──────────────────────────────────────┐
+  │  monitoring → diagnostic → recommendation        │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent + Agent loop ▼────────────────────────┐
+  │  runAgentLoop (lib/agents/base.ts)               │
+  │  parse + validate + FALLBACK (the trust boundary)│
+  └─────────────────────────┬────────────────────────┘
+                            │  anthropic.messages.create  L102
+  ┌─ Provider ──────────────▼────────────────────────┐  ← we are here
+  │  ★ THE LLM (Anthropic Messages SDK) ★            │
+  │  P(next | context) → sample → append → stop      │
+  └─────────────────────────┬────────────────────────┘
+                            │  res.content → join → finalText: string
+                            ▼
+                     back up to per-agent for parse/validate
+```
 
-Before treating the model as a function with an untyped return:
-- Code path assumes `finalText` is valid JSON and accesses `diagnosis.conclusion` directly
-- A prose preamble ("Here is the diagnosis:") makes `JSON.parse` throw
-- The whole investigation 500s on output the model considered perfectly reasonable
-
-After:
-- `finalText` is treated as an opaque `string`
-- `parseAgentJson` extracts the JSON, a type guard proves the shape, and a `FALLBACK` covers total failure
-- The investigation always returns a valid `Diagnosis` object, even when the model produced garbage
-
-It is the same discipline as never trusting `JSON.parse` on a network response — applied to a backend whose "API contract" is a prompt and whose adherence to it is statistical.
+**Zoom in — narrow to the concept.** The question is: what is the *type* of the thing on the other end of `anthropic.messages.create`? It is a probabilistic next-token function whose output is `string` — never `Diagnosis`, never `Anomaly[]`. Everything How it works covers — `parseAgentJson`, the type guards, the three-tier fallback — exists because that single fact is true.
 
 ---
 
@@ -338,3 +345,4 @@ What is the exact return type of `runAgentLoop`, and which field of it is the un
 Updated: 2026-05-28 — Re-derived the drifted `diagnostic.ts`/`monitoring.ts` line refs (chain L74–L75, `tryParseDiagnosis` L22–L29, `FALLBACK` L16–L20, monitoring degradation L95–L101) and noted the post-derived `diag.confidence`; `base.ts`/`runAgentLoop` refs verified unchanged.
 Updated: 2026-05-29 — Monitoring degradation path moved: `parseAgentJson` + degrade guard now L113–L118 (was L95–L101), `parsed: unknown` declaration now L112 (was L85).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

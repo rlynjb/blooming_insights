@@ -8,25 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Every retrieval blooming insights does today is sparse. When the diagnostic agent runs `execute_analytics_eql` (`lib/mcp/tools.ts` L16), it sends an exact, structured query — specific event names, specific property filters, an exact time window — and gets back exactly the rows that match those terms. There is no "find me events *similar to* checkout"; there is only "find me rows *where* `event = checkout_started`." That is the sparse, lexical end of the retrieval spectrum, and it is the only end the codebase uses.
+**Zoom out — the bigger picture.** Dense vs sparse is the *retriever's matching strategy* — the kind of index that sits between the query and the candidate set. blooming insights only does the sparse end today: every EQL query (`execute_analytics_eql` at `lib/mcp/tools.ts` L16) and every intent check (`parseIntent` in `lib/agents/intent.ts` L6–L12) is exact-term matching. The dense end — vector cosine over embeddings — would sit alongside as a second retriever, and the two would feed a hybrid combiner (next file).
 
-The question dense-vs-sparse answers is: when you look something up, do you match on exact terms or on meaning — and which one does your query actually need?
+```
+  Zoom out — where dense and sparse retrievers sit (WOULD BE)
 
-**The pivot: exact-term matching nails identifiers and fails synonyms; meaning matching nails synonyms and blurs identifiers — and choosing wrong silently returns the unhelpful neighbor.** A query for `event_4471` must match `event_4471` exactly; a dense embedding would happily return `event_4472` as "close." A query for "abandoned purchases" must find the `checkout_started`-without-`purchase` pattern; a sparse keyword search finds neither word. The two methods have opposite strengths, and most real questions need both.
+  ┌─ Query ──────────────────────────────────────────┐
+  │  "abandoned purchases"   or   event_4471          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+            ┌───────────────┴────────────────┐
+            ▼                                ▼
+  ┌─ Sparse retriever ─┐         ┌─ Dense retriever ─┐  ← we are here
+  │  exact-term match   │         │  ★ embed → cosine ★│
+  │  BM25 / EQL filters │         │  vector nearest-k  │
+  │  IDs & exact names  │         │  synonyms / meaning│
+  └─────────┬──────────┘         └─────────┬─────────┘
+            │ top-k                          │ top-k
+            └───────────────┬────────────────┘
+                            ▼
+  ┌─ (hybrid combiner → next file) ──────────────────┐
+  │  fuse the two lists → final ranking → LLM context │
+  └──────────────────────────────────────────────────┘
 
-Before understanding the split:
-- You assume "retrieval" means embeddings (dense) and reach for them reflexively
-- An exact-ID or exact-event-name lookup returns a near-miss neighbor
-- Or: you keyword-search a meaning question and get nothing
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; EQL is sparse-only and there is no dense side.
+```
 
-After:
-- You classify the query: exact term (sparse) or meaning (dense)?
-- EQL/keyword for exact event names, IDs, filters; embeddings for synonyms and paraphrase
-- The hard cases that need both are routed to hybrid (`06-hybrid-retrieval-rrf.md`)
-
-It is the same distinction as `array.find(x => x.id === id)` (exact) versus `nearestByCosine(embed(query))` (meaning) — and EQL is firmly the `===` side.
+**Zoom in — narrow to the concept.** The question is: when you look something up, do you match on exact terms or on meaning — and which one does your query actually need? Exact-term matching nails identifiers (`event_4471`) and fails synonyms; meaning matching nails synonyms (`"abandoned purchases"` → `checkout_started` without `purchase`) and blurs identifiers. Choosing wrong silently returns the unhelpful neighbor. How it works walks the two strengths, the failure modes, and the rule that most real queries need both — the case the next file (hybrid + RRF) answers.
 
 ---
 
@@ -284,3 +296,4 @@ What kind of retrieval does blooming insights do, and which tool is the evidence
 
 → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

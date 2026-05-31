@@ -8,28 +8,44 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have called an API in a `while` loop before: fetch a paginated list, check if there is a next-page token, if yes call again with the token, if no break and return the accumulated data. The agent loop is the same shape — but instead of deciding "do I have the next-page token?" you hand that decision to a language model. The model reads the accumulated data, decides what query to run next, and you execute that query and feed the result back. The question is: how do you STOP, and how do you guarantee the final iteration produces a parseable JSON result rather than prose?
+**Zoom out — the bigger picture.** Multi-agent orchestration centers on the Pipeline/Route coordinator (`app/api/agent/route.ts`) and the per-agent classes in `lib/agents/`, which all share one `runAgentLoop` in `lib/agents/base.ts`. blooming insights is a **sequential pipeline** (chains-of-agents, not agentic-router): monitoring → diagnostic → recommendation, with the diagnostic→recommendation handoff split across two HTTP requests and carried by the client via `sessionStorage` (`07-client-stream-handoff.md`). One shared loop, three specialist agents, each with its own prompt + tool subset + JSON validator + safe fallback.
 
-The question this file answers is: how does an LLM agent run a bounded tool-use loop and reliably end with structured JSON a downstream function can parse?
+```
+Zoom out — where multi-agent orchestration lives
 
-**The stakes are concrete.** Without a turn budget the agent runs until the `maxDuration = 300` route limit kills the request mid-stream; the client receives a truncated NDJSON stream and the UI never gets a `done` event. Without a forced synthesis turn the loop exhausts its budget and returns `finalText: ''` — `tryParseDiagnosis('')` returns `null`, `synthesize()` is the last line of defense, but if the tool calls themselves contained nothing useful, the investigation ends with `FALLBACK: { conclusion: 'Insufficient data…', evidence: [] }` and the recommendation step has nothing actionable to build on.
+┌─ UI / client handoff ──────────────────────────┐
+│  app/page.tsx (briefing)                       │
+│  app/investigate/[id]/page.tsx (step 2)        │
+│  app/investigate/[id]/recommend/page.tsx (step 3)│
+│  bi:diag:<id> sessionStorage (step 2 → step 3) │
+└─────────────────────┬──────────────────────────┘
+                      │  /api/briefing  /api/agent?step=...
+┌─ Route coordinator ─▼──────────────────────────┐  ← we are here
+│  app/api/briefing/route.ts (Monitoring only)   │
+│  app/api/agent/route.ts (Diagnostic OR Reco)   │
+│  step param routes to one agent per request    │
+└─────────────────────┬──────────────────────────┘
+                      │  per-agent
+┌─ Per-agent definitions ────────────────────────┐
+│  ★ monitoring.ts ★ scan(hooks, runnable)      │
+│  ★ diagnostic.ts ★ investigate()              │
+│  ★ recommendation.ts ★ propose(diagnosis)     │
+│  each: prompt + tool subset + validator       │
+└─────────────────────┬──────────────────────────┘
+                      │  all call →
+┌─ Shared agent loop ────────────────────────────┐
+│  runAgentLoop (lib/agents/base.ts)             │
+│  for turn in maxTurns: forceFinal? + tool exec │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Provider wrappers + MCP ──────────────────────┐
+│  McpClient → Bloomreach                        │
+└────────────────────────────────────────────────┘
+```
 
-Before the budget + synthesis pass:
-- `finalText` is empty or mid-thought prose when the budget ran out
-- `parseAgentJson(finalText)` throws, `tryParseDiagnosis` returns `null`
-- `synthesize()` also has no gathered evidence to work from
-- the route emits a `diagnosis` event with the `FALLBACK` conclusion and zero evidence
-- `RecommendationAgent.propose` receives a hollow diagnosis and returns `[]`
-
-After the budget + dedicated synthesis call:
-- the loop forces a tool-less turn at budget exhaustion; the model emits its JSON
-- if the loop's final turn still produces prose, `synthesize()` hands the model the actual tool results (formatted as `Query N: toolName args\nResult: ...`) and requests ONLY the structured JSON
-- the diagnostic agent produced a 7-evidence diagnosis in the run where the loop final turn failed
-- `RecommendationAgent.propose` received a concrete diagnosis and returned 3 ranked recommendations
-
-It is a `while` loop with a hard turn budget and a guaranteed-final-render step.
+**Zoom in — narrow to the concept.** The question is: how does an LLM agent run a bounded tool-use loop and reliably end with structured JSON a downstream function can parse — and how do you compose three of those agents into an investigation without losing the diagnosis between two HTTP requests? The answer is a `while` loop with a hard turn budget (`maxToolCalls`, `maxTurns`), a `forceFinal` flag that omits the tool definitions on the last turn so the model *must* emit text, a `synthesisInstruction` nudge appended to the system prompt on that turn, and a three-tier fallback chain per agent (`tryParse(finalText) ?? synthesize(toolCalls) ?? FALLBACK`). The next sections walk the loop mechanics, the synthesis pass, the four agents that share the loop, and how the route + client carry the diagnosis across the step-2 → step-3 boundary.
 
 ---
 
@@ -642,3 +658,4 @@ Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-sp
 ---
 Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `scan(hooks?, categories: AnomalyCategory[] = [])` and described the per-category checklist injection; added a "schema gate" sub-section with an ASCII diagram showing schema → capabilities → runnable categories → scan(hooks, runnable), noting the gate is upstream of the unchanged `runAgentLoop`; corrected the `scan` line range (L68–L103 → L69–L120) and the `DiagnosticAgent` `maxToolCalls` ref (L61 → L62); verified `runAgentLoop` (L48–L176) and `DiagnosticAgent.investigate` (L45–L83) against current code.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

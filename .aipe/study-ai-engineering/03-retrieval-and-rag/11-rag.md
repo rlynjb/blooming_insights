@@ -8,27 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-This is the file to read first in this sub-section, because it is the one that explains why the other eleven describe a road blooming insights deliberately did not take. The whole `03-retrieval-and-rag` directory is Case B for one reason: the codebase chose *live tool-retrieval* over *embedding-RAG*. Understanding RAG is necessary to understand what that choice gave up and why it was still right.
+**Zoom out — the bigger picture.** RAG is the whole *grounding pipeline* — the discipline of putting the right specific context in the prompt at query time so the model answers from real data rather than training-time priors. Classic RAG builds an Indexer → Vector store → Retriever chain. blooming insights uses a *different retriever* — live MCP tool calls (`lib/mcp/tools.ts`, `lib/agents/base.ts` L144) that hit the Bloomreach API and put the live result back into the context. Same shape, different retriever: a fresh live query instead of a cached embedding.
 
-Every model answers from two sources: what it learned in training (frozen, general, no knowledge of *your* data) and what you put in the prompt (current, specific). RAG is the discipline of *retrieving* the right specific context at query time and putting it in the prompt so the answer is grounded in real data rather than in the model's training-time guesses.
+```
+  Zoom out — the two retrieval roads (RAG vs live tools)
 
-The question RAG answers is: how does a model answer questions about data it was never trained on — your documents, your analytics, your current state?
+  CLASSIC RAG (WOULD BE)              LIVE TOOL RETRIEVAL (this codebase)
+  ┌─ Query ──────────────────┐         ┌─ Query ──────────────────┐
+  └──────────┬───────────────┘         └──────────┬───────────────┘
+             │                                    │
+  ┌─ Indexer ▼ embed + chunk ┐         ┌─ Agent loop ▼ pick tool ┐
+  ┌─ Vector store ───────────┐         │  runAgentLoop  base.ts L102│
+  ┌─ Retriever (cosine) ─────┐         ┌─ Tools (MCP) ────────────┐
+  │  top-k chunks            │         │  ★ execute_analytics_eql ★│
+  └──────────┬───────────────┘         │  mcp.callTool  base.ts L144│
+             │                          └──────────┬───────────────┘
+  ┌─ LLM context ▼───────────┐         ┌─ LLM context ▼───────────┐
+  │  retrieved chunks + query│         │  live tool result + query │
+  └──────────────────────────┘         └──────────────────────────┘
 
-**The pivot: the model's weights are frozen at training time and know nothing about your specific, current data, so the answer's grounding has to come from retrieval — and the only real choice is *how* you retrieve: from a pre-built embedding index, or live from the source.** Classic RAG builds an embedding index of a document corpus and retrieves the nearest chunks. blooming insights retrieves differently — it calls a live tool (EQL against Bloomreach) and puts the *result* in the prompt. Both are retrieval-augmented generation. The difference is the index: one is a cached, embedded snapshot; the other is a fresh live query.
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists for
+  schema-lookup, and EQL tool calls are the codebase's
+  retrieval discipline (RAG with a live tool as the retriever).
+```
 
-Without retrieval grounding:
-- The model answers analytics questions from training-time priors — confident, generic, wrong for your workspace
-- It hallucinates event names and numbers it has no way to know
-- The answer cannot reflect what happened in *your* data last week
-
-With retrieval (the blooming insights way — live tools):
-- The agent runs `execute_analytics_eql` and gets the *actual current* numbers
-- It grounds the diagnosis in real query results, not priors
-- Every answer reflects the live state of the workspace
-
-It is the brain/hands split from tool-calling (`../04-agents-and-tool-use/02-tool-calling.md`): the model decides *what* to retrieve, the loop retrieves it live, and the result grounds the answer — RAG with a live tool as the retriever instead of a vector index.
+**Zoom in — narrow to the concept.** This is the file to read first in the sub-section, because it is the one that explains why the other eleven describe a road blooming insights deliberately did not take. The question RAG answers is: how does a model answer questions about data it was never trained on? The grounding has to come from retrieval, and the only real choice is *how* — from a pre-built embedding index, or live from the source. How it works walks the trade between the two retrievers and the conditions under which the codebase's choice (live tools) would tip back toward embedding-RAG.
 
 ---
 
@@ -289,3 +296,4 @@ Does blooming insights do RAG, and what is its retriever? (Answer: yes — it do
 ---
 Updated: 2026-05-28 — corrected one stale ref: `maxDuration: 60` → `maxDuration = 300`. Case-B rationale (live tool retrieval over embedding-RAG) unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

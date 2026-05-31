@@ -8,27 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You ship a feature and the cloud bill jumps. You open the dashboard and it tells you *which service* and *which line item* drove it — compute here, egress there. You optimize the line item that actually grew, not the one that was easy to find. The dashboard is the whole point: you cannot cut a cost you cannot see.
+**Zoom out — the bigger picture.** Cost optimization is the *shape of decisions* the Provider wrappers band carries, plus a meter that does not yet exist. The levers span layers: the haiku classifier at the Intent-parsing boundary (`lib/agents/intent.ts` L14), the `maxToolCalls` budgets in each Per-agent file, the `truncate` cap and `budgetSpent`/`forceFinal` in the Agent loop, and the TTL tool cache at `lib/mcp/client.ts`. The one piece missing — `res.usage` logging — would sit right at the Provider call.
 
-An LLM application has the same problem with one missing piece — most teams have no dashboard at all. The question this concept answers is: *where does the money go per request, and which lever actually moves it?*
+```
+  Zoom out — every layer holds a lever (and one is missing)
 
-**The levers are not equal, and the obvious one is usually wrong.** Engineers reach for "use a cheaper model everywhere" first, but output tokens cost several times more than input tokens, and a single long structured-output call can outweigh a dozen short tool calls. blooming insights made the right edge call (a haiku classifier instead of sonnet for a one-word job) and the right structural calls (hard budgets, truncation, caching) — but it runs every agent on sonnet and has no cost meter, so the `synthesize()` call that emits a full diagnosis JSON is the biggest line item and nobody is watching it.
+  ┌─ Intent parsing ─────────────────────────────────┐
+  │  HAIKU classifier  intent.ts L14  ← tier lever    │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent ─────────────▼────────────────────────┐
+  │  maxToolCalls 6/6/4/6  ← bound calls              │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Agent loop ────────────▼────────────────────────┐
+  │  truncate 16_000 chars  base.ts L31–34            │
+  │  budgetSpent → forceFinal L90–91                  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider wrappers ─────▼────────────────────────┐  ← we are here
+  │  ★ TTL cache  mcp/client.ts L18 (60s) ★            │
+  │  (would-be) prompt prefix cache — ABSENT          │
+  │  (would-be) res.usage logging — ABSENT (no meter) │
+  │  SONNET on every agent — no escalation tiering    │
+  └──────────────────────────────────────────────────┘
+```
 
-Before naming the levers:
-- Every request, including a one-word classification, would default to the strongest model
-- An agent loop could explore until it times out, burning tokens with no cap
-- A 50k-char tool result would be fed back in full, re-charged on every subsequent turn
-- Nobody could say what a single investigation costs
-
-After what blooming insights built (and what it skipped):
-- The intent classifier runs on haiku (`max_tokens: 16`) — pennies for a routing decision
-- Every agent has a hard `maxToolCalls` cap (6/6/4/6) that bounds tokens and latency
-- Tool results truncate at 16k chars before re-entering the context
-- Identical tool calls hit the 60s cache — but the prompt prefix is never cached, no agent ever escalates from a cheaper model, and `res.usage` is read by nobody
-
-It is three good cost decisions, two unbuilt levers, and zero visibility.
+**Zoom in — narrow to the concept.** The question is: where does the money go per request, and which lever actually moves it? The levers are not equal — output tokens cost several times more than input tokens, and a single long structured-output call (`synthesize()`) can outweigh a dozen short tool calls. blooming insights made the right edge calls (haiku for the one-word job, hard budgets, truncation, the TTL cache) but runs every agent on sonnet and has no cost meter, so the biggest line item is the one nobody is watching. How it works walks each lever, the asymmetric input/output pricing, and the one-field meter (`res.usage`) that would turn guesses into facts.
 
 ---
 
@@ -395,3 +403,4 @@ Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived drifted 
 ---
 Updated: 2026-05-29 — Added a "gate before spend" shrink lever: `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204) gates the monitoring agent's category checklist before it spends any of the ~1 req/s MCP budget (monitoring.ts L73–86 / scan call L223/240). Verified maxDuration L20 already cites 300. Cross-ref ../04-agents-and-tool-use/07-capability-gating.md.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

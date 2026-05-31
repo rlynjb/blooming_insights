@@ -8,26 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-A `fetch` fails with a transient 503. You wrap it in a retry loop: try, and if it fails, wait and try again, a bounded number of times. Most transient failures clear on the second attempt, so the retry turns a flaky call into a reliable one — and the bound stops a permanently-broken upstream from looping forever.
+**Zoom out — the bigger picture.** Retry + circuit breaker is the Provider wrappers band — the resilience logic between the Agent loop's outbound call and the Tools transport that hits Bloomreach. blooming insights' `McpClient.callTool` retries rate-limit errors up to 3 times, preferring the server's stated Retry-After window (with a 500 ms buffer) and otherwise backing off exponentially off a 10s base, capped at 20s per wait — done well. The circuit breaker — the second mechanism that *stops calling* during a sustained outage — is the gap.
 
-Retry handles the *transient* failure: the blip that clears on its own. But it has a dark side. When the upstream is not blipping but *down* — a sustained outage — every single call still pays the full retry sequence (wait, try, wait, try…) before giving up. Multiply that across many callers and you have made the outage worse: a flood of retrying clients hammering a dying service. The question this concept answers is: *how do you retry transient failures without amplifying a real outage?*
+```
+  Zoom out — where retry sits and where the breaker would
 
-**The answer needs two mechanisms, and blooming insights has only the first.** Retry recovers from blips. A **circuit breaker** detects sustained failure and *stops calling* — failing fast for a cooldown window instead of paying the retry tax on every request. blooming insights retries rate-limit errors with a bounded loop that *honors the server's stated Retry-After window* and otherwise backs off exponentially — both correct — but the backoff has no jitter (so concurrent retries can synchronize into a thundering herd), and there is no breaker, so a Bloomreach outage means every call grinds through its full retry sequence before failing.
+  ┌─ Agent loop ─────────────────────────────────────┐
+  │  outbound tool call                               │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider wrappers ─────▼────────────────────────┐  ← we are here
+  │  ★ retry: up to 3 attempts ★                      │
+  │    Retry-After + 500ms buffer (preferred)         │
+  │    else: exponential off 10s, capped at 20s/wait  │
+  │    NO jitter — concurrent retries can sync        │
+  │                                                   │
+  │  ABSENT here:                                     │
+  │    - circuit breaker (closed→open→half-open)      │
+  │    - fail-fast during outage cooldown             │
+  └─────────────────────────┬────────────────────────┘
+                            │  HTTPS
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  Bloomreach MCP server                            │
+  │  outage → every call pays full retry tax (slow)   │
+  └──────────────────────────────────────────────────┘
+```
 
-Before naming the mechanisms:
-- A rate-limit 429 kills the agent run on the first hit
-- A transient blip is indistinguishable from a hard failure
-- A provider outage makes every call wait, try, wait, try, then fail — slowly
-
-After what `callTool` provides (and what it doesn't):
-- A 429-equivalent triggers a bounded retry loop (up to 3 retries)
-- Each wait prefers the server's stated window (parsed Retry-After + a 500 ms buffer), else exponential backoff off a 10s base, every wait capped at a 20s ceiling
-- BUT the backoff does not randomize (no jitter)
-- AND there is no breaker — during an outage, every call pays the full retry tax
-
-It is the `fetch`-retry pattern done well — Retry-After-aware with exponential backoff — missing only jitter and the fail-fast breaker.
+**Zoom in — narrow to the concept.** The question is: how do you retry transient failures without amplifying a real outage? Retry handles the blip (the failure that clears on its own); a circuit breaker handles the sustained outage (stop calling for a cooldown window, fail fast). Without the breaker, every caller pays the full retry tax during an outage and a flood of retrying clients makes the dying service worse. blooming insights has the first mechanism, not the second — and the backoff lacks jitter, so concurrent retries can synchronize. How it works walks the retry loop, the Retry-After honor, the missing jitter, and the closed/open/half-open shape the breaker would have.
 
 ---
 
@@ -347,3 +356,4 @@ How many total transport attempts does `callTool` make in the worst case for a r
 ---
 Updated: 2026-05-28 — Corrected the retry framing from "fixed 1200ms delay" to the real exponential backoff (10s base, 20s ceiling) with parsed Retry-After + 500ms buffer; re-derived all client.ts line refs; worst-case retry tax now ~51s and the route budget is 300s.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

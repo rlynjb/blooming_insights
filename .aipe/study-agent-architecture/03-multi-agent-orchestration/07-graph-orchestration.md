@@ -8,65 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** Graph orchestration would replace the Pipeline coordinator band's *implementation*, not its position — same place in the stack, but the imperative `.then()` chain in `lib/agents/pipeline.ts` becomes an explicit graph (nodes, conditional edges, checkpointed state) executed by a graph runtime. In blooming insights, the Pipeline band is imperative: a ~50-line `if`-ladder plus sequential function calls. No graph runtime, no checkpointing, no resume. The UI's `ProcessStepper` is a state machine but it's a *UI* state machine — not the orchestration graph.
 
 ```
-The graph orchestration shape
+  Zoom out — where graph orchestration WOULD live
 
-  ┌──────┐    ┌──────┐    ┌──────┐
-  │ node │───►│ node │───►│ node │
-  │  A   │    │  B   │    │  C   │
-  └──────┘    └──┬───┘    └──────┘
-                 │ conditional edge
-                 ▼
-              ┌──────┐
-              │ node │  (loop back / branch)
-              │  D   │
-              └──────┘
-
-  state lives in a checkpointed graph context;
-  edges are transitions; conditions live on edges
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
+  │  ★ GRAPH ORCHESTRATION shape (★ THIS ★, absent):  │
+  │    nodes(monitor, diagnose, human_review,         │
+  │          recommend, final)                        │
+  │    + conditional edges + checkpointed state       │
+  │  ── absent in blooming insights ──                │
+  │                                                   │
+  │  blooming insights' actual shape:                 │
+  │    imperative route + sequential function calls   │
+  │    no graph runtime, no checkpoints, no pause     │
+  │    (ProcessStepper UI is not the graph runtime)   │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  workers identical either way                     │
+  └──────────────────────────────────────────────────┘
 ```
 
-You've built a multi-step form. Step 1 collects an email, step 2 collects a name, step 3 confirms — and there's a side path: if the email is already taken, step 1 redirects to step 4 (sign in) instead. The form's state lives in a state machine (`useReducer`, XState, whatever); each step is a node; the conditional edge from step 1 to step 4 is a transition condition; the user can refresh the page and the form picks up where they left off because the state is persisted.
-
-Now picture the same shape, except each *node is an agent*, the *state is shared agent context*, and the *edges are agent turns*. The user can pause the run between any two nodes for human review; the engineer can replay a checkpoint to debug. The whole multi-agent run is one inspectable graph with explicit transitions.
-
-### Move 2 — name the question
-
-That second shape is what graph orchestration names. The question this file answers: **when does it pay to express agent orchestration as an explicit state graph — instead of as imperative route code (this codebase) or as a supervisor agent reasoning over transitions?**
-
-The technical hinges: explicit nodes (each step is a named graph vertex), conditional edges (transitions can depend on state), checkpointed state (you can pause and resume), human-in-the-loop pauses (the graph can stop on a designated node and wait for human input).
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because agent orchestration becomes hard to debug, hard to evolve, and hard to recover from failure once it has more than a handful of transitions — and the cure is *making the orchestration inspectable*. An imperative route file like blooming insights' `app/api/agent/route.ts` is easy to read at 50 lines; at 500 lines with branches it becomes opaque. A supervisor agent is even harder — its reasoning is in the model. A state graph is the third option: explicit, inspectable, debuggable.
-
-In this codebase: orchestration is imperative. The route file is a 50-line `if`-ladder + sequential function calls. There's no graph runtime. There's no checkpointing — if the diagnostic stage errors mid-way, you lose the whole run; if you want to retry the recommendation step with a different prompt, you re-run everything. The UI's `ProcessStepper` component is a state machine, but it's a *UI* state machine (which step is rendered) — it doesn't carry agent context or know how to resume a paused run on the server.
-
-The clarification this file insists on: **the ProcessStepper is not the graph runtime.** It's the visualization of step progression. A real agent-orchestration graph runtime (LangGraph, OpenAI Agents SDK graph mode) would own server-side state, expose checkpoints, and let the UI pause a run between nodes. The ProcessStepper today doesn't do any of that.
-
-### Move 4 — concrete before/after
-
-Imperative route code (this codebase, today):
-- Route reads query params → picks lead agent
-- Calls `diagAgent.investigate(...)` → returns `Diagnosis`
-- Calls `recAgent.propose(inv, diagnosis, ...)` → returns recommendations
-- Streams events to client
-- If anything throws mid-run, the request errors; no partial state survives
-
-Graph orchestration (hypothetical):
-- Graph defined with nodes (`monitor`, `diagnose`, `human_review`, `recommend`, `final`)
-- Edges: `monitor → diagnose`, `diagnose → human_review` (conditional: if confidence < 0.7), `human_review → diagnose` (loop, if rejected) or `human_review → recommend` (if approved), `recommend → final`
-- State (the typed `Diagnosis`, the anomaly, the user's choices) lives in a graph context object
-- Engine runs nodes, evaluates edges, persists state to a checkpoint store after each node
-- If `recommend` errors, you replay from the last checkpoint — `diagnose`'s output is already there
-
-### Move 5 — one-line summary
-
-A graph runtime turns the orchestration *itself* into data you can inspect — a multi-step-form's state machine, but the state is shared agent context. blooming insights uses imperative route code instead; here's how graph orchestration works and what would have to change to adopt it.
+**Zoom in — narrow to the concept.** The question is: when does it pay to express orchestration as an explicit state graph — instead of as imperative route code (this codebase) or as a supervisor agent reasoning over transitions? The win is *inspectability* — the orchestration becomes data you can replay, pause, and resume. The cost is a runtime to operate and a state store to persist checkpoints. blooming insights' orchestration is small enough (3 stages, fixed order) that imperative code reads fine; the breakpoint is when transitions multiply or human-in-the-loop pauses become a requirement. Below, you'll see the graph mechanics and what would have to change to adopt them here.
 
 ---
 
@@ -571,3 +541,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

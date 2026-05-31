@@ -8,25 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have written a `.then().then()` pipeline: fetch the user, then fetch their orders with the user id, then fetch shipping for each order. Each step is a separate function with one responsibility, and the output of one is the typed input of the next. If `fetchOrders` throws, you catch it there and the failure is isolated to that link — `fetchUser` already succeeded, `fetchShipping` never ran. A prompt chain is the same shape with language-model calls in the links instead of `fetch`.
+**Zoom out — the bigger picture.** Prompt chaining is the shape of the *whole request flow*: the Pipeline coordinator (the Route + client) owns the order, and each link is a separate Per-agent invocation running its own focused model call. The chain spans Route → Per-agent → Agent loop → Provider, and the seams between links are HTTP requests (for the live diagnose→recommend split, with the `Diagnosis` handed over via sessionStorage `bi:diag:<id>`) or `await` calls (for the legacy combined-capture run).
 
-The question a multi-step LLM workflow faces: when a task has distinct stages — detect, explain, act — do you hand the whole thing to one model call and hope, or do you split it into separate calls each with one job and a clean handoff?
+```
+  Zoom out — where the chain sits
 
-**The pivot: a chain gives each step a focused prompt, a small tool set, and an isolated failure boundary, so a failure or a weak result in one stage is contained instead of corrupting the whole answer.** One giant prompt that detects, diagnoses, and recommends in a single call has a bloated context, all tools always visible, and no place to validate the intermediate results — and if it goes wrong, the whole answer goes wrong with no seam to catch it. blooming insights splits the briefing into three named steps so each is simple, testable, and bounded, and the route sequences them with `await`.
+  ┌─ Route + client (own the order) ─────────────────┐  ← we are here
+  │  ?step=diagnose  ──[bi:diag:<id> handoff]──▶     │
+  │                                ?step=recommend    │
+  │  app/api/agent/route.ts L224–249                  │
+  └─────────────────────────┬────────────────────────┘
+                            │ one job per link
+  ┌─ Per-agent (each link is its own focused call) ──┐
+  │  ★ link 1: MonitoringAgent.scan      (briefing)   │
+  │  ★ link 2: DiagnosticAgent.investigate ★          │
+  │  ★ link 3: RecommendationAgent.propose ★          │
+  │   each: own prompt + tool subset + validator     │
+  │   each: gather→synthesize micro-chain inside    │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  every link → its own anthropic.messages.create  │
+  │  (all on AGENT_MODEL — per-step tiering not wired)│
+  └──────────────────────────────────────────────────┘
+```
 
-Before a chain:
-- One prompt holds the detection rules, the diagnostic strategy, and the recommendation catalog
-- Every tool is visible at every moment; the prompt is large and unfocused
-- A failure anywhere fails everything; there is no intermediate output to validate
-
-After a chain:
-- `MonitoringAgent.scan` returns a validated `Anomaly[]`; `DiagnosticAgent.investigate` takes one anomaly and returns a `Diagnosis`; `RecommendationAgent.propose` takes the diagnosis and returns `Recommendation[]`
-- Each step has its own prompt file, its own tool subset, its own validator
-- A failure in one step degrades to a safe default for that step, and the route still emits a coherent stream
-
-It is a `.then().then()` pipeline where each link is a model call with one responsibility.
+**Zoom in — narrow to the concept.** The question is: when a task has distinct stages — detect, explain, act — do you hand the whole thing to one model call and hope, or split it into separate calls each with one job and a clean handoff? A chain wins on focus (each prompt is small), isolation (each link has its own fallback), and observability (each seam is a streaming/validation point). How it works walks the briefing chain, the gather→synthesize micro-chain inside each link, and the un-taken per-step model optimization the chain already enables.
 
 ---
 
@@ -356,3 +365,4 @@ Which two `await` calls in `app/api/agent/route.ts` run the investigation chain'
 Updated: 2026-05-28 — Rewrote the chain orchestration as the two-step `?step=diagnose`/`?step=recommend` split with the `bi:diag:<id>` sessionStorage handoff (was a single in-process `await` chain); `maxDuration` 60→300; re-derived all route.ts/diagnostic.ts/recommendation.ts/monitoring.ts/useInvestigation.ts line refs.
 Updated: 2026-05-29 — Added "The monitoring link is gated to the workspace's runnable categories": `scan(hooks?, categories=[])` (monitoring.ts L69) injects a per-category checklist via the `{categories}` slot (L73–L86), gated by `runnableCategories` (categories.ts L157–L160) at briefing route L204/L223; cross-refs the new capability-gating file.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

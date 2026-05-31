@@ -8,27 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You fire `fetch('/api/heavy-task')` and it takes two minutes to return. You could `await res.json()` — the browser waits, the spinner spins, the user stares. Or you could stream: the server writes partial results the moment they exist and the browser appends them to the list in state as each chunk arrives. You already know this pattern from virtual scroll and pagination — data arrives in pieces and you render pieces.
+**Zoom out — the bigger picture.** Streaming NDJSON is a producer/consumer pipe that spans three bands — the Route handler (where `ReadableStream` enqueues bytes), the network boundary (HTTP chunked transfer with `Content-Type: application/x-ndjson`), and the UI (where `useInvestigation` or the feed reads chunks with `getReader()`). The wire contract is the `AgentEvent` discriminated union in `lib/mcp/events.ts`; `encodeEvent(e)` is literally `JSON.stringify(e) + '\n'`. Both `/api/agent` and `/api/briefing` emit NDJSON; both consumers use the same `buf.split('\n')` + `lines.pop()` line-buffering loop. The framing details live in the DSA companion (`../02-dsa/03-ndjson-line-buffering.md`); this file is about the architecture that uses them.
 
-The question is: how does the server push incremental events and the browser render them as they arrive, over a single HTTP request?
+```
+Zoom out — where NDJSON streaming lives
 
-**This matters in practice.** A live investigation in this codebase runs for ~115 seconds. A blank spinner for that long reads as a hang. Streaming the reasoning trace — each thought, each tool call, each hypothesis — is the product's "show your work" differentiator: the user watches the agent think in real time rather than waiting for a completed report. The choice of transport is also load-bearing: `EventSource` (the browser API purpose-built for server-push) auto-reconnects on close, which would silently re-fire the entire ~115s agent run every time the connection dropped. `fetch`-stream does not auto-reconnect, which is exactly what this case needs.
+┌─ Route handler ────────────────────────────────┐  ← producer
+│  app/api/agent/route.ts (★ ReadableStream ★)   │
+│  app/api/briefing/route.ts (★ ReadableStream ★)│
+│  send(e) = controller.enqueue(encodeEvent(e))  │
+└─────────────────────┬──────────────────────────┘
+                      │  HTTP chunked transfer
+                      │  Content-Type: application/x-ndjson
+                      │  one JSON object per line
+                      ▼
+┌─ Network boundary ─────────────────────────────┐  ← we are here (spans)
+│  TCP chunks may split a line mid-byte          │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ UI ────────────────▼──────────────────────────┐  ← consumer
+│  lib/hooks/useInvestigation.ts (reader loop)   │
+│  app/page.tsx (feed reader loop)               │
+│  buf.split('\n') · lines.pop() · JSON.parse    │
+│  → setState per event → React re-render        │
+└────────────────────────────────────────────────┘
+```
 
-Before streaming:
-- Server runs the full agent pipeline (~115s)
-- Browser waits behind a spinner
-- User has no signal the request is alive
-- A dropped connection means the entire run restarts
-
-After streaming:
-- Server writes one NDJSON line per event as it produces it
-- Browser appends each event to React state as it arrives
-- User watches the reasoning trace animate in real time
-- A dropped connection closes the stream; it does not restart
-
-It is `fetch` you read chunk-by-chunk instead of `await res.json()`.
+**Zoom in — narrow to the concept.** The question is: how does the server push incremental events and the browser render them as they arrive, over one HTTP request, with no `EventSource` auto-reconnect to re-trigger a ~115s agent run? The answer is `fetch` + `ReadableStream` on both ends, with NDJSON (one JSON object per line) as the wire format and a tiny `AgentEvent` discriminated union as the contract. The producer enqueues encoded bytes the moment events exist; the consumer drains chunks, reassembles lines across chunk boundaries, parses each, and `switch`es on `e.type` into the right `setState`. The next sections walk both sides of the pipe, the cache-replay path that uses the same wire format, and the briefing route's local-superset `BriefingEvent` extension.
 
 ---
 
@@ -778,3 +786,4 @@ Updated: 2026-05-28 — maxDuration 300; reader loop moved to useInvestigation.t
 ---
 Updated: 2026-05-29 — documented the briefing route as a second NDJSON surface (local `BriefingEvent` superset L54–58, paced demo replay REPLAY_DELAY_MS=140 L23, per-category `coverage_item` tile-by-tile fill L209–212 / client accumulate app/page.tsx L333–339).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

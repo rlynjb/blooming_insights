@@ -8,27 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have sorted a table of rows by a status column before. The column holds strings: `"critical"`, `"warning"`, `"info"`, `"positive"`. You pass a comparator to `Array.prototype.sort`. The question: what does the comparator subtract? Strings cannot be subtracted — `"critical" - "info"` is `NaN`, which makes `sort` treat every pair as equal and leave the order undefined. Even if you lexicographically compare them, `"critical" < "info"` alphabetically, so the sorted order becomes `critical, info, positive, warning` — alphabetical, not by urgency.
+**Zoom out — the bigger picture.** `SEV_RANK`'s sort lives inside `MonitoringAgent.scan` (`lib/agents/monitoring.ts` L51 + L119) — it's the last operation before the agent returns its `Anomaly[]` to the briefing route, sandwiched between `parseAgentJson` + `isAnomalyArray` (which produced the array) and `anomalies.map(anomalyToInsight)` (which projects to `Insight[]`). The `queryTools` Set-union (`lib/mcp/tools.ts` L38–L40) lives in the Tools band and is read at module load by `QueryAgent` when it asks `filterToolSchemas` for the deduplicated tool list. Both primitives sit in the Per-agent definitions / Tools layer of the architecture map — pure functions over data already in hand, called once per request.
 
-The question this file answers is: how do you impose a custom total order on a non-numeric enum, and how do you merge overlapping arrays without duplicates?
+```
+Zoom out — where the sort + dedup live
 
-**The stakes are concrete.** The monitoring feed must show the most urgent anomaly first. An alphabetical sort delivers `critical, info, positive, warning` — the two middle values swap, so a low-urgency `info` anomaly surfaces above a `positive` one, and a `warning` is buried at the bottom under `positive`. The query agent needs every tool from three partially-overlapping subsets, but the model API rejects — or silently misbehaves — if you pass the same tool name twice in the schema list. Both bugs are silent: no exception, wrong behavior.
+┌─ Per-agent definitions ────────────────────────┐  ← we are here
+│  MonitoringAgent.scan (lib/agents/monitoring.ts)│
+│    finalText → parseAgentJson → isAnomalyArray  │
+│    ★ [...parsed].sort(SEV_RANK[b]-SEV_RANK[a]) │
+│    ★ .slice(0, 10) → return Anomaly[]          │
+│                                                  │
+│  QueryAgent (reads tools array)                 │
+│         ▲                                       │
+│         │                                       │
+│  Tools band (lib/mcp/tools.ts)                  │
+│  ★ queryTools = [...new Set([...m,...d,...r])] │ ← we are here
+│      monitoringTools ∪ diagnosticTools ∪        │
+│      recommendationTools (first-seen, no dupes) │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Route / mapping ──────────────────────────────┐
+│  app/api/briefing/route.ts                     │
+│  anomalies.map(anomalyToInsight) → insights[]  │
+└────────────────────────────────────────────────┘
+```
 
-Before the rank map + dedup:
-
-- `sort` on raw severity strings produces `critical, info, positive, warning` — lexicographic, not urgency order
-- spreading three arrays naively gives duplicates (`execute_analytics` appears in both `monitoringTools` and `diagnosticTools`)
-- passing duplicate tool names to the Anthropic SDK produces a schema validation error at runtime
-
-After:
-
-- `SEV_RANK[b.severity] - SEV_RANK[a.severity]` is a numeric subtraction; `sort` gets a clean negative/zero/positive signal
-- `[...new Set([...a, ...b, ...c])]` collapses overlaps by Set's identity rule in one expression
-- `queryTools` is a deduplicated const array, safe to pass directly to `filterToolSchemas`
-
-It is `sort` with a lookup-table comparator, plus `new Set` to dedupe a union.
+**Zoom in — narrow to the concept.** The question is: how do you impose a custom total order on a non-numeric enum (so `Array.prototype.sort` can do its job), and how do you merge overlapping arrays without duplicates? The answer is a `Record<Severity, number>` rank table that lets the comparator subtract integers (`SEV_RANK[b.severity] - SEV_RANK[a.severity]`) and `[...new Set([...a, ...b, ...c])]` that uses Set's identity rule to collapse three overlapping arrays into one first-seen-wins union. The TypeScript `Record<Severity, number>` type makes adding a new severity to the union a compile-time error if you forget to add it to the rank table. The next sections trace both operations step by step.
 
 ---
 
@@ -402,3 +410,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers (sort 
 ---
 Updated: 2026-05-29 — sort + slice moved L102 → L119; `SEV_RANK` now L51 (was cited L50); `scan` method L69 (was L68); `queryTools` refs unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

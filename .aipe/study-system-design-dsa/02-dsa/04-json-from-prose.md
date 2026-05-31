@@ -8,18 +8,40 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-An endpoint that returns text like `Here you go:\n\`\`\`json\n{"status":"ok"}\n\`\`\`` will throw the moment you call `JSON.parse(body)`. The response is *almost* JSON — a structured value is in there — but a strict parse fails because the content type is prose, not JSON.
+**Zoom out — the bigger picture.** `parseAgentJson` + the three `is`-predicate guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) live in `lib/mcp/validate.ts` and are called by every specialist agent — `MonitoringAgent.scan`, `DiagnosticAgent.investigate`, `RecommendationAgent.propose`. They sit between the Agent loop (which returns `finalText: string` from `runAgentLoop`) and the per-agent fallback chain (`tryParse ?? synthesize ?? FALLBACK`). This is the seam where the model's prose-wrapped output becomes a typed value the downstream route + UI can trust.
 
-The question becomes: how do you reliably extract a structured object from text a model wrote, when the model was told to emit JSON but chose to wrap it in a sentence?
+```
+Zoom out — where JSON-from-prose extraction lives
 
-**The stakes are concrete.** The monitoring agent, diagnosis agent, and recommendation agent in this codebase all emit JSON inside prose. A strict `JSON.parse` on the full text throws and the briefing/investigation call chain fails entirely. Even after a successful parse, the extracted value is `unknown` — TypeScript cannot guarantee the shape at runtime. A malformed anomaly that passes into the downstream briefing pipeline without a guard check corrupts the report silently.
+┌─ Per-agent definitions ────────────────────────┐
+│  monitoring.ts · diagnostic.ts · recommendation.ts│
+│  call runAgentLoop → finalText: string         │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Agent loop ───────▼───────────────────────────┐
+│  runAgentLoop (lib/agents/base.ts)             │
+│  returns { finalText, toolCalls }              │
+└─────────────────────┬──────────────────────────┘
+                      │  finalText (may have prose wrap)
+┌─ Extraction + validation ──────────────────────┐  ← we are here
+│  ★ parseAgentJson(text): unknown ★            │
+│      1. fenced-block regex                    │
+│      2. bare JSON.parse                       │
+│      3. substring scan                        │
+│         │                                      │
+│         ▼                                      │
+│  ★ isAnomalyArray / isDiagnosis /             │
+│    isRecommendationArray (v is T) ★           │
+└─────────────────────┬──────────────────────────┘
+                      │  typed value (or fallback)
+┌─ Route + UI ───────────────────────────────────┐
+│  send({type:'insight'/'diagnosis'/...}) → UI   │
+└────────────────────────────────────────────────┘
+```
 
-Before: `JSON.parse(agentOutput)` throws → agent pipeline crashes.
-After: `parseAgentJson(agentOutput)` extracts the JSON → `isAnomalyArray(parsed)` narrows the type → downstream code works on a typed, validated value.
-
-It reduces to: `JSON.parse` in a try/catch with a fenced-block fast-path and a substring-scan fallback, then a type guard to confirm shape.
+**Zoom in — narrow to the concept.** The question is: how do you reliably extract a structured object from text a model wrote, when the model was told to emit JSON but chose to wrap it in a sentence — and how do you make sure the parsed value is the shape you expected, not whatever happens to parse? The answer is a three-attempt extraction ladder followed by a structural type guard. Each ladder step short-circuits if the previous succeeded: try the fenced-block regex first, then a bare `JSON.parse`, then a substring scan from the first `[`/`{` to the last `]`/`}`. Whatever parses is then handed to a TypeScript `v is T` predicate that walks every required field at runtime. The next sections name the regex, the substring math, and the difference between liberal extraction at the boundary and strict validation at the gate.
 
 ---
 
@@ -512,3 +534,4 @@ A teammate argues: "We should replace `parseAgentJson` with Zod's `z.array(Anoma
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; noted that `isRecommendationArray` now accepts `estimatedImpact` as either a string or a `{ range, ... }` object (the `impactOk` union check)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

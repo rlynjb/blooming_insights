@@ -8,25 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You don't keep your component templates in a database column edited through an admin panel — they live in files, in the repo, reviewed in PRs, with a git history that tells you who changed what and why. A prompt that drives a production agent deserves the same treatment, because a prompt *is* program logic: change one line and the behavior of the whole feature changes. The failure mode of the alternative — prompts edited live in a vendor dashboard or a hot-reloaded config — is that you ship a behavior change with no diff, no review, and no way to bisect when it regresses.
+**Zoom out — the bigger picture.** Prompts-as-code spans more bands than any other concept in this guide. The `.md` files sit in the Repo (under source control, reviewed in PRs), the `readFileSync` load happens at the Per-agent definitions band (each agent's module import), the model ID lives separately at the Provider/agent-loop boundary, and the persisted outputs land in the cross-cutting telemetry surface where `saveInvestigation` writes records. The concept's authoring half is everywhere on the left; its observability half — pairing prompt with model and logging the pair against output — is everywhere absent on the right.
 
-The question this file answers: are blooming insights' prompts treated as code, and if so, how completely — what's version-controlled, what's reviewed, and what's *not* yet tracked?
+```
+  Zoom out — where prompts-as-code lives
 
-**The pivot: storing prompts as files gets you diffability and review for free, but "prompts as code" is only half done until the prompt version is paired with the model version and logged against the output — and blooming insights has the first half, not the second.** The first half is real and valuable. The second half is the gap that turns a model upgrade into a silent regression you can't trace.
+  ┌─ Repo ──────────────────────────────────────────┐  ← we are here
+  │  ★ lib/agents/prompts/*.md (git-versioned) ★    │
+  │  git log · PR diff · review                     │
+  └─────────────────────────┬────────────────────────┘
+                            │  readFileSync at import
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
+  │  ★ PROMPT const  monitoring.ts L13 etc. ★        │
+  │  runtime-immutable (no live edit)                │
+  └─────────────────────────┬────────────────────────┘
+                            │  runs on
+  ┌─ Provider / agent loop ─▼────────────────────────┐
+  │  AGENT_MODEL = 'claude-sonnet-4-6'  base.ts L9   │
+  │  (decoupled from the prompt — never paired)       │
+  └─────────────────────────┬────────────────────────┘
+                            ┊  no co-logging
+  ┌ ─ Telemetry (gap) ─ ─ ─▼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+   saveInvestigation  route.ts L254 persists OUTPUTS
+   MISSING: prompt sha + model id per output
+  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+```
 
-Before prompts-as-code:
-- The prompt lives somewhere mutable; a behavior change has no diff
-- You can't tell which prompt produced last week's bad diagnosis
-- A reviewer never sees the instruction change that caused the bug
-
-After (what this codebase has):
-- `git log lib/agents/prompts/monitoring.md` shows every change, authored and reviewed
-- A prompt edit shows up in a PR diff next to the code that loads it
-- But: nothing records "this output came from monitoring.md@<sha> running on claude-sonnet-4-6"
-
-It is the templates-in-the-repo discipline, applied to strings a model reads — done halfway.
+**Zoom in — narrow to the concept.** The question this file answers: are the prompts treated as code, and if so, how completely — what's version-controlled, what's reviewed, and what's *not* yet tracked? blooming insights nails the authoring half (file + git + PR + import-time read) and skips the observability half (prompt SHA + model ID logged per output). Below, you'll see why a one-line bump to `AGENT_MODEL` is the diff that silently regresses every prompt tuned to the old model, and why "prompts as code" needs the pairing and the per-output log to be real.
 
 ---
 
@@ -326,3 +336,4 @@ Where does the model ID that runs the three agents live, and is it stored anywhe
 ---
 Updated: 2026-05-29 — Documented the `{categories}` runtime checklist injection as a prompts-as-code interpolation pattern (`monitoring.ts` L69–86: `scan` now takes a `categories` param at L69, builds a checklist, and `.replace('{categories}', checklist)` at L86 — same versioned-`.md`-plus-runtime-interpolation as `{schema}`/`{project_id}`). Also corrected stale code refs: `monitoring.ts` L12→L13 and `saveInvestigation` `route.ts` L162→L254 (with the stream body L169–256 and `collected` declared L171).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

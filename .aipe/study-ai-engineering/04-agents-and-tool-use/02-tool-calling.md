@@ -8,27 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-A language model cannot run code. It produces tokens — that is the entire surface of its capability. When you call `anthropic.messages.create`, what comes back is text and, optionally, a structured request that says "I would like to call `execute_analytics_eql` with these arguments." The model does not — cannot — execute that call. It has no network socket, no file handle, no database connection. It only *describes* the call it wants. Your code is the only thing in the system that can actually reach Bloomreach.
-
-The question this file answers: how does a model that can only emit tokens cause a real query to run against a real backend, and get the real answer back?
-
-**Answering it matters because the entire value of an agent collapses without it.** A model reasoning about analytics with no live data is a confident guesser — it will hallucinate funnel numbers. Tool calling is the mechanism that grounds every claim in a real query result. Get the protocol wrong and you get one of two failures: the model "calls" a tool but your code never runs it (the model talks to a wall), or your code runs it but never feeds the result back (the model is blind to what it just requested). The `tool_use` → run → `tool_result` round-trip is the contract that makes the difference between a chatbot and an analyst.
-
-Before and after the round-trip:
+**Zoom out — the bigger picture.** Tool calling is the *round-trip* between the Provider (where the model emits `tool_use` requests) and the Tools + MCP transport bands below it (where your code runs them and hands the result back). The Agent loop is the coordinator: it pulls `tool_use` blocks out of the model response (`lib/agents/base.ts` L116–L118), runs each via `mcp.callTool` (L144), and pushes the results back as the next user turn (L161–L171). The model is the brain; your loop is the hands.
 
 ```
-Without tool calling                    With tool calling (this codebase)
-────────────────────────────────       ────────────────────────────────────
-model: "mobile conversion likely        model: tool_use execute_analytics_eql
-        dropped ~15%"                           {eql, project_id}
-        (made up — no data)             code:  runs it against Bloomreach
-                                        model: "mobile conversion dropped 18%
-                                                vs the 7-day baseline" (grounded)
+  Zoom out — the tool-use round-trip
+
+  ┌─ Per-agent + Agent loop ─────────────────────────┐  ← we are here (orchestrator)
+  │  runAgentLoop  base.ts L48–176                   │
+  │   1. send (system, messages, tools)              │
+  │   2. extract tool_use blocks   L116–118          │
+  │   3. ★ run via mcp.callTool ★  L144              │
+  │   4. push tool_result back     L161–171          │
+  │   5. repeat or stop on forceFinal                │
+  └─────────────────────────┬────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼ tool_use      │               ▲ tool_result
+  ┌─ Provider ──────────┐   │   ┌─ Tools + MCP transport ─┐
+  │  model emits        │   │   │  toolSchemas (filtered) │
+  │  tool_use {name,    │   │   │  McpClient.callTool     │
+  │   input}            │   │   │  → SdkTransport → MCP   │
+  └─────────────────────┘   │   └─────────────────────────┘
+                            ▼
+                          HTTPS → Bloomreach MCP server
 ```
 
-One-line summary: **the model is the brain that decides which tool and with what arguments; your loop is the hands that run it and hand the result back.**
+**Zoom in — narrow to the concept.** The question is: how does a model that can only emit tokens cause a real query to run against a real backend, and get the real answer back? The model never executes anything — it *describes* the call it wants in a structured `tool_use` block. Your loop interprets the description, runs the call, and hands the `tool_result` back so the next turn sees real data. How it works walks the four-step round-trip, the `tool_use_id` pairing that makes results trace back to requests, and the failure modes if either side of the contract drops a block.
 
 ---
 
@@ -355,3 +362,4 @@ What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps 
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTools` (L203) and `hooksFor` (L181–195) refs, and updated the per-agent `project_id`-injection line numbers.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

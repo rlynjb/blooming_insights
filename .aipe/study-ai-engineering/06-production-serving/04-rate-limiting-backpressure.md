@@ -8,25 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Your search box fires a `fetch` on every keystroke and the API starts returning 429s. You reach for `debounce` — wait until typing pauses before firing — so calls leave the client no faster than the server tolerates. That is client-side rate limiting: you throttle at the *caller* before the server has to reject you.
+**Zoom out — the bigger picture.** Rate limiting + backpressure is the Provider wrappers band — the spacing logic between the Agent loop's outbound tool calls and the Tools + MCP transport that hits Bloomreach. blooming insights' `McpClient.liveCall` enforces a per-instance ~1100 ms minimum gap on every live call, so a single agent's 6–13 sequential EQL queries never bunch up at the upstream's ~1 req/s ceiling. There is no shared queue, no backpressure signal, no load-shedding — concurrent users in the same process share only the spacer.
 
-A backend client calling a rate-limited upstream faces the same problem with a sharper edge: there is no human pausing between keystrokes, and a single agent run can fire a dozen calls back-to-back. The question this concept answers is: *how does one client stay under a hard upstream limit, and what happens when many clients share that one limit at once?*
+```
+  Zoom out — where the spacer sits
 
-**The second half of that question is the one most implementations skip.** Spacing one caller's calls is easy — a timestamp and a sleep. Coordinating *many* callers against a shared limit, and deciding what to do when demand exceeds the limit (queue? reject? shed?), is the hard part. blooming insights solves the first half well: `liveCall` spaces a single user's serial call chain at 1100 ms. It does not solve the second — there is no queue, no backpressure signal, and no load-shedding when concurrent users collide on Bloomreach's per-user quota.
+  ┌─ Agent loop ─────────────────────────────────────┐
+  │  6–13 sequential tool calls per run               │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider wrappers ─────▼────────────────────────┐  ← we are here
+  │  ★ liveCall: minIntervalMs = 1100ms spacer ★     │
+  │  per-instance; serial; no queue                   │
+  │                                                   │
+  │  ABSENT here:                                     │
+  │    - shared queue across concurrent runs          │
+  │    - backpressure signal to upstream              │
+  │    - load shedding under burst                    │
+  └─────────────────────────┬────────────────────────┘
+                            │  ~1 req/s
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  HTTPS → Bloomreach (~1 req/s per-user quota)     │
+  │  429 = Too many requests = run killed             │
+  └──────────────────────────────────────────────────┘
+```
 
-Before naming the mechanism:
-- An agent fires 6–13 sequential EQL calls per run
-- Back-to-back calls arrive at Bloomreach faster than ~1 req/s
-- A 429 ("Too many requests") kills the run with no recovery path
-
-After what `liveCall` provides (and what it doesn't):
-- Each live call waits until `minIntervalMs` has elapsed since the last one
-- A single user's serial call chain never exceeds ~1 req/s
-- BUT concurrent runs in the same process do not coordinate, and there is no queue to absorb a burst — just per-instance spacing
-
-It is `debounce`'s cousin — a minimum-gap throttle — but built for one serial caller, not a multi-tenant queue.
+**Zoom in — narrow to the concept.** The question is: how does one client stay under a hard upstream limit, and what happens when many clients share that one limit at once? Spacing one caller's calls is easy — a timestamp and a sleep. Coordinating *many* callers against a shared limit (queue? reject? shed?) is the hard part most implementations skip. blooming insights solves the first half well via `liveCall`'s minimum-gap spacer; the second half is honest gap. How it works walks the spacer, why minimum-gap differs from a token bucket, and what changes when "concurrent users" arrives.
 
 ---
 
@@ -347,3 +356,4 @@ What value is `minIntervalMs` set to for the live Bloomreach connection, and on 
 ---
 Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived liveCall refs (client.ts L148–L163, lastCallAt L81) and connectMcp construction (connect.ts L91–L96, comment L81–L88); added the pre-stream setup try/catch note (both routes return real error JSON, not a bare 500).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

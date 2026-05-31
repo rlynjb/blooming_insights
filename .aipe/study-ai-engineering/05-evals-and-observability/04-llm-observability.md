@@ -8,25 +8,40 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You debug a slow page by opening the browser Network tab: a waterfall of requests, each a bar whose length is its duration, nested under the document that triggered them, with timings and status codes you can click into. That waterfall is a trace — a tree of timed operations (spans) you read to answer "what ran, in what order, how long did each take, and which one failed?" You already think in traces; you just call it the Network tab.
+**Zoom out — the bigger picture.** Observability is cross-cutting *and* it spans every band of the live request flow. Each agent's `runAgentLoop` emits typed events (`reasoning_step`, `tool_call_start`, `tool_call_end` with `durationMs`) via hooks; the Route's `send` choke-point in `ReadableStream.start` (`app/api/agent/route.ts` L172–L175) records them and enqueues NDJSON; the UI renders them as they arrive. The trace is not a backend log you grep — it is the thing the user watches.
 
-An agent run has exactly this shape. `DiagnosticAgent.investigate` is the root request; each `mcp.callTool` it makes is a child span with a duration; each reasoning step is an annotation on the timeline. The question this file answers is: **how do you make an LLM agent's hidden multi-step execution visible — what it decided, which tools it called, how long each took, and what it concluded — so you can debug a bad run and show a user the work?**
+```
+  Zoom out — the trace runs alongside every layer
 
-**Why answering it matters: an agent without a trace is a black box that you cannot debug and the user cannot trust.** When a diagnosis comes back wrong or slow, "the model did something" is not a debuggable statement. You need the ordered record: this reasoning step, then this EQL call (340ms), then this one (1.1s, the slow one), then this conclusion. blooming insights treats that record as a first-class output — it streams the trace to the UI *as the agent runs*, so observability is not a backend log you grep, it is the thing the user watches. That is the load-bearing design choice: the trace is both the debug instrument and the product.
+  ┌─ UI (renders the trace live) ────────────────────┐
+  │  useInvestigation hook: per-event React state     │
+  └─────────────────────────▲────────────────────────┘
+                            │  NDJSON
+  ┌─ Route handler (frames events) ──────────────────┐
+  │  send(e) → collected.push + controller.enqueue    │
+  │  route.ts L172–175                                │
+  └─────────────────────────▲────────────────────────┘
+                            │
+  ┌─ Per-agent + Agent loop (emits events) ──────────┐  ← we are here
+  │  ★ hooksFor: onText/onToolCall/onToolResult ★     │
+  │  reasoning_step + tool_call_start +               │
+  │  tool_call_end{durationMs}                        │
+  │  lib/mcp/events.ts (the event vocabulary)         │
+  └─────────────────────────▲────────────────────────┘
+                            │
+  ┌─ Provider + Tools ──────┴────────────────────────┐
+  │  per-tool timing measured here                    │
+  └──────────────────────────────────────────────────┘
 
-Before a trace:
-- A wrong diagnosis is "the model messed up" — no record of which tool returned bad data
-- A slow run is "it felt slow" — no per-step timing to find the bottleneck
-- The user sees a spinner, then an answer, with no evidence of the work behind it
+  blooming insights does NOT export to OpenTelemetry,
+  Langfuse, or Datadog. The trace is the UI; persistence
+  is the cache snapshot (saveInvestigation). Backend-grade
+  observability is the gap.
+```
 
-After:
-- Every run is an ordered stream of typed events — reasoning, tool start, tool end with `durationMs`, conclusion
-- The slow span is identified by its `durationMs`; the bad tool result is in the `tool_call_end` payload
-- The user watches the agent reason and query in real time — the trace *is* the UI
-
-It is the Network-tab waterfall, modeled as a typed event union and streamed over `fetch` instead of rendered in devtools.
+**Zoom in — narrow to the concept.** The question is: how do you make an agent's hidden multi-step execution visible — what it decided, which tools it called, how long each took, what it concluded — so you can debug a bad run and show a user the work? An agent without a trace is a black box you cannot debug and the user cannot trust. blooming insights treats the trace as a first-class output, streaming it as the agent runs, which is the same network-tab instinct applied to a typed event union over NDJSON. How it works walks the event vocabulary, the `durationMs` on each tool span, and what would change to export the trace to a real observability backend.
 
 ---
 
@@ -412,3 +427,4 @@ Where is a tool call's `durationMs` captured, and why does capturing it there gu
 ---
 Updated: 2026-05-28 — Replaced the dead `summarizeTrace` view with the real briefing narration (`describeToolCall`, route L28–L33); documented the grown UI surface (StatusLog sticky sidebar on both investigate steps, ReasoningTrace per-line timestamps via the `TraceItem` type in ReasoningTrace.tsx, TraceContent markdown/JSON renderer with no `dangerouslySetInnerHTML`, the StrictMode-safe `useInvestigation` hook); re-derived all route.ts/types.ts/investigations.ts refs. NDJSON + AgentEvent contract unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

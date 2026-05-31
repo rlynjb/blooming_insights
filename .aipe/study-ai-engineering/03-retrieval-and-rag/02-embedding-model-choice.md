@@ -8,25 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You already pick models by tier in this codebase: `claude-haiku-4-5` for the cheap one-word intent classification, `claude-sonnet-4-6` for the analyst agents (`lib/agents/intent.ts` L14, `lib/agents/base.ts` L9). That decision — small/cheap model for the easy job, large/capable model for the hard job — is exactly the embedding-model decision, applied to a different model family. You would not run the intent classifier on Sonnet; you should not reflexively reach for the 3072-dimension embedding model either.
+**Zoom out — the bigger picture.** Embedding-model choice is the *decision* that configures the Indexer of a retrieval pipeline that does not yet exist here. It sets the dimension of every vector in the Vector store and the cost of every `embed(query)` at the Retriever. Once chosen, the dimension is paid forever on every comparison — it is not a runtime knob like `max_tokens`, it is an architectural commitment. blooming insights has no embedding model, no index, no retriever; this is study material plus the same tiering judgment the codebase already makes for chat models (haiku vs sonnet at `lib/agents/intent.ts` L14 / `lib/agents/base.ts` L9).
 
-The question this answers is: of the dozen available embedding models, which one do you embed your schema terms with — and on what evidence?
+```
+  Zoom out — where embedding-model choice lands (WOULD BE)
 
-**The pivot: a bigger embedding model is not automatically a better one for your data, and every extra dimension is paid for on every comparison, forever.** A 3072-dimension model stores 8× the floats of a 384-dimension model, costs more per embed call, and makes every cosine computation 8× longer — and if your terms are short event names that a 384-dimension model already separates cleanly, you bought nothing. The choice is a measurement, not a default.
+  ┌─ Model-choice decision (architectural commitment) ┐  ← we are here
+  │  ★ pick: 384-dim vs 1536-dim vs 3072-dim ★        │
+  │  drives dim + cost + latency of everything below   │
+  └─────────────────────────┬─────────────────────────┘
+                            │  fixed for the life of the index
+  ┌─ Indexer ───────────────▼─────────────────────────┐
+  │  embed(term) at the chosen dimension               │
+  └─────────────────────────┬─────────────────────────┘
+                            │
+  ┌─ Vector store ──────────▼─────────────────────────┐
+  │  N vectors × D dims (D scales storage + cosine cost)│
+  └─────────────────────────┬─────────────────────────┘
+                            │
+  ┌─ Retriever (per query) ─▼─────────────────────────┐
+  │  embed(query) cost + cosine cost ∝ D              │
+  └───────────────────────────────────────────────────┘
 
-Before a deliberate choice:
-- You pick the model with the highest benchmark number on a leaderboard
-- The leaderboard tested news articles; your data is event names like `add_to_cart`
-- You pay for 3072 dimensions and get the same retrieval quality 384 would have given
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; no embedding model has been chosen.
+```
 
-After:
-- You evaluate two or three candidates on *your* event/property names
-- You pick the smallest dimension that holds retrieval quality on that set
-- Cost and latency drop with no quality loss
-
-It is the haiku-vs-sonnet tiering decision, made for the embedding model family.
+**Zoom in — narrow to the concept.** The question is: of the dozen available embedding models, which one do you embed your schema terms with — and on what evidence? A bigger model is not automatically better for *your* data, and every extra dimension is paid on every comparison, forever. The decision is a measurement: evaluate two or three candidates on your event/property names and pick the smallest dimension that holds retrieval quality. How it works walks the dim/cost tradeoff, the MTEB benchmark trap (your data is not the leaderboard's data), and the haiku-vs-sonnet analogy the codebase already practices for chat models.
 
 ---
 
@@ -267,3 +278,4 @@ What model-selection discipline does blooming insights already demonstrate, and 
 
 → 01-embeddings.md · → 04-vector-databases.md · → 09-stale-embeddings.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -8,25 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You don't write one function that validates the form, hits the API, transforms the response, and renders the table — you write four, because when the table renders wrong you need to know whether the bug is in validation, the request, the transform, or the render. A single mega-function is undebuggable; four named functions with typed boundaries between them localize every failure. A multi-step LLM feature is the same: one prompt that detects-and-diagnoses-and-recommends in a single breath is a mega-function with a probabilistic core, and when its output is wrong you can't tell which *job* it botched.
+**Zoom out — the bigger picture.** Single-purpose chains span the Pipeline coordinator (where the diagnose→recommend chain is wired in code) and the Per-agent definitions band (where each prompt's `## Role` scopes itself to one verb and disclaims the others). The chain is not a single concept on one band — it is two cooperating mechanisms: scoping declared in the prompts, ordering enforced in `route.ts`. The model never decides "now I'll diagnose"; the code calls the agent and the prompt tells the model to do only that.
 
-The question this file answers: how does blooming insights decompose "be an analyst" into separable steps, and what does the decomposition buy beyond tidiness?
+```
+  Zoom out — where single-purpose chains live
 
-**The pivot: one job per chain isn't an aesthetic preference — it's what makes the system debuggable (you know which link failed) and what makes model-routing possible (a cheap job runs on a cheap model).** The moment a prompt has two jobs, a wrong output gives you no signal about which job failed, and you're stuck paying your most capable model for the easy parts too.
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts (entry)                  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here (ordering)
+  │  ★ route.ts L145–162: wired in code ★            │
+  │  DiagnosticAgent.investigate → Diagnosis         │
+  │       │ typed handoff (L158)                     │
+  │       ▼                                          │
+  │  RecommendationAgent.propose                     │
+  │  agent-tagged trace (L116–131) → failure localizes│
+  └─────────────────────────┬────────────────────────┘
+                            │  per-agent
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here (scoping)
+  │  ★ four ## Roles, each disclaiming the others ★  │
+  │  monitoring.md L5 · diagnostic.md L5             │
+  │  recommendation.md L5 · query.md L5              │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  classify→Haiku · agents→Sonnet (per-job routing) │
+  └──────────────────────────────────────────────────┘
+```
 
-A monolithic analyst prompt:
-- "Detect changes, explain them, suggest fixes, and answer questions" — one prompt
-- Wrong output → which of the four jobs failed? unknown
-- Runs on one model → you pay top-tier rates for the trivial classification too
-
-The decomposed version (this codebase):
-- Four prompts, each with one `## Role` that disclaims the others
-- Wrong output → the link is named (the trace says `diagnostic` vs `recommendation`)
-- Classification runs on Haiku, agents on Sonnet — routed by job
-
-It is the small-named-functions discipline, applied to prompts so failures localize.
+**Zoom in — narrow to the concept.** The question this file answers: how does blooming insights decompose "be an analyst" into separable steps, and what does the decomposition buy beyond tidiness? Two payoffs and two costs. The payoffs: failures localize to a named link (the trace tells you whether the diagnosis or the recommendation went wrong) and per-job model routing becomes possible (Haiku for the classify, Sonnet for the agents). The costs: more round-trips and a lossy typed handoff. Below, you'll see how the `## Role` disclaimers act as typed boundaries between links, why the `Diagnosis` handoff is what makes attribution real, and where decomposition stops paying off.
 
 ---
 
@@ -361,3 +374,4 @@ In the investigation flow, what is the typed value passed from the diagnostic li
 
 → 01-anatomy.md · → 07-output-mode-mismatch.md · → 02-structured-outputs.md · → 09-chain-of-thought.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

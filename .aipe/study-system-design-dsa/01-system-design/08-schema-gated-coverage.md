@@ -8,15 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You render a dashboard of feature cards. Each card needs certain backend fields. You ship it against one tenant's data, it looks great — then a second tenant with a thinner schema loads it, three cards call fields that don't exist, and the user sees spinners that never resolve or numbers that are quietly wrong. The question is: how does a pipeline decide *what work is even possible* for this particular workspace, do it before spending a constrained budget, and tell the user honestly which parts couldn't run?
+**Zoom out — the bigger picture.** Schema-gated coverage is a stage in the briefing route that sits *between* schema bootstrap and `MonitoringAgent.scan`, and the gate's verdict is streamed out as `coverage_item` events while the runnable subset is handed forward to the agent. The pure functions live in `lib/agents/categories.ts` (the DSA primitive is `../02-dsa/07-coverage-gate.md`); the orchestration lives in `app/api/briefing/route.ts`; the UI consumer is `components/feed/CoverageGrid.tsx`. It is a cross-cutting concept: one upstream computation (the schema check) produces two downstream outputs (UI state for the grid, runnable subset for the agent).
 
-That is what schema-gated coverage answers: gate the checklist against the live schema up front, run only the supported items, and surface the gate's verdict — supported / degraded / unavailable — as first-class UI state.
+```
+Zoom out — where schema-gated coverage lives
 
-**The stakes are concrete.** The monitoring agent shares a ~1 req/s MCP budget and a 300 s function ceiling. Its checklist has 10 anomaly categories; a given workspace might only support 7. Querying the other 3 burns calls on guaranteed-empty results and slows the whole briefing. Worse, faking a tile for a category the data can't support is exactly the kind of cosmetic dishonesty this product refuses. The gate runs the schema check first (free, in-memory), hands the agent only the runnable subset, and streams every category's status to the feed — including dashed "no data source" ghosts — so the user sees the full checklist and trusts the parts that fired.
+┌─ UI ───────────────────────────────────────────┐
+│  CoverageGrid.tsx (10 tiles, fills tile-by-tile)│
+│  app/page.tsx (accumulates coverage_item events)│
+└─────────────────────▲──────────────────────────┘
+                      │  NDJSON: coverage_item per category
+┌─ Route handler ─────┴──────────────────────────┐
+│  app/api/briefing/route.ts                     │
+│  bootstrapSchema(mcp) → schema                 │
+│         │                                       │
+│  ★ schemaCapabilities(schema) → Set<string> ★ │ ← we are here
+│  ★ coverageReport(set) → 10 items (UI) ★      │
+│  ★ runnableCategories(set) → subset (agent) ★ │
+│         │                                       │
+│         ▼                                       │
+│  MonitoringAgent.scan(hooks, runnable)         │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Agent + Provider wrappers ────────────────────┐
+│  spends ~1 req/s budget on runnable only       │
+└────────────────────────────────────────────────┘
+```
 
-One-line reduction: gate before you spend, then stream the gate's verdict as UI state — never fabricate a tile the schema can't back.
+**Zoom in — narrow to the concept.** The question is: how does a pipeline decide *what work is even possible* for this particular workspace, do it before spending a constrained budget, and tell the user honestly which parts couldn't run? The answer is a three-function gate (`schemaCapabilities` flattens the schema into a `Set<string>` of capability tokens; `coverageReport` classifies all 10 categories as `full`/`limited`/`unavailable`; `runnableCategories` keeps the non-`unavailable` ones), run *before* `runAgentLoop` ever fires. One computation, two consumers: the report drives the grid (including ghost tiles for unsupported categories), the runnable subset bounds the agent's `maxToolCalls: 6` budget. The next sections walk the stage, the streaming reveal, and how the three tile states map to three UI vocabularies.
 
 ---
 
@@ -304,3 +325,4 @@ Your PM says: "The ghost tiles look broken — just hide categories the workspac
 
 → 01-request-flow.md · → 05-streaming-ndjson.md · → 06-multi-agent-orchestration.md · → ../02-dsa/07-coverage-gate.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

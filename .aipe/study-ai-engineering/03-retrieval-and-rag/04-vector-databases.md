@@ -8,25 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-blooming insights already keeps a `Map<string, {result, expiresAt}>` on `McpClient` (`lib/mcp/client.ts` L18) and a module-level `let cached: WorkspaceSchema | null` in `lib/mcp/schema.ts` L130. Those are the storage tier a small retrieval system uses too — a plain in-memory `Map` of vectors, scanned exhaustively on every query. You only graduate to a "vector database" when the `Map` gets too big to scan or too big to fit in memory. So the real question is not "which vector DB" but "do I even need one yet?"
+**Zoom out — the bigger picture.** A vector database is the *storage tier* of a retrieval pipeline that blooming insights does not yet have. Where embeddings define what goes in and chunking defines what counts as one row, the vector store decides how those rows are held and scanned: an in-memory `Map`, a SQLite extension, or a managed service like Pinecone. The codebase already uses the same shape of in-memory `Map` for caches (`McpClient` TTL cache at `lib/mcp/client.ts` L18, schema cache at `lib/mcp/schema.ts` L130) — same primitive, different payload.
 
-The question a vector database answers is: how do you find the k nearest vectors to a query among millions, fast enough to serve a request?
+```
+  Zoom out — where the vector store sits (WOULD BE)
 
-**The pivot: nearest-neighbor at small scale is a `for` loop over an array; at large scale that loop is too slow, and the entire reason vector databases exist is to make it approximate-but-fast.** Scanning 80 schema-term vectors is microseconds. Scanning ten million is hundreds of milliseconds per query — too slow. A vector index (HNSW, IVF) trades exactness for speed: it returns *probably* the nearest k by searching a clever graph or cluster structure instead of every vector. The DB is the index plus persistence, filtering, and operations.
+  ┌─ Indexer (embed + chunk) ────────────────────────┐
+  │  produces (id, vector, metadata) rows             │
+  └─────────────────────────┬────────────────────────┘
+                            │  write
+  ┌─ Vector store ──────────▼────────────────────────┐  ← we are here
+  │  ★ THE TIER DECISION ★                            │
+  │  <1k:   Map<id, vector>        (scan-all)          │
+  │  ~10k:  SQLite + sqlite-vss     (B-tree + ANN ext) │
+  │  >100k: managed (Pinecone, etc.) (HNSW/IVF)        │
+  └─────────────────────────┬────────────────────────┘
+                            │  read (top-k)
+  ┌─ Retriever ─────────────▼────────────────────────┐
+  │  embed(query) → nearest-k → feed to LLM context   │
+  └──────────────────────────────────────────────────┘
 
-Before a vector store decision:
-- You assume "RAG means I need Pinecone/a vector DB"
-- You provision a managed vector service for 80 schema terms
-- You pay and operate infrastructure for a `for` loop's worth of data
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; the in-memory Map pattern is already used for
+  caches (mcp/client.ts L18, mcp/schema.ts L130).
+```
 
-After:
-- You recognize the tier: <1k vectors fits the `Map` you already use
-- You scan exhaustively — exact, simple, zero new infrastructure
-- You adopt a vector DB only when the scan gets too slow or the data outgrows memory
-
-It is the same instinct as not reaching for Redis when a `Map` cache suffices — which is exactly the choice `McpClient` already made.
+**Zoom in — narrow to the concept.** The question is: how do you find the k nearest vectors to a query among millions, fast enough to serve a request? At small scale this is a `for` loop over an array — microseconds for 80 schema terms. At large scale the loop is too slow, and the entire reason vector databases exist is to make it *approximate-but-fast* via HNSW or IVF indices. How it works walks the tier ladder (Map → SQLite → managed), the exact-vs-approximate tradeoff, and the engineering rule of not adopting a vector DB before the scan stops being microseconds.
 
 ---
 
@@ -282,3 +292,4 @@ What storage tier does blooming insights already run that a small vector index w
 
 → 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

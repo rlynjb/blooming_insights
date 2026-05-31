@@ -8,26 +8,39 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You write a sort comparator and accidentally make it non-transitive — `cmp(a,b)` and `cmp(b,a)` do not agree. The sort silently produces garbage: the result depends on input order, not on the actual values. You would never ship that comparator. An LLM-as-judge is a comparator for output quality, and out of the box it is exactly that broken: ask it "is A or B better?" and it leans toward whichever you listed first, regardless of content. Swap the order and the winner flips. That is a non-transitive comparator deciding which prompt version you ship.
+**Zoom out — the bigger picture.** LLM-as-judge sits inside the eval band as one *option* for the scorer (alongside exact-match and rubric — see → 02-eval-methods.md). It is itself a Provider call — a second LLM that grades the system-under-test's output — which makes the eval flow look like a smaller version of the request flow. The bias surface (position, length, self-preference) is what this file is about: the judge's prejudices that distort the score before any decision is made on top of it.
 
-The question this file answers is: **when you delegate quality scoring to a model, what systematic errors does that judge introduce, and how do you correct them so the score reflects the answer's quality rather than the judge's prejudices?**
+```
+  Zoom out — where the judge sits inside the eval band
 
-**Why answering it matters: an uncorrected judge turns your eval into a confident lie.** A biased judge still returns a clean number — 4.2/5, v2 wins 64% — and a number is persuasive. You will edit prompts and swap models based on it. If that number is driven by position, length, or family rather than substance, every decision you make on top of it is wrong, and you will not know, because the judge never reports its own bias. The fixes are cheap; not applying them is how teams ship "data-driven" decisions powered by noise.
+  ┌─ Per-agent under test ───────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly)             │
+  │  → produced Diagnosis (prose)                     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Eval band — scorer ────▼────────────────────────┐  ← we are here
+  │  ★ LLM-as-judge (a Provider call inside eval) ★   │
+  │  "is A or B better?"  or  "score this 1–5"        │
+  │  BIASES that distort the score:                   │
+  │    - position bias (whichever listed first wins)  │
+  │    - length bias  (verbose wins)                  │
+  │    - self-preference (same family rated higher)   │
+  │  debias by: randomize order, control length,      │
+  │             use a different model family          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Eval score (acted on) ─▼────────────────────────┐
+  │  trustworthy ⇒ ship; biased ⇒ confident lie       │
+  └──────────────────────────────────────────────────┘
 
-Before debiasing:
-- A pairwise eval favors whichever output is listed first → the "winner" is an artifact of ordering
-- The judge rewards the longer, more verbose diagnosis → prompts drift toward padding
-- A `claude-sonnet-4-6` judge rates `claude-sonnet-4-6` output higher → the eval flatters the system it grades
+  Currently in this codebase: no LLM-as-judge is wired —
+  this file is study material plus the debiasing checklist
+  you'd apply when introducing one.
+```
 
-After:
-- Order is randomized (or both orders averaged) → position cancels out
-- Length is capped or controlled for → verbosity stops winning
-- The judge is a different model family → self-preference is removed
-- The score tracks quality, and decisions on top of it are sound
-
-A debiased judge is the difference between a comparator you can sort with and one that reorders your priorities every time you swap the inputs.
+**Zoom in — narrow to the concept.** The question is: when you delegate quality scoring to a model, what systematic errors does that judge introduce, and how do you correct them so the score reflects the answer's quality rather than the judge's prejudices? An uncorrected judge turns your eval into a confident lie — a biased judge still returns a clean number, and a number is persuasive. The fixes (randomized order, length controls, cross-family judging) are cheap; not applying them is how teams ship "data-driven" decisions powered by noise. How it works walks each bias, the cheap correction, and why a judge of the same family flatters the system it grades.
 
 ---
 
@@ -307,3 +320,4 @@ What model do the diagnostic and recommendation agents run on, and why does that
 ---
 Updated: 2026-05-28 — Re-derived `Diagnosis` ref (types.ts L64–L73). `AGENT_MODEL` (base.ts L9) and `CLASSIFIER_MODEL` (intent.ts L14) verified unchanged — the sonnet-judges-sonnet self-preference trap still holds. Still Case B (no judge wired).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

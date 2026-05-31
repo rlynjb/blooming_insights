@@ -8,28 +8,31 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've built a multi-step form. Step 1 collects an email, step 2 collects a name, step 3 confirms. The order is hardcoded in your component: `if (step === 1) … else if (step === 2) …`. You wrote the transitions. The form fills in *values*, but it never decides to skip step 2 or invent a step 4 — the path is yours, baked into the JSX, the same every time.
+**Zoom out — the bigger picture.** The chain/agent boundary in blooming insights sits exactly between two bands: the Route handler (which picks the next stage) and the Shared agent loop (which decides what happens inside a stage). Above the line, `route.ts` is a deterministic `if`-ladder — that's the chain half. Below the line, `runAgentLoop` is a model-driven ReAct loop — that's the agent half. The whole system is "a chain of agents," so this concept sits *on the seam*, not in any one band.
 
-Now picture a different shape. A `.then()` chain where each link decides whether the *next* link should even run, and which one — based on what it just saw. `fetchUser().then(u => u.isPremium ? loadDashboard() : loadUpsell())`. The branch isn't fixed; it depends on the data. Push that all the way: a loop where the code doesn't know how many `.then()`s there will be, because each step reads its result and *chooses the next call* until it decides it's done.
+```
+  Zoom out — where the chain/agent boundary lives
 
-That second shape is the question this file answers: **when does control flow live in your code (a chain) versus in the model at runtime (an agent)?** Not "is there an LLM" — both have one. The line is who writes the steps. In a chain, the engineer writes the step order and the LLM fills each slot. In an agent, the model writes the step order as it goes.
+  ┌─ Route handler ─────────────────────────────────┐  ← chain half
+  │  app/api/agent/route.ts                          │
+  │  if-ladder picks monitoring → diagnostic →       │
+  │  recommendation (CODE writes the order)          │
+  └─────────────────────────┬────────────────────────┘
+                            │  ★ THIS ★ — the boundary
+                            ▼
+  ┌─ Pipeline coordinator ──┴────────────────────────┐  ← we are here
+  │  lib/agents/pipeline.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← agent half
+  │  runAgentLoop (lib/agents/loop.ts)               │
+  │  model writes the chain at runtime (ReAct)       │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because the two shapes fail in opposite ways, and you debug them with opposite tools. A chain that breaks broke at a *known* step — you look at step 2's code. An agent that breaks chose a *wrong path* — you replay its trajectory to find where the reasoning went off. Mislabel which one you have and you debug the wrong thing: you grep route code for a bug that's actually in a prompt, or you tune a prompt for a bug that's actually a hardcoded `if`.
-
-Without naming the boundary:
-- A diagnosis comes back wrong
-- You assume "the model picked the wrong agent" and start rewriting prompts
-- But the route code (`route.ts`) is what picks diagnostic-then-recommendation — deterministically, every time
-- You burned an afternoon on the wrong layer
-
-With the boundary named:
-- A diagnosis comes back wrong
-- You ask: was this the *order* (chain — check `route.ts`) or the *investigation* (agent — replay `runAgentLoop`'s tool calls)?
-- You go straight to the right layer
-
-One-line summary: **a chain is a `.then()` chain you wrote; an agent is a `while` loop the model drives — and blooming insights runs a chain of agents, so it's both at once.** Here's how that plays out in the code.
+**Zoom in — narrow to the concept.** The question is: who writes the steps — your code or the model? On the chain side, the engineer wrote them; on the agent side, the model writes them as it goes. Naming where the line sits tells you which layer to debug when something goes wrong: a wrong *order* is a chain bug (look at `route.ts`), a wrong *investigation* is an agent bug (replay `runAgentLoop`'s trajectory). Below, you'll see both halves in code and the seam between them.
 
 ---
 
@@ -335,3 +338,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

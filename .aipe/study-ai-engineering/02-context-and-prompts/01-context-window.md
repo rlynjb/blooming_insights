@@ -8,25 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-A `ReadableStream` reader fills a `buf` string and you `buf.split('\n')` to pull out complete lines. There is a hard ceiling on how much you let `buf` grow before you must drain it — if you append forever without draining, the buffer outgrows what the consumer can hold and the read fails. The context window is that same fixed buffer, except it holds *everything* the model sees on a single call: the system prompt, every prior turn, every tool result fed back, and the tokens the model still needs free to write its answer.
+**Zoom out — the bigger picture.** The context window is the fixed-size array every model call shares — system prompt, message history, tool results, and the answer all compete for the same slots. Defending it spans two bands: the Per-agent definitions build the prefix (`schemaSummary` caps in `lib/agents/monitoring.ts` L15–L48), and the Agent loop grows the transcript turn by turn (`truncate` at `lib/agents/base.ts` L31–L34, `forceFinal` at L90–L91 / L101). The Provider is where the bounded array meets the model.
 
-The question every multi-turn LLM system faces: the window is a fixed number of slots, and each tool call you feed back consumes more of them — so how do you keep a six-call investigation inside the window while leaving the model enough room to actually answer at the end?
+```
+  Zoom out — where the window is defended
 
-**The pivot: the context window is shared and finite, so every inflow must be bounded at the door and the transcript must stop growing before the model is asked to synthesize.** If you let raw tool results flow in unbounded, the conversation either overflows the window (the call fails) or crowds out the model's output budget (it runs out of room mid-answer). blooming insights bounds every inflow by character count and then, on the final turn, withholds tools so the conversation stops accumulating and the model spends its remaining budget writing JSON instead of asking for more data.
+  ┌─ Per-agent (builds the prefix) ──────────────────┐
+  │  schemaSummary caps  monitoring.ts L15–48        │
+  │    20 events / 10 props / 30 cprops              │
+  └─────────────────────────┬────────────────────────┘
+                            │  system prefix
+  ┌─ Agent loop (grows the transcript) ──────────────┐  ← we are here
+  │  ★ MAX_TOOL_RESULT_CHARS = 16_000 ★ base.ts L29  │
+  │  truncate per tool_result   L31–34, applied L150 │
+  │  forceFinal → omit tools    L90–91, L101         │
+  │    → transcript STOPS growing                    │
+  └─────────────────────────┬────────────────────────┘
+                            │  bounded array
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  anthropic.messages.create({system, messages,    │
+  │     max_tokens })   ← reserves output room       │
+  │  one shared array: input slots + output slots    │
+  └──────────────────────────────────────────────────┘
+```
 
-Before any budgeting:
-- A single EQL tool result is tens of thousands of characters
-- Six tool results concatenate into a transcript that crowds the window
-- The final turn has little room left, so the model truncates its own answer or never reaches a conclusion
-
-After character budgeting + the forced-final turn:
-- Each tool result is sliced to 16,000 chars before it re-enters the conversation
-- The schema prefix is capped to ~20 events × 10 props instead of the full 112KB
-- The final turn carries no tool schemas, so the model cannot grow the transcript further and synthesizes within the room that remains
-
-It is the same discipline as draining a `ReadableStream` buffer on a ceiling — applied to every string that enters a model call, plus a hard stop on the loop that fills it.
+**Zoom out — narrow to the concept.** The question is: the window is a fixed number of slots, and each tool call you feed back consumes more of them — so how do you keep a six-call investigation inside it while leaving the model enough room to actually answer? Two disciplines: bound every inflow at the door (`truncate`, `schemaSummary`) and stop the loop filling it before the model synthesizes (the forced tool-less final turn). How it works walks each budget and the tool-omission move that protects the answer's room.
 
 ---
 
@@ -330,3 +338,4 @@ Which line withholds the tool schemas so the model cannot grow the transcript on
 ---
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); the character-budget/forced-final-turn mechanics and `base.ts`/`monitoring.ts` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

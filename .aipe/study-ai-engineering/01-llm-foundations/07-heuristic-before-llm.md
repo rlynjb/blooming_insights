@@ -8,25 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Before you fire a network request to validate an email, you run `value.includes('@')`. The regex is free, instant, and catches the obvious failures; the network call is slow and costs a request, so you only make it when the cheap check passes. You do not delete the cheap check just because the network call is more thorough — you put the cheap one first precisely *because* it is cheap, and reserve the expensive one for the cases the cheap one cannot resolve.
+**Zoom out — the bigger picture.** Heuristic-before-LLM lives right at the boundary between Intent parsing (the cross-cutting `lib/agents/intent.ts`) and the Pipeline. The Route handler does the first free check (parameter-presence: `q && !insightId` at `app/api/agent/route.ts` L210); `parseIntent` (`lib/agents/intent.ts` L6–L12) does the second free check (substring); and only if neither resolves does `classifyIntent` (L17–L31) reach down through the Provider band to a haiku model call.
 
-An LLM call is the expensive network request of this story. The question is: before you pay tokens and latency to ask a model, is there a free deterministic check that resolves the easy cases?
+```
+  Zoom out — where the free path sits before the paid path
 
-**The pivot: an LLM call is the most expensive way to answer a question, so a cheap deterministic check belongs in front of it whenever one exists.** Tokens cost money, model calls add latency, and their output is non-deterministic and needs validation (→ 01-what-an-llm-is.md). A substring match costs nothing, returns instantly, and is perfectly deterministic. If a substring match can answer the question, the model call is pure waste.
+  ┌─ Route handler ───────────────────────────────────┐
+  │  q && !insightId ?  → query flow                   │  free heuristic #1
+  │                       (route.ts L210)               │
+  └─────────────────────────┬──────────────────────────┘
+                            │  query flow
+  ┌─ Intent parsing (cross-cutting) ────────────────────┐  ← we are here
+  │  ★ parseIntent (FREE, pure)  intent.ts L6–12 ★      │
+  │    includes("monitoring"|"diagnostic"|"recommendation")
+  │    decisive? → return Intent  (NO model call)       │
+  │    else ↓                                           │
+  │  classifyIntent (PAID, haiku)  intent.ts L17–31     │
+  │    res text ──▶ parseIntent(text)   ← free re-parse │
+  └─────────────────────────┬──────────────────────────┘
+                            │  only when free path fails
+  ┌─ Provider (last resort) ▼──────────────────────────┐
+  │  haiku, max_tokens 16   (cheapest possible call)    │
+  └────────────────────────────────────────────────────┘
+```
 
-Before the fast-path discipline:
-- Every intent decision pays for an LLM round-trip, even "show me monitoring" which is unambiguous
-- A typo in the question still triggers a paid classification
-- Latency and cost scale with request volume linearly
-
-After:
-- The free heuristic resolves the obvious cases instantly
-- The paid model is reserved for genuinely ambiguous free-form queries
-- Cost and latency drop for the common, easy inputs
-
-It is `value.includes('@')` before the verification API — applied to LLM routing.
+**Zoom in — narrow to the concept.** The question is: before you pay tokens and latency for a model, is there a free deterministic check that resolves the easy cases? Two are layered here — parameter-presence in the route, substring match in `parseIntent` — and even the paid path's text output is normalized back through the free parser. How it works walks each layer and the drift risk that makes the heuristic confidently wrong on tricky phrasing.
 
 ---
 
@@ -318,3 +326,4 @@ What does `parseIntent` return for an input with no intent keyword, and where is
 ---
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` structural-heuristic refs (query branch now L210, `classifyIntent` L211, neither→400 at L121–L123, investigation flow L221); `intent.ts` `parseIntent`/`classifyIntent` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

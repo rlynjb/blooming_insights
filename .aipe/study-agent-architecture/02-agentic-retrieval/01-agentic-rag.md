@@ -8,28 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a search box once. The user types, you `fetch('/search?q=' + query)`, the API returns ten rows, you render them. The shape is fixed: one query in, one batch out, render. If the answer isn't in those ten rows, the user types something different and tries again — *they* are the loop. The code does one round trip.
+**Zoom out — the bigger picture.** Agentic RAG would sit at the Shared agent loop band — a ReAct loop whose primary tool is a retriever (vector index, search API, or live query API). In blooming insights there is no retriever in the classic sense; what fills the same architectural slot is the live EQL/event tools wired through the MCP transport. So the loop shape (model decides each next retrieval call) is exactly what `runAgentLoop` already does — but the retrieval target is a live analytics API, not a vector index. The diagram below shows the would-be vector-RAG retrieval shape on top and blooming insights' live-tool shape on the bottom.
 
-Now picture the same search box, but you put a model in the user's seat. The model reads the question, sends a query, reads the ten rows, and decides — based on what came back — whether to ask again with a different query or stop and answer. The number of round trips isn't fixed. The query on round 2 depends on what round 1 returned. The loop moved from the user into the code.
+```
+  Zoom out — where agentic RAG WOULD live
 
-That second shape is the question this file answers: **when does retrieval stop being a one-shot pipeline step and start being a loop the agent drives?** Not "do you have RAG" — both shapes are RAG, both ground the model in retrieved context. The line is who decides the *next* retrieval call. In static RAG, your code decides (one query, one top-k, done). In agentic RAG, the model decides each next call as the loop runs.
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  lib/agents/pipeline.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here
+  │  ★ agentic RAG (★ THIS ★, vector-RAG flavor):     │
+  │    runAgentLoop with tools = [vector_search,     │
+  │      rerank, fetch_chunk] — model decides each   │
+  │      next retrieval call from the prior result   │
+  │  ── absent in blooming insights ──                │
+  │                                                   │
+  │  blooming insights' actual shape:                 │
+  │    runAgentLoop with tools = [execute_eql,        │
+  │      get_event_segmentation, …]                   │
+  │    same LOOP shape, retrieval target is live MCP  │
+  └─────────────────────────┬────────────────────────┘
+                            │  every tool call
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  lib/tools/* | lib/mcp/client.ts                 │
+  │  Not yet implemented: vector store / embeddings   │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because the failure modes are different and you fix them at different layers. A static-RAG miss is a *retriever miss* — the top-k didn't contain the answer, you tune the embeddings, the chunk size, the reranker. An agentic-RAG miss is a *trajectory miss* — the model asked the wrong sequence of queries, or stopped too early, or never widened. You don't tune the index; you replay the agent's tool calls and find where the reasoning went off.
-
-Without naming the boundary:
-- A user asks "why did purchases drop?" — the diagnostic comes back wrong
-- You assume the retrieval was bad and start tuning the chunker
-- But there is no chunker — the retriever is a live EQL tool the model chose to call once with the wrong WHERE clause
-- The fix is in the prompt or in the loop's stopping rule, not in an index that does not exist
-
-With the boundary named:
-- A user asks "why did purchases drop?" — the diagnostic comes back wrong
-- You replay the agent's tool calls, see it ran one EQL and stopped, ask why
-- The fix is "the model should have widened the window" or "should have asked one more query" — a loop-shape problem, not an index problem
-
-One-line summary: **agentic RAG is a ReAct loop whose primary tool is retrieval — the model writes the query sequence at runtime instead of your code writing one query at build time.** Here's how that plays out when the retriever is a live API call rather than a vector index.
+**Zoom in — narrow to the concept.** The question is: when does retrieval stop being a one-shot pipeline step (static RAG) and start being a loop the model drives? The line is who decides the *next* retrieval call — your code (one query, one top-k, done) or the model (each call shaped by the prior result). blooming insights does NOT implement vector RAG; surface-level intent matching via `String.includes` in `lib/agents/intent.ts` is what exists instead. Below, you'll see the agentic-RAG loop shape — and why blooming insights' live-tool agents are the closest architectural analog.
 
 ---
 
@@ -387,3 +396,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

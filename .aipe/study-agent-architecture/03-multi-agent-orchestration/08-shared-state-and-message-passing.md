@@ -8,60 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** This concept lives at the seam between the Pipeline coordinator and the Per-agent definitions — the place where one agent's output becomes another agent's input. blooming insights' implementation here is *message passing*: the typed `Diagnosis` (defined in `lib/schemas/*`) is handed as a function argument from the diagnostic stage to `recommendation.propose(anomaly, diagnosis, hooks)`. There's no shared blackboard; each agent's window holds exactly what was handed to it. The cross-request carrier is `sessionStorage` plus a URL param, but the principle is identical: explicit typed messages, not global state.
 
 ```
-The two models
+  Zoom out — where shared-state vs message-passing lives
 
-  SHARED STATE (blackboard):       MESSAGE PASSING:
-  ┌──────────────────────┐         agent A ──msg──► agent B
-  │   shared context     │         agent B ──msg──► agent C
-  │  (all agents read     │         (each agent sees only
-  │   and write here)    │          what's passed to it)
-  └──────────────────────┘
-   ▲      ▲       ▲
-   A      B       C
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  lib/agents/pipeline.ts (the orchestrator)       │
+  └─────────────────────────┬────────────────────────┘
+                            │  ★ THIS ★ — the handoff
+                            ▼
+  ┌─ Per-agent definitions ─┴────────────────────────┐  ← we are here
+  │  diagnostic.ts produces  ──► Diagnosis (typed)    │
+  │       │                                            │
+  │       ▼  (message passing — function argument)     │
+  │  recommendation.propose(anomaly, diagnosis, hooks)│
+  │                                                    │
+  │  Alternative (shared state, NOT here):             │
+  │    a global WorkspaceState every agent reads/      │
+  │    writes; every agent's window carries every      │
+  │    other agent's content                           │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Schemas (orthogonal) ──▼────────────────────────┐
+  │  lib/schemas/* — the typed message contracts      │
+  └──────────────────────────────────────────────────┘
 ```
 
-You have a `<Wizard>` component. The form has three children — `<Step1>`, `<Step2>`, `<Step3>`. Two ways to share data between them:
-
-Option A: a single Redux store. Every step reads from and writes to the same global state. Step 3 has access to everything Step 1 and Step 2 wrote — and to everything irrelevant they also wrote.
-
-Option B: explicit props. Step 1 returns a typed value to the parent; the parent passes it as a prop to Step 2; Step 2 returns its typed value; the parent passes both as props to Step 3. Each step only sees what's been explicitly handed in.
-
-The first is shared state. The second is message passing. Now picture each step as an *agent* and the typed value as the model's input context. Same two shapes; bigger stakes.
-
-### Move 2 — name the question
-
-Those two shapes — shared blackboard vs explicit messages — are the two answers to **how do agents communicate?** The question this file answers: which one does blooming insights use, why, and what's the cost?
-
-The answer in this codebase is firmly *message passing*: the typed `Diagnosis` is handed from diagnostic agent to recommendation agent as a function argument (or, across requests, as a `sessionStorage` write + URL param read). The recommendation agent does NOT see the diagnostic agent's full conversation history, its tool calls, its scratchpad reasoning, or any other agent's context. It sees `inv` (the anomaly), `diagnosis` (the typed message), and its own prompt + tool subset.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because shared state and message passing have opposite failure modes, opposite cost profiles, and opposite debug shapes. Shared state is simple to reason about ("everyone can see everything") but expensive at scale (every agent's window carries every other agent's content) and unsafe (one bad write poisons every reader). Message passing is harder up-front (you have to design the schema of what gets passed) but scoped (each agent's context is exactly its job) and isolated (one agent's mistakes don't leak into another's window).
-
-In this codebase: the recommendation agent's prompt explicitly references `diagnosis.conclusion` and iterates over `diagnosis.evidence[]` — it operates on the *typed message*, not on a shared blackboard the diagnostic agent left behind. If the diagnostic agent went down a wrong path during its investigation (a hypothesis tested and rejected), the recommendation agent doesn't see the rejected hypothesis as context — it sees only what the diagnostic agent chose to include in the `Diagnosis` object. That curation is the point.
-
-### Move 4 — concrete before/after
-
-Shared state (hypothetical, NOT this codebase):
-- DiagnosticAgent investigates, makes 5 EQL calls, writes everything to a shared `WorkspaceState`
-- RecommendationAgent's context includes all 5 EQL responses (raw), all of DiagnosticAgent's intermediate reasoning, all the rejected hypotheses, plus the final conclusion
-- RecommendationAgent's window: ~40k tokens of context, much of it irrelevant
-- Recommendation drift: the recommendation agent might propose actions based on a rejected hypothesis it read from shared state
-
-Message passing (this codebase):
-- DiagnosticAgent investigates, makes 5 EQL calls, builds a typed `Diagnosis` object with `conclusion`, `evidence[]`, `hypothesesConsidered[]`
-- RecommendationAgent receives only the typed `Diagnosis` + the original anomaly
-- RecommendationAgent's window: ~8k tokens of context, all of it relevant
-- Recommendation focus: the recommendation agent operates on the conclusion + evidence, not on the diagnostic agent's full trajectory
-
-### Move 5 — one-line summary
-
-A shared blackboard is "every agent reads everyone's everything"; message passing is "each agent sees exactly what's been handed to it." blooming insights uses message passing — the typed `Diagnosis` is the message, the carriers are function args (in-process) and `sessionStorage` + URL param (cross-request) — because scoped context is cheaper and less noise, at the cost of having to design the schema. Here's how the mechanics work.
+**Zoom in — narrow to the concept.** The question is: how do agents communicate — through a shared blackboard or through explicit messages? Shared state is simple to reason about but expensive at scale (every window carries every other agent's content) and unsafe (one bad write poisons every reader). Message passing costs schema-design effort up-front but keeps each agent's context scoped to its job. blooming insights picked message passing — the typed `Diagnosis` is the contract. Below, you'll see both shapes, the cost ledger, and why a curated message beats a blackboard for this codebase's shape.
 
 ---
 
@@ -635,3 +610,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

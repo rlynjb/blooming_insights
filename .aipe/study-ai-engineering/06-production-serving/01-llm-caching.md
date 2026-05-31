@@ -8,25 +8,39 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You memoize a pure function with a `Map`: hash the arguments, check the map, return the stored value on a hit, compute and store on a miss. The hit path is free; the miss path pays once. Every cache you have ever written — `useMemo`, React Query's `staleTime`, a `WeakMap` of parsed results — is this shape with a different key function and a different eviction rule.
+**Zoom out — the bigger picture.** LLM caching is the wrappers band — same shape as the TTL cache example in the format brief, but the *layer* is what matters. Three caches sit at three different layers, and each protects a different cost: the MCP tool cache (`McpClient` `Map<key, {result, expiresAt}>` at `lib/mcp/client.ts` L18) protects rate-limited network calls; the investigation replay cache (`saveInvestigation`/`getCachedInvestigation` in `lib/state/investigations.ts`) protects whole agent runs; and the *prompt prefix cache* — which would sit at the Provider call alongside `anthropic.messages.create` — is the one this codebase has not built.
 
-An LLM application has three distinct things worth caching, and they sit at three different layers. The question this concept answers is: *which layer are you caching at, and is it the layer where the cost actually lives?*
+```
+  Zoom out — three cache layers, three different costs
 
-**That distinction is the whole game.** Caching the wrong layer wastes engineering effort and leaves the bill untouched. blooming insights re-sends a multi-thousand-token system prompt to Claude on every single turn of every agent loop — and caches none of it. It caches the MCP tool results (cheap to re-fetch, but slow and rate-limited) and the finished investigation (so a demo replays without burning a key). The expensive layer — the repeated prompt prefix — is the one gap.
+  ┌─ Pipeline + Per-agent ───────────────────────────┐
+  │  Investigation replay cache  saveInvestigation/   │
+  │   getCachedInvestigation     lib/state/           │
+  │   keyed by insightId  → whole agent run skipped   │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Agent loop ────────────▼────────────────────────┐
+  │                                                   │
+  │  ┌─ Provider wrappers ─────────────────────────┐ │  ← we are here
+  │  │  ★ THE THREE LAYERS ★                        │ │
+  │  │  (would-be) PROMPT PREFIX CACHE  ← ABSENT    │ │
+  │  │     cache_control on system + tools          │ │
+  │  │     (Anthropic native, ~90% prefix discount) │ │
+  │  │  TOOL CACHE  mcp/client.ts L18 (TTL 60s)    │ │
+  │  │     keyed by (toolName, JSON.stringify(args))│ │
+  │  │     no-cache-on-error  L58–60                │ │
+  │  └─────────────────────────────────────────────┘ │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  rate-limited (~1 req/s); the tool cache makes   │
+  │  identical EQL return in 0ms                     │
+  └──────────────────────────────────────────────────┘
+```
 
-Before naming the layers:
-- Same EQL query, same args, within 60s → re-hits Bloomreach over the network every time
-- Same investigation viewed twice → re-runs three agents and ~15 Claude calls
-- Same 2,000-token system prompt → re-tokenized and re-charged at full input price every turn
-
-After the layers blooming insights built (and the one it skipped):
-- Exact-match tool cache → identical EQL returns in 0 ms, no network, no rate-limit cost
-- Investigation replay cache → a viewed investigation streams from disk, zero Claude calls
-- Prompt cache (ABSENT) → the static prefix would re-cost ~10% of full input price on a hit
-
-It is three `Map`-shaped ideas keyed differently: by tool args, by investigation id, and (the missing one) by prompt prefix.
+**Zoom in — narrow to the concept.** The question is: which layer are you caching at, and is it the layer where the cost actually lives? Caching the wrong layer wastes effort and leaves the bill untouched. blooming insights re-sends a multi-thousand-token system prompt on every turn — the expensive repeated layer — and caches none of it. It does cache MCP tool results (cheap to re-fetch but slow + rate-limited) and finished investigations (so a demo replays without burning a key). How it works walks all three `Map`-shaped ideas, the keys, the TTLs, and the one gap.
 
 ---
 
@@ -374,3 +388,4 @@ What is the default TTL of the L1 tool cache, and on which line is it set? (Answ
 ---
 Updated: 2026-05-28 — Re-derived drifted refs after the client.ts/route.ts rewrites: cache key L102 / ttl L103 / read L105–L110 / no-cache-on-error L137–L139 / write L143–L144 (callTool L97–L146, field L80); replay branch route.ts L127–L141, REPLAY_DELAY_MS L105, saveInvestigation L254. L2 prompt-cache gap unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

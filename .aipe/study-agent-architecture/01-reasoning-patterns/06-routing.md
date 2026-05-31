@@ -8,29 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've built this in React without thinking of it as routing. The user types into a search box: `/products`, `Add a todo: buy milk`, `What's my balance?`. Your code looks at the prefix: `/` → command palette, `Add a todo:` → todo creator, anything else → search the docs. You wrote a small ladder of `if (input.startsWith('…'))` that decides *which feature handles the input* before any feature runs. The feature itself doesn't decide whether it should run — the router decides for it.
+**Zoom out — the bigger picture.** Routing in blooming insights lives at the seam between the Route handler and the Pipeline coordinator — and it spans an orthogonal intent-parsing band that sits alongside the request flow. The Route reads `?q=` or `?step=`, hands the free-text query to `parseIntent` in `lib/agents/intent.ts` (a `String.includes` heuristic, no LLM), and the Pipeline coordinator uses the result to pick which agent runs. This is a *cheap-deterministic-first* router; the LLM-classifier escalation that other codebases use sits in the same slot but doesn't fire here.
 
-Now picture the user typing free-form English: "what changed in revenue last quarter?" There's no `/` prefix to grep for, no fixed command. Your `if`-ladder runs out of conditions. You need something smarter: read the meaning, pick the handler. You can either teach the code more rules (regex, keyword lists, scoring), or you can hand the decision to a model.
+```
+  Zoom out — where routing lives
 
-That's the question this file answers: **how do you pick the right handler for an input before committing to it, when the handlers are different (different prompts, different tools, different budgets, sometimes different agents entirely)?** And then the harder one: **how do you split that decision between cheap-deterministic and expensive-LLM so you don't pay the LLM cost on inputs you could have routed for free?**
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts (reads ?q= / ?step=)     │
+  └─────────────────────────┬────────────────────────┘
+                            │  raw query string
+  ┌─ Intent parsing ────────▼────────────────────────┐  ← we are here
+  │  ★ parseIntent (lib/agents/intent.ts) ★          │
+  │  String.includes heuristic — no LLM call          │
+  │  (escalation slot for LLM-classifier: empty)      │
+  └─────────────────────────┬────────────────────────┘
+                            │  routed intent
+  ┌─ Pipeline coordinator ──▼────────────────────────┐
+  │  lib/agents/pipeline.ts picks the agent          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring | diagnostic | recommendation | query │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because routing is the bridge from one-agent thinking to multi-agent thinking. The same `if`-then-fallback shape that picks a *tool* inside a single ReAct loop picks an *agent* in a multi-agent system. If you understand the router's two-layer shape (heuristic first, LLM second), you understand the supervisor pattern in SECTION C. If you skip the routing step, you either run every agent on every input (wasteful) or you pick one agent statically (wrong sometimes).
-
-Without naming the routing layer:
-- User types "what changed last week?" → straight to DiagnosticAgent
-- DiagnosticAgent's prompt is "investigate this anomaly" — but there's no anomaly
-- The model freelances; the answer is shallow or hallucinated
-- You blame the prompt, but the bug was at the dispatch — wrong agent for the input
-
-With the routing layer:
-- User types "what changed last week?" → classify intent
-- "what changed" → MonitoringAgent intent → route to QueryAgent under that intent
-- QueryAgent's tool subset matches the question; the answer grounds
-- The fix was in the dispatch, not the prompt
-
-One-line summary: **a router is the dispatcher in front of your agent set — same shape as URL routing in your app, except the route is decided from natural-language intent and the destinations are agents.** Here's how that splits between heuristic and LLM in this codebase.
+**Zoom in — narrow to the concept.** The question is: how do you pick the right handler for an input before committing to it — and how do you split the decision between cheap-deterministic and expensive-LLM so you don't pay the LLM cost on inputs you could route for free? In blooming insights, the answer is one tier today (`String.includes`) with an empty escalation slot above it — an LLM classifier would slot in only when the heuristic stops being accurate enough. Below, you'll see the two-layer router shape and which tier blooming insights actually runs.
 
 ---
 
@@ -425,3 +429,4 @@ Open and verify. ✓ Files + function names + the path-firing rule matter; line 
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

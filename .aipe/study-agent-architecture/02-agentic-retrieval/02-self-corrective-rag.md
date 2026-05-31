@@ -8,29 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a search box that returns ten rows. The first row matches the query — title hit, snippet looks right — so you render it. But your code never asked "is the matching row *useful*?" A title can match a query and the row's actual content can be off-topic. The first nearest-neighbor is whatever was closest in the index, not whatever was relevant to the question. The two are not the same thing.
+**Zoom out — the bigger picture.** Self-corrective RAG would sit at the Shared agent loop ↔ Tools seam — a grader between "retrieved chunks came back" and "the model uses them," with a fallback path (rewrite query / widen / escalate) when the grader says "not relevant." In blooming insights there's no retrieval pipeline to gate, so this band has no corrective-RAG loop. What sits in the closest architectural slot is a *premise gate* in the diagnostic flow: if the monitoring step found no anomaly, the pipeline doesn't run a diagnostic at all (no retrieval to correct because no question is being asked). Different problem, same shape — a gate that decides whether the downstream work is worth doing.
 
-Now picture a model reading those ten rows and answering the user's question from them. The model will use whatever's in the window — including off-topic chunks that happened to embed close. The answer comes out fluent, the citations look real, and the chunk it cited *was* retrieved. None of that proves the chunk was *relevant*, and none of it proves the answer is *grounded* in it.
+```
+  Zoom out — where self-corrective RAG WOULD live
 
-That's the question this file answers: **how do you tell whether retrieval actually returned the right context, before the model uses it to answer?** Not "did anything come back" — something always comes back. The line is between *retrieval success* (the index returned chunks) and *answer success* (the chunks were relevant and the answer is grounded in them). They are different success criteria.
+  ┌─ Shared agent loop ─────────────────────────────┐  ← we are here
+  │  runAgentLoop calls a retrieval tool             │
+  └─────────────────────────┬────────────────────────┘
+                            │  retrieved chunks
+  ┌─ Grader / corrective ───▼────────────────────────┐  ← ★ THIS ★ (absent)
+  │  ★ score relevance + groundedness ★               │
+  │   pass → continue to generate                     │
+  │   fail → rewrite query, widen, or escalate        │
+  │  ── absent in blooming insights ──                │
+  │  closest analog: premise gate in pipeline.ts —    │
+  │  if no anomaly, no diagnostic runs                │
+  └─────────────────────────┬────────────────────────┘
+                            │  validated context
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  lib/tools/* | lib/mcp/client.ts                 │
+  │  Not yet implemented: retrieval index / grader    │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because retrieval can succeed by every infrastructure metric (the index responded, the top-k came back, no errors) and still hand the model garbage. Without a relevance check, "we retrieved" is silently equated with "we have the right answer," and the failure shows up downstream as a confidently wrong response with real-looking citations. The bug isn't in the index; it's in the absence of a gate between the index and the model.
-
-Without a relevance gate:
-- A user asks "why did checkout conversion drop?"
-- The retriever returns five chunks; two are about a different funnel, one is from last quarter, two are loosely related
-- The model answers fluently from what's in the window, citing the loosely related chunks
-- The user trusts the answer; the answer is grounded in the wrong evidence
-
-With a relevance gate:
-- A user asks "why did checkout conversion drop?"
-- The retriever returns five chunks; a grader scores each: relevant? grounded?
-- The two off-topic chunks are dropped; the loosely related ones are flagged
-- The model either answers from the relevant subset, or the fallback path runs (rewrite query, widen search, escalate to human)
-
-One-line summary: **the grader is the gate that separates "retrieval ran" from "retrieval helped" — a relevance check between retrieve and generate, with a fallback for when the check fails.** Here's the shape of the pattern, and where blooming insights has it (it doesn't, on the retrieval path itself) and where it has something adjacent (yes — on the *premise* of retrieval).
+**Zoom in — narrow to the concept.** The question is: how do you tell whether retrieval actually returned the right context — before the model uses it to answer? Self-corrective RAG inserts a grader between retrieve and generate, with a fallback path when the grader flags off-topic or ungrounded chunks. blooming insights does NOT implement this on a retrieval path (no retrieval exists); the closest architectural analog is the premise gate that decides whether a diagnostic should run at all. Below, you'll see the grader/fallback mechanics and where blooming insights' premise gate parallels them.
 
 ---
 
@@ -437,3 +441,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

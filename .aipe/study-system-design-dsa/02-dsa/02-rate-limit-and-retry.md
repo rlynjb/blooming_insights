@@ -8,15 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Your autocomplete input fires a `fetch` on every keystroke. After three fast keystrokes the server returns 429s. You reach for `debounce` to stop the flood, and when a call still slips through and 429s you retry it — capped at three attempts so it can't spin forever.
+**Zoom out — the bigger picture.** Rate-limit spacing + bounded retry are the second and third stages of `McpClient.callTool` (`lib/mcp/client.ts`), just below the TTL cache and just above the live transport call. The spacing gate lives inside `liveCall`; the retry loop lives in `callTool` and re-enters `liveCall` on each attempt, so retries automatically inherit the spacing. Both policies are in the Provider wrappers band, between the Agent loop above and the `SdkTransport` → Bloomreach MCP server below — they are the proactive + reactive defenses for the same ~1 req/s server limit.
 
-The question is: **how does a client guarantee a minimum gap between live calls AND recover from a transient rate-limit hit without spinning forever?**
+```
+Zoom out — where spacing + retry live
 
-**Bloomreach enforces ~1 req/sec per user GLOBALLY.** A single briefing agent fires 6–13 sequential MCP calls. Without spacing, back-to-back calls arrive at Bloomreach faster than 1/sec and trip "Too many requests." Without bounded retry, one transient 429 kills the entire briefing run. With unbounded retry, a persistent limit could spin the loop indefinitely.
+┌─ Agent loop ───────────────────────────────────┐
+│  runAgentLoop → mcp.callTool(name, args)       │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Provider wrappers ─▼──────────────────────────┐  ← we are here
+│  McpClient.callTool                            │
+│  ┌────────────────────────────────────────┐    │
+│  │ TTL cache (miss → continue)            │    │
+│  │     ↓                                   │    │
+│  │ ★ spacing gate (1100 ms) — liveCall ★ │    │
+│  │     ↓                                   │    │
+│  │ transport.callTool → result            │    │
+│  │     ↓                                   │    │
+│  │ ★ bounded retry on isRateLimited ★    │    │
+│  │     (re-enters liveCall — inherits     │    │
+│  │      the spacing gate)                  │    │
+│  └────────────────────────────────────────┘    │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Transport + MCP ──────────────────────────────┐
+│  SdkTransport → Bloomreach (~1 req/s)          │
+└────────────────────────────────────────────────┘
+```
 
-It is a `throttle` + bounded fixed-delay backoff, inside one client method.
+**Zoom in — narrow to the concept.** The question is: how does a client guarantee a minimum gap between live calls AND recover from a transient 429 without spinning forever? Two policies composed in one method. The spacing gate reads `elapsed = Date.now() - lastCallAt` and awaits `minIntervalMs - elapsed` if needed — proactive, prevents most 429s. The bounded retry detects rate-limit responses by shape (`isError === true` + regex on the serialized content), sleeps a parsed retry-after hint or capped exponential backoff, and re-enters `liveCall` up to `maxRetries` times — reactive, recovers from the ones that slip through. The next sections name the four load-bearing pieces (spacing gate, `lastCallAt` clock, rate-limit detector, bounded retry + ceiling) and the one piece of optional hardening this codebase ships (`parseRetryAfterMs`).
 
 ---
 
@@ -473,3 +496,4 @@ Under what conditions does the parsed-hint path beat the raw backoff? Is jitter 
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now prefers a parsed retry-after window / exponential backoff capped at `retryCeilingMs` (defaults `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

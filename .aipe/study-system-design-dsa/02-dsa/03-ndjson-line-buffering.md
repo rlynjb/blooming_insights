@@ -8,21 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You call `fetch('/api/agent?insightId=…')`, get a `ReadableStream` back, call `getReader()`, and loop over `reader.read()` chunks. Each chunk is a `Uint8Array`. You decode it and call `JSON.parse`. On the first real run, one chunk arrives decoded as:
+**Zoom out — the bigger picture.** NDJSON line-buffering lives in the UI band — three reader loops share the same `buf.split('\n')` + `lines.pop()` pattern: `lib/hooks/useInvestigation.ts` (investigation step 2 + step 3 consumer), `app/page.tsx` L418–L443 (feed's live monitoring stream), and `app/page.tsx` L171–L192 (feed's capture-drain helper). The bytes come in over the HTTP network boundary from the two route producers (`app/api/agent/route.ts` and `app/api/briefing/route.ts`); the framing decision (newline-delimited JSON) is set by `lib/mcp/events.ts`. The reverse-scan reconciliation for `tool_call_start`/`tool_call_end` pairs is factored into the same hook (`replaceRunningTool`, L86–L95).
 
 ```
-{"type":"tool_call_start","toolName":"fetch_metrics","agent":"diagn
+Zoom out — where NDJSON line-buffering lives
+
+┌─ Route handler (producer) ─────────────────────┐
+│  /api/agent · /api/briefing                    │
+│  send(e) = controller.enqueue(JSON.stringify(e)│
+│            + '\n')                             │
+└─────────────────────┬──────────────────────────┘
+                      │  TCP chunks may split a line mid-byte
+                      ▼
+┌─ UI (consumer) ────────────────────────────────┐  ← we are here
+│  ★ lib/hooks/useInvestigation.ts L184–L208 ★  │
+│      reader loop · buf.split('\n') · pop()    │
+│  ★ app/page.tsx L418–L443 (feed live) ★       │
+│  ★ app/page.tsx L171–L192 (capture drain) ★   │
+│                                                 │
+│  ★ replaceRunningTool (reverse scan) L86–L95 ★│
+│      (pairs tool_call_end with last running    │
+│       item by toolName)                        │
+│         │                                       │
+│         ▼                                       │
+│  setItems / setDiagnosis / setRecommendations  │
+│  → React re-renders ReasoningTrace             │
+└────────────────────────────────────────────────┘
 ```
 
-`JSON.parse` throws `SyntaxError: Unexpected end of JSON input`. The object was cut in half mid-flight. Nothing in `fetch` or `ReadableStream` guarantees that chunk boundaries fall on newlines — they fall wherever TCP and the HTTP layer decide to flush.
-
-**The question:** how do you reassemble complete records when network chunks can arrive with an object split across two of them?
-
-**Without buffering, valid events are silently dropped or throw.** The reasoning trace misses tool calls. The pipeline pill never advances. The UI freezes at "connecting to agent…" because `tool_call_end` never fires to resolve the `running` item. You have no error to act on — the `catch` block just swallows the parse failure and moves on.
-
-The one-line reduction: split on the newline delimiter, but always carry the last incomplete piece forward into the next iteration.
+**Zoom in — narrow to the concept.** The question is: how do you reassemble complete JSON records when network chunks can arrive with an object split across two of them? The answer is a string `buf` that persists across `reader.read()` iterations, with one invariant — after every iteration, `buf` holds at most one incomplete record. Append the decoded chunk (with `{ stream: true }` so multi-byte UTF-8 doesn't get truncated), `split('\n')` on the buffer, `pop()` the last element back into `buf` (it's either empty or the next partial), and `JSON.parse` everything else. A companion reverse scan then reconciles `tool_call_end` events with the matching earlier `tool_call_start` items in React state. The next sections trace exactly what happens to `buf` across two chunks when a `tool_call_start` lands split in the middle.
 
 ---
 
@@ -461,3 +477,4 @@ Show every variable at every step: `buf` before and after each chunk, `lines`, `
 ---
 Updated: 2026-05-28 — repointed the reader-loop + reverse-scan reconciliation refs from `app/investigate/[id]/page.tsx` (now removed) to the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208, L86–L121) and the feed's own loop (`app/page.tsx` L418–L443); noted the hook's started-guard + no-cancel-on-cleanup StrictMode decision
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

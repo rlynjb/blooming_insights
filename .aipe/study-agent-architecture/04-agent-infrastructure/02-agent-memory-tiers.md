@@ -8,27 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Picture the storage layering you already use in a frontend app. There's React state — what's true *right now*, gone on unmount. There's sessionStorage — what's true *for this tab*, gone when the tab closes. There's localStorage / IndexedDB — what's true *for this user, persisted across sessions*, kept until they clear it. Three tiers, different durability, and you choose which one to write to based on how long the data needs to live. A typed-but-unsubmitted form goes to React state; a multi-step flow's progress goes to sessionStorage; a user's theme preference goes to localStorage. Wrong tier and you either lose data the user expected to keep, or you persist data that should have been ephemeral.
+**Zoom out — the bigger picture.** Agent memory tiers cut across the whole request: working memory lives inside the Shared agent loop (the `messages[]` array growing turn by turn); episodic memory lives between stages of the Pipeline coordinator (the typed `Diagnosis` handed forward, or the cross-request `sessionStorage` + URL handoff); long-term memory would sit *orthogonal* to the request flow entirely (a persistent store outside any band). In blooming insights, the first two are explicit and named; the third is absent — there's no persistent user-preference store, so the agent is amnesic across sessions by design.
 
-An agent has the same problem, with the same shape. Inside a single task it needs the running scratchpad — "I asked tool X, it returned Y, so now I want Z." Across tasks within a short window — "the user already gave me their workspace ID last turn, I shouldn't re-ask" — it needs something more durable but still task-scoped. And across sessions — "this user prefers monthly windows, not weekly; last month they tagged the holiday spike as expected" — it needs persistent knowledge that survives every kind of restart.
+```
+  Zoom out — where the memory tiers live
 
-That tiered storage question is what this file answers: **how do you split an agent's memory so the right thing is remembered at the right scope?** Not "is there a database" (every system has storage). The architectural question is which *tier* each piece of state belongs in, and the same answer that wrong-tiers your frontend data wrong-tiers your agent data.
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here (episodic)
+  │  lib/agents/pipeline.ts                          │
+  │  ★ episodic memory ★: typed Diagnosis flows from │
+  │  stage to stage (in-process function arg, or     │
+  │  cross-request sessionStorage + URL handoff)     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here (working)
+  │  runAgentLoop                                     │
+  │  ★ working memory ★: messages[] grows per turn    │
+  │  (gone the moment the loop returns)               │
+  └──────────────────────────────────────────────────┘
 
-**Why answering that question matters:** because the failure modes are silent and they degrade the agent in different ways. Putting a long-term user preference in working memory means the agent forgets it the second the run ends. Putting transient tool results in long-term memory bloats retrieval and pollutes future runs. Skipping a tier entirely means the agent can't do what its job description implies — a "personal" agent without long-term memory isn't personal, it's just amnesic with a friendly tone.
+  Orthogonal (NOT in the request flow):
+  ┌─ Long-term memory ──────────────────────────────┐  ← absent
+  │  ★ THIS ★ (absent in blooming insights)           │
+  │  Would be: persistent user-preference store,      │
+  │  retrievable by relevance across sessions.        │
+  │  Today: agent is amnesic between sessions.        │
+  └──────────────────────────────────────────────────┘
+```
 
-Without naming the tiers:
-- A user finishes a diagnosis, scrolls to recommendations, the diagnosis is *gone* — the agent has no memory of step 2's conclusion
-- Or worse, the agent re-runs all of step 2 because there's no handoff
-- Or the agent "remembers" the workspace ID by inventing one, because it had no real memory of it
-
-With them:
-- Working memory holds this turn's tool calls and reasoning (the `messages[]` array)
-- Episodic memory holds the just-finished diagnosis so step 3 can read it without re-running
-- Long-term memory (if present) holds the user's persistent preferences
-
-One-line summary: **agent memory is your storage-layering instinct from frontend, applied to an LLM's knowledge — pick the tier by how long the fact needs to live, not by what's easiest to grab.** Here's how the tiers actually map in this codebase, including the one that doesn't exist yet.
+**Zoom in — narrow to the concept.** The question is: how do you split an agent's memory so the right thing is remembered at the right scope? Same instinct you use for React state vs sessionStorage vs localStorage — pick the tier by how long the fact needs to live, not by what's easiest to grab. Wrong tier and you either lose data the user expected to keep, or you persist data that should have been ephemeral. Below, you'll see the three tiers, what blooming insights has wired today (working + episodic), and what changes when the third tier (long-term) becomes a requirement.
 
 ---
 
@@ -432,3 +441,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

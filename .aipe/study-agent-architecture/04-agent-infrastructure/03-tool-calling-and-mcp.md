@@ -8,29 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've got a React app with a custom hook that wraps `fetch`. Every component that needs data calls `useFetch('/api/projects')` or `useFetch('/api/events')`. The endpoints aren't defined in the components — they're defined once on the server, in routes the components have never seen. The component knows the *shape* of the call (URL + JSON in, JSON out) and the *contract* of the response (the types). It doesn't know — or care — what file handles `/api/projects` on the backend. One endpoint definition, every component reuses it.
+**Zoom out — the bigger picture.** Tool calling + MCP lives at the seam between the Shared agent loop and the External world — the Tools band (`lib/tools/*`) defines what's available, the MCP transport band (`lib/mcp/client.ts`) carries the call to the Bloomreach MCP server, and the response flows back as the next observation the model reads. One client, one discovery surface, four agents reuse it — per-agent surfaces are filters at the boundary, not separate tool definitions.
 
-Now picture the same shape for an LLM. The model needs to "call tools" — query a database, hit an API, search a catalog — but it doesn't have code, it has tokens. Something has to (1) tell the model which tools exist and what their inputs look like, (2) execute the call when the model emits one, and (3) feed the result back as the next "input" the model reads. And in a system with multiple agents, you don't want to re-define the same tools four times — you want one definition, every agent reuses it, with each agent seeing only the slice of tools its job needs.
+```
+  Zoom out — where tool calling + MCP lives
 
-That substrate question is what this file answers: **what's the connective tissue under every reasoning pattern that lets the model actually *do* things, and how do you avoid wiring it per-agent?** Not "what's a tool call" (that's mechanics; the AI-eng tool-calling file covers it). The architectural question is **the protocol that standardizes how agents discover, call, and share tools across a system** — which is what MCP, the Model Context Protocol, does.
+  ┌─ Per-agent definitions ─────────────────────────┐
+  │  each agent's tool subset (via filterToolSchemas) │
+  └─────────────────────────┬────────────────────────┘
+                            │  emits tool_use blocks
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop (lib/agents/loop.ts)               │
+  │  parses tool_use → dispatches to MCP client       │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Tools + MCP transport ─▼────────────────────────┐  ← we are here
+  │  ★ lib/tools/* (tool definitions / filters) ★     │
+  │  ★ lib/mcp/client.ts (StreamableHTTPClient) ★     │
+  │  one client per request; listTools + callTool     │
+  └─────────────────────────┬────────────────────────┘
+                            │  HTTPS
+  ┌─ External ──────────────▼────────────────────────┐
+  │  Bloomreach MCP server (cloud — the tool host)   │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because the cost of wiring tools per agent compounds. Two agents that both need to query analytics quickly become two slightly different `executeAnalytics` definitions, drifting in arg shape, drifting in error handling, drifting in how they handle the workspace's project_id requirement. Multiply by four agents and you've got a per-agent integration tax on every new tool. MCP collapses that: one server defines the tools, all agents discover them via the same protocol, you slice per agent at the boundary.
-
-Without a protocol like MCP:
-- Each agent has its own `tools = [{name: 'execute_eql', input_schema: ...}, ...]` array
-- A schema change in one tool requires editing four files
-- Connection logic (auth, retries, rate limiting) gets re-implemented per agent
-- Tool drift is silent — three agents call slightly different versions of "the same" tool
-
-With MCP:
-- One server (loomi connect) defines the tools
-- One client (`McpClient`) discovers them via `listTools()` and calls them via `callTool()`
-- Per-agent surfaces are a *filter* over the discovered list, not a separate definition
-- Auth (OAuth), rate limiting (~1.1s spacing), caching (60s TTL), and backoff live once, in the client
-
-One-line summary: **MCP is the `/api` boundary for LLMs — one definition on the server, every agent calls it the same way, the per-agent surface is a filter at the boundary, not a fork.** Here's how that plays out in this codebase, including the parts that earn their complexity (OAuth + rate-limit retry + caching) because the tool host imposes them.
+**Zoom in — narrow to the concept.** The question is: what's the connective tissue under every reasoning pattern that lets the model actually *do* things — and how do you avoid wiring it per agent? MCP is the `/api` boundary for LLMs: one definition on the server, every agent calls it the same way, the per-agent surface is a filter (`filterToolSchemas`) at the boundary, not a fork. The cost of skipping the protocol is per-agent drift on shared tools; the cost of adopting it is the auth / rate-limit / caching plumbing the tool host imposes, paid once in `lib/mcp/client.ts`. Below, you'll see the discovery + execute mechanics and what each piece of the client's complexity earns.
 
 ---
 
@@ -479,3 +484,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

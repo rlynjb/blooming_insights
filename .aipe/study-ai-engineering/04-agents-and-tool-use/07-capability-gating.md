@@ -8,27 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have shipped a dashboard that conditionally renders. You read a `capabilities` object from the API and you only render the "export to CSV" button when `capabilities.export === true`; the feature isn't disabled-and-greyed after a click fails, it's *never offered* because the backend can't back it. That is a capability gate: a cheap check against what the backend actually supports, run *before* you commit the user to an action that would fail.
-
-The question this file answers: when an agent's work is a list of independent checks, and each check needs specific data, how do you stop the agent from spending an expensive, rate-limited budget on checks the data can't support?
-
-**Answering it matters because the agent's budget is the scarce resource, and the failure mode is silent waste.** The monitoring agent runs against Bloomreach's MCP server at roughly one request per second, inside a 300-second function ceiling, with a hard `maxToolCalls` cap. Every category it investigates costs a slice of that budget. If you let it run all ten anomaly categories, three of them — search failure, return spikes, fraud — query events this workspace never emits, and come back empty. That's three wasted slots, three pulls of irrelevant context, and a slower briefing, for guaranteed-nothing. The fix is not a better prompt telling the agent "skip categories without data" — the agent can't know what the schema holds until it queries. The fix is **scope before spend**: run a free, in-memory check against the schema first, and hand the agent only the runnable subset.
-
-Before and after gating:
+**Zoom out — the bigger picture.** Capability gating sits *between* the Per-agent definitions and the Tools layer: a cheap in-memory check of the live `WorkspaceSchema` decides which categories the monitoring agent is even *offered*. The gate (`schemaCapabilities` → `coverageReport` → `runnableCategories` in `lib/agents/categories.ts`) runs in the Briefing route *before* `MonitoringAgent.scan` is called, and the runnable set is passed in as the agent's checklist (`scan(hooks?, categories=[])` at `lib/agents/monitoring.ts` L69, injected via `{categories}` slot at L73–L86).
 
 ```
-No gate                                  Gated (this codebase)
-──────────────────────────────────       ──────────────────────────────────
-agent runs all 10 categories             schemaCapabilities(schema) → Set
-  → search_failure queries `search`        coverageReport → 7 runnable, 3 unavailable
-    events that don't exist → empty      agent.scan(hooks, runnable)  ← 7 categories
-  → 3 wasted rate-limited slots,           → never queries the 3 the data can't support
-    slower briefing, empty results       UI: 3 "no data source" ghost tiles (honest)
+  Zoom out — where the gate sits
+
+  ┌─ Route (briefing) ───────────────────────────────┐
+  │  bootstrapSchema(conn.mcp) → WorkspaceSchema      │
+  │  schemaCapabilities(schema) → Set                 │
+  │  coverageReport → runnableCategories              │  ← we are here
+  │    app/api/briefing/route.ts L202–204             │
+  └─────────────────────────┬────────────────────────┘
+                            │  runnable[] (subset of 10)
+  ┌─ Per-agent ─────────────▼────────────────────────┐
+  │  ★ scan(hooks, runnable) ★                        │
+  │  builds per-category checklist into {categories}  │
+  │  prompt slot   monitoring.ts L73–86, L69          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Agent loop + Tools ────▼────────────────────────┐
+  │  model only sees & queries the runnable categories│
+  │  → no wasted budget on unsupported categories      │
+  └──────────────────────────────────────────────────┘
 ```
 
-One-line summary: **a capability gate is a cheap in-memory check of the live schema that scopes the agent's work before it spends a rate-limited budget — and produces the UI's coverage state from the same computation.**
+**Zoom in — narrow to the concept.** The question is: when an agent's work is a list of independent checks, and each check needs specific data, how do you stop the agent from spending an expensive, rate-limited budget on checks the data cannot support? The fix is not a better prompt — the agent cannot know what the schema holds until it queries. The fix is *scope before spend*: run a free in-memory check against the schema first, and hand the agent only the runnable subset. How it works walks the three-stage gate (capabilities → coverage → runnable), and how the same computation produces both the agent's checklist and the UI's coverage grid.
 
 ---
 
@@ -318,3 +324,4 @@ What two outputs does the gate produce from a single `coverageReport`, and who c
 ---
 Updated: 2026-05-29 — created (the anomaly-coverage schema gate: scope the monitoring agent's category checklist against the live schema before spending the rate-limited budget)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

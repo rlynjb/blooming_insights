@@ -8,67 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** Supervisor-worker is a *role* at the Pipeline coordinator band — whoever decomposes the task, picks the worker, and merges results. In blooming insights, that role is played by code, not a model: the supervisor IS `lib/agents/pipeline.ts` (and the `if`-ladder in `app/api/agent/route.ts` that picks which lead agent runs). The workers are the per-agent definitions one band below. The LLM-supervisor variant would replace the Pipeline band's owner with an agent that reasons about each next worker; the workers and the loop below stay identical either way.
 
 ```
-The supervisor-worker shape
+  Zoom out — where the supervisor role lives
 
-         ┌─────────────────────────────────┐
-         │       Supervisor                │
-         │  (decomposes task, delegates,    │
-         │   collects results, synthesizes) │
-         └──────┬──────────┬──────────┬─────┘
-                ▼          ▼          ▼
-           ┌────────┐ ┌────────┐ ┌────────┐
-           │worker A│ │worker B│ │worker C│
-           │(spec.) │ │(spec.) │ │(spec.) │
-           └────┬───┘ └────┬───┘ └────┬───┘
-                └──────────┼──────────┘
-                           ▼
-                  supervisor synthesizes
-                  worker results → answer
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts (entry-point if-ladder)  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
+  │  ★ SUPERVISOR ROLE ★                              │
+  │  Today (CODE supervisor):                         │
+  │    lib/agents/pipeline.ts — sequential, no LLM    │
+  │  Alternative (LLM supervisor):                    │
+  │    a supervisor agent reasons each next worker    │
+  │    (+1 loop, +1 budget, +1 debug suspect)         │
+  └─────────────────────────┬────────────────────────┘
+                            │  delegates to workers
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring | diagnostic | recommendation | query │
+  │  (the workers — unchanged either way)             │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop — each worker runs this            │
+  └──────────────────────────────────────────────────┘
 ```
 
-You have a manager `<Page>` component. It receives a user request, owns the overall state, and delegates rendering to three child components — one for the header, one for the list, one for the footer. Each child does its job and returns its rendered output; the page assembles the final UI from those three returns.
-
-Now picture that, but the children are *agents*, and the parent is also a *kind of agent* — except the parent's job isn't to render UI, it's to decide which children to invoke, in what order, and how to merge their answers.
-
-### Move 2 — name the question
-
-That parent — the role that decomposes a user request into sub-jobs, picks which worker runs each one, and merges the workers' outputs back into a single answer — is what supervisor-worker names. The question this file answers: **when does that supervisor role need to be a model, and when can code play the same role?**
-
-That last clause matters. The shape is the same either way. A supervisor is whoever decomposes-delegates-merges; it does not have to be an LLM. blooming insights' route file plays exactly that role, just deterministically.
-
-### Move 3 — why answering that question matters
-
-**What depends on getting this right:** the entire cost ledger of your multi-agent system. An LLM supervisor pays a model call per ordering decision, runs its own ReAct loop with its own iteration cap, and adds a third suspect to every bug ("did the supervisor mis-route?"). A code supervisor pays zero extra LLM cost and adds zero extra suspects — but it can only express decompositions you can predict.
-
-The thing to refuse: the implicit claim that "supervisor-worker" requires an LLM supervisor. It doesn't. The pattern is about *the role*, not the implementation. Most production multi-agent systems use code supervisors and tell themselves they're "not really multi-agent" — they are. They've just been honest about not needing a model for the supervisor's job.
-
-In this codebase: there is a supervisor. It lives in `app/api/agent/route.ts` L199–L249. It decomposes the user journey (free-form query vs anomaly investigation vs split-step recommend), picks the worker agent, and hands one worker's output (the typed `Diagnosis`) to the next worker. It is a supervisor that does not reason — and that's the deliberate choice.
-
-### Move 4 — the two flavors, walked
-
-LLM supervisor flavor (not this codebase):
-- User: "compare last week's revenue to the prior week"
-- Supervisor agent reads the request, picks worker A (analytics), delegates
-- Worker A returns data
-- Supervisor decides whether to call worker B (segments) based on what A returned
-- Supervisor synthesizes a final paragraph from both workers' results
-- Cost: 3 agent loops (supervisor + 2 workers) + supervisor synthesis cost
-
-Code supervisor flavor (this codebase):
-- User opens an anomaly card → route reads `insightId` query param
-- `if`-ladder in `route.ts` picks `DiagnosticAgent` (decomposition is hard-coded — the user journey is the decomposition)
-- Diagnostic worker investigates, returns a typed `Diagnosis`
-- Route hands the diagnosis to `RecommendationAgent.propose(...)` — the merge is a function call, not a model
-- Cost: 2 worker loops, zero supervisor LLM cost
-
-### Move 5 — one-line summary
-
-A supervisor-worker is one role (decompose-delegate-merge) over a set of specialists; blooming insights has the role played by code (`route.ts`'s `if`-ladder), not by a model. Here's how both flavors work.
+**Zoom in — narrow to the concept.** The question is: when does the supervisor role need to be a model, and when can code play the same role? The shape is identical either way — decompose, delegate, merge — only the implementation changes. blooming insights has a supervisor; it just doesn't reason. Below, you'll see both flavors walked and why this codebase's order-is-knowable property lets code play the supervisor for free.
 
 ---
 
@@ -514,3 +483,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

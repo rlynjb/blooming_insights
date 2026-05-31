@@ -8,25 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a form component that renders the same way every time and a payload that fills its fields per request — the markup is fixed, the data is variable, and you do not regenerate the markup on every keystroke. A production prompt is that exact split. The `.md` file is the fixed markup; `{project_id}` / `{anomaly}` / `{diagnosis}` / `{intent}` and the `userPrompt` are the per-request fields. Get the split wrong — bake the variable into the constant, or scatter the constant across call-sites — and you lose the one thing that makes a prompt debuggable: a stable thing to diff against.
+**Zoom out — the bigger picture.** Prompt anatomy lives squarely inside the Per-agent definitions band — the layer where each agent's system prompt is assembled before `runAgentLoop` ever sees it. The `.md` file is loaded at module import in the agent class; the per-call `.replace` chain runs right above the loop; the synthesis append happens one band lower, inside `base.ts`. So when you ask "what does the model actually read this turn?" you are looking at three sites that span the boundary between Per-agent definitions and the Shared agent loop.
 
-The question this file answers: when you open `lib/agents/prompts/diagnostic.md`, what are you actually looking at, which parts are the same on every call, and which parts get stamped in at runtime?
+```
+  Zoom out — where prompt anatomy lives
 
-**The pivot: a production prompt is not one blob — it is a constant system file plus per-call injection plus a last-second synthesis nudge, and knowing which layer a given line lives in is what lets you change behavior without breaking three other things.** When a diagnosis comes back malformed, the first question is "did the constant change or did the injected payload change?" If you can't answer that instantly, you don't have a prompt — you have a string you're afraid of.
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  monitoring → diagnostic → recommendation        │
+  └─────────────────────────┬────────────────────────┘
+                            │  per-agent
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
+  │  ★ .md file (Layer 1) + .replace (Layer 2) ★    │
+  │  lib/agents/prompts/*.md   monitoring.ts L12     │
+  └─────────────────────────┬────────────────────────┘
+                            │  system string
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  ★ synthesis append (Layer 3) ★  base.ts L96–98 │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  anthropic.messages.create  (sees assembled bytes)│
+  └──────────────────────────────────────────────────┘
+```
 
-Before you see the anatomy:
-- "The prompt" is a vague monolith; a regression could be anywhere
-- You can't tell whether `{anomaly}` arrived malformed or the Role drifted
-- Adding a fourth agent means copy-pasting an undocumented shape and hoping
-
-After:
-- Six named sections, same order in all four files — you read the new one in 30 seconds
-- The injected placeholders are a closed set you can grep for: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, `{categories}` (the last is monitoring-only)
-- The synthesis nudge is in one place (`base.ts` L98), not smeared into every prompt
-
-It is the markup-vs-data discipline, applied to a string the model reads instead of a browser.
+**Zoom in — narrow to the concept.** The question is: when you open `diagnostic.md`, which lines are the same on every call, which get stamped in at runtime, and which only show up on the final turn? Anatomy answers that by naming three time-layers — the constant `.md` file, per-call `.replace` injection, and the synthesis append on the forced-final turn — so every line you can point at traces to exactly one layer. Below, you'll see the six shared sections, the closed placeholder set, and why the synthesis string lives in code rather than in the `.md`.
 
 ---
 
@@ -356,3 +363,4 @@ In `lib/agents/base.ts`, what exactly is the `system` value on the forced-final 
 ---
 Updated: 2026-05-29 — Corrected stale monitoring.md section line refs (Role L3 / Hard rules L13 / method L20 / EQL reminders L49 / Output L69 / schema L99) and added the `## Your category checklist` section (L7, `{categories}` slot L11) as monitoring's seventh section and a 4th per-call injection placeholder (`monitoring.ts` L69–86).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

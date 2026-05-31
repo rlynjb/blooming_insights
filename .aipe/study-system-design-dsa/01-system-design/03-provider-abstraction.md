@@ -8,27 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a `<UserList />` component that calls `fetch('/api/users')` directly inside `useEffect`. The component works in the browser. Now you write a test. The test environment has no network, so `fetch` errors, or you're forced to intercept it with `msw` or `vi.mock`. Neither option is great: `msw` is a full interceptor layer, and `vi.mock` ties the test to the import path of whatever `fetch` polyfill you're using. What you really want is to pass the data-fetcher as a prop — `<UserList fetchUsers={fn} />` — so the test hands in a function that returns a fixed array, no network required. That prop is the seam.
+**Zoom out — the bigger picture.** The provider/transport abstraction is a vertical seam, not a horizontal band — it cuts through the Agent loop band (`McpCaller` interface) and the Provider wrappers band (`McpTransport` interface), separating "code that depends on a behavior" from "code that talks to the vendor SDK." `runAgentLoop` depends on an `McpCaller`; `McpClient` depends on an `McpTransport`. The two real implementations (`McpClient` itself, `SdkTransport`) live in production; the two test fakes (`buildFakeMcp`, `fakeTransport`) live in `test/`. This is why 125 tests run offline without an API key or an MCP server — the seam is everywhere a vendor edge would have been.
 
-The question this pattern answers: how do you test code that drives a network service or vendor SDK without touching the network?
+```
+Zoom out — where the provider/transport seam lives
 
-**The stakes are concrete.** The agent loop in this codebase makes real Anthropic API calls and real MCP tool calls. Without an injectable seam every agent test needs live API keys, an active MCP server, and patience for ~1 req/s rate limits. With the seam, 125 tests run offline in ~0.5 s.
+┌─ Agent loop ───────────────────────────────────┐
+│  runAgentLoop(opts: { anthropic, mcp, ... })   │
+│  depends on ↓                                  │
+│  ★ McpCaller ★  (lib/agents/base.ts L16–L22)  │ ← seam #1
+│         │                  │                   │
+│   McpClient        buildFakeMcp (test)         │
+│  (prod)            base.test.ts                │
+└─────────────────────┬──────────────────────────┘
+                      │  depends on ↓
+┌─ Provider wrappers ─▼──────────────────────────┐  ← we are here
+│  McpClient (cache · spacing · retry)           │
+│  depends on ↓                                  │
+│  ★ McpTransport ★  (lib/mcp/transport.ts L7) │ ← seam #2
+│         │                  │                   │
+│   SdkTransport     fakeTransport (test)        │
+│  (prod)            client.test.ts              │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Vendor SDKs ──────────────────────────────────┐
+│  @modelcontextprotocol/sdk · @anthropic-ai/sdk │
+└────────────────────────────────────────────────┘
+```
 
-Before the seam:
-- tests require `ANTHROPIC_API_KEY` in the environment
-- a flaky network connection fails the entire test suite
-- CI costs real tokens on every run
-- rate-limit retries in `McpClient` can't be triggered deterministically
-
-After the seam:
-- tests pass no-network, no-key, in under a second
-- fakes return scripted responses, including errors and rate-limit payloads
-- retry logic is exercised deterministically by returning a failing result first
-- the Anthropic client or MCP SDK can be swapped by changing one constructor argument
-
-It is passing your dependency as a prop, but for a backend client.
+**Zoom in — narrow to the concept.** The question is: how do you test code that drives a vendor SDK without touching the network or paying for tokens? The answer is two narrow interfaces this codebase *owns* — `McpTransport` (two methods: `callTool`, `listTools`) and `McpCaller` (one method: `callTool`) — and constructor/parameter injection at the edges (`new McpClient(transport)`, `runAgentLoop({ anthropic, mcp })`). Production passes real implementations; tests pass plain objects that satisfy the same shape. The next sections walk both interfaces and the two flavors of injection.
 
 ---
 
@@ -474,3 +484,4 @@ A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is 
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; added a note on the capturing-fetch error seam (`HttpErrorHolder`/`makeCapturingFetch`) and `McpToolError`
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

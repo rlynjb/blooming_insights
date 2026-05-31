@@ -8,25 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You render a long `.map()` of list items and the user only ever notices the first few and the last one — the items in the middle scroll past unread. A language model has a measurable version of the same bias: across a long context, it recalls information placed at the beginning and the end far more reliably than information buried in the middle. This is not a metaphor; it is a reproducible empirical effect (Liu et al. 2023, "Lost in the Middle").
+**Zoom out — the bigger picture.** Lost-in-the-middle is a property of the model itself in the Provider band, but the levers that fight it sit one layer up in the Per-agent definitions and the Agent loop: the `synthesisInstruction` concatenated last to the system prompt (`lib/agents/base.ts` L98), tool results pushed as the most-recent user turn (L171), and the dedicated `synthesize()` call that collapses the whole context into a short flat message. The retrieval/rerank layer that *curates* what sits in the middle is absent — blooming insights only does placement, not curation.
 
-The question every system that packs a lot into one context faces: given that position determines how reliably the model uses a fact, *where in the context* do you put the thing the answer most depends on?
+```
+  Zoom out — where placement happens (and where curation would)
 
-**The pivot: position is not neutral — the same fact recalled perfectly at the end of the context can be effectively invisible in the middle, so placement is a correctness lever, not a formatting detail.** A system that ignores ordering can feed the model exactly the right evidence and still get a wrong answer because the evidence landed in the dead zone. blooming insights cannot reorder *retrieved* content — it does no retrieval — but it controls *conversation* ordering, and it puts the instruction that must be obeyed and the evidence that must be used at the end, where attention is strongest.
+  ┌─ Per-agent + Agent loop (placement decisions) ───┐  ← we are here
+  │  ★ synthesisInstruction appended LAST ★          │
+  │    base.ts L95–98                                │
+  │  tool results = MOST RECENT turn   base.ts L171  │
+  │  synthesize() collapses context  diagnostic.ts   │
+  │    L87–126                                       │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ (would-be Retrieval/Rerank) — NOT PRESENT ─────┐
+  │  would surface only relevant evidence and       │
+  │  rerank so top hits land at the ends            │
+  │  see → ../03-retrieval-and-rag/07-reranking.md  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider (U-shaped attention) ─▼───────────────┐
+  │  front (strong)  ─  middle (sag)  ─  end (strong)│
+  │  anthropic.messages.create({system, messages})   │
+  └──────────────────────────────────────────────────┘
+```
 
-Before any ordering discipline:
-- The instruction to "stop and emit JSON" sits at the top of a long system prompt, far from where the model decides what to do
-- Tool results are scattered through a long transcript with no positional emphasis
-- The model's final decision is made furthest from the content it should weight most
-
-After recency placement:
-- The `synthesisInstruction` is concatenated to the *end* of the system prompt on the final turn — last thing the model reads before answering
-- Tool results are always the *most recent* user turn — the freshest position in the transcript
-- The load-bearing content sits at the high-attention end, not the middle
-
-It is the same instinct as putting the call-to-action button at the end of a form where the eye lands, not buried in the middle of a wall of fields.
+**Zoom in — narrow to the concept.** The question is: position determines how reliably the model uses a fact, so *where in the context* do you put the thing the answer most depends on? Two strategies — primacy (front) and recency (back) — and blooming insights consistently uses recency: the must-obey directive at the end of the system prompt, the freshest evidence as the most recent turn. How it works walks each placement and names the ceiling: only retrieval + reranking can curate what sits in the middle.
 
 ---
 
@@ -332,3 +341,4 @@ On the forced-final turn, where in the system prompt does the must-obey directiv
 ---
 Updated: 2026-05-28 — Re-derived the drifted `synthesize()` ranges (diagnostic L87–L126, recommendation L82–L132, compact message L105–L113) and per-agent `synthesisInstruction` text refs (diagnostic L63–L67, monitoring L85–L89); the recency-placement `base.ts` refs (L95–L98, L171) verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

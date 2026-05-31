@@ -8,25 +8,39 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-`05-dense-vs-sparse.md` established that dense and sparse retrieval fail on opposite inputs: dense misses exact IDs, sparse misses synonyms. The obvious move — once you have both — is to run both and combine the results. But you immediately hit a frontend-familiar problem: the two retrievers return scores on incomparable scales. A cosine similarity is in [0, 1]; a BM25 score is an unbounded positive number. You cannot just add them, the same way you cannot add a `score` of `0.8` to a `price` of `19.99` and call it a ranking. You need a way to merge two ranked lists that does not depend on the raw scores.
+**Zoom out — the bigger picture.** Hybrid retrieval is the *fusion step* that sits after both a dense and a sparse retriever in a retrieval pipeline. RRF is the fusion *algorithm* — a position-based merge of two ranked lists into one. blooming insights has neither retriever and no fusion step; this layer would receive top-k from each side and emit one ranked list to the LLM context.
 
-The question RRF answers is: how do you fuse two (or more) ranked lists into one when the lists' scores are on different, uncomparable scales?
+```
+  Zoom out — where hybrid + RRF sits (WOULD BE)
 
-**The pivot: fusing by raw score requires calibrating two different scoring systems against each other, which is fragile and corpus-specific — fusing by *rank position* sidesteps calibration entirely.** Reciprocal Rank Fusion ignores the scores and looks only at where each document landed in each list. A document ranked #1 in either list gets a big contribution; rank #50 gets a tiny one. Sum the reciprocal-rank contributions across lists and re-sort. No score normalization, no per-corpus tuning, one constant.
+  ┌─ Query ──────────────────────────────────────────┐
+  └─────────────────────────┬────────────────────────┘
+              ┌─────────────┴────────────┐
+              ▼                          ▼
+  ┌─ Sparse retriever ─┐      ┌─ Dense retriever ─┐
+  │  BM25 ranked list   │      │  cosine ranked list│
+  │  scores: unbounded  │      │  scores: [0, 1]   │
+  └────────────┬────────┘      └─────────┬─────────┘
+               │ ranked positions          │ ranked positions
+               └────────────┬──────────────┘
+                            ▼
+  ┌─ Hybrid fusion (RRF) ──────────────────────────┐  ← we are here
+  │  ★ score(d) = Σ 1/(k + rank_list(d)) ★          │
+  │  ignore raw scores; fuse by RANK only            │
+  └─────────────────────────┬──────────────────────┘
+                            │  one ranked list
+  ┌─ Reranker / LLM context ▼──────────────────────┐
+  │  top-k goes into the prompt                     │
+  └─────────────────────────────────────────────────┘
 
-Before hybrid + RRF:
-- You retrieve dense-only and miss the exact-event-name match
-- Or sparse-only and miss the synonym match
-- Or you try to add cosine + BM25 scores and the unbounded BM25 dominates
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; there is no dense retriever to fuse with.
+```
 
-After:
-- Both retrievers run; each contributes its ranked list
-- RRF fuses by position, immune to scale differences
-- A document near the top of *either* list rises in the fused result
-
-It is `Array.prototype.sort` over a merged key that is computed from ranks, not from the original incomparable scores.
+**Zoom in — narrow to the concept.** The question is: how do you fuse two (or more) ranked lists into one when the lists' scores are on different, uncomparable scales? A cosine similarity is in [0, 1]; a BM25 score is unbounded — adding them lets BM25 dominate, and calibrating them against each other is corpus-specific and fragile. RRF sidesteps calibration entirely by summing reciprocal *ranks* instead of scores. How it works walks the formula, the one constant (`k ≈ 60`), and why a document near the top of *either* list rises in the fused result.
 
 ---
 
@@ -278,3 +292,4 @@ How many retrieval paths does blooming insights run, and what would hybrid need 
 
 → 05-dense-vs-sparse.md · → 07-reranking.md · → 01-embeddings.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

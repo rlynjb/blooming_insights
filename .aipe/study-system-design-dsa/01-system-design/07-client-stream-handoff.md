@@ -8,27 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You build a drill-down page: click a feed card, land on `/investigate/[id]`, and a `useEffect` fires `fetch('/api/agent?…')` to stream the diagnosis. In dev it runs twice — the logs show two agent runs, double the MCP cost. You add a cleanup that calls `reader.cancel()`. Now the log panel is empty: the cleanup aborts the stream you just started. You move to step 3 (`/recommend`) and the diagnosis the user just watched compute is gone — the new page has no idea what step 2 found. You hit refresh on step 2 and wait 40 seconds for the whole agent run again.
+**Zoom out — the bigger picture.** Client stream handoff lives in the UI band and the network boundary — `lib/hooks/useInvestigation.ts` runs the `fetch` reader loop, owns the `startedRef` latch that survives React StrictMode's double-invoke, and writes/reads four `sessionStorage` keys (`bi:insight:<id>`, `bi:inv:<step>:<id>`, `bi:diag:<id>`) that bridge boundaries the *server* cannot. The route handler on the other side reads `?insight=` and `?diagnosis=` from the query string because Vercel's per-instance memory can't carry an insight from the feed request to the investigation request, or a diagnosis from step 2 to step 3.
 
-**The question a React data-fetching hook faces:** how do you run an effect's `fetch` exactly once, keep its result alive across a route change, and survive a serverless backend that forgets everything between requests?
+```
+Zoom out — where client stream handoff lives
 
-**The naive answer — `useEffect` with a cleanup that cancels — is wrong on all three counts in this codebase.** StrictMode mounts → cleans up → re-mounts; a cancel on the first cleanup kills the only stream. A route change unmounts the component and drops its state. And on Vercel the feed request and the investigation request can hit different function instances, so server-side in-memory anomaly storage is not there when the investigation asks for it.
+┌─ UI ───────────────────────────────────────────┐  ← we are here
+│  app/page.tsx (feed: stash bi:insight:<id>)    │
+│  ★ lib/hooks/useInvestigation.ts ★            │
+│    · startedRef latch (StrictMode-safe)       │
+│    · sessionStorage 4 keys (cross-nav state)  │
+│    · reader loop (NDJSON consumer)            │
+│  app/investigate/[id]/page.tsx (diagnose)      │
+│  app/investigate/[id]/recommend/page.tsx       │
+└─────────────────────┬──────────────────────────┘
+                      │  /api/agent?insightId=&step=
+                      │   &insight=<from sessionStorage>
+                      │   &diagnosis=<from sessionStorage>
+┌─ Network boundary ──▼──────────────────────────┐
+│  serverless: instance A ≠ instance B           │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Route handler ────────────────────────────────┐
+│  app/api/agent/route.ts                        │
+│  resolveAnomaly: prefer ?insight= over         │
+│    getAnomaly(id) (empty on a fresh instance)  │
+└────────────────────────────────────────────────┘
+```
 
-Before:
-- Effect runs twice (StrictMode) → two agent runs, double cost
-- `reader.cancel()` on cleanup → aborted stream, empty logs
-- Route to step 3 → diagnosis lost, agent re-runs from scratch
-- Server in-memory anomaly lookup → misses on a different Vercel instance
-
-After:
-- A `startedRef` boolean guards the effect → exactly one fetch per mount
-- No cancel on cleanup → the in-flight stream completes; `setState`-after-unmount is a no-op
-- Each step's result stashed in `sessionStorage` → re-visits hydrate in 0 ms
-- The browser carries the insight and the diagnosis across requests → instance-independent
-
-It is React Query's `staleTime` + `dehydrate`/`hydrate`, hand-rolled into one hook with `sessionStorage` as the cache, plus the one StrictMode rule the library handles for you.
+**Zoom in — narrow to the concept.** The question is: how do you run an effect's `fetch` exactly once under React StrictMode's double-invoke, keep each step's result alive across a route change, and feed the server state it can't remember on its own — without `EventSource`, without React Query, without a backend session store? The answer is three storage tiers (`useRef` latch for the in-process double-invoke, `useState` for live UI, `sessionStorage` for navigation + cross-instance handoff) plus one rule: *don't cancel the in-flight stream on effect cleanup*. The next sections walk the started-guard, the four `sessionStorage` keys, the diagnosis handoff that turns step 2's `done` event into step 3's `&diagnosis=` URL parameter, and the feed's insight handoff that lets a Vercel instance B serve a card produced by instance A.
 
 ---
 
@@ -378,3 +388,4 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 
 → 05-streaming-ndjson.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

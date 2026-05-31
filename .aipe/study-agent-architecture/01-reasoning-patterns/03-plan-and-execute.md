@@ -8,28 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've built a multi-step form before. The flow is: ask for an email, then a name, then plan, then payment, then confirm. The order is written *once* in your form's wizard component — `if (step === 1) … else if (step === 2) …` — and every user walks the same five steps. The user never decides the order. The wizard fills in *values*; it never invents step 3.5 or skips step 2 mid-session.
+**Zoom out — the bigger picture.** Plan-and-execute would sit *above* the Shared agent loop — a separate planner-model call producing a JSON plan that the loop then walks as an executor. In blooming insights, that planner phase does not exist; the Pipeline coordinator goes straight from "which agent runs" into `runAgentLoop` and the model decides every turn from there. The closest thing to a plan in this codebase is a static "Suggested query plan" section baked into the monitoring system prompt at `lib/agents/prompts/monitoring.md` L39–L47 — the plan went into a prompt, not into a phase.
 
-Now picture a different shape. Same five steps, but each step decides *whether the next step should run, and which one* — based on what the user just typed. Premium tier? Skip plan, jump to billing. Self-serve? Skip payment. You wrote a wizard whose route changes per session. That's already a step past a static form, and you can feel the cost: more branches to test, harder to debug a stuck user, every step's logic now depends on the whole prior state.
+```
+  Zoom out — where plan-and-execute WOULD live
 
-Now push it one more step. The wizard isn't five steps at all — it's "ask a model to list the steps for *this user* up front, then walk them." The model returns `[step1, step2, step5]` for one user and `[step1, step3, step4, step5]` for another, and your runtime just executes the list. That's the question this file answers: **when does separating the planner from the executor earn its overhead, and when is a single ReAct loop with a tight prompt enough?**
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
+  │  lib/agents/pipeline.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Planner (would-be) ────▼────────────────────────┐  ← ★ THIS ★ (absent)
+  │  ★ separate model call: emits JSON plan ★         │
+  │  ── absent in blooming insights ──                │
+  └─────────────────────────┬────────────────────────┘
+                            │  plan as data
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring.md L39–L47 — "Suggested query plan"   │
+  │  is the degenerate plan-in-prompt analog          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop — would become a step executor      │
+  │  today: it's pure ReAct, model decides each turn  │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because plan-and-execute looks like rigor and often is just overhead. Adding a "plan first" model call doubles your latency for every run and adds a brittleness — the plan is built from what the model *knows now*, not what it'll *find* mid-execution. If the data surprises the executor, the plan goes stale and the system has to choose between re-planning (expensive) and forging ahead on a wrong plan (wrong). The breakpoint is precise: is the path knowable up front, or does it depend on what the work uncovers?
-
-Without naming the breakpoint:
-- You add a planner because "good systems plan"
-- Every investigation now pays one expensive call to produce a plan you could have written in the prompt
-- The first time the data is sparse, the plan says "compare 90d vs prior 90d" and the executor faithfully returns ±100% on an empty window
-- You add a re-plan trigger, then a re-plan budget, then a plan critic — drift
-
-With the breakpoint named:
-- Ask: is the path knowable? In monitoring, *yes* — the prompt's "Suggested query plan" lists exactly the 5 EQL queries that work
-- That plan went into a prompt, not a phase — no extra model call
-- The runtime stays a single ReAct loop that the model can adapt within (e.g. shift the time window when query #1 returns zero)
-
-One-line summary: **plan-and-execute is moving the wizard's `if`-ladder from a code file into a "list the steps" model call — earn it only when the steps depend on per-run inputs that a static prompt can't enumerate.** blooming insights does not earn it; here's why.
+**Zoom in — narrow to the concept.** The question is: when does separating the planner model from the executor model earn its overhead — and when is a single ReAct loop with a tight prompt enough? The breakpoint is whether the path is knowable up front. Monitoring's path IS knowable (same five EQL queries every workspace) so the plan went into the prompt; diagnostic and recommendation are NOT (each step depends on prior data) so they stay pure ReAct. Below, you'll see the three positions a codebase can take on this — and which one blooming insights sits at, and why.
 
 ---
 
@@ -401,3 +407,4 @@ Open and verify. ✓ File + section name + the "one model call per turn" answer 
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

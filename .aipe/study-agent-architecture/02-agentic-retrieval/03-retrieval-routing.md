@@ -8,28 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a `useUser()` hook that pulls user data. Behind the hook is one data source — a `/api/me` endpoint, say — and the hook always calls it. The same shape is in your reducer: `state.user`, one slot, one source of truth. You don't think about "which source" because there is only one.
+**Zoom out — the bigger picture.** Retrieval routing would sit at the seam between the Shared agent loop and the Tools band — a dispatcher that reads the query, picks the right retrieval *source* (vector vs SQL vs web search), and only then fires retrieval. In blooming insights, there is no source-routing because there is only one source (Bloomreach MCP). What does exist at roughly this slot is a *capability* router: `filterToolSchemas` (`lib/mcp/tools.ts`) hands each agent a different subset of the same MCP toolset based on the agent's role. Same dispatch shape (route → tool subset), different axis (capability per agent, not source per query).
 
-Now picture a different shape. You have a search input, and behind the input are three places the answer could live: a `users` table (exact lookups by email), an Algolia index (typo-tolerant search by name), and a web search (when the user types a brand or a public name). Hit the wrong one and you waste a query or return nothing — Algolia returns empty for a UUID, the `users` table returns empty for a typo, the web search returns nothing for an internal email. You can't run all three on every keystroke. So *something* has to look at the query and pick the right source first.
+```
+  Zoom out — where retrieval routing WOULD live
 
-That's the question this file answers: **when there's more than one place the answer could live, what picks the right one before the retrieval happens?** Not "what's the best retriever" — they're each best at something different. The line is at *dispatch*: a router that reads the query and routes it to the source whose shape fits.
+  ┌─ Shared agent loop ─────────────────────────────┐
+  │  runAgentLoop emits a tool_use block             │
+  └─────────────────────────┬────────────────────────┘
+                            │  query shape
+  ┌─ Retrieval router ──────▼────────────────────────┐  ← ★ THIS ★ (absent as source-router)
+  │  ★ vector? SQL? web? — pick by query shape ★      │  ← we are here
+  │  ── absent in blooming insights ──                │
+  │  closest analog: filterToolSchemas in             │
+  │  lib/mcp/tools.ts (capability routing per agent)  │
+  └─────────────────────────┬────────────────────────┘
+                            │  routed tool call
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  lib/tools/* (one source: Bloomreach MCP)        │
+  │  lib/mcp/client.ts                               │
+  │  Not yet implemented: multi-source retrievers     │
+  └─────────────────────────┬────────────────────────┘
+                            │  HTTPS
+  ┌─ External ──────────────▼────────────────────────┐
+  │  Bloomreach MCP server (the only source)         │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because retrievers have non-overlapping strengths. Vector indexes are good at paraphrase ("a customer wrote 'cancel my subscription'" matches "I want to unsubscribe") and bad at exact lookups. SQL is good at exact lookups and bad at semantic match. Web search is good at freshness and bad at private data. Pick the wrong source and the strong retriever for *that question* never gets called. The cost isn't slower retrieval — it's an empty top-k from the wrong source masquerading as "no answer found."
-
-Without routing:
-- The system has one retriever (say, a vector index) and uses it for everything
-- A user asks "what's the SKU for product X" — the vector index returns the chunk that *mentions* the product, not the SKU itself
-- The model answers from the chunk's prose, which paraphrases or hallucinates the SKU
-- The answer is plausible-looking and wrong; the SQL table where the SKU lives was never consulted
-
-With routing:
-- The system has a router that reads "what's the SKU for product X" and recognises an exact-lookup shape
-- It routes to the SKU table, returns the row, the model cites the value
-- The vector index never gets the wrong question; the SQL DB gets the right one
-
-One-line summary: **retrieval routing is `if/else` over data sources — the same dispatch you'd write in a request handler, but the chooser sits between the question and the retriever, and the inputs are query shapes rather than HTTP verbs.** Here's the shape of the pattern, and why this codebase has a *capability* route but not a *source* route (because there's only one source).
+**Zoom in — narrow to the concept.** The question is: when there's more than one place the answer could live, what picks the right source before retrieval runs? Vector for paraphrase, SQL for exact lookup, web for freshness — pick wrong and the strong retriever never gets called. blooming insights does NOT implement source routing (one source — Bloomreach MCP) but it does route on a different axis: per-agent capability via `filterToolSchemas`. Below, you'll see the source-routing pattern and how blooming insights' capability routing sits in the same architectural slot for a different reason.
 
 ---
 
@@ -457,3 +465,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

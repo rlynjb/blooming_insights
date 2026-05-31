@@ -8,34 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a page that fetches 12 things in parallel. `Promise.all([fetchA(), fetchB(), ...fetchN()])` — and at first it's faster than the sequential version. Then you ship it and the API starts returning 429s. The 12 concurrent calls hit the upstream's per-second limit; some succeed, some fail, the page renders half-empty. You reach for the same pattern every senior frontend dev has built once: a concurrency cap. `Promise.all` with a semaphore — at most 4 in flight, the rest queue, pop when one finishes.
+**Zoom out — the bigger picture.** Fan-out backpressure would sit at the Pipeline coordinator band — a semaphore + queue holding N concurrent workers, plus an upward signal that tells the supervisor to stop decomposing when the queue fills. In blooming insights, the Pipeline band is sequential (one agent at a time, user-gated), so there's nothing to fan out and no backpressure needed. What this codebase has instead is *serial spacing* in the Provider wrappers (`lib/llm/rate-limit.ts`, token bucket) — same upstream-protection intent, different shape. The diagram below shows the fan-out shape on top and blooming insights' sequential shape underneath.
 
-Now picture the same shape but the "12 things" aren't fetches you wrote — they're agents a supervisor decided to spawn. The supervisor reads a task, decides "this decomposes into 12 sub-questions," and fires off 12 worker agents in parallel. Each worker calls tools, hits the same upstream, and gets the same 429s. The fix is the same — semaphore + queue. The twist is that the *producer* isn't your code firing fetches; it's an agent making a runtime decision to spawn more work. If the queue fills up, the supervisor needs to *know* — otherwise it keeps spawning workers that just sit in the queue.
+```
+  Zoom out — where fan-out backpressure WOULD live
 
-That's the question this file answers: **when a topology can produce work faster than the system can consume it, what holds the rate?** Not "how do I throttle one call" — single-call rate limiting (the ai-eng version) covers that. The line is between *serial spacing* (one call chain, slow it down) and *fan-out backpressure* (many concurrent chains from one task, bound the parallelism AND signal upward when the bound is hit).
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
+  │  ★ FAN-OUT BACKPRESSURE shape (★ THIS ★, absent): │
+  │    supervisor ──► [semaphore: 4 in flight]        │
+  │                   [queue: bounded depth]          │
+  │                   [signal upward when full]       │
+  │  ── absent in blooming insights ──                │
+  │                                                   │
+  │  blooming insights' actual shape:                 │
+  │    sequential pipeline — one agent runs at a time │
+  │    no parallel workers, no queue, no backpressure │
+  └─────────────────────────┬────────────────────────┘
+                            │  every model call
+  ┌─ Provider wrappers ─────▼────────────────────────┐
+  │  lib/llm/rate-limit.ts (token-bucket spacing)    │
+  │  closest analog: serial protection, not fan-out   │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because the fix is at two layers, and most implementations only get one. The semaphore alone bounds the *outbound* concurrency — good, the upstream doesn't see more than N at a time. But without an upward signal, the *inbound* producer (the supervisor) keeps spawning workers into an ever-growing queue. The system pretends to be working — the queue depth metric grows — and meanwhile the user is waiting forever for a task that's stuck behind 80 queued workers. The backpressure name covers both layers, and they fail differently.
-
-Without fan-out backpressure (semaphore + upward signal):
-- Supervisor decomposes a task into 12 sub-questions, spawns 12 workers
-- 12 concurrent tool calls hit the upstream; rate limit kicks in
-- Some workers succeed, some get 429s, the supervisor has no idea
-- Synthesis tries to merge 12 results, gets 7 valid and 5 errors, returns garbage
-
-With fan-out backpressure:
-- Supervisor decomposes into 12 sub-questions, spawns 12 workers
-- Semaphore admits 4 at a time; the other 8 queue with bounded depth
-- When the queue is full, the supervisor sees the signal and stops decomposing further
-- 12 workers complete in 3 waves of 4; synthesis merges 12 valid results
-
-Without fan-out at all (this codebase's shape):
-- Each agent runs sequentially in a chain; no parallel workers, no semaphore needed
-- Inter-call spacing in *one* chain handles serial rate-limit compliance
-- The pattern this file teaches doesn't apply yet — there's nothing to fan out
-
-One-line summary: **fan-out backpressure is `Promise.all` with a concurrency cap, extended with an upward signal so the producer slows down when the queue fills — and blooming insights doesn't need it yet, because its topology is sequential and user-gated, not parallel.** Here's the shape of the pattern, why this codebase's serial spacing isn't a smaller version of it, and what would change if a parallel topology were added.
+**Zoom in — narrow to the concept.** The question is: when a topology can produce work faster than the system can consume it, what holds the rate? The fix has two layers — a semaphore bounds *outbound* concurrency, an upward signal stops the *inbound* producer from piling into an unbounded queue. Most implementations only get the first; without the upward signal, the queue grows silently while the supervisor keeps spawning. blooming insights' sequential topology doesn't need either yet. Below, you'll see both layers, the silent-queue failure mode, and the breakpoint where this codebase would need to add backpressure.
 
 ---
 
@@ -510,3 +508,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

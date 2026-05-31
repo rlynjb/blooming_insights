@@ -8,24 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You scaffold a new module with a generator — `next` or a component CLI emits the boilerplate file with the imports, the type signature, and a TODO body — and then you edit it into the thing you actually wanted. You did not hand-type the boilerplate; you also did not ship the generated stub unread. The generator gets you to a 70%-complete starting point fast, and your judgment turns it into the real artifact.
+**Zoom out — the bigger picture.** Meta-prompting sits in an *authoring-time* band that does not exist in the codebase today — a dev-time helper that drafts a `.md` file which then drops into the existing Per-agent definitions band like any hand-written prompt. The runtime path (`readFileSync` → `runAgentLoop` → Provider) never sees the meta-prompt; it sees the committed file, identical in kind to the hand-written four. So the diagram has two halves: the Authoring band (where the human, the meta-prompt, the draft, and the human review live) sits above the Repo, and the Runtime path is untouched below it.
 
-A complex prompt is a similar artifact. blooming insights' `diagnostic.md` is 85 lines with a Role, Hard rules, an investigation method, EQL reminders, a CRITICAL historical-data block, and a precise JSON output schema. Writing all of that from a blank file is slow. The question this file answers: **when does using a model to draft that prompt save real time, when does it just add a review pass over output you have to rewrite anyway, and how do you keep a generated prompt from reading like generated prose instead of a spec?**
+```
+  Zoom out — where meta-prompting lives
 
-**The pivot: meta-prompting is scaffolding for prompts — it is leverage on the initial draft of a complex prompt and a tax on small tweaks, and the human review step is not optional, because a prompt that reads like LLM output is a liability.** The value is in getting from a blank file to a reviewable draft fast; the danger is treating the draft as done.
+  ┌─ Authoring band (dev-time, NOT built) ──────────┐  ← we are here
+  │  human GOAL + {schema} shape                     │
+  │     ↓                                            │
+  │  ★ META-PROMPT (encodes house anatomy) ★         │
+  │     ↓ drafting call                              │
+  │  DRAFT .md text                                  │
+  │     ↓ ⚠ HUMAN REVIEW (non-optional)              │
+  │  reviewed prompt                                 │
+  └─────────────────────────┬────────────────────────┘
+                            │ commit
+  ┌─ Repo ──────────────────▼────────────────────────┐
+  │  lib/agents/prompts/<new>.md  (same dir as the 4)│
+  └─────────────────────────┬────────────────────────┘
+                            │ readFileSync at import
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  PROMPT.replace('{schema}',…) → runAgentLoop     │
+  │  (RUNTIME path unchanged — never sees the meta)  │
+  └──────────────────────────────────────────────────┘
+```
 
-Before meta-prompting:
-- A new agent prompt starts from a blank file or a copy-paste of an existing one, hand-edited line by line
-- Getting the anatomy right (Role, Hard rules, Output schema, `{schema}` placeholder) is slow re-derivation each time
-
-After (used well):
-- The human writes a goal and hands the model the workspace schema; the model drafts a prompt with the right anatomy
-- The human reviews, deletes the fluff, tightens the rules, and commits a spec — not the raw draft
-
-After (used badly):
-- The generated draft gets committed mostly unread; it reads like marketing copy, hedges where it should command, and nobody can tell which lines are load-bearing
+**Zoom in — narrow to the concept.** The question this file answers: when does using a model to draft a prompt save real time, when does it just add a review pass over output you have to rewrite anyway, and how do you keep a generated prompt from reading like LLM output? Meta-prompting earns its place on the initial draft of a *complex* prompt (the 0→70% leap) and becomes overhead on tweaks and high-iteration prompts. The non-negotiable step is the human review — because a generated draft defaults to the polite register ("try to," "where possible") and a prompt with soft rules has soft enforcement. Below, you'll see what the meta-prompt has to encode (the house anatomy from → 01), the hedging-drift failure mode, and the EQL-invention trap only a reviewer catches.
 
 ---
 
@@ -313,3 +323,4 @@ If a meta-prompting helper produced a new agent prompt, what would have to be tr
 Updated: 2026-05-29 — Added a note distinguishing the new `{categories}` injection (dynamic prompt assembly / template interpolation, → 03-prompts-as-code.md) from meta-prompting; Case B verdict unchanged.
 Updated: 2026-05-29 — Resynced the stale `diagnostic.md` "customers matching" ban ref L33→L35 (pre-existing drift) across all three citations.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

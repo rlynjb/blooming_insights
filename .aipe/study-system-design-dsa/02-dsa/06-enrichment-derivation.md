@@ -8,25 +8,39 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Your component receives an `Insight` object from the API. It has a `funnel` field — `{ view, cart, checkout, purchase }`, each a signed percent change. The designer wants a coral "▼ leak at checkout" chip pointing at the worst stage. You reach for `.reduce()` to find the minimum, an `if` ladder to bucket a confidence label, and a `typeof` check to handle a field that is sometimes a string and sometimes an object. No fetch, no new data — just arithmetic over what you already hold.
+**Zoom out — the bigger picture.** The derivation layer lives in `lib/insights/derive.ts` — pure functions that sit between the agents (which emit raw evidence) and the UI (which renders business-owner fields). Three places call into it: `lib/state/insights.ts` L25 spreads `...deriveInsightFields(a)` onto each `Insight` when the briefing route builds it; `lib/agents/diagnostic.ts` L80 labels a `Diagnosis` with `diagnosisConfidence(diag)` before returning it; `components/feed/InsightCard.tsx` L155–L161 runs the funnel-leak `argmin` reduce inline at render. None of it touches the network — every function is a scan or a fold over a handful of items already in hand.
 
-**The question a UI-derivation layer faces:** how do you compute the fields a business owner wants to *see* (revenue lost, the leak stage, a confidence label) from the raw evidence an agent already *gathered*, without going back to the source?
+```
+Zoom out — where derivation lives
 
-**The naive alternative — asking the agent or the API for these fields — costs a round-trip and a prompt change for every new display field.** It also couples the agent's output schema to the UI's display needs. Deriving them client/build-side keeps the agent emitting raw evidence and lets the presentation layer compute whatever it needs from that evidence, cheaply, deterministically.
+┌─ Agent layer (raw evidence) ───────────────────┐
+│  MonitoringAgent → Anomaly[]                   │
+│  DiagnosticAgent → Diagnosis                   │
+│  RecommendationAgent → EstimatedImpact (union) │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ State / build-time mapping ───────────────────┐
+│  lib/state/insights.ts L25                     │
+│  anomalyToInsight: {...deriveInsightFields(a)} │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Derivation (pure, no I/O) ────────────────────┐  ← we are here
+│  ★ lib/insights/derive.ts ★                   │
+│    findCurrentPrior · deriveInsightFields      │
+│    diagnosisConfidence · hypothesesTested      │
+│    impactRange · impactAssumption              │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ UI (rendering) ───────────────────────────────┐
+│  InsightCard.tsx (funnel-leak argmin reduce)   │
+│  EvidencePanel.tsx · RecommendationCard.tsx    │
+│  investigationMarkdown.ts (export)             │
+└────────────────────────────────────────────────┘
+```
 
-Before:
-- Every display field is a new field the agent must emit and the schema must carry
-- A presentation change (show the leak stage) means re-prompting the agent
-- The same `{current, prior}` numbers exist in evidence but are re-requested for display
-
-After:
-- The agent emits raw evidence once; the derivation layer computes display fields from it
-- A new display field is a new pure function over existing data — no I/O, no prompt change
-- `revenueImpact`, `leakKey`, `diagnosisConfidence`, `impactRange` are all `O(n)` over tiny `n`
-
-It is `.map()`/`.reduce()`/`.filter()` over data already in hand — the same thing you do to turn a `fetch`ed array into rendered rows, formalized as a derivation module.
+**Zoom in — narrow to the concept.** The question is: how do you compute the fields a business owner wants to *see* (revenue lost, the leak stage, a confidence label) from the raw evidence an agent already *gathered*, without going back to the source for each one? The answer is to treat any value that is a pure function of data you already hold as a derivation, not a fetch. Each derivation here is a tiny array operation — a linear scan (`findCurrentPrior`), an `argmin` reduce (the funnel leak), a count-and-threshold (`diagnosisConfidence`), or a `typeof` union narrow (`impactRange`/`impactAssumption`) — all `O(n)` over single-digit `n`. The next sections walk each one and show how the same evidence array drives multiple display fields without any extra round-trip.
 
 ---
 
@@ -430,3 +444,4 @@ A reviewer says: "Move `diagnosisConfidence` into the agent prompt — let the m
 ---
 Updated: 2026-05-29 — funnel-leak reduce refreshed to current lines (block L155–L161, `funnelStages` map L156–L158, `leakKey` argmin L159–L161); verified `anomalyToInsight` copies `category` at `lib/state/insights.ts` L25 and `derive.ts` refs unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

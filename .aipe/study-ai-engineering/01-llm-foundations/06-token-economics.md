@@ -8,27 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You profile a slow page and find one component re-fetching on every render. You do not guess — you open the network tab, see 40 requests where there should be 4, and fix the one that matters. The fix is cheap; *finding* it required a meter. Without the network tab you would be optimizing blind, "improving" things that were already fine and missing the one that was not.
+**Zoom out — the bigger picture.** Token economics is not in one band — it is the *shape of decisions* made across several. The bounds live in the Per-agent definitions (`maxToolCalls` budgets) and the Agent loop (`budgetSpent`/`forceFinal` in `lib/agents/base.ts` L90–L91, `truncate` at L31–L34); model tiering picks haiku for intent (`lib/agents/intent.ts` L14) vs sonnet for analysis (`lib/agents/base.ts` L9); and the Provider returns `res.usage` on every response — the one piece of cost data that nothing in this codebase ever reads.
 
-LLM cost is the same problem with the meter missing. Every `anthropic.messages.create` call bills by tokens consumed, and a multi-agent investigation makes many calls. The question is two-part: how do you *bound* the cost so a runaway loop cannot rack up an unbounded bill, and how do you *measure* it so you know which call is the expensive one?
+```
+  Zoom out — where cost levers live (and the missing meter)
 
-**The pivot: bounding cost and measuring cost are different jobs, and a system can do the first well while doing the second not at all.** A turn budget caps the worst case; a cost log tells you the typical case. blooming insights invests heavily in the bounds and skips the meter entirely — defensible for a demo, a real gap for production tuning.
+  ┌─ Intent parsing + Pipeline ─────────────────────┐
+  │  HAIKU classifier   intent.ts L14  ← tier lever │
+  └─────────────────────────┬───────────────────────┘
+                            │
+  ┌─ Per-agent + Agent loop ▼───────────────────────┐  ← we are here
+  │  maxToolCalls budgets (6/6/4/6)                 │
+  │  budgetSpent → forceFinal   base.ts L90–91      │
+  │  truncate (16_000 chars)    base.ts L31–34      │
+  │  synthesize() spike (conditional)               │
+  └─────────────────────────┬───────────────────────┘
+                            │  create(params)
+  ┌─ Provider ──────────────▼───────────────────────┐
+  │  SONNET ($)   cost = in·p_in + out·(5·p_in)     │
+  │  res.usage = { input_tokens, output_tokens }    │
+  │                      ★ NEVER READ ★             │
+  └─────────────────────────────────────────────────┘
+```
 
-Before cost controls:
-- A diagnostic agent loops until the 300-second route timeout, burning tokens the whole way
-- Every classification uses the full sonnet model
-- A 60KB tool result re-enters the conversation in full, inflating every subsequent turn
-
-After:
-- `maxToolCalls` caps each agent at a fixed number of round-trips
-- A cheap haiku model classifies intent; expensive sonnet does the analysis
-- Tool results are truncated to 16,000 chars before re-entering the context
-
-But still missing: any record of how many tokens that investigation actually cost.
-
-It is the network-tab discipline — bound the request count *and* watch the meter — with the meter not yet built.
+**Zoom in — narrow to the concept.** The question is two parts: how do you *bound* cost so a runaway loop cannot rack up an unbounded bill, and how do you *measure* it so you know which call dominates? blooming insights answers the first with three levers (budgets, truncation, tiering) and answers the second not at all. How it works walks each lever, names the conditional `synthesize()` spike as the likely line item, and points at the one-field fix (`res.usage`) the codebase never makes.
 
 ---
 
@@ -330,3 +335,4 @@ Which model classifies intent, and why is it the cheap choice rather than the ag
 ---
 Updated: 2026-05-28 — `maxDuration` 60→300 (route.ts L20); re-derived the `synthesize()` line ranges (diagnostic L87–L126, recommendation L82–L132) and the `saveInvestigation` location (now `lib/state/investigations.ts` L30, called at route.ts L254).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -8,25 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a form with a placeholder that shows the expected format — `MM/DD/YYYY` greyed out in the date field, `you@example.com` in the email field. You did not write a paragraph explaining the date format; you showed one example and the user matched it. A concrete example constrains behavior in a way an instruction never does, because the user pattern-matches the shape instead of parsing a rule.
+**Zoom out — the bigger picture.** Few-shot examples in this codebase live in two distinct sub-regions of the Per-agent definitions band. The format exemplars — `## EQL reminders`, the suggested query plan, the JSON output block — sit inside each agent's `.md` file, shaping what the model emits before any consumer ever sees it. The one true classifier decision (`classifyIntent`) sits one step outside, in `lib/agents/intent.ts`, with its system prompt declared inline in code — and it uses *no* examples at all. So the diagram marks two sub-regions of the same band: where examples are shown (format) and where they are deliberately absent (classification).
 
-An LLM does the same thing, more strongly. The question this file answers: when blooming insights wants the model to emit a specific shape — an EQL query, a JSON anomaly object, an intent label — does it *show* the shape (few-shot) or *describe* it (zero-shot), and which choice did it make where?
+```
+  Zoom out — where few-shot lives
 
-**The pivot: examples constrain output more reliably than instructions, because the model imitates a demonstrated shape better than it follows a described rule.** I learned this rewriting a classifier prompt that kept returning "the category is probably billing" instead of `billing`. I had *described* the output ("respond with one category word"). The model complied semantically and failed structurally. The fix was not a sterner instruction — it was two examples: `Q: my card was charged twice → billing`. The structural failure vanished. A demonstrated shape is a stronger constraint than a stated one.
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  classify → monitoring/diagnostic/recommendation │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
+  │                                                  │
+  │  ★ FORMAT exemplars (shown, imitated) ★          │
+  │   EQL reminders   monitoring.md L49–54           │
+  │                   diagnostic.md L27–37           │
+  │   query plan      monitoring.md L39–47           │
+  │   JSON output     monitoring.md L73–85 (one-shot)│
+  │                                                  │
+  │  ★ CLASSIFIER decision (ZERO-shot) ★             │
+  │   classifyIntent  intent.ts L17–31                │
+  │   label DEFINITIONS, no query→label examples     │
+  │                                                  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop / Provider ──▼────────────────┐
+  │  the model imitates demonstrated shapes here     │
+  └──────────────────────────────────────────────────┘
+```
 
-Before examples (instruction-only):
-- "Return an EQL query" → the model invents `customers matching ...`, an unsupported clause
-- "Return JSON" → the model returns valid JSON of the *wrong shape*
-- "Classify the intent" → the model returns a sentence, not a label
-
-After examples:
-- A worked EQL line shows the exact supported syntax; the model copies it
-- A JSON output block shows the exact field set; the model fills the template
-- (For classification) labeled examples would pin the label format — but the classifier here does *not* use them
-
-It is the format-placeholder discipline, applied to a model that imitates shapes far more reliably than it parses rules.
+**Zoom in — narrow to the concept.** The question this file answers: when blooming insights wants the model to emit a specific shape — an EQL query, a JSON object, an intent label — does it *show* the shape (few-shot) or *describe* it (zero-shot), and which choice did it make where? Format exemplars are everywhere the codebase wants shape-imitation; the JSON output block doubles as the request side of the structured-output contract (→ 02). The classifier is zero-shot by choice — three distinct categories, `max_tokens: 16`, definitions plausibly suffice. Below, you'll see why showing six correct EQL shapes plus one forbidden one constrains syntax (not judgment), and why the one place few-shot would measurably help is the buildable experiment, not a settled answer.
 
 ---
 
@@ -371,3 +383,4 @@ Is `classifyIntent` few-shot or zero-shot, and what does its system prompt conta
 Updated: 2026-05-29 — Resynced monitoring.md exemplar refs after the `{categories}` shift: EQL reminders L43–48→L49–54, Suggested query plan L33–41→L39–47 (with inner step annotations L35–41→L41–47), output exemplar L54–64→L73–85 (verified against the live JSON block, which sits lower than the +6 estimate due to the expanded field-rules).
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md EQL reminders L26–34→L27–37 and negative-example L33→L35, diagnostic.md output exemplar L48–66→L63–85, recommendation.md output exemplar L49–59→L49–74 and id-ban L64→L82.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

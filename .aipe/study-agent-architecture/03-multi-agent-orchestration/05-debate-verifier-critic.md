@@ -8,61 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** Debate and verifier-critic would sit at the Pipeline coordinator band — extra agents wedged between a producer stage and the consumer of its output, looping until approved or until a judge picks a winner. In blooming insights, that band is a sequential pipeline with no critic-agent slot; the closest thing is the *forced-synthesis turn* inside `runAgentLoop` (when the budget is spent, tools are stripped and the same model is asked again). Same-model re-pass, not a critic. The diagram below shows the two would-be shapes on top and blooming insights' single-producer pipeline underneath.
 
 ```
-The two flavors
+  Zoom out — where debate / critic WOULD live
 
-  DEBATE (symmetric):              VERIFIER-CRITIC (asymmetric):
-  ┌────────┐    ┌────────┐         ┌──────────┐    ┌──────────┐
-  │agent A  │◄──►│agent B  │        │ producer │ ──►│ critic   │
-  │(propose)│    │(counter)│        │          │ ◄──│(approve/ │
-  └────┬───┘    └────┬───┘         └──────────┘    │ reject)  │
-       │              │                             └──────────┘
-       └──────┬───────┘                    loop until approved
-              ▼                            (cap the rounds)
-         judge picks
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
+  │  ★ DEBATE shape (★ THIS ★, absent):               │
+  │    [agent A] ◄──► [agent B]  →  [judge]           │
+  │                                                   │
+  │  ★ VERIFIER-CRITIC shape (★ THIS ★, absent):      │
+  │    [producer] ──► [critic] ──► approve/reject     │
+  │                       │ rejected loops back        │
+  │                       ▼                            │
+  │  ── absent in blooming insights ──                │
+  │                                                   │
+  │  blooming insights' actual shape:                 │
+  │    monitoring ─► diagnostic ─► recommendation     │
+  │    (no critic; forced-synthesis is a same-model    │
+  │     retry inside the loop, not a cross-model       │
+  │     review)                                        │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop's forced-final is the closest analog│
+  └──────────────────────────────────────────────────┘
 ```
 
-You've shipped a feature where the user types a question and your agent answers. Sometimes the answer is wrong in a subtle way — a 200 OK from an API was misinterpreted, a number was correct but the conclusion was inverted. The user doesn't catch it because the answer is confident-sounding. Quality feels like 90% and the 10% is the kind of wrong that's expensive.
-
-You can spot-fix the prompt. Or you can introduce a *second agent* whose only job is to look at the first agent's answer and say "this looks wrong because X" — and have the first agent revise. Two agents collaborating: one produces, one critiques.
-
-### Move 2 — name the question
-
-That second agent — whose only job is to *check* the first agent's output rather than to produce its own — is what verifier-critic names. Two symmetric agents proposing and counter-proposing until a third agent judges is what *debate* names. The question this file answers: **when does adding a second perspective measurably catch errors the producer alone misses, and when does it just double your token bill for no quality gain?**
-
-The job is review, not production. A critic that produces its own answers is just a worse second producer. A critic that *only* says "this output is wrong because X" is doing the job.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because second-opinion architecture is one of the most over-applied patterns in agentic systems — and one of the most subtly broken. If the critic shares the producer's blind spots (same model family, same training data, same biases), the critic confidently approves the producer's confident wrong answer. You've doubled your token cost and gotten nothing.
-
-The failure mode: **same model family shares blind spots.** If GPT-4 produces and GPT-4 critiques, the critic has the same self-preference bias the LLM-as-judge literature documents — it'll tend to approve outputs that match its own writing style, miss the same factual errors, and apply the same flawed reasoning. The cross-reference is `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` for the mechanics. For a critic to add value, it has to be from a *different model family*, or it has to be doing a structurally different job the producer's loop can't do (e.g. running a deterministic schema check the producer can't run on itself).
-
-In this codebase: there's no debate or critic agent. The closest thing is the forced-synthesis turn in `runAgentLoop` — when the budget is spent (`base.ts` L90), the loop strips tools, appends a `synthesisInstruction` to the system prompt, and forces the *same* model on the *same* trajectory to emit its final answer. That's a re-pass, not a critic. The producer is reviewing its own work with no fresh perspective.
-
-### Move 4 — concrete before/after
-
-Without a critic (this codebase):
-- Diagnostic agent investigates, produces a `Diagnosis`
-- If the model went down a wrong reasoning path during the loop, the final answer reflects that
-- The user sees the confident wrong diagnosis and may or may not catch the error
-- The only "review" is the forced synthesis — same model, same trajectory
-
-With a critic (hypothetical):
-- Diagnostic agent investigates, produces a `Diagnosis`
-- Critic agent (different model family — e.g. Sonnet producing, Haiku-or-OpenAI critiquing) reads the diagnosis
-- Critic checks: "does the conclusion follow from the evidence? are the hypotheses considered exhaustive? does the affectedCustomers count match the segment description?"
-- If critic approves → diagnosis flows to recommendation
-- If critic rejects → diagnosis goes back to the diagnostic agent with the critique as additional context
-- Loop with a max round count
-
-### Move 5 — one-line summary
-
-A critic is a second agent whose only job is to review the first agent's output; debate is two symmetric agents proposing and counter-proposing under a judge. blooming insights has neither — the closest is the forced-synthesis re-pass in `base.ts` L90, which is the producer reviewing its own work. Here's how the topologies work and why this codebase hasn't reached the breakpoint that justifies them.
+**Zoom in — narrow to the concept.** The question is: when does adding a second perspective catch errors the producer alone misses, and when does it just double your token bill? A critic that shares the producer's blind spots (same model family, same biases) confidently approves the producer's confident wrong answer — the LLM-as-judge bias literature documents this. blooming insights does NOT implement either shape; the failure modes it would address haven't shown up in production traces yet. Below, you'll see both topologies, the blind-spot failure mode, and the breakpoint that would justify either one.
 
 ---
 
@@ -508,3 +482,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -8,15 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You memoize fetch results in a `Map` so repeat queries are instant — but stale data lingers forever. There is no mechanism to expire entries. A component that calls the same endpoint again after ten minutes gets the same ten-minute-old payload, silently. The question is: how does a lazy cache expire entries by time without a background sweep?
+**Zoom out — the bigger picture.** The TTL cache is the first stage of `McpClient.callTool` (`lib/mcp/client.ts`) — it sits inside the Provider wrappers band, just above the spacing gate and the live transport call. Every MCP request from every agent in the pipeline funnels through this one `Map`-backed lookup before any network bytes leave the process. A hit returns in ~0 ms; a miss falls through to the spacing gate, the live call, the retry loop, and then writes back into the same `Map` (only on success — see the no-cache-on-error rule below).
 
-That is what a TTL cache answers: every write records `expiresAt = Date.now() + ttl`; every read checks `expiresAt > Date.now()` and serves the entry only when that is true.
+```
+Zoom out — where TTL cache lives
 
-**The stakes are concrete.** An MCP tool call takes 1.1 s or more when the rate limiter kicks in. Caching identical `(name, args)` pairs for 60 s turns repeat queries into ~0 ms. But you must never cache an error result — if a 429 is stored, every caller for the next 60 s gets that poisoned response without any chance for the server to recover.
+┌─ Agent loop ───────────────────────────────────┐
+│  runAgentLoop → mcp.callTool(name, args)       │
+└─────────────────────┬──────────────────────────┘
+                      │  every tool call
+┌─ Provider wrappers ─▼──────────────────────────┐  ← we are here
+│  McpClient.callTool                            │
+│  ★ TTL cache (Map<key,{result,expiresAt}>) ★  │
+│       │ miss                                    │
+│       ▼                                         │
+│  spacing gate (1100 ms) → liveCall             │
+│       │                                         │
+│       ▼                                         │
+│  retry loop → cache write (success only)       │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Transport + MCP ──────────────────────────────┐
+│  SdkTransport → Bloomreach MCP                 │
+└────────────────────────────────────────────────┘
+```
 
-One-line reduction: a TTL cache is a `Map` where the value is `{result, expiresAt}` and a read is only valid while `expiresAt > Date.now()`.
+**Zoom in — narrow to the concept.** The question is: how does a lazy cache expire entries by time without a background sweep, and how do you keep an error response from poisoning the slot for the entire TTL? The answer is a `Map<string, { result, expiresAt }>` where every write records `expiresAt = Date.now() + ttl` and every read short-circuits on `cached.expiresAt > Date.now()` — pure arithmetic, no timer, no eviction pass. The no-cache-on-error rule (an `isError === true` result returns without a `Map.set`) is what makes the pattern composable with the retry loop below it. The next sections name the four load-bearing pieces of the kernel and the optional hardening this codebase chose to ship.
 
 ---
 
@@ -425,3 +444,4 @@ Your tech lead says: "Expired entries stay in the Map forever — this leaks mem
 Updated: 2026-05-28 — refreshed code references to current line numbers
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

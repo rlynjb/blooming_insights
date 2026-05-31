@@ -8,25 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a `WorkspaceSchema` with an `events` array — `purchase`, `add_to_cart`, `view_item`, `checkout_started`, and ~80 more. A user asks "why did sales drop on mobile?" The agent has to pick which events are relevant. Today it does this by handing the model a text list (`schemaSummary`) and letting the model read it. But suppose you wanted code — not the model — to pre-select the five events closest in meaning to "sales": you would reach for `events.filter(e => e.name.includes('sale'))` and get *nothing*, because the event is named `purchase`, not `sale`. Substring matching fails on synonyms.
+**Zoom out — the bigger picture.** Embeddings would sit at the *front* of a retrieval pipeline that does not yet exist in blooming insights: an Indexer turns each schema string into a vector, a Vector store holds the index, a Retriever embeds the query and pulls nearest neighbors, and the result feeds the LLM's context. The codebase has none of these layers — the closest thing it does is exact substring matching in `lib/agents/intent.ts` and a truncated `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) handed to the model in full.
 
-The question an embedding answers is: how do you compute "these two strings mean similar things" as a number, when the strings share no characters?
+```
+  Zoom out — where embeddings would live (WOULD BE)
 
-**The pivot: similarity in *meaning* is not similarity in *spelling*, and `String.includes` only sees spelling.** An embedding maps each string to a point in a high-dimensional space (typically 384–3072 dimensions) such that `purchase` and `sale` land near each other and `purchase` and `password_reset` land far apart. Once both strings are points, "how similar are they?" becomes "how close are the points?" — a single arithmetic operation (cosine similarity) over two float arrays.
+  ┌─ Indexer (offline, one-time per schema) ─────────┐  ← we are here
+  │  for each schema term:                            │
+  │  ★ embed(term) → fixed-length float vector ★      │
+  └─────────────────────────┬────────────────────────┘
+                            │  vectors
+  ┌─ Vector store ──────────▼────────────────────────┐
+  │  { term → vector }   ANN index                   │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Retriever (per query) ─▼────────────────────────┐
+  │  embed(query) → cosine-nearest neighbors          │
+  └─────────────────────────┬────────────────────────┘
+                            │  top-k relevant terms
+  ┌─ LLM context ───────────▼────────────────────────┐
+  │  pack only the relevant schema slice in the prompt│
+  └──────────────────────────────────────────────────┘
 
-Before embeddings:
-- `"sales".includes` finds nothing because the event is `purchase`
-- The agent must read the whole schema text every time to find relevant terms
-- Synonyms, abbreviations, and renamed events are invisible to code-level matching
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead (plus a truncated schemaSummary handed to the model).
+```
 
-After:
-- `embed("sales")` and `embed("purchase")` are vectors with cosine similarity ≈ 0.7
-- Code can rank all 80 event names by closeness to the query term, no model call
-- The match survives spelling differences entirely
-
-It is `Array.prototype.indexOf` replaced by `nearestByCosine` — exact lookup replaced by nearest-neighbor lookup in meaning-space.
+**Zoom in — narrow to the concept.** The question is: how do you compute "these two strings mean similar things" as a number, when the strings share no characters? An embedding maps each string to a point in a high-dimensional space (384–3072 dims typically) where geometric closeness encodes semantic similarity — `purchase` lands near `sale` even though `"sale".includes("purchase")` is false. How it works walks the function shape, cosine similarity, and the one-shot offline cost vs the per-query lookup cost.
 
 ---
 
@@ -278,3 +289,4 @@ Does blooming insights compute any vector similarity, and what does the only ter
 
 → 02-embedding-model-choice.md · → 05-dense-vs-sparse.md · → 11-rag.md · → ../04-agents-and-tool-use/04-tool-routing.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

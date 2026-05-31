@@ -8,29 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've got a localStorage-backed shopping cart in a React app. Every render, you read the cart back out of storage to populate the UI. The cart has 200 items in it because users never clean up. Some renders, you only need the *count*; some renders, you need the *top three items*; some, you need the *whole list*. If you blindly stuff all 200 items into every render, the `<Cart>` component slows down, the children re-render on every tiny change, and the user sees jank — even though the right answer was always "give me the slice this view actually needs."
+**Zoom out — the bigger picture.** Context engineering is a cross-cutting discipline that touches three bands at once — Per-agent definitions (which prompt + tool subset goes in), Shared agent loop (which tool results come back and how they're truncated), and Tools/MCP (which schema slice is exposed in the first place). In blooming insights, every band has explicit curation: per-agent tool subsets via `filterToolSchemas`, tool-result truncation in `runAgentLoop`, schema-summarised injection in the monitoring prompt. The window the model sees on any turn is the *intersection* of those curation decisions, not a default.
 
-Picture the same shape with an LLM. The model has a context window — say, 200,000 tokens. Stuffing it full is "free" in the sense that the API will accept it. But the model gets slower, more expensive, and — crucially — *worse at the task*, because relevant facts get buried among irrelevant ones (the lost-in-the-middle effect). The job isn't to fit; the job is to **curate the slice this turn actually needs**.
+```
+  Zoom out — where context engineering lives
 
-That curation job is what this file answers: **what discipline decides what goes into the window on each turn?** Not prompt engineering (that's how you phrase the slice once it's in). Not RAG (that's one retrieval source feeding the slice). The bigger discipline that owns the whole window — system prompt, tool definitions, retrieved snippets, prior tool results, memory, user state, in a multi-agent run *which agent sees which slice* — is context engineering.
+  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here
+  │  ★ prompt + tool subset per agent ★              │
+  │  filterToolSchemas curates what enters the window │
+  └─────────────────────────┬────────────────────────┘
+                            │  curated context
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here
+  │  runAgentLoop                                     │
+  │  ★ tool-result truncation (16k chars) ★           │
+  │  ★ message accumulation policy ★                  │
+  └─────────────────────────┬────────────────────────┘
+                            │  every model call
+  ┌─ Provider wrappers ─────▼────────────────────────┐
+  │  cache · rate limit · retry · anthropic SDK      │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Tools + MCP transport ─▼────────────────────────┐  ← we are here
+  │  lib/tools/* | lib/mcp/client.ts                 │
+  │  ★ schema-summarised injection (top-20 events) ★  │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because most agent failures are not model failures, they are context failures. A stale retrieval poisons every downstream turn. A 112KB raw schema dumped into the system prompt evicts the actual task instructions to the middle of the window where the model loses them. A 200KB JSON tool result fed back un-truncated burns the next turn's budget on parsing noise it didn't ask for. Bigger windows do not fix this — they make room for more noise.
-
-Without context engineering as a discipline:
-- The schema dump is 112KB; the prompt is 2KB; the model spends attention on schema and misses "stop after 6 calls"
-- A tool result returns a 200KB JSON blob; the next turn's window is now mostly tool noise
-- The monitoring agent sees the recommendation agent's tools too, so it considers irrelevant options
-- An anomaly category the workspace can't even run gets queried anyway, burning a tool call
-
-With it:
-- The schema is summarised to a token-bounded slice (top 20 events × top 10 props) before it enters the prompt
-- Every tool result is truncated to 16,000 chars before going back
-- Each agent gets its own tool subset — the wrong tool isn't in the window at all
-- The category checklist is gated against the schema first, then *injected by replacement* so the model sees only what's actually runnable
-
-One-line summary: **context engineering is the discipline of curating what fills the window for the next step — the same `useMemo(() => slice(state), [deps])` instinct you use to avoid re-rendering with the whole world, applied to the LLM's working set.** Here's how that plays out in the code.
+**Zoom in — narrow to the concept.** The question is: what discipline decides what goes into the window on each turn? Not prompt engineering (how you phrase the slice once it's in), not RAG (one retrieval source feeding the slice) — but the bigger discipline that owns the whole window. Most agent failures are context failures, not model failures: a 112KB schema dump evicts the task instructions to the middle where the model loses them; a 200KB un-truncated tool result burns the next turn's budget on noise. Below, you'll see how blooming insights curates every entry point so the model sees only what it needs on this turn.
 
 ---
 
@@ -397,3 +403,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

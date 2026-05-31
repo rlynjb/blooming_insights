@@ -8,27 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You write a test for a `formatCurrency` helper: `expect(formatCurrency(1234.5)).toBe('$1,234.50')`. The input is fixed, the output is deterministic, and the assertion is exact — the function either returns that string or it does not. That test guards behaviour forever: the day someone breaks the thousands separator, it goes red.
+**Zoom out — the bigger picture.** Eval sets are *orthogonal* to the request flow — they run alongside it, not inside it. The same `Anomaly → DiagnosticAgent.investigate → Diagnosis` chain that serves a live user feeds an offline harness with fixed inputs and a scoring rubric. blooming insights has a small eval band today (`lib/eval/*` for schema validation and the coverage gate), but no golden/adversarial/regression *sets* — the kind that compare a model swap or a prompt edit before/after on quality.
 
-Now point that same instinct at an LLM. `DiagnosticAgent.investigate(anomaly)` does not return `'$1,234.50'` — it returns a paragraph of prose explaining *why* mobile conversion dropped. Run it twice and you get two different paragraphs, both arguably correct. The question an eval set answers is: **how do you build a fixed, scoreable dataset for a function whose output is non-deterministic prose, so you can tell whether a model swap or a prompt edit made the answers better or worse?**
+```
+  Zoom out — the eval band runs parallel to the request flow
 
-**Why answering it matters: without an eval set, every prompt change and model upgrade is a blind deploy.** You edit `lib/agents/prompts/diagnostic.md`, the demo still "looks good," you ship — and you have no idea whether you improved diagnosis quality, left it flat, or regressed it on the inputs you did not happen to click. The 169 Vitest tests will stay green through all three outcomes, because they never look at answer quality. An eval set is the only instrument that turns "looks good" into a number you can compare across versions.
+  REQUEST FLOW (live)                EVAL FLOW (offline, parallel)
+  ┌─ User → Route ─────────────┐    ┌─ Eval harness ──────────────┐  ← we are here
+  │                              │    │  fixed inputs (anomaly fixtures)│
+  └────────────┬─────────────────┘    └─────────────┬───────────────┘
+               │                                    │
+  ┌─ Pipeline + Per-agent ──────┐    ┌─ same per-agent ────────────┐
+  │  DiagnosticAgent.investigate │    │  DiagnosticAgent.investigate │
+  └────────────┬─────────────────┘    └─────────────┬───────────────┘
+               │  Diagnosis                          │  Diagnosis
+               ▼                                     ▼
+  ┌─ UI (live render) ──────────┐    ┌─ ★ scorer (rubric / judge) ★ ┐
+  │  user reads                  │    │  golden ↔ produced            │
+  └─────────────────────────────┘    │  adversarial: refuse/sanitize? │
+                                      │  regression: every past bug    │
+                                      └─────────────┬─────────────────┘
+                                                    ▼
+                                              quality number tracked
+                                              over time
 
-Before an eval set:
-- A prompt edit ships on vibes — "the diagnosis reads better to me on this one insight"
-- A model swap (`claude-sonnet-4-6` → next) is a coin flip on quality with no before/after number
-- A regression — an edit that fixes input A but breaks input B — is invisible until a user hits B
-- The adversarial `?q=` path is untested against injection until someone exploits it
+  Currently in this codebase: lib/eval/ holds schema validation
+  and the coverage gate. The golden / adversarial / regression
+  SETS this file describes are not yet present.
+```
 
-After:
-- A golden set gives a quality baseline you re-run on every prompt/model change
-- An adversarial set proves the system refuses or sanitizes hostile inputs
-- A regression set freezes every past failure as a permanent guard
-- A model swap becomes a scored A/B, not a gamble
-
-An eval set is the `formatCurrency` test reconceived for prose: fixed inputs, an expected-answer rubric instead of `.toBe()`, and a score you track over time.
+**Zoom in — narrow to the concept.** The question is: how do you build a fixed, scoreable dataset for a function whose output is non-deterministic prose, so you can tell whether a model swap or a prompt edit made the answers better or worse? Three set shapes do different jobs: a *golden* set proves quality on representative inputs, an *adversarial* set proves the system refuses hostile inputs, and a *regression* set freezes every past bug. How it works walks each shape, the rubric vs `.toBe()` distinction, and the principle that "looks good" is not a metric.
 
 ---
 
@@ -336,3 +347,4 @@ What does `isDiagnosis` (`lib/mcp/validate.ts` L29–L35) actually assert about 
 Updated: 2026-05-28 — Test count 125→157 (17 files, `vitest run`); re-derived `?q=` path refs (trim L115, answer L214) and the eval-exercise type ranges (Anomaly L53–L61, Diagnosis L64–L73, Recommendation L85–L99). Still Case B — no eval harness; `isDiagnosis` (validate.ts L29–L35) unchanged.
 Updated: 2026-05-29 — Test count 157→169 (all live occurrences); diagnostic try-parse chain ref L73–L77→L74–L75 (verified against current `diagnostic.ts`).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

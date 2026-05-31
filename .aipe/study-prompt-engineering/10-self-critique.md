@@ -8,23 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have an autocomplete that suggests a value, and for a high-stakes field — say a wire amount — you do not just take the first suggestion. You either show a confirmation step ("you typed $4,200 — confirm?") or you compute the value two independent ways and flag a mismatch. The pattern is: for outputs where being wrong is expensive, you spend extra work to catch the wrong ones before they ship.
+**Zoom out — the bigger picture.** Self-critique and self-consistency are a hypothetical second-pass band that would sit *between* the existing Per-agent definitions output and the consumer (Pipeline coordinator for the agents, UI for the classifier). In blooming insights today this band is empty — `DiagnosticAgent.investigate` returns and the diagnosis streams straight to the user with no verify step, and `classifyIntent` returns one word with no vote. The only second model call that exists — `synthesize()` — sits inside the Per-agent definitions band as a clean-context retry gated on parse failure, *not* on the successful path, which is what makes it recovery and not verification.
 
-An LLM output is the same. The first sample is one draw from a distribution; for low-stakes output you take it, for high-stakes output you want a second opinion. The question this file answers: **when is it worth running the model again to check or re-vote its own answer, and when is that just paying 2–5× the tokens to confirm its own mistake?**
+```
+  Zoom out — where self-critique/self-consistency would live
 
-**The pivot: self-critique and self-consistency trade tokens for reliability, and the trade only pays off when the failures are catchable by a re-read or a vote — not when the model is confidently and systematically wrong.** A model asked to grade its own output will pass the same hallucination that produced it, because the blind spot is shared. Knowing which failures these techniques catch — and which they cannot — is the whole skill.
+  ┌─ Per-agent definitions ─────────────────────────┐
+  │  DiagnosticAgent.investigate → Diagnosis v1     │
+  │  classifyIntent → one word                       │
+  │  (synthesize() is here too: RECOVERY, not critique)│
+  └─────────────────────────┬────────────────────────┘
+                            │ first output
+  ┌ ─ VERIFICATION band ─ ─ ▼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐  ← we are here
+   ★ self-critique (sequential): critique(v1) → v2 ★
+   ★ self-consistency (parallel): run N → vote ★
+     ⚠ shared blind spot: same model approves its own
+       systematic error
+   (Not yet implemented in blooming insights)
+  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+                            │
+  ┌─ Pipeline / UI ─────────▼────────────────────────┐
+  │  ships verified output                            │
+  └──────────────────────────────────────────────────┘
+```
 
-Before any verification:
-- The diagnostic agent's first conclusion streams straight to the user; a confident-wrong cause is shown as fact
-- The intent classifier's one-word answer (`intent.ts` L17–31) is taken as-is; a borderline question is misrouted with no second look
-- There is no mechanism to catch "well-formed but wrong" — the type guards prove shape, not truth (→ 02-structured-outputs.md)
-
-After (if added):
-- A verify pass re-reads the diagnosis against the evidence before it streams, catching "you concluded X but your evidence shows Y"
-- An N-run vote on the classifier turns a coin-flip borderline case into a majority decision
-- Both cost more tokens, and both have a clear ceiling on what they can catch
+**Zoom in — narrow to the concept.** The question this file answers: when is it worth running the model again to check or re-vote its own answer, and when is that just paying 2–5× the tokens to confirm its own mistake? Self-critique trades depth (one careful re-read) for reliability; self-consistency trades breadth (N independent samples) for it. Both have a hard ceiling — a model grading its own work shares the priors that produced the error — and both target different output shapes (critique for prose, vote for discrete labels). Below, you'll see why `synthesize()` is recovery and not critique, where verification would actually pay off here, and how to blunt the shared-blind-spot trap with an independent checker.
 
 ---
 
@@ -307,3 +317,4 @@ What is the exact trigger condition under which `synthesize()` runs in the diagn
 
 → 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

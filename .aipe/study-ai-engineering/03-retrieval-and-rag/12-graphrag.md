@@ -8,25 +8,41 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-The `WorkspaceSchema` blooming insights builds is already a graph, not a flat list. An *event* (`purchase`) has a set of *properties* (`amount`, `currency`); a *catalog* relates to the events that reference it; a customer property links customers to events. `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks this structure with four sequential tool calls — event schema, customer properties, catalogs, overview — and assembles the nodes-and-edges into one `WorkspaceSchema`. That is a graph traversal that produces a graph. Flat embedding retrieval (files 01–10) throws that structure away — it treats every chunk as an independent point and only knows "similar to," never "connected to."
+**Zoom out — the bigger picture.** GraphRAG is a retrieval pipeline that swaps the Vector store for a *graph store* and the cosine retriever for *edge traversal*. The Indexer extracts entities + relationships, the Graph store holds nodes and edges, and the Retriever walks the connections — not the embedding space. blooming insights already builds a graph-shaped artifact: `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks event/property/catalog/customer-property links with four sequential tool calls and assembles a `WorkspaceSchema`. The graph *shape* is in the codebase; the graph *retrieval* is not.
 
-The question GraphRAG answers is: when the answer depends on *relationships* between entities, not just their textual similarity, how do you retrieve by traversing the connections?
+```
+  Zoom out — where GraphRAG sits (WOULD BE)
 
-**The pivot: vector similarity captures "these mean the same thing" but is blind to "these are linked," and many real questions are about links — shared metrics, shared scope, cause-and-effect chains — that no cosine can see.** "What other insights touch the same metric as this one?" is a *relationship* query: it follows the `metric` edge from one `Insight` to others, not the nearest-vector edge. A flat embedding index would return insights with *similar wording*, missing a differently-worded insight about the exact same metric. GraphRAG retrieves along the edges.
+  ┌─ Source documents / entities ────────────────────┐
+  │  insights (Insight), schema nodes, events, scopes │
+  └─────────────────────────┬────────────────────────┘
+                            │  extract entities + edges
+  ┌─ Indexer (entity + relation extraction) ─────────┐
+  │  for each doc: nodes + typed edges                │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Graph store ───────────▼────────────────────────┐
+  │  nodes: Insight, Metric, Scope, Event             │
+  │  edges: same_metric, same_scope, caused_by, …     │
+  └─────────────────────────┬────────────────────────┘
+                            │  query
+  ┌─ Retriever (traversal) ─▼────────────────────────┐  ← we are here
+  │  ★ graph.neighbors(node, edgeType, depth) ★      │
+  │  multi-hop: insight → metric → other insights     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ LLM context ───────────▼────────────────────────┐
+  └──────────────────────────────────────────────────┘
 
-Before graph retrieval:
-- Retrieval is similarity-only: nearest vectors, no notion of connection
-- "Related insights" returns textually-similar ones, not metric-linked ones
-- Multi-hop questions ("what led to what") cannot be answered — there are no edges to follow
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; the schema graph IS built (bootstrapSchema walks
+  nodes and edges), but no traversal-as-retrieval consumes it.
+```
 
-After:
-- Entities (insights, metrics, scopes, events) are nodes; shared attributes are edges
-- "Related to this insight" traverses the `metric`/`scope` edges
-- Multi-hop traversal answers connection questions similarity cannot
-
-It is the difference between `array.filter(x => cosine(x.vec, q) > t)` (similarity) and `graph.neighbors(node, edgeType)` (traversal) — and `bootstrapSchema` already does the latter shape over the schema.
+**Zoom in — narrow to the concept.** The question is: when the answer depends on *relationships* between entities — not just textual similarity — how do you retrieve by traversing the connections? Vector similarity captures "these mean the same thing" but is blind to "these are linked," and many real questions are about links (shared metrics, shared scope, cause-and-effect chains). How it works walks the entity-extraction step, edge typing, traversal queries, and the rule that the more your domain is a graph, the more cosine alone misses.
 
 ---
 
@@ -296,3 +312,4 @@ What graph-shaped data does blooming insights already build and walk, and what e
 ---
 Updated: 2026-05-28 — corrected one stale ref: `bootstrapSchema` moved to `lib/mcp/schema.ts` L170–L192 (was L152–L176). Case-B rationale (graph-shaped schema, no graph query yet) unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -8,25 +8,28 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You set `maxLength={280}` on a textarea to keep a post under a tweet limit. The limit the server actually enforces might be measured differently — bytes, grapheme clusters, "weighted" characters — but `maxLength` is a cheap, client-side approximation that is *close enough* to stop most over-limit submissions before they hit the network. You are bounding one unit (the real limit) with a proxy unit (character count) because the proxy is free to measure and the real one is not.
+**Zoom out — the bigger picture.** Tokenization is the unit the Provider band counts in — context window, `max_tokens`, per-call billing — but blooming insights never runs a tokenizer. The bounding that *should* be token-aware lives one layer up in the per-agent and pipeline code (the `MAX_TOOL_RESULT_CHARS = 16_000` truncation in `lib/agents/base.ts`, the `schemaSummary` caps in `lib/agents/monitoring.ts`, and the `TRUNC = 4000` UI-stream cap in `app/api/agent/route.ts`), all measured in *characters* as a coarse proxy. The only token-denominated control is `max_tokens` on the output side, set right at the Provider call.
 
-The question every LLM system faces is the same: the model's hard limits — context window, `max_tokens`, per-call cost — are all denominated in *tokens*, a unit your code cannot see without running a tokenizer. So how do you keep a prompt inside the window when you do not count the unit the window is measured in?
+```
+  Zoom out — where tokenization lives (and where the proxy sits)
 
-**The pivot: a token is roughly four characters of English, so a character budget is a usable — if coarse — proxy for a token budget.** Counting tokens requires the model's tokenizer; counting characters is `s.length`. blooming insights makes the engineering call to skip the tokenizer entirely and bound everything by characters, accepting that the bound is loose. This works because the consequences of being loose here are mild: a slightly-too-large prompt costs a few extra tokens, not a crash.
+  ┌─ Route + Per-agent (bounds in CHARACTERS — proxy) ┐
+  │  schemaSummary caps    monitoring.ts L15–48        │
+  │  truncate (16_000)     base.ts L31–34              │
+  │  TRUNC (4000) UI       route.ts L99–103            │
+  └─────────────────────────┬──────────────────────────┘
+                            │  messages[] (input size: unknown in tokens)
+  ┌─ Provider ──────────────▼──────────────────────────┐  ← we are here
+  │  anthropic.messages.create({ max_tokens: 4096 })   │
+  │  ★ TOKENIZER ★ (lives inside the SDK, not called)  │
+  │  input tokens = f(messages)  ← never measured      │
+  │  output capped by max_tokens (the real unit)       │
+  └────────────────────────────────────────────────────┘
+```
 
-Before any budgeting:
-- A single EQL tool result can be tens of thousands of characters
-- Concatenated across six tool calls, the conversation balloons past the context window
-- The model call fails or silently drops the oldest turns
-
-After character budgeting:
-- Each tool result is sliced to 16,000 chars before it re-enters the conversation
-- The schema summary is capped to ~20 events × 10 props
-- Each call carries a hard `max_tokens` ceiling on the *output*
-
-It is `maxLength` on a textarea — applied to every string that flows into a model call, using characters because the real unit (tokens) is not free to measure.
+**Zoom in — narrow to the concept.** The question is: how do you keep a prompt inside the window when you do not count the unit the window is measured in? blooming insights answers with a 4-chars-per-token proxy — bound input by `string.length`, bound output by `max_tokens` — and accepts the slop. How it works walks through every budget, the proxy's failure mode for JSON, and the trigger to upgrade to real token accounting.
 
 ---
 
@@ -319,3 +322,4 @@ What `max_tokens` value forces the intent classifier to answer in one word, and 
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); character-budget facts and `base.ts`/`monitoring.ts`/`intent.ts` refs verified unchanged.
 Updated: 2026-05-29 — Corrected the two stale diagnostic-synthesis `max_tokens` citations from L94 to L99 (verified against current `diagnostic.ts`: `max_tokens: 2048` is at L99).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

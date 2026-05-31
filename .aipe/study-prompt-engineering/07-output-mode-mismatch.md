@@ -8,19 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have an endpoint that returns JSON and a client that renders it; the contract is "this returns `application/json`," and the day someone changes the handler to return an HTML error page while the client still calls `res.json()`, the client throws on the first byte. The mismatch isn't in either side alone — it's between what the producer declares and what the consumer assumes. An LLM agent has the exact same contract: the prompt declares an output *mode* (JSON or prose), and downstream code assumes one. When the declared mode and the assumed mode diverge, you get a parser throwing on prose, or prose getting force-fed through a JSON validator that rejects every word.
+**Zoom out — the bigger picture.** Output mode mismatch lives at the boundary between Per-agent definitions (where the `## Output` section declares JSON or prose) and the consumer code that reads `finalText` — `parseAgentJson` + a type guard for the JSON agents, or a bare `.trim()` for the prose agent. The concept is exactly that boundary: producer declares, consumer assumes, and a mismatch is the two sides disagreeing about which mode is in play. The mismatch never crashes — it silently degrades, which is why you catch it by reading the two ends together, not by waiting for an exception.
 
-The question this file answers: blooming insights has four agents, three emitting JSON and one emitting prose — how is each agent's output mode declared, where is it enforced, and how would you catch a mismatch before it ships?
+```
+  Zoom out — where output mode mismatch lives
 
-**The pivot: output mode is a per-prompt contract that must be declared in the prompt and enforced at the consuming boundary — and a mismatch is invisible in the prompt alone; you only see it where the output is handled.** The query agent reads almost identically to the others (same six-section anatomy, → 01-anatomy.md) except for one line that flips its mode. If you skim the prompt and miss that line, you'd assume it returns JSON and wire it through the JSON path — and the bug wouldn't surface until a real prose answer hit `parseAgentJson`.
+  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here (producer)
+  │  monitoring.md L71  "ONLY JSON, fenced"  ─┐      │
+  │  diagnostic.md L61  "ONLY JSON, fenced"   ├─JSON │
+  │  recommendation.md L49 "ONLY JSON, fenced"─┘     │
+  │  query.md L49 "No JSON — just answer text" ─PROSE│
+  │  (mode also declared in synthesisInstruction)    │
+  └─────────────────────────┬────────────────────────┘
+                            │  finalText (untrusted string)
+  ┌─ Consumer band ─────────▼────────────────────────┐  ← we are here (consumer)
+  │  ★ JSON path: parseAgentJson + isDiagnosis ★     │
+  │     mon.ts L85–92 · diag.ts L73–77 · rec L69–76 │
+  │  ★ PROSE path: finalText.trim() ★                │
+  │     query.ts L47  (NO parseAgentJson)            │
+  │  separate consumer code → modes can't share enforcement│
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ UI / next agent ───────▼────────────────────────┐
+  │  silent mismatch shows up here (degraded output) │
+  └──────────────────────────────────────────────────┘
+```
 
-The two modes in this codebase:
-- **JSON mode** (monitoring, diagnostic, recommendation): "Return ONLY a JSON … fenced block" → consumed by `parseAgentJson` + a type guard
-- **Prose mode** (query): "No JSON shape is required — just the answer text" (`query.md` L49) → consumed as a trimmed string
-
-It is the content-type contract, applied to an agent whose declared mode lives in one prompt line and whose enforcement lives in a different file.
+**Zoom in — narrow to the concept.** The question this file answers: how is each agent's output mode declared, where is it enforced, and how would you catch a mismatch before it ships? Three agents share the JSON path (declare-fenced-JSON → parseAgentJson → guard → reject-on-mismatch) and one agent is deliberately on the prose path (declare-prose → trim → default), with *separate* consumer code so the modes can't accidentally share enforcement. The mode is also declared a second time in each agent's `synthesisInstruction`, so a refactor must keep three sites in sync. Below, you'll see how each mismatch direction degrades silently, and the three-site checklist that catches one in review.
 
 ---
 
@@ -330,3 +346,4 @@ Which agent consumes its `finalText` without calling `parseAgentJson`, and what 
 Updated: 2026-05-29 — Corrected the monitoring.md JSON-output fence reference L52→L71 (the `## Output` "Return ONLY a JSON array" line moved down after the `{categories}` section) across all 7 citations.
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an earlier prompt-file revision): diagnostic.md output fence L46→L61, recommendation.md output fence L46→L49, query.md prose-output L36→L49, across all prose + diagram citations.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

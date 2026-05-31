@@ -8,25 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-A long upload shows a progress bar; a chat UI shows a typing indicator; a build log streams lines as they happen. None of these make you wait for the whole operation before showing *something* — they turn a slow, opaque request into a sequence of visible increments. The mechanism is always the same: the server writes chunks as work completes, and the client renders each chunk as it arrives instead of buffering to the end.
+**Zoom out — the bigger picture.** Streaming is the *only* concept in this guide that spans three bands at once: the agent loop emits events in the Per-agent layer (`hooksFor` wiring), the Route handler frames them as NDJSON inside `ReadableStream.start` (`app/api/agent/route.ts` L169–L265), and the UI reads them line-by-line in `lib/hooks/useInvestigation.ts`. The Provider sits below, producing reasoning increments; the consumer sits above, rendering each event as it arrives.
 
-An agent investigation is a slow, opaque operation: six tool calls, two model passes, tens of seconds. The question is: do you make the user stare at a spinner until the final `Diagnosis` lands, or do you stream each reasoning step, tool call, and partial result as it happens?
+```
+  Zoom out — where streaming lives (spans three bands)
 
-**The pivot: for an agent, the intermediate steps are not loading noise — they are the product.** A briefing tool whose value is "explain why a metric moved" earns trust by *showing* the investigation: the hypotheses considered, the queries run, the evidence gathered. Streaming is not a latency mask here; it is the feature. Hiding the trace behind a spinner would discard the thing users came for.
+  ┌─ UI ─────────────────────────────────────────────┐  ← we are here (one end)
+  │  useInvestigation hook: getReader + line buffer  │
+  │  ★ buf = lines.pop() — partial-line guard ★      │
+  └─────────────────────────▲────────────────────────┘
+                            │  NDJSON "{...}\n{...}\n..."
+  ┌─ Route handler ─────────┴────────────────────────┐  ← we are here (other end)
+  │  ★ ReadableStream.start ★  route.ts L169–265     │
+  │  send(e) → encode → controller.enqueue           │
+  │  NDJSON_HEADERS  (NOT text/event-stream)         │
+  └─────────────────────────▲────────────────────────┘
+                            │  per-event callbacks
+  ┌─ Pipeline + Per-agent ──┴────────────────────────┐
+  │  hooksFor wires onText/onToolCall → send         │
+  └─────────────────────────▲────────────────────────┘
+                            │
+  ┌─ Provider ──────────────┴────────────────────────┐
+  │  runAgentLoop produces reasoning increments      │
+  └──────────────────────────────────────────────────┘
+```
 
-Before streaming:
-- The investigate page shows a spinner for 30+ seconds
-- The user has no signal the agent is making progress or stuck
-- The whole run is invisible; only the final verdict appears
-
-After streaming:
-- Each reasoning step, tool call, and result renders the instant it is produced
-- The pipeline pill advances through diagnostic → recommendation live
-- The investigation *is* the UI — the trace is the product, not a side effect
-
-It is a build log for an LLM agent: every line of work, visible as it happens.
+**Zoom in — narrow to the concept.** The question is: do you make the user stare at a spinner for 30+ seconds while the agent runs, or do you stream each reasoning step, tool call, and partial result as it happens? For this product the trace *is* the value — and the transport choice (NDJSON over `fetch`/`getReader()`, not `EventSource`) is decisive because each `GET` *starts* an expensive non-idempotent run that auto-reconnect would double. How it works walks the event vocabulary, the server stream, and the client's line-buffer loop.
 
 ---
 
@@ -441,3 +450,4 @@ What `Content-Type` does the agent route return, and why does that choice rule o
 Updated: 2026-05-28 — `maxDuration` 60→300; documented schema bootstrap moved inside the `ReadableStream` (+ try/catch error events, briefing route mirror); NDJSON consumer relocated from the investigate page to the StrictMode-safe `useInvestigation` hook; re-derived all route.ts/hook line refs.
 Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (local `BriefingEvent` superset L54–L58 that does NOT widen the shared `AgentEvent`; demo paced replay `REPLAY_DELAY_MS = 140` vs the agent route's 180; per-category `coverage_item` streaming L209–L212 that fills the grid tile-by-tile); refreshed drifted refs — briefing `maxDuration` L16→L17, and the feed's briefing reader from the stale `app/page.tsx` L311–L312 to the live reader (`getReader()` L323, loop L439–L457, `BriefingEvent` L28–L32).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

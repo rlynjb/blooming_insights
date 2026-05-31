@@ -8,25 +8,31 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a feature where an input field accepts arbitrary user text — a comment box, a search query, a document upload — and you learned the hard way that "it works on my test string" tells you nothing about what happens when someone pastes 40KB. You added a `maxLength`, you truncated server-side, you measured payload size before sending. The boundary between "small input I tested" and "real input at scale" is where features quietly break, and the failure is never a clean error — it's a 30-second hang, a truncated half-answer, or a 500 three layers downstream.
+**Zoom out — the bigger picture.** Token budgeting spans three bands. The prefix cap (`schemaSummary`) lives at the Per-agent definitions band, where each agent assembles its system prompt. The transcript caps (`truncate`, `maxToolCalls`) live one layer down in the Shared agent loop, where every Observation gets clipped and the turn count gets gated. The output cap (`max_tokens`) is what every call hands to the Provider band, sized to the job — 4096 for the agents, 16 for the classifier. Four caps on three bands, all aimed at keeping the sum under the practical window — and the one optimization left on the table (prefix caching) sits at the Provider boundary where `cache_control` would go.
 
-An LLM call is exactly this boundary, except the size limit is denominated in tokens, not characters, and there are three separate limits stacked on top of each other: how much you can put *in* (the context window), how much the model can put *out* (`max_tokens`), and how much you should *actually* use before quality degrades (the practical fraction of the window, well below the hard ceiling). The question this file answers: where does blooming insights spend its token budget, what bounds each line item, and what is it leaving on the table.
+```
+  Zoom out — where token budgeting lives
 
-**The pivot: token counting is basic hygiene, not an optimization you bolt on later.** I have watched a teammate ship a summarizer that worked beautifully in the demo — three-paragraph inputs — and silently truncated every real document because nobody counted tokens. The model didn't error. It just stopped reading at the window boundary and confidently summarized the first third. The bug was invisible until a user complained the summary "missed the whole second half." Counting tokens up front is the difference between a feature that scales and one that demos.
+  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here (prefix cap)
+  │  ★ schemaSummary 20/10/30  monitoring.ts L16–49 ★│
+  │  PROMPT.replace('{schema}', bounded summary)     │
+  └─────────────────────────┬────────────────────────┘
+                            │  system + userPrompt
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here (transcript caps)
+  │  ★ truncate() ≤16k chars  base.ts L29–34 ★       │
+  │  ★ maxToolCalls 6/6/4/6  base.ts L90–101 ★       │
+  └─────────────────────────┬────────────────────────┘
+                            │  max_tokens reserved
+  ┌─ Provider ──────────────▼────────────────────────┐  ← we are here (output cap)
+  │  ★ max_tokens: 4096 / 2048 / 16 ★                │
+  │  anthropic.messages.create  base.ts L92–102      │
+  │  ✗ no cache_control — prefix re-sent every turn │
+  └──────────────────────────────────────────────────┘
+```
 
-Before budgeting:
-- The full 112KB workspace schema is injected raw; one agent call blows past the practical window and the model starts ignoring the back half of its own instructions
-- A single tool result returns 80KB of JSON; it floods the transcript and pushes the original anomaly out of the model's effective attention
-- The model "thinks" forever on the final turn and never emits the JSON because nothing bounds output
-
-After:
-- `schemaSummary` ships a compact, bounded schema instead of the raw 112KB blob (`monitoring.ts` L16–L49)
-- `truncate()` caps every observation at 16,000 chars (`base.ts` L29–L34)
-- `maxToolCalls` + `max_tokens` bound how big the transcript and the output can grow
-
-It is the `maxLength`-and-measure-before-send discipline, applied to a backend whose payloads are priced per token and whose "field" is a finite context window.
+**Zoom in — narrow to the concept.** The question this file answers: where does blooming insights spend its token budget, what bounds each line item, and what is it leaving on the table? The answer is four independent caps on three layers — prefix, transcript-per-observation, transcript-turn-count, output — plus one named omission: prefix caching is unused and `{schema}` is appended *last* in every prompt, which is the wrong place for the cacheable-prefix rule. Below, you'll see how each cap targets one source, why the classifier's 16-token ceiling enforces a one-word format through the budget itself, and what the `{schema}-last` layout costs every multi-turn run.
 
 ---
 
@@ -382,3 +388,4 @@ What is `MAX_TOOL_RESULT_CHARS`, where is it defined, and what does `truncate` a
 ---
 Updated: 2026-05-29 — Resynced monitoring refs after the `{categories}` shift: `schemaSummary` L15–48→L16–49, monitoring `maxToolCalls` L74→L101, `{schema}` placement L75–77→L99–101, plus the ~112KB comment L14→L15 and the `.replace('{schema}',…)` call L62→L84.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

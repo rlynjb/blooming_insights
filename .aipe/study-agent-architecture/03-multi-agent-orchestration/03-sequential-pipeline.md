@@ -8,66 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
-
-```
-The sequential pipeline shape
-
-  ┌─────────┐  draft  ┌─────────┐ reviewed ┌─────────┐
-  │ Stage A │ ──────► │ Stage B │ ───────► │ Stage C │
-  │ (find)  │         │(explain)│          │(propose)│
-  └─────────┘         └─────────┘          └─────────┘
-
-  output of one = input of next; order is fixed
-```
-
-You've written this code a thousand times:
+**Zoom out — the bigger picture.** Sequential pipeline IS the Pipeline coordinator band in blooming insights. `lib/agents/pipeline.ts` is the file — the place where `monitoring → diagnostic → recommendation` is wired as a `.then()` chain of agents, with the typed `Diagnosis` flowing from stage two into stage three as the input that the next agent literally cannot start without. The Per-agent definitions below are the stages; the Shared agent loop below them is what each stage runs inside. This is the topology blooming insights actually uses — every other topology in this folder is a contrast against this one.
 
 ```
-const user = await fetchUser(id);
-const orders = await loadOrders(user);
-const summary = await summarize(orders);
-return render(summary);
+  Zoom out — where sequential pipeline lives
+
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
+  │  ★ lib/agents/pipeline.ts ★                       │
+  │  monitoring ──► diagnostic ──► recommendation     │
+  │              Anomaly        Diagnosis             │
+  │  output of one stage IS input of the next         │
+  │  (typed handoff, fixed order, no parallelism)     │
+  └─────────────────────────┬────────────────────────┘
+                            │  per-stage invocation
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring.ts | diagnostic.ts | recommendation.ts│
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop (lib/agents/loop.ts) per stage     │
+  └──────────────────────────────────────────────────┘
 ```
 
-A `.then()` chain of single-purpose functions. Each step takes the previous step's output and produces the next step's input. The order is fixed (you can't summarize before you've loaded orders). The whole thing is a pipeline.
-
-Now picture the same shape, except each function is an *agent* — a ReAct loop with its own prompt, its own tool subset, its own budget. The chain shape stays the same; the cells of the chain just got smarter inside.
-
-### Move 2 — name the question
-
-That second shape — a `.then()` chain where each function is an agent — is what sequential pipeline names. Not the diffing between agents, not the parallelism (there is none), just the order. The question this file answers: **when does it make sense to have agents as pipeline stages, versus one big agent that does everything, versus parallel workers?**
-
-Sequential pipeline is the answer when the *sub-jobs are real* (different prompts, different tool needs, different output schemas) AND the *order is fixed* (each stage needs the previous one's output to start). Both halves matter.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because the alternative shapes (one mega-agent, parallel fan-out) fail in opposite ways, and the failure cost is highest when you pick the wrong one.
-
-One mega-agent with all tools fails by *responsibility-blending*: one prompt has to handle detection AND diagnosis AND recommendation; one tool budget has to cover all three; the model mixes outputs. Parallel fan-out fails when the sub-jobs aren't actually independent — if stage B needs stage A's diagnosis, running them in parallel just means B runs without context and you throw its work away.
-
-In this codebase: the diagnostic agent's typed `Diagnosis` is literally an input to the recommendation agent's `propose(anomaly, diagnosis, hooks)` call. The recommendation agent cannot start without it. That data dependency is the constraint that forces sequential — not preference, not aesthetics. The order has to be sequential because the data flow is sequential.
-
-### Move 4 — concrete before/after
-
-One mega-agent with everything:
-- One prompt, ~20 tools, one 12-iteration budget for detect + diagnose + recommend combined
-- The model has to decide every turn: "am I detecting, diagnosing, or recommending?" — and the answer drifts
-- Tool budget burned 8 turns on detection, only 4 left for diagnosis + recommendation
-- Output schema is a soup — sometimes a diagnosis, sometimes a recommendation list, sometimes both, sometimes neither
-
-Sequential pipeline (this codebase):
-- Three prompts, each ~5–8 tools, each with its own budget (6/6/4 turns)
-- Diagnostic agent runs with diagnostic prompt + diagnostic tools — no detection, no recommendation
-- Diagnosis returned as typed `Diagnosis` object — a clean handoff
-- Recommendation agent gets the diagnosis as an input; its prompt is focused on action proposals
-- Each stage's output is schema-validated before becoming the next stage's input
-
-### Move 5 — one-line summary
-
-A sequential pipeline is a `.then()` chain where each function is an agent — same shape as `a().then(b).then(c)`, except `a` and `b` and `c` are ReAct loops. blooming insights uses this for `monitoring → diagnostic → recommendation`, with the typed `Diagnosis` as the message handed step-to-step. Here's how the mechanics work.
+**Zoom in — narrow to the concept.** The question is: when do you wire agents as pipeline stages instead of one mega-agent or parallel workers? Sequential pipeline is the answer when the sub-jobs are real (different prompts, different tools, different schemas) AND the order is fixed by a data dependency (each stage needs the previous one's output to start). blooming insights ticks both boxes: the typed `Diagnosis` is literally an input to `recommendation.propose(anomaly, diagnosis, hooks)`. Below, you'll see the mechanics — the typed handoffs, the per-stage budgets, and the schema gate between stages.
 
 ---
 
@@ -496,3 +464,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

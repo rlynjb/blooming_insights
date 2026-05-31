@@ -8,27 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You write a component that fetches user data, and you do *not* hard-code `fetch` inside it — you take the fetcher as a prop (or a context value) so your test can pass a stub that returns a fixed object with no network. The component does not know or care whether the real `fetch` or a stub is behind the prop; it only knows the *shape* of what it's calling. That seam — depend on an interface, accept the implementation from outside — is what makes the component testable in isolation.
+**Zoom out — the bigger picture.** Provider abstraction lives at the seam between the Per-agent / Agent loop layer and the Provider band. The agent loop in `lib/agents/base.ts` depends on two narrow interfaces — `McpCaller` (L16–L22) and the injected `anthropic: Anthropic` parameter (L48–L49) — and constructs neither. The Route handler builds the real clients (`new Anthropic` at `app/api/agent/route.ts` L207, `connectMcp` for MCP) and passes them down; tests pass fakes through the same parameter.
 
-The question for an LLM system is the same: the agent loop calls Claude and an MCP server, both of which are slow, paid, networked, and non-deterministic. How do you test the loop's logic — does it stop at the budget, does it feed tool results back, does it force a final turn — without a live API key and a live server on every test run?
+```
+  Zoom out — where the injection seam sits
 
-**The pivot: depend on an interface and accept the implementation from outside, so tests inject fakes.** The agent loop should not construct its own Anthropic client or MCP client; it should receive them. Then a test passes a fake that returns scripted responses, and the loop runs its full logic against no network at all.
+  ┌─ Route / Test (chooses implementation) ─────────┐
+  │  PROD: new Anthropic(...) + connectMcp           │
+  │  TEST: fakeAnthropic + scripted McpCaller        │
+  └─────────────────────────┬───────────────────────┘
+                            │  passed as parameters
+  ┌─ Per-agent + Agent loop ▼───────────────────────┐  ← we are here
+  │  ★ runAgentLoop({ anthropic, mcp, ... }) ★      │
+  │  depends on:  Anthropic (CONCRETE SDK type)     │
+  │               McpCaller (structural interface)  │
+  │  constructs:  nothing                           │
+  └─────────────────────────┬───────────────────────┘
+                            │
+  ┌─ Provider wrappers + Provider ──▼──────────────┐
+  │  anthropic.messages.create(params)              │
+  │  mcp.callTool(name, args)                       │
+  │  (one provider; no vendor-neutral interface,    │
+  │   no factory, no swap path)                     │
+  └─────────────────────────────────────────────────┘
+```
 
-But be precise about what this buys: a *test seam* is not the same as *provider portability*. One enables fakes-in-tests; the other lets you swap Claude for GPT in production. blooming insights built the first and not the second.
-
-Before the seam:
-- The agent loop constructs `new Anthropic(...)` and `new McpClient(...)` internally
-- Every test needs a real API key and hits the network — slow, flaky, costly
-- You cannot script the model's response to test the budget logic deterministically
-
-After the seam:
-- `runAgentLoop` receives `anthropic` and `mcp` as parameters
-- Tests inject fakes; 169 tests run with no network and no key
-- The loop's control flow is verified against scripted responses
-
-It is the inject-the-fetcher pattern, applied to the model client and the tool client.
+**Zoom in — narrow to the concept.** The question is: how do you test the loop's logic — budget, tool feedback, forced final turn — without a live API key and a live server on every run? Inject both clients by parameter so a test passes a fake. But be precise about what this buys: a *test seam* is not *provider portability*. blooming insights built the first (fakes over the network — 169 tests run with no key) and stopped short of the second (the `anthropic` param is the concrete SDK type, not a vendor-neutral interface).
 
 ---
 
@@ -329,3 +336,4 @@ Is the `anthropic` parameter of `runAgentLoop` a vendor-neutral interface or a c
 Updated: 2026-05-28 — Documented the transport's `HttpErrorHolder`/`makeCapturingFetch` error-body capture and `client.ts`'s `McpToolError` (both error-detail plumbing behind the unchanged narrow interface); re-derived transport.ts (`McpTransport` L7–10, `SdkTransport` L41–74) and the route's `new Anthropic` location (now L207, inside the stream).
 Updated: 2026-05-29 — Test count 157→169 (both occurrences).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

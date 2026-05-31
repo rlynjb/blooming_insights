@@ -8,58 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** Swarm/handoff would distribute control *across* the Per-agent definitions band — each agent could hand off to a peer at runtime via a `transfer_to_X` tool, with no central supervisor mediating. In blooming insights, control is centralized: the Pipeline coordinator picks which agent runs and that agent runs to completion. There is no peer-to-peer handoff. The diagram below shows the swarm topology on top (model-decided peer routing) and blooming insights' centralized pipeline shape underneath for contrast.
 
 ```
-The swarm / handoff shape
+  Zoom out — where swarm / handoff WOULD live
 
-      ┌────────┐  "you take it"  ┌────────┐
-      │agent A  │ ──────────────► │agent B  │
-      └────────┘                  └───┬────┘
-           ▲                          │ "back to you"
-           └──────────────────────────┘
-
-  no central boss; peers transfer control to each other
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  Today: centralized — code picks the next agent  │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
+  │  ★ SWARM shape (★ THIS ★, absent):                │
+  │    ┌──────┐  hand off  ┌──────┐  hand off ┌─────┐│
+  │    │ A    │ ────────►  │ B    │ ────────► │ C   ││
+  │    └──────┘  ◄────────  └──────┘  ◄──────  └─────┘│
+  │    no supervisor — model emits transfer tool       │
+  │  ── absent in blooming insights ──                 │
+  │                                                    │
+  │  blooming insights' actual shape:                  │
+  │    each agent runs to completion; pipeline.ts      │
+  │    is the only thing that decides "next"           │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop — bounded, no peer transfer tool    │
+  └──────────────────────────────────────────────────┘
 ```
 
-You've built a `<SupportChat>` component. The user types "I want a refund." The frontend has three children — `<BillingChat>`, `<ShippingChat>`, `<AccountChat>` — each specialized for one topic. Today the parent picks which child renders based on the user's first message and never switches.
-
-Now picture this instead: the user starts in `<BillingChat>` (refund is billing-shaped). Mid-conversation the user mentions "the package was damaged in shipping" — and `<BillingChat>` *hands off* to `<ShippingChat>` directly, not by routing back to the parent. The two children talk to each other. Later if it's actually an account-level issue, `<ShippingChat>` hands off to `<AccountChat>`. There's no parent supervisor deciding; the *children* decide who takes the conversation next.
-
-### Move 2 — name the question
-
-That second shape — peer agents transferring control to each other without going back through a central supervisor — is what swarm/handoff names. The question this file answers: **when does it pay to let agents hand off to peers directly, instead of always routing decisions through a central supervisor (or a fixed pipeline)?**
-
-The technical hinge: in handoff, the *model* decides who runs next. In supervisor-worker and pipeline, *code* (or a supervisor model) does. Handoff makes specialist routing a runtime model decision.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because handoff trades centralized control for runtime adaptability, and the cost is real: an *infinite-handoff* failure mode where two peers keep deferring to each other (A → B → A → B → A → ...) burns the budget on routing instead of doing the work. Without a handoff counter or a final-decider gate, the system loops until the iteration cap stops it — emitting nothing useful.
-
-In this codebase: there is no peer handoff anywhere. The route file's `if`-ladder picks which agent runs at the start of each request, and that agent runs to completion. The diagnostic agent doesn't call the recommendation agent; the route does. The query agent doesn't call the diagnostic agent; the query branch is separate from the investigation branch. Each agent's input is exactly what the route hands it — no peer can transfer control mid-run.
-
-The thing that's intentionally absent: model-decided routing between specialists. The route is the supervisor; agents are workers; workers do not communicate with peers.
-
-### Move 4 — concrete before/after
-
-Centralized routing (this codebase, today):
-- User asks free-form question with `?q=` → route calls `classifyIntent` → route picks `QueryAgent`
-- `QueryAgent` runs end-to-end with its own loop
-- If the question turns out to be about an anomaly, `QueryAgent` has no way to hand off to `DiagnosticAgent` mid-run
-- The user gets a query-shaped answer, even if a diagnostic flow would have been more useful
-
-Swarm/handoff (hypothetical):
-- User asks free-form question → starts in `QueryAgent`
-- Mid-run, `QueryAgent` realizes "this is an anomaly investigation request" — it emits a *handoff* to `DiagnosticAgent`
-- Control transfers; `DiagnosticAgent` resumes the conversation with the handed-over context
-- `DiagnosticAgent` might hand off again to `RecommendationAgent` once the diagnosis is complete
-- A handoff counter caps the total transfers (else infinite handoff)
-
-### Move 5 — one-line summary
-
-A swarm is peer agents handing control to each other at runtime — no central boss, model-decided routing, with infinite handoff as the failure mode you have to bound. blooming insights' control is centralized in the route, so no handoff exists; here's how the topology works and what would have to change for it to earn its overhead.
+**Zoom in — narrow to the concept.** The question is: when does it pay to let agents hand off to peers directly instead of routing decisions through a central supervisor or a fixed pipeline? Handoff trades centralized control for runtime adaptability; the cost is the *infinite-handoff* failure mode (A → B → A → B → … burning the budget on routing instead of work). blooming insights does NOT implement this — control is centralized, no peer can transfer mid-run. Below, you'll see the handoff mechanics, the bounding tricks (handoff counter, final-decider gate), and what would have to change for swarm to earn its overhead here.
 
 ---
 
@@ -524,3 +501,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

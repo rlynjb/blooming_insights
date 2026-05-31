@@ -8,25 +8,31 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You receive a webhook payload and need a typed object out of it. You do not write `const order = body as Order` and move on — you parse the JSON, then run it through a validator (Zod, a hand-written guard) that checks every field, and you have a fallback for when the payload is malformed. The boundary between "bytes from outside" and "typed object inside" is where you spend your reliability budget, because everything downstream assumes the type is real.
+**Zoom out — the bigger picture.** Structured outputs span two layers: the Per-agent definitions ask for JSON (via `synthesisInstruction` appended in `lib/agents/base.ts` L96–L98), and the trust boundary lives one layer up where each agent runs `parseAgentJson` → type guard → `synthesize()` → `FALLBACK`. The model itself sits in the Provider band and emits prose-with-JSON; the contract that turns that prose into a typed `Diagnosis` / `Anomaly[]` / `Recommendation[]` lives in `lib/mcp/validate.ts` and the per-agent fallback chains.
 
-An LLM that should return structured data is exactly this boundary, with one extra hazard: the model frequently wraps the JSON in prose — "Here's my analysis:" before it, "Let me know if you need more" after it. So the question is not just "is this valid JSON of the right shape?" but "where, inside this string of natural language, is the JSON, and what do I do when there isn't any?"
+```
+  Zoom out — where the output contract lives
 
-**The pivot: a structured-output contract is parse + validate + repair, and getting all three right is what separates a demo from a system.** Asking the model for JSON is necessary but not sufficient — the model honors the request statistically. The contract is the code that turns "usually JSON-ish" into "always a valid typed object or a known-safe default."
+  ┌─ Per-agent (asks for JSON, parses, repairs) ─────┐  ← we are here
+  │  synthesisInstruction       base.ts L96–98       │
+  │  tryParseDiagnosis ?? synthesize ?? FALLBACK     │
+  │    diagnostic.ts L74–75                          │
+  │  ★ parseAgentJson + type guards ★  validate.ts   │
+  └─────────────────────────┬────────────────────────┘
+                            │  call
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  anthropic.messages.create  (text out)           │
+  │  finalText = "...```json {...}```..."            │
+  └─────────────────────────┬────────────────────────┘
+                            │  (input side uses native tool-use; output does NOT)
+  ┌─ Tools (input side, contrast) ──────────────────┐
+  │  toolSchemas: native tool-use enforced by SDK   │
+  └─────────────────────────────────────────────────┘
+```
 
-Before the contract:
-- `JSON.parse(finalText)` throws on the prose preamble; the investigation 500s
-- A response missing `hypothesesConsidered` is accepted and crashes a downstream `.map`
-- A run that exhausts its budget returns `''` and there is no recovery
-
-After:
-- `parseAgentJson` finds the JSON whether it's fenced, bare, or buried in prose
-- `isDiagnosis` rejects anything missing a required field
-- `synthesize()` retries in a clean context; `FALLBACK` covers total failure
-
-It is the webhook-validation discipline, applied to a backend whose payloads are natural language with JSON somewhere inside.
+**Zoom in — narrow to the concept.** The question is: how do you guarantee a typed value when the model's "API" is a probabilistic text generator that wraps JSON in prose? The contract is three jobs — extract the JSON (`parseAgentJson`), validate the shape (`isDiagnosis` etc.), repair on failure (`synthesize()` in clean context, then a hand-written `FALLBACK`). How it works walks each stage and the deliberate split between native tool-use for input and parse-from-prose for output.
 
 ---
 
@@ -377,3 +383,4 @@ In `parseAgentJson`, what are the three extraction strategies in order, and what
 Updated: 2026-05-28 — Refreshed the output contract for grown types (Insight/Diagnosis/Recommendation optional fields, `EstimatedImpact` union), the loosened `isRecommendationArray` `impactOk` check, post-validation derivation via `deriveInsightFields`/`diagnosisConfidence`, and re-derived all validate.ts/diagnostic.ts/recommendation.ts line refs.
 Updated: 2026-05-29 — Synthesis-instruction append ref drifted to L96–L98 (was L95–L98); corrected the three remaining occurrences (the In-this-codebase line already read L96–L98).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

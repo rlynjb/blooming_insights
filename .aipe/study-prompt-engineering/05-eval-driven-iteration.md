@@ -8,25 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a form-validation function and you change a regex to accept a new email format. You do not eyeball one address and ship — you run the test suite, watch the new case pass, and watch the 200 existing cases stay green. If the regex now rejects `a+b@example.com` that used to pass, the suite catches it before the user does. The discipline is: a change is only safe if you can measure that it helped the target case and hurt nothing else.
+**Zoom out — the bigger picture.** Eval-driven iteration is an *orthogonal* path that runs parallel to the request flow, not inside it. You edit a prompt at the Per-agent definitions band, but the eval harness exercises the real production path (Per-agent definitions → Shared agent loop → Provider) from a separate entry point — a `evals/` runner that injects a deterministic `McpCaller` through the same seam the unit tests use. The dataset, runner, scorer, and gate all live in a sibling layer that touches the same agent classes the request path touches, just driven by a different caller.
 
-Prompt edits are exactly this, with one missing piece: most teams have no suite. You change `monitoring.md` to fix a bug where the agent reported a +infinity% swing off an empty window, you run it once, the swing is gone, you ship. The question this file answers: **how do you know the edit that fixed today's bug didn't silently break a case you fixed three weeks ago?**
+```
+  Zoom out — where eval-driven iteration lives
 
-**The pivot: prompt quality is a number on a fixed dataset, not a feeling about one output.** Without a golden set you are iterating on vibes — and vibes have a specific failure mode that is brutal in production: a "better" prompt that lifts the average but regresses a critical edge case nobody is tracking. The average looks great in the demo; the one merchant whose workspace has historical-only data gets a confidently-wrong briefing.
+  ┌─ Engineer edits prompt ─────────────────────────┐
+  │  lib/agents/prompts/<name>.md                    │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ EVAL band (orthogonal) ▼─────────  ┌─ Request flow ──────┐
+  │  ★ evals/cases/*.json (dataset) ★   │ app/api/agent/route │
+  │  ★ evals/run.ts (runner) ★          │ → Pipeline coord    │
+  │  uses REAL Per-agent definitions ──→│ → Per-agent defs    │
+  │  + Shared agent loop + Provider     │ → Shared agent loop │
+  │  + injected deterministic McpCaller │ → Provider          │
+  │  ↓                                  │ ↓                   │
+  │  ★ scorer (assert | LLM-judge) ★    │ user receives result │
+  │  ↓                                  └─────────────────────┘
+  │  ★ gate: avg ↑ AND no regression ★   ← we are here
+  └──────────────────────────────────────────────────┘
+       (not yet implemented in blooming insights)
+```
 
-Before an eval harness:
-- You change `diagnostic.md`, run the one anomaly you have on hand, conclusion looks fine, you ship
-- A model upgrade lands; you have no way to re-score the prompts against the old behavior
-- A production miss gets fixed in prose ("Never report a change derived from an empty window") but there is no test pinning that the fix stays fixed
-
-After an eval harness:
-- You change `diagnostic.md`, run `evals/`, see 47/50 pass and the 3 fails are the same 3 as before — safe to ship
-- A model upgrade lands; you re-run `evals/` and see exactly which cases moved
-- Every production miss becomes a permanent case in the set; the regression cannot silently come back
-
-It is the test-suite discipline, applied to a system whose unit under test is a prompt and whose output is judged for *answer quality*, not shape.
+**Zoom in — narrow to the concept.** The question this file answers: how do you know the edit that fixed today's bug didn't silently break a case you fixed three weeks ago? A golden set + runner + scorer + gate moves the definition of "better prompt" out of your head and onto a number, with the gate checking two things — aggregate up AND no critical case regressed. blooming insights has the misses (every CRITICAL block in the prompts is a regression fix in prose) and the injection seam (used by 169 unit tests that check shape) but has not yet turned either into a scored harness. Below, you'll see why unit tests aren't evals, what the runner has to share with production, and the LLM-judge trap to respect before trusting a score.
 
 ---
 
@@ -346,3 +353,4 @@ Which seam in `lib/agents/base.ts` would an eval runner reuse to feed determinis
 Updated: 2026-05-29 — Updated the Vitest test count from 125 to 169 across all 11 body references (the suite grew this session).
 Updated: 2026-05-29 — Resynced stale prompt-line refs (the {categories} shift + earlier prompt revisions): monitoring.md CRITICAL block L25–31→L31–37, small-baseline caution L23→L29; diagnostic.md historical-data block L36–42→L38–50, "customers matching" ban L33→L35; recommendation.md id-ban L64→L82; query.md prose L36→L49.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

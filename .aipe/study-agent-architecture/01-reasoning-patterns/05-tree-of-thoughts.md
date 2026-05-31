@@ -8,32 +8,32 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've probably written this in a brute-force algorithm interview: explore every possible move, score the resulting positions, pick the move that led to the best score. Chess engines do it. Sudoku solvers do it. You start at a root state, you branch out, you evaluate, you pick. The cost is the branching factor — at branch factor 3 and depth 5 you've evaluated 243 leaves to commit to one root move.
+**Zoom out — the bigger picture.** Tree of Thoughts would *replace* the Shared agent loop band — instead of one ReAct trajectory, you'd run b×d partial trajectories in parallel, score them, and commit to the winning branch. In blooming insights, that band holds a single bounded `runAgentLoop` per agent; nothing branches. The diagram below shows what ToT would look like on top, with blooming insights' single-path loop on the bottom for contrast — the same band, two very different shapes, multiplied by branch factor in tokens and time.
 
-Now picture the same shape with a reasoning task. Instead of board positions, the nodes are "candidate thoughts" — the model writes three different ways to start a diagnosis ("check the time series first", "segment by country first", "check campaigns first"), runs each one a couple of steps, scores the resulting partial-investigations, and picks the branch with the highest score. The branching factor is the number of thoughts the model considers per step; the depth is the number of steps before you commit; the cost is the product.
+```
+  Zoom out — where Tree of Thoughts WOULD live
 
-That's the question this file answers: **when does explicit branch-and-score reasoning earn its cost over a single ReAct path, and why does this codebase almost certainly never want it?**
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  lib/agents/pipeline.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here
+  │  TREE-OF-THOUGHTS shape (★ THIS ★, absent):       │
+  │    ┌─ branch 1 ─┐  ┌─ branch 2 ─┐  ┌─ branch 3 ─┐│
+  │    │ partial    │  │ partial    │  │ partial    ││
+  │    │ trajectory │  │ trajectory │  │ trajectory ││
+  │    └─────┬──────┘  └─────┬──────┘  └─────┬──────┘│
+  │          └─── score → pick best ◄────────┘       │
+  │                                                   │
+  │  BLOOMING INSIGHTS shape (single path):           │
+  │    runAgentLoop → one trajectory, bounded         │
+  │    (b=1, d≤maxToolCalls — no branching)           │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because Tree of Thoughts looks academically rigorous and is, in production, almost always a worse deal than a well-prompted single-path ReAct loop. Every time the branch factor goes up by 1, your token spend and latency multiply. A b=3, d=4 tree explores 81 partial paths to commit to one — that's 81x the tokens of a single ReAct trajectory, plus the cost of scoring each. For a system with a ~1 req/s MCP rate limit and a 300-second ceiling, 81x cost is not "more rigorous"; it's "this run won't finish."
-
-Knowing why you *didn't* use ToT is the interview-grade answer here. The wrong answer is "I didn't think of it." The right answer is "I considered it and the budget arithmetic killed it before I wrote any code."
-
-Without naming the cost shape:
-- "Should we try Tree of Thoughts on the diagnostic agent?"
-- Someone wires up branch factor 3, depth 3, scorer model = same model
-- One investigation now fires 27 partial trajectories instead of 1
-- 6 tool calls per trajectory × 27 trajectories × ~1s per MCP call ≈ 162s of serial calls
-- Vercel times out at 300s; the investigation never returns
-
-With the cost shape named:
-- "Tree of Thoughts would multiply our tool calls by the branch factor"
-- "Our MCP rate is ~1 req/s; our ceiling is 300s; our current run is ~100–115s"
-- "Anything above 2x is over the ceiling. ToT is a non-starter."
-- Decision made in 30 seconds without writing code
-
-One-line summary: **Tree of Thoughts is minimax over reasoning paths — it earns its cost only on tasks where (a) the branches lead to measurably different end-states and (b) you can afford branch-factor × depth × per-step cost.** Neither holds here.
+**Zoom in — narrow to the concept.** The question is: when does explicit branch-and-score reasoning beat a single well-prompted ReAct path — and how much do you pay for branching? A b=3, d=4 tree explores 81 partial paths to commit to one; at the ~1 req/s MCP rate limit and the 300-second route ceiling in blooming insights, that arithmetic alone kills ToT before code gets written. Below, you'll see the branch/score/prune mechanics and the cost shape that makes ToT a non-starter for any task that fits in a single ReAct loop's budget.
 
 ---
 
@@ -398,3 +398,4 @@ Open and verify. ✓ The "no" answer, the rate-limit / ceiling numbers, and the 
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

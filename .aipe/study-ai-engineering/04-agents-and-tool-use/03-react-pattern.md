@@ -8,29 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a feature where the UI shows what the system is doing as it does it: an upload that streams "validating… uploading… processing… done," each stage appearing the moment it starts. You did not wait for the whole operation and dump a summary; you emitted an event per stage so the user could watch progress and, when it stalled, see *which* stage stalled. That intuition — render the steps, not just the result — is exactly what ReAct gives an agent.
-
-The question this file answers: how does an agent alternate between reasoning and acting, and how do you make that alternation observable instead of a black box?
-
-**Answering it matters because an agent that only returns its final answer is undebuggable and untrustworthy.** When a diagnosis comes back wrong, "the model got it wrong" is not an answer you can act on. You need to see: what did it *think*, what did it *query*, what did it *see*, and where did the reasoning go off the rails. ReAct names those three moves — Thought, Action, Observation — and blooming insights streams each one as a distinct event, so the trace is not a log you grep after the fact; it is the thing the user watches on the investigation page in real time. The trace being a product surface is what makes the reasoning auditable by the analyst, not just by the engineer.
-
-Before and after making the loop observable:
+**Zoom out — the bigger picture.** ReAct is the canonical *shape* of the agent loop — the alternation between Thought (model emits text), Action (model emits `tool_use`), and Observation (your code runs it and feeds back `tool_result`). It is the inner loop of every step in the chain (→ 01-agents-vs-chains.md). blooming insights makes all three observable: each is a streamed NDJSON event (`reasoning_step` / `tool_call_start` / `tool_call_end` in `lib/mcp/events.ts`) so the trace is the product, not just a log.
 
 ```
-Black-box agent                         ReAct, streamed (this codebase)
-────────────────────────────            ──────────────────────────────────
-[60s of silence]                        thought:  "checking the mobile funnel…"
-                                        action:   tool_call_start get_funnel
-"mobile conversion dropped              observation: tool_call_end (320ms)
- due to a checkout bug"                 thought:  "step 3 has the drop…"
-                                        action:   tool_call_start execute_analytics_eql
-why? on what evidence? unknown          observation: tool_call_end (910ms)
-                                        conclusion: grounded, with visible evidence
+  Zoom out — Thought/Action/Observation as a streamed loop
+
+  ┌─ Per-agent + Agent loop ─────────────────────────┐  ← we are here
+  │  runAgentLoop  base.ts L48–176                   │
+  │                                                   │
+  │  Thought      → model emits text  → onText        │
+  │                  → send('reasoning_step')         │
+  │  Action       → model emits tool_use → onToolCall │
+  │                  → send('tool_call_start')        │
+  │  Observation  → mcp.callTool result → onToolResult│
+  │                  → send('tool_call_end')          │
+  │                                                   │
+  │  loop until forceFinal (L90–91, L101)             │
+  └───────────────┬──────────────────┬───────────────┘
+                  │ tool_use         │ NDJSON events
+                  ▼                  ▼
+  ┌─ Tools + MCP transport ─┐ ┌─ Route → UI stream ─┐
+  │  mcp.callTool runs it   │ │  client renders the  │
+  │  → result               │ │  trace live          │
+  └─────────────────────────┘ └──────────────────────┘
 ```
 
-One-line summary: **Thought is the text the model emits, Action is the tool call, Observation is the result fed back — and here all three are streamed events, which makes the loop a debuggable product.**
+**Zoom in — narrow to the concept.** The question is: how does an agent alternate between reasoning and acting, and how do you make that alternation observable instead of a black box? ReAct names the three moves — Thought, Action, Observation — and blooming insights streams each as a distinct event so the loop is a debuggable product, not a 60-second silence followed by a verdict. How it works walks each move, how `runAgentLoop` wires them via hooks, and why the trace being on-screen earns the user's trust in a way a one-shot answer never can.
 
 ---
 
@@ -391,3 +396,4 @@ Which line in `lib/agents/base.ts` turns an Observation into input for the model
 Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page.tsx` to `lib/hooks/useInvestigation.ts` (StrictMode-safe `startedRef` reader, shared by both step pages) and refreshed all `route.ts` hook/stream and `ReasoningStep` line refs.
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

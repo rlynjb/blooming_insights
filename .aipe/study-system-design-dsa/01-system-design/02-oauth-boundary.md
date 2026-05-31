@@ -8,17 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a `fetch()` in your frontend that hits a protected API. It gets back a `401`. Your app bounces the user to `/login?return=...`, the IdP redirects back with a `code`, you exchange it for a token, store it in `localStorage`, and every subsequent `fetch` carries `Authorization: Bearer <token>`. You know what crossed the round-trip: the `?code=` in the redirect URL, and whatever you used to verify it wasn't tampered with. The question shifts when a *server* is the OAuth client — a Next.js route handler calling `client.connect(transport)`. It cannot open a browser tab. It has no `localStorage`. And in Dynamic Client Registration it does not even have a pre-issued `client_id` to paste into a config file.
+**Zoom out — the bigger picture.** OAuth lives at the boundary between the Route handler and the Provider wrappers — it's the gate that turns a `bi_session` cookie into a `McpClient` that's allowed to call Bloomreach. `connectMcp` in `lib/mcp/connect.ts` either returns a ready client (existing tokens) or captures an `authUrl` for the page to redirect to (no tokens yet). The auth state itself rides between requests in two places: an encrypted `bi_auth` cookie in prod (carried by the browser) and a JSON file in dev. Everything in `lib/mcp/auth.ts` exists to solve the durability problem this band introduces — the connect request and the callback request are two separate hits, often on two separate Vercel instances.
 
-The specific question is: how does a server-side app execute Authorization Code + PKCE when it must capture (not follow) the authorize redirect, has no pre-registered client, and runs in a process that hot-reloads mid-flow?
+```
+Zoom out — where the OAuth boundary lives
 
-**The PKCE verifier and the DCR `client_id` MUST survive between the connect request and the callback request.** The SDK saves both to the provider during `client.connect()`. If the provider's store is wiped before `transport.finishAuth(code)` runs — because Next hot-reloaded the module (dev) or the callback landed on a fresh instance (prod) — `finishAuth` throws `"Existing OAuth client information is required"` and the flow is dead. Every design decision in `lib/mcp/auth.ts` exists to solve exactly this durability problem — dev with a file, prod with an encrypted cookie the browser carries between the two requests.
+┌─ UI ───────────────────────────────────────────┐
+│  app/page.tsx (401 → window.location = authUrl)│
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Route handler ─────▼──────────────────────────┐
+│  app/api/briefing/route.ts                     │
+│  app/api/mcp/callback/route.ts (finishAuth)    │
+└─────────────────────┬──────────────────────────┘
+                      │  await connectMcp(sid)
+┌─ Session + OAuth gate ─────────────────────────┐  ← we are here
+│  lib/mcp/session.ts (bi_session cookie)        │
+│  ★ lib/mcp/connect.ts (connectMcp) ★          │
+│  ★ lib/mcp/auth.ts (BloomreachAuthProvider) ★ │
+│  ★ bi_auth encrypted cookie (prod state) ★    │
+└─────────────────────┬──────────────────────────┘
+                      │  StreamableHTTPClientTransport
+┌─ Provider wrappers + MCP ──────────────────────┐
+│  lib/mcp/client.ts → Bloomreach MCP            │
+└────────────────────────────────────────────────┘
+```
 
-Before this approach: every OAuth connection attempt would have required pre-registering a client with Bloomreach, embedding a `client_id` and `client_secret` in env vars, and writing a full authorize/exchange middleware by hand.
-
-After: an `OAuthClientProvider` implementation (`auth.ts`, ~260 lines including the prod cookie crypto) and a ~30-line callback route. The SDK drives the protocol; the provider drives the persistence.
+**Zoom in — narrow to the concept.** The question is: how does a server-side app run Authorization Code + PKCE + Dynamic Client Registration when it can't open a browser, has no pre-issued `client_id`, and runs in a process that may not even be the same one when the callback returns? The answer is the `OAuthClientProvider` interface — the SDK drives the protocol, our provider answers two questions ("where do you want to persist this?" and "what should happen on redirect?"). The next sections walk the four sub-mechanisms: PKCE+DCR, the provider's persistence shape, capture-don't-open `redirectToAuthorization`, and the `bi_auth` cookie that carries state across serverless instances.
 
 ---
 
@@ -627,3 +645,4 @@ Answer points: `localStorage` is accessible to any JavaScript on the page — an
 ---
 Updated: 2026-05-28 — documented the PRODUCTION auth store: AES-256-GCM encrypted httpOnly `bi_auth` cookie keyed by `bi_session`, seeded/flushed once per request by `withAuthCookies` via an `AsyncLocalStorage` `requestStore` (`aesKey`/`encryptStore`/`decryptStore`/`readAll`/`writeAll`/`_authCookieCrypto`); added a Move-2 sub-section + ASCII diagram, reflected it in the primary diagram/Summary; noted host-based async `redirectUri()`, `SameSite=None; Secure` prod cookies, and the `AUTH_SECRET`-missing 500 failure mode; refreshed all line refs.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -8,25 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-`schemaSummary` (`lib/agents/monitoring.ts` L15–L48) already faces the chunking problem without calling it that. The full workspace schema is large (the comment says "NOT the full 112KB schema"). It will not fit in the prompt, so the code slices it: top-20 events, top-10 properties each, top-30 customer properties. That is a chunking decision — *which slice of a too-large document do you keep, and what gets cut?* The current answer is "truncate by rank and hope the relevant event is in the top 20."
+**Zoom out — the bigger picture.** Chunking is what the Indexer does *before* embedding — it decides what counts as one retrievable unit. blooming insights has no retrieval pipeline, but it already faces the chunking problem in spirit: `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) slices a 112KB schema by rank (top-20 events, top-10 props, top-30 cprops), and `truncate` (`lib/agents/base.ts` L31–L34) cuts tool results at 16,000 chars without regard for structure. Those are chunking-by-truncation; deliberate chunking would split at meaning boundaries before anything is embedded.
 
-The question chunking answers is: when a document is too large to embed or retrieve as one unit, how do you split it so a query reliably lands on the piece that contains the answer?
+```
+  Zoom out — where chunking sits (WOULD BE)
 
-**The pivot: the chunk is the atomic unit of retrieval — you can only ever get back a whole chunk, so the chunk boundary decides whether the answer is retrievable at all.** If you split a past investigation mid-sentence, the chunk holding "conversion dropped because" and the chunk holding "the mobile checkout broke" are separate, and a query about mobile checkout may retrieve neither cleanly. If you make the whole investigation one chunk, its embedding averages a dozen topics into a vague point that matches everything weakly and nothing strongly.
+  ┌─ Source documents (too large to embed whole) ───┐
+  │  past investigations / docs / schema             │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Indexer — chunking ────▼────────────────────────┐  ← we are here
+  │  ★ split into chunks (size + overlap) ★          │
+  │    fixed-window? semantic? structural?           │
+  │  each chunk = the atomic unit of retrieval       │
+  └─────────────────────────┬────────────────────────┘
+                            │  chunks
+  ┌─ Indexer — embedding ───▼────────────────────────┐
+  │  embed(chunk) → vector                           │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Vector store + Retriever ──▼───────────────────┐
+  │  query → top-k chunks → LLM context              │
+  └──────────────────────────────────────────────────┘
 
-Before deliberate chunking:
-- `schemaSummary` truncates by rank — relevant event #21 is silently dropped
-- A large past investigation is one blob; its embedding is a blurry average
-- A query about a specific finding matches the whole-document average, not the finding
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; the closest cousins are schemaSummary rank-truncation
+  and base.ts truncate (char-offset cut, structure-blind).
+```
 
-After:
-- The document is split at meaning boundaries (per finding, per section)
-- Each chunk embeds to a sharp, single-topic point
-- A query retrieves exactly the chunk that holds the answer, with a little overlap for context
-
-It is the difference between `text.slice(0, 16_000)` (what `truncate` does in `base.ts`) and splitting on paragraph boundaries with a few sentences of overlap.
+**Zoom in — narrow to the concept.** The question is: when a document is too large to embed or retrieve as one unit, how do you split it so a query reliably lands on the piece that contains the answer? The chunk is the atomic unit of retrieval — you can only ever get back a *whole* chunk — so the chunk boundary decides whether the answer is retrievable at all. Too small and meaning fragments across chunks; too big and the embedding averages a dozen topics into a blurry point. How it works walks fixed-window vs semantic chunking, the overlap parameter, and the difference between `text.slice(0, 16_000)` and a paragraph-boundary split.
 
 ---
 
@@ -285,3 +298,4 @@ What chunking strategy does blooming insights use today, where, and what does it
 
 → 01-embeddings.md · → 04-vector-databases.md · → 10-incremental-indexing.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

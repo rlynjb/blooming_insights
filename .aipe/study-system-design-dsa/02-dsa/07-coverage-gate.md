@@ -8,15 +8,43 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You keep a list of features, and each feature only works if the backend exposes certain fields. You hard-code which features to show. Then a workspace turns up that doesn't emit one of those fields, the feature renders anyway, calls the missing field, and returns garbage. The question is: given a list of required dependencies per feature and a set of what the backend actually provides, how do you decide — cheaply, for every feature at once — which features are fully supported, which are degraded, and which can't run at all?
+**Zoom out — the bigger picture.** The three coverage-gate functions (`schemaCapabilities`, `coverageFor`, `coverageReport` / `runnableCategories`) live in `lib/agents/categories.ts` — they are pure DSA primitives over the workspace schema, called by the briefing route between bootstrap and `MonitoringAgent.scan`. The system-design framing is in `../01-system-design/08-schema-gated-coverage.md`; this file is the in-process data-structure mechanics underneath that pipeline stage. The gate sits in the Per-agent / Schemas band of the architecture map — no network, no LLM, just `Set.has` lookups.
 
-That is what a coverage gate answers: build one `Set` of everything the schema exposes, then for each registry item run a membership test of its declared deps against that set.
+```
+Zoom out — where the coverage gate functions live
 
-**The stakes are concrete.** The monitoring agent has a checklist of 10 ecommerce anomaly categories. Each category needs specific events (`conversion_drop` needs `view_item`, `checkout`, `purchase`). A workspace that never emits `search` events can't run the `search_failure` category — querying for it wastes an EQL call against the ~1 req/s budget and produces a meaningless zero. The gate filters the checklist to the runnable categories *before* the agent spends a single call, and labels the rest honestly so the UI shows a ghost tile instead of faking a result.
+┌─ Route handler (orchestrator) ─────────────────┐
+│  app/api/briefing/route.ts                     │
+│  bootstrapSchema(mcp) → schema                 │
+└─────────────────────┬──────────────────────────┘
+                      │
+┌─ Coverage gate (pure DSA) ─────────────────────┐  ← we are here
+│  ★ lib/agents/categories.ts ★                 │
+│  ★ schemaCapabilities(schema) → Set<string> ★ │
+│      add(eventName)                            │
+│      add(eventName + "." + property)           │
+│      add("catalog:" + catalogName)             │
+│         │                                       │
+│  ★ coverageFor(cat, set) ★                    │
+│      if !requires.every(has) → 'unavailable'  │
+│      else if !enriches.every(has) → 'limited' │
+│      else → 'full'                             │
+│         │                                       │
+│  ┌──────┴──────┐                               │
+│  ▼             ▼                                │
+│  coverageReport runnableCategories             │
+│  (10 items)    (subset for agent)             │
+└─────────┬─────────────┬────────────────────────┘
+          │             │
+┌─ UI ────▼─┐      ┌────▼─ Agent layer ──────────┐
+│ CoverageGrid│      │ MonitoringAgent.scan       │
+│ (10 tiles) │      │ (only runnable categories) │
+└────────────┘      └────────────────────────────┘
+```
 
-One-line reduction: a coverage gate is `requires ⊆ available ?` evaluated per registry item, with a softer `enriches ⊆ available ?` deciding full-vs-degraded.
+**Zoom in — narrow to the concept.** The question is: given a list of required dependencies per feature and a set of what the backend actually provides, how do you decide — cheaply, for every feature at once — which features are fully supported, which are degraded, and which can't run at all? The answer is two halves: first flatten the nested schema into one `Set<string>` of capability tokens (event names, `event.property` strings, `catalog:<name>` strings); then walk the registry running two short-circuiting `every()` tests per item — `requires ⊆ available` is the hard gate (miss any → `unavailable`), `enriches ⊆ available` is the soft gate (miss any → `limited`), all present → `full`. One classification feeds two consumers: the full report for the UI grid, the runnable subset for the agent. The next sections walk the set construction and the per-item test.
 
 ---
 
@@ -356,3 +384,4 @@ Your teammate says: "Drop `enriches` — just have `requires`, and a category is
 
 → ../01-system-design/08-schema-gated-coverage.md · → 05-severity-sort.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

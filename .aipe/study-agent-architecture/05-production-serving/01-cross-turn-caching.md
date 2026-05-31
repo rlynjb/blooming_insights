@@ -8,37 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a search box once. Every keystroke fires `fetch('/api/search?q=' + q)`. The first time the user types `react`, the API hits the DB and returns 80 rows. The second time, the same keystrokes hit the same endpoint and the DB does the same work. You reach for a `Map` keyed on the query string: hit → return the cached rows in 0 ms; miss → fetch and store. Every cache you've written — `useMemo`, React Query's `staleTime`, a `WeakMap` of parsed results — is this shape with a different key and a different eviction rule.
+**Zoom out — the bigger picture.** Cross-turn caching sits at two bands at once — the Provider wrappers (for prompt-prefix and per-call TTL caching on every model call) and the Tools + MCP transport (for intra-run memoization of repeated tool calls inside one investigation). A *cross-run* semantic cache would sit alongside both, orthogonal to a single request. blooming insights has the first two (Provider TTL cache in `lib/llm/cache.ts`; MCP intra-run cache in `lib/mcp/client.ts`); the third is deliberately absent because a stale cross-run hit would poison the trajectory.
 
-Now picture the same memoization, but the "function" being cached is *an agent's tool call.* An agent's diagnostic run can call `execute_analytics_eql` six times. Two of those calls might be identical — same EQL, same args — because the model decided to verify a number it already saw on an earlier turn. Without a cache, those two identical calls each pay the full HTTP round trip, the 1.1s spacing, and a slot in the per-investigation budget. With a cache, the second call returns in 0 ms and the budget goes farther.
+```
+  Zoom out — where cross-turn caching lives
 
-That's the first piece of the question this file answers: **inside a single agent run, when the model re-derives the same sub-result, who returns it from cache?** But the question doesn't stop there. Agents also run *across* tasks — task A and task B, run an hour apart, can ask sub-questions that are *similar* (not identical) and would each benefit from reusing the other's work. That's a different cache, with a different key (semantic similarity instead of exact match) and a much sharper failure mode.
+  ┌─ Shared agent loop ─────────────────────────────┐
+  │  runAgentLoop                                     │
+  └─────────────────────────┬────────────────────────┘
+                            │  every model call
+  ┌─ Provider wrappers ─────▼────────────────────────┐  ← we are here (Cache 1)
+  │  ★ lib/llm/cache.ts — TTL cache on prompt hash ★  │
+  └─────────────────────────┬────────────────────────┘
+                            │  every tool call
+  ┌─ Tools + MCP transport ─▼────────────────────────┐  ← we are here (Cache 2)
+  │  ★ lib/mcp/client.ts — intra-run Map cache ★      │
+  │  (same EQL fired twice in one investigation       │
+  │   returns from memory in 0 ms)                    │
+  └──────────────────────────────────────────────────┘
 
-**Why answering that question matters:** because the same caching instinct you have for `useMemo` doesn't transfer cleanly to an agent. Caching a frontend function is safe — same args mean same result, every time. Caching an agent's tool call is conditional — same args might mean different results if the underlying data changed, and a stale hit feeds *into the model's reasoning*, which then conditions every downstream turn on the stale value. The bug doesn't show up as a wrong cached number; it shows up as a confidently-wrong trajectory built on top of one stale read.
+  Orthogonal / Not yet implemented:
+  ┌─ Cross-run semantic cache ──────────────────────┐  ← Cache 3 (absent)
+  │  ★ THIS ★ deliberately skipped — stale hits      │
+  │  would poison the trajectory across requests     │
+  └──────────────────────────────────────────────────┘
+```
 
-Without intra-run caching:
-- A diagnostic agent re-runs the same EQL twice in one investigation
-- Each call pays 1.1s spacing + HTTP round trip + a slot in the 6-call budget
-- The 6-call cap is hit earlier; the agent gives up before the right question lands
-
-With intra-run caching (what `McpClient` has):
-- The second identical EQL returns from the in-memory `Map` in 0 ms
-- The 6-call budget covers more *distinct* queries
-- The investigation has room to actually triangulate the cause
-
-Without cross-run semantic caching (what this codebase chose):
-- Task B asks "purchases vs prior 90 days" two hours after Task A asked the same
-- Task B re-runs the full EQL, re-spaces it, re-counts it against the budget
-- It also pays for being correct — its numbers reflect the latest two hours of data, not Task A's snapshot
-
-With cross-run semantic caching (the version this codebase skipped):
-- Task B's "purchases vs prior 90 days" matches Task A's cached result, returns in 0 ms
-- But the two hours of new data are silent; Task B answers from a snapshot that's stale-by-design
-- The model reasons forward from the cached value; every downstream turn inherits the stale read
-
-One-line summary: **agent caches come in scopes — within a turn, within a run, across runs — and the failure mode gets sharper as the scope widens, because a stale hit poisons the *trajectory*, not just one response.** Here's the shape of the three scopes, which two this codebase has, and the deliberate reason it skipped the third.
+**Zoom in — narrow to the concept.** The question is: inside an agent run, when the model re-derives the same sub-result, who returns it from cache — and across runs, can you reuse one investigation's work for another? Agent caches come in scopes nested by blast radius: within a turn (prompt-prefix), within a run (intra-run tool memoization), across runs (semantic). The failure mode gets sharper as scope widens — a stale hit doesn't just return one wrong number, it poisons every downstream turn that reasons from it. Below, you'll see all three scopes, which two blooming insights has, and the deliberate reason the third was skipped.
 
 ---
 
@@ -456,3 +454,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

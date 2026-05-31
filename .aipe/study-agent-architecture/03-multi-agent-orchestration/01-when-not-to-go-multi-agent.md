@@ -8,45 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario
+**Zoom out — the bigger picture.** The "when not to go multi-agent" question sits at the Pipeline coordinator band — the place where blooming insights decided to use a deterministic `if`-ladder instead of promoting orchestration to an LLM supervisor. It's a *decision about the band itself*: keep the supervisor as code (`lib/agents/pipeline.ts`) or promote it to a model. blooming insights chose code, and this file is the gate that justified it. The Per-agent definitions and Shared agent loop below are unchanged either way — only the Pipeline band's owner moves between "engineer" and "model."
 
-You've got a `<Wizard>` component on screen — three steps, one after the next. Step 1 collects input, step 2 transforms it, step 3 confirms. The parent component owns `currentStep` and decides which child renders next. It's a five-line `if` ladder in the parent. Boring. Predictable. You can grep for the bug.
+```
+  Zoom out — where the "do we go multi-agent?" gate lives
 
-Now picture the team's "make it smart" pitch: replace the parent with an *LLM* that reads each step's output and decides which child renders next. Same three children. Same three transitions. But now every transition costs a model call, the transition can drift run-to-run, and when step 3 renders the wrong thing you don't know whether step 2 emitted garbage or the LLM mis-routed.
+  ┌─ Route handler ─────────────────────────────────┐
+  │  app/api/agent/route.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
+  │  ★ THE GATE ★                                     │
+  │  Today (CODE owns coordination):                  │
+  │    lib/agents/pipeline.ts — sequential, fixed     │
+  │    order: monitoring → diagnostic → recommendation│
+  │  Alternative (MODEL owns coordination):           │
+  │    a supervisor agent reasons each next stage     │
+  │    +1 LLM call per stage, ~2–5x cost tax          │
+  └─────────────────────────┬────────────────────────┘
+                            │  (same below either way)
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  monitoring | diagnostic | recommendation | query │
+  └─────────────────────────┬────────────────────────┘
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop (lib/agents/loop.ts)               │
+  └──────────────────────────────────────────────────┘
+```
 
-### Move 2 — name the question
-
-That second shape is what "going multi-agent with an LLM supervisor" actually buys you. Most teams reach for it by reflex when they hear the word "agent." The question this file answers is the inverse: **when do you NOT promote the parent `if`-ladder to an LLM, and when do you?**
-
-It's not "do you have multiple agents." blooming insights has four. It's "does control flow between them live in code, or in a model?" The escalation gate is the test that decides.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because autonomous LLM coordination adds a roughly 2–5x cost and latency tax on every run, and the failure surface goes from "one loop to debug" to "a conversation between loops to debug." If the failure your single-agent baseline produces isn't genuinely decomposable into independent specialties — or if the *order* of specialties is already knowable — you pay the tax and gain nothing.
-
-In this codebase: the analyst journey is genuinely three jobs (detect, diagnose, recommend) — that part is real decomposition. But the *order* of those jobs is fixed (you never recommend before you diagnose), so the route file's `if`-ladder is enough; promoting it to an LLM supervisor would buy nothing the code already does for free. The thing the user gets that LLMs ARE earning their cost on is the *work inside* each stage — variable EQL query sequences the model writes at runtime.
-
-### Move 4 — the escalation gate, walked
-
-Without the gate (most teams):
-- Read about "agentic systems," reach for a supervisor + 5 workers on day one
-- Pay 5x token cost and ~3x latency per run from turn 1
-- First production incident: a supervisor mis-routed, you replay 4 trajectories to find the bug
-- Tune the supervisor prompt for two weeks before realizing the single-agent baseline would have worked
-
-With the gate (this codebase):
-- Single-agent baseline first (the diagnostic agent alone, in earlier internal builds)
-- Measured: where does it actually fail? Tool budget exhausted on combined detect+diagnose+recommend prompts; mixed responsibilities bloat the system prompt
-- Decomposed by *responsibility* (separate tool subsets per stage, separate prompts) — not by handing routing to a model
-- Kept the route `if`-ladder as the supervisor because the order was already known
-
-### Move 5 — one-line summary
-
-The senior answer this file earns: "I split into specialists but kept orchestration deterministic, because the coordination didn't need an LLM to decide it." That's the whole point of the gate.
-
-Here's how the gate works.
+**Zoom in — narrow to the concept.** The question is: when do you *not* promote the parent `if`-ladder to an LLM supervisor — and when do you? It's not "do you have multiple agents" (blooming insights has four). It's "does control flow between them live in code or in a model?" The escalation gate is the test that decides; blooming insights walked through it once and chose code. Below, you'll see the gate's criteria and how this codebase passes them.
 
 ---
 
@@ -471,3 +462,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

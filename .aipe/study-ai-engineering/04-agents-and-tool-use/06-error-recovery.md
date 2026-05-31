@@ -8,28 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have written a data-fetching component that handles every branch: loading, success, empty, and error — and within error, you distinguish "retry might help" (a 429 or a network blip) from "retry will not help" (a 404). You wrapped the fetch in a bounded retry, you rendered a safe empty state instead of crashing the tree, and you made sure a transient failure did not get cached so the next render could try again. That discipline — name every failure, give each one a recovery, never let one failure cascade — is exactly what an agent loop needs, except the failures are stranger: a model that will not stop querying, a model that returns prose where JSON was required, a backend that rate-limits mid-run.
-
-The question this file answers: what are the ways an agent run fails, and what coded recovery does each one have?
-
-**Answering it matters because an agent has more failure modes than a fetch, and any one of them, unhandled, breaks the whole run.** A model with no turn cap runs until the 60-second route timeout kills the stream mid-flight — the user gets a truncated trace and no result. A model that emits reasoning prose instead of JSON makes `JSON.parse` throw, and a thrown parse error in the wrong place takes down the investigation. A rate-limit error cached for 60 seconds poisons every subsequent call. The difference between a demo and a product is whether each of these has a recovery wired in *before* it happens. blooming insights maps each failure to a specific recovery, and the unifying mechanism is the budget — the thing that bounds the loop is the same thing that protects it.
+**Zoom out — the bigger picture.** Error recovery is a cross-cutting discipline — every band has its own named failure mode and its own recovery. The Agent loop caps runaway loops (`forceFinal`); the Per-agent fallback chain catches parse failures (`tryParseDiagnosis ?? synthesize ?? FALLBACK`); the Provider wrappers handle 429s (`McpClient` exponential-backoff + no-cache-on-error); the Route's `try/catch/finally` turns thrown errors into `error` events without dropping the stream. Each layer guards the one below it.
 
 ```
-Failure mode                            Recovery (this codebase)
-────────────────────────────────       ──────────────────────────────────
-model never stops querying              forceFinal turn (no tools) caps the loop
-loop returns prose, not JSON            synthesize() — clean-context retry
-synthesize() also fails                 FALLBACK diagnosis / [] recommendations
-backend rate-limits (429)               exponential-backoff retry in McpClient
-error result cached → poison            no-cache-on-error guard
-monitoring output unparseable           return [] (graceful degrade)
-pre-stream setup throws (e.g. config)   try/catch → real error JSON, not bare 500
-alpha MCP token revoked (mins)          client auto-reconnects ONCE (reset + reload)
+  Zoom out — the recovery stack (one per layer)
+
+  ┌─ Route handler ──────────────────────────────────┐
+  │  try/catch → send('error') + finally close       │
+  │  pre-stream setup try/catch → real error JSON     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent (parse-failure fallback chain) ───────┐  ← we are here
+  │  ★ tryParseDiagnosis ?? synthesize ?? FALLBACK ★  │
+  │  monitoring: parseAgentJson failure → []          │
+  │  diagnostic.ts L74–75 / monitoring.ts L113–118   │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Agent loop (loop-runaway cap) ──────────────────┐
+  │  budgetSpent → forceFinal → tools omitted L101    │
+  │  caps token bleed and runaway exploration         │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider wrappers + Tools ──────────────────────┐
+  │  McpClient exponential-backoff on 429             │
+  │  no-cache-on-error guard (L58–60)                 │
+  │  alpha-token auto-reconnect ONCE                  │
+  └──────────────────────────────────────────────────┘
 ```
 
-One-line summary: **every failure has a named recovery, fallbacks are layered three deep, and the per-agent budget is the loop protection.**
+**Zoom in — narrow to the concept.** The question is: what are the ways an agent run fails, and what coded recovery does each one have? An agent has more failure modes than a fetch — a model that will not stop querying, a model that returns prose where JSON was required, a backend that rate-limits mid-run — and any one of them, unhandled, breaks the whole run. blooming insights maps each failure to a specific recovery, and the unifying mechanism is the budget: the thing that bounds the loop is the same thing that protects it. How it works walks each failure mode and its named recovery.
 
 ---
 
@@ -459,3 +468,4 @@ When `McpClient.callTool` gets an error result, does it write it to the cache, a
 ---
 Updated: 2026-05-28 — Corrected the transport claim: retry is now exponential backoff (parsed server-window preferred, capped at `retryCeilingMs = 20_000`), not fixed-delay; added the route's pre-stream setup `try/catch` and the feed's one-time token-revocation auto-reconnect; refreshed all `client.ts`/`diagnostic.ts`/`monitoring.ts` line refs.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

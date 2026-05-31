@@ -8,27 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've got a React component with a unit test: render it, click a button, assert the output. The test isn't checking *that React rendered* — it's checking that this specific shape of input produces this specific shape of output. A pure function, in test. Now imagine a different kind of test: the component is part of a multi-step wizard with conditional branches, and you want to assert "the user gets to a correct final state" — but the *path* they take depends on what data the server returned at step 2, and you also want to know "did they make it without going through unnecessary steps?" The old unit test still works for one render, but it can't tell you whether the journey was efficient or whether the wizard handled a step-2 failure gracefully.
+**Zoom out — the bigger picture.** Agent evaluation lives *orthogonal* to the request flow — it doesn't run inside any band, it grades them. blooming insights has the orthogonal eval-time path partially wired: `lib/eval/*` runs schema validation and coverage gates against agent outputs, and the trajectory is *recorded* (tool name, args, result, duration) in the route's NDJSON stream. What's missing is the trajectory-eval *harness* that would replay those recorded runs against golden expectations and grade them automatically.
 
-That second kind of test is the question this file answers: **how do you evaluate something whose unit of work isn't a single input/output but a sequence of decisions across many steps?** Not "does the final answer look right" (that's LLM eval — one call, one output). The architectural question is **how to grade the trajectory** — was the right tool called, in the right order, with the right recovery from errors, in a reasonable number of steps for a reasonable cost?
+```
+  Zoom out — where agent evaluation lives
 
-**Why answering that question matters:** because final-output eval alone misses the failure modes that cost the most. An agent that returns the right answer after 12 tool calls when 4 would have done costs 3× as much and burns its budget on noise. An agent that recovers from a transient 429 silently is *better* than one that fails — but final-output eval doesn't see the difference. An agent that consistently picks `list_email_campaigns` when it should pick `list_sms_campaigns` may still produce an OK-looking recommendation by coincidence, but the trajectory is wrong and it'll break the moment a real user routes by channel.
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  lib/agents/pipeline.ts                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop emits trace events                 │
+  │  (tool, args, duration, result, error)            │
+  └─────────────────────────┬────────────────────────┘
+                            │  recorded trajectory
+  Orthogonal to request flow (eval-time):
+  ┌─ Eval band ─────────────┴────────────────────────┐  ← we are here
+  │  ★ lib/eval/* ★ (today: schema + coverage gates)  │
+  │  ★ trajectory-eval harness ★ (absent — would       │
+  │     replay recorded runs, grade vs golden)        │
+  │  Measures: tool-call accuracy, trajectory length, │
+  │   recovery on errors, cost per investigation      │
+  └──────────────────────────────────────────────────┘
+```
 
-Without trajectory-aware eval:
-- You ship a "fix" that improves final-answer accuracy by 2% and increases tool calls per investigation by 40%
-- A regression in tool-call accuracy goes silent because the model coincidentally finds the right answer through wrong tools
-- "It worked on my staging anomaly" doesn't reproduce because staging only exercised one trajectory shape
-- Cost per investigation creeps up monthly with no one noticing until the bill arrives
-
-With it:
-- Each run produces an inspectable trajectory (tool name, args, duration, result, error)
-- You can grade trajectories against expected tool shapes (was `execute_analytics_eql` the right first call?)
-- You can grade trajectories against frozen "golden" runs to catch regressions
-- You can measure efficiency (steps to completion) and recovery (was a 429 absorbed silently?)
-
-One-line summary: **agent eval is unit-testing for a thing that's no longer pure — you grade the path, not just the destination, because the path is what determines the cost and the failure surface.** Here's what blooming insights has built (the trajectory is recorded; the tests cover the loop's shape) and what it hasn't (the trajectory-eval harness that would grade those trajectories automatically).
+**Zoom in — narrow to the concept.** The question is: how do you evaluate something whose unit of work isn't a single input/output but a sequence of decisions? Final-output eval alone misses the failure modes that cost the most — an agent that returns the right answer after 12 tool calls when 4 would have done; an agent that recovers from a 429 silently; an agent that picks the wrong tool but stumbles into a right-looking answer. Trajectory-aware eval grades the path, not just the destination. Below, you'll see what blooming insights records today, what's gated by schema, and what a trajectory-eval harness would add on top.
 
 ---
 
@@ -436,3 +442,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

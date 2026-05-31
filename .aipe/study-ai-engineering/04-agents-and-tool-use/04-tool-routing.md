@@ -8,30 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a form router: a `switch` on `action.type` that dispatches to the right reducer, and a permissions layer that only renders the buttons a user is allowed to click. Two different routing decisions, both about *narrowing a large space of possibilities to the correct subset before anything runs*. The permission layer prevents an unauthorized action by never offering it; the `switch` sends a request to its one correct handler. An agent system needs both: it must offer the model only the tools relevant to its job, and it must send each incoming request to the right agent.
-
-The question this file answers: how do you stop a model from reaching for the wrong tool, and how do you send a free-form question to the right specialist?
-
-**Answering it matters because the failure mode is silent and expensive.** Show a model 40 tools and ask it to diagnose a funnel drop, and it will sometimes call a recommendation tool or a campaign-listing tool that has nothing to do with the question — burning a tool-call budget slot, polluting the context with irrelevant data, and degrading the diagnosis. Models get measurably worse at tool selection as the tool count grows; the selection error rate is not zero and it rises with the menu size. The fix is not a better prompt — it is **routing by construction**: hand the model a small, curated subset so the wrong tool is not even on the menu. The second routing problem — which agent answers a free-form question — is where you choose between a cheap heuristic and a model call, and getting that ordering right saves latency and tokens on the common case.
-
-Before and after routing:
+**Zoom out — the bigger picture.** Tool routing is two decisions at two different layers. The Intent-parsing band routes a free-form `?q=` to the right agent (`parseIntent` first, `classifyIntent` second — see → ../01-llm-foundations/07-heuristic-before-llm.md). The Per-agent definitions band routes the *tool menu* per agent — each agent receives only its filtered subset (e.g. `diagnosticTools` of ~17 instead of the full ~40), so the wrong tool is never on the menu when the model picks.
 
 ```
-No routing                              Routed (this codebase)
-────────────────────────────────       ──────────────────────────────────
-diagnostic agent sees all ~40 tools     diagnostic agent sees ~17 tools
-  → sometimes calls list_voucher_pools    (diagnosticTools only)
-    (a recommendation tool) — wasted       → cannot call a recommendation tool;
-    budget slot, irrelevant data             it is not on the menu
+  Zoom out — the two routing decisions
 
-"what changed?" → guess the agent       parseIntent → 'monitoring' (free)
-                                          or classifyIntent → haiku → 'monitoring'
-                                        → routed to QueryAgent with the right framing
+  ┌─ Route ──────────────────────────────────────────┐
+  │  ?q=... or ?insightId=...                          │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Intent parsing (cross-cutting) ─────────────────┐  ← we are here (decision 1)
+  │  ★ parseIntent (free) → classifyIntent (haiku) ★  │
+  │    → which agent handles this?                     │
+  │  lib/agents/intent.ts                              │
+  └─────────────────────────┬────────────────────────┘
+                            │ chosen agent
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here (decision 2)
+  │  ★ filterToolSchemas(allTools, agentToolNames) ★  │
+  │    monitoring → monitoringTools                    │
+  │    diagnostic → diagnosticTools (~17)              │
+  │    recommendation → recommendationTools            │
+  │  lib/mcp/tools.ts                                  │
+  └─────────────────────────┬────────────────────────┘
+                            │  curated menu
+  ┌─ Agent loop + Tools ────▼────────────────────────┐
+  │  model picks from the SUBSET only                 │
+  └──────────────────────────────────────────────────┘
 ```
 
-One-line summary: **subset-scoping is routing by construction (the wrong tool is never offered); intent routing is heuristic-first, LLM-second (cheap path before the model call).**
+**Zoom in — narrow to the concept.** The question is: how do you stop a model from reaching for the wrong tool, and how do you send a free-form question to the right specialist? The failure mode is silent and expensive — show a model 40 tools and it sometimes calls one with nothing to do with the question, burning a budget slot and polluting the context. The fix is *routing by construction*: hand the model a small curated subset (decision 2) and route the request to the right specialist first (decision 1). How it works walks both decisions and the rule that subset-scoping beats prompt-discipline.
 
 ---
 
@@ -363,3 +370,4 @@ What does `classifyIntent` do with the haiku model's text output before returnin
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15 and refreshed the `route.ts` query-branch refs (L210–L218); noted the investigation chain is now `step`-gated (`step=diagnose`/`step=recommend`) and fixed the `bootstrapTools`/`list_voucher_pools`/per-agent subset line numbers.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

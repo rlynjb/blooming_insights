@@ -8,25 +8,29 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-A `Math.random()`-driven shuffle gives you a different order every call; a fixed seed gives you the same order every time. Some features want the variety (a "surprise me" feed); some need the repeatability (a test snapshot, a deterministic pager). The knob between them is how much randomness you allow into the selection step — and choosing the wrong setting makes a feature either boringly repetitive or untestably flaky.
+**Zoom out — the bigger picture.** Sampling parameters live inside the Provider step — the moment after the model produces a distribution over the next token and *something* has to pick one. That selection happens inside `anthropic.messages.create` at `lib/agents/base.ts` L102, and the codebase touches only one knob alongside it: `max_tokens`. Temperature, top-p, top-k are all left at provider defaults across every call site (agent loop, both `synthesize()` calls, intent classifier).
 
-The LLM equivalent is the sampling step. After the model produces a probability distribution over the next token, *something* has to pick one. Picking the single most-probable token every time is deterministic; sampling from the distribution introduces variety. The question is: for *this* task, do you want the model's output to vary call-to-call, or to be the same every time?
+```
+  Zoom out — where sampling lives
 
-**The pivot: sampling parameters trade determinism for diversity, and the right setting is task-specific — a classifier wants determinism, a brainstorm wants diversity.** Temperature scales the distribution (higher = flatter = more random); top-p and top-k restrict which tokens are even eligible. Leave them at defaults and you inherit a middle-ground randomness that is fine for analysis prose and slightly wrong for a one-word classifier.
+  ┌─ Per-agent (what gets passed)  ───────────────────┐
+  │  classifier   intent.ts L18–25     max_tokens 16   │
+  │  agent turn   base.ts L92–100      max_tokens 4096 │
+  │  synthesis    diagnostic.ts L97–116 max_tokens 2048│
+  │  NO temperature / top_p / top_k on any call site   │
+  └─────────────────────────┬──────────────────────────┘
+                            │  params → create()
+  ┌─ Provider ──────────────▼──────────────────────────┐  ← we are here
+  │  anthropic.messages.create(params)                 │
+  │  P(next token)  ──▶  ★ SAMPLE ★  ──▶  append      │
+  │  ↑ reshape by temperature/top_p/top_k (DEFAULT)    │
+  │  max_tokens bounds how many iterations of the loop │
+  └────────────────────────────────────────────────────┘
+```
 
-Before thinking about sampling:
-- A classifier returns "monitoring" on one call and "diagnostic" on a borderline query the next
-- A JSON-extraction agent's output varies in phrasing run-to-run, complicating any snapshot test
-- "Why did the same query give a different intent?" has no answer
-
-After understanding the knobs:
-- You know the variation comes from non-zero default temperature, not a bug
-- You can pin temperature to 0 where determinism matters (classification, synthesis)
-- You can justify keeping the default where mild variety is harmless (analysis prose)
-
-It is the seed-vs-`Math.random()` choice, made per model call instead of per shuffle.
+**Zoom in — narrow to the concept.** The question is: for *this* call, do you want the output to vary or to be the same every time? Sampling parameters are the per-task answer — temperature 0 for classification, default for exploration, somewhere in between for synthesis. blooming insights answers "default everywhere," which How it works shows is defensible for three of the four agents and a small gap on the classifier.
 
 ---
 
@@ -319,3 +323,4 @@ How many sampling-randomness parameters does any `anthropic.messages.create` cal
 ---
 Updated: 2026-05-28 — Re-derived the drifted synthesis-call ranges (diagnostic L97–L116 / `max_tokens` L99, recommendation L96–L122); the no-temperature finding and `base.ts`/`intent.ts` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

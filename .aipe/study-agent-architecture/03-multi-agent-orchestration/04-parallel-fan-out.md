@@ -8,65 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape)
+**Zoom out — the bigger picture.** Parallel fan-out would replace the Pipeline coordinator band's *shape* — instead of a sequential `monitoring → diagnostic → recommendation` chain, you'd split a query into N independent sub-questions, fire N agent loops concurrently, and merge their results. In blooming insights, the Pipeline band is sequential and forced to be so by a typed data dependency: `recommendation.propose(anomaly, diagnosis, hooks)` literally requires the diagnosis as input. The diagram below shows the parallel-fan-out topology on top and blooming insights' sequential pipeline underneath for contrast.
 
 ```
-The parallel fan-out shape
+  Zoom out — where parallel fan-out WOULD live
 
-           ┌──────── split ─────────┐
-           ▼          ▼             ▼
-      ┌────────┐ ┌────────┐    ┌────────┐
-      │agent A │ │agent B │    │agent C │   (concurrent)
-      └────┬───┘ └────┬───┘    └────┬───┘
-           └──────────┼─────────────┘
-                      ▼
-              ┌──────────────┐
-              │ merge agent  │  synthesizes
-              └──────────────┘
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
+  │  ★ PARALLEL FAN-OUT shape (★ THIS ★, absent):     │
+  │       split                                       │
+  │    ┌────┼────┬────┬────┐                          │
+  │    ▼    ▼    ▼    ▼    ▼                          │
+  │   [A]  [B]  [C]  [D]  [E]   (concurrent agents)   │
+  │    └────┴────┴────┴────┘                          │
+  │              ▼ merge                              │
+  │  ── absent in blooming insights ──                │
+  │                                                   │
+  │  blooming insights' actual shape (sequential):    │
+  │    monitoring ─► diagnostic ─► recommendation     │
+  │    (typed handoff forces order — Diagnosis is a   │
+  │     required argument to propose())               │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent definitions ─▼────────────────────────┐
+  │  workers identical either way                     │
+  └──────────────────────────────────────────────────┘
 ```
 
-You've written this code: `const [users, orders, products] = await Promise.all([getUsers(), getOrders(), getProducts()]);`. Three independent fetches; instead of waiting for each one to finish before starting the next, you start all three at once and wait for the slowest. The page renders in `max(t_users, t_orders, t_products)` instead of `t_users + t_orders + t_products`.
-
-Now picture the same shape, except each fetch is an *agent* — a ReAct loop that goes off and investigates its own sub-question, returning a result the merger combines. Three independent investigations running at the same time, one merger collecting their answers.
-
-### Move 2 — name the question
-
-That second shape is what parallel fan-out names. The question this file answers: **when does parallelism between agents save latency without sacrificing correctness, and when does it just multiply your costs?**
-
-Two halves. The latency win is real only when the sub-jobs are *genuinely* independent (no sub-job needs another's output). The cost win is real only when the parallelism is bounded — fan-out without a concurrency cap hits provider rate limits and serializes back to the slow case, plus 429 retries.
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because the *fake* fan-out failure mode is silent. Three workers running in parallel that secretly depend on each other will produce three plausible-looking answers, all wrong, that the merger then averages into a confident composite. You don't see the error in the trajectory — each worker did its job — but the system answer is wrong because the dependency was hidden.
-
-In this codebase: the recommendation agent's `propose(anomaly, diagnosis, hooks)` signature literally takes the diagnosis as a required argument. Parallelizing the diagnostic and recommendation stages would mean running recommendation without a diagnosis — typescript wouldn't let you, and even if you bypassed that, the recommendation prompt explicitly references `diagnosis.conclusion` and iterates over `diagnosis.evidence[]`. There's no parallelizable structure here; the dependency is enforced by the function signature.
-
-Where fan-out *would* fit: a future "ask blooming insights about the last 30 days across funnel, conversion, retention, AND segments" query — four sub-questions across four independent domains. The QueryAgent today handles one domain at a time; fanning out across four would parallelize the latency, with the budget tax that the rate limiter would otherwise impose.
-
-### Move 4 — concrete before/after
-
-Sequential (this codebase, today):
-- Diagnostic stage runs (4–6 EQL queries, ~1s spacing) → ~5–7 seconds
-- Diagnosis returned → typed Diagnosis
-- Recommendation stage runs (3–5 tool calls) → ~4–6 seconds
-- Total: ~9–13 seconds, all sequential
-
-Parallel fan-out (hypothetical, not this codebase):
-- Three independent sub-questions, three workers fan out at once
-- Each worker runs its own 3–5 turn ReAct loop concurrently
-- Concurrency cap (e.g. N=2 under ~1 req/s MCP rate) serializes some
-- Merge agent combines the three results
-- Total: ~max(t1, t2, t3) + merge ≈ ~5–8 seconds with merge
-
-The cost: you pay 3 worker loops + 1 merge loop instead of 1 sequential loop. The win: latency is `max` instead of `sum`. Worth it when the sub-jobs are independent AND the rate limit isn't the bottleneck.
-
-### Move 5 — one-line summary
-
-Parallel fan-out is `Promise.all()` with a merge step — except each promise is a ReAct loop and the merge is either a function call or another agent. blooming insights doesn't use it today (sequential pipeline, user-gated, rate-limited) but the breakpoint is clear: independent sub-questions across multiple domains in a single request.
-
-Here's how it works.
+**Zoom in — narrow to the concept.** The question is: when does parallelism between agents save latency without sacrificing correctness, and when does it just multiply costs? The latency win is real only when the sub-jobs are *genuinely* independent; the cost win only when parallelism is bounded against provider rate limits. blooming insights' sub-jobs are NOT independent (the typed `Diagnosis` enforces a dependency), so fan-out doesn't apply to the current flow. Below, you'll see where fan-out fits, the silent failure mode of fake-independence, and the future query shape that would earn the topology.
 
 ---
 
@@ -524,3 +494,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

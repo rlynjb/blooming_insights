@@ -8,25 +8,36 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-blooming insights already does the *first half* of query understanding. When a free-form `?q=` arrives, `classifyIntent` (`lib/agents/intent.ts` L17–L31) sends it to a cheap model to label it monitoring/diagnostic/recommendation, and then the agent translates the natural-language question into structured EQL and tool arguments. That translation — from "why did sales drop on mobile?" into `event = checkout_started AND device = mobile` — is query understanding: reshaping the human question into the form the retrieval engine actually consumes.
+**Zoom out — the bigger picture.** Query rewriting / HyDE is the *pre-retrieval* transform — it reshapes the user's raw query *before* it hits the retriever, so the embedded query lands near the answer documents rather than near other questions. blooming insights already does an upstream cousin of this: `classifyIntent` (`lib/agents/intent.ts` L17–L31) labels the free-form `?q=` and each agent translates natural-language questions into structured EQL. But a retrieval-style query rewrite would sit between the user and a (non-existent) retriever, not between the user and the agent.
 
-The question query rewriting answers is: when the user's literal words are a poor match for the documents, how do you transform the query so retrieval finds the right ones?
+```
+  Zoom out — where query rewriting / HyDE sits (WOULD BE)
 
-**The pivot: the user phrases questions in their vocabulary, but documents are written in theirs, and the vocabulary gap means the literal query embeds far from the answer that would satisfy it.** A user asks "why are people leaving without buying?"; the relevant past investigation is titled "cart abandonment on mobile checkout." Embedding the *question* lands near other questions; embedding a *hypothetical answer* (HyDE) lands near real answers, because answers look like answers. Rewriting closes the gap before retrieval, not after.
+  ┌─ User query ─────────────────────────────────────┐
+  │  "why are people leaving without buying?"         │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Query transform ───────▼────────────────────────┐  ← we are here
+  │  ★ rewrite | decompose | HyDE (hypothetical doc) ★│
+  │  embed an answer-shaped string, not the question  │
+  └─────────────────────────┬────────────────────────┘
+                            │  transformed query (or hypothetical doc)
+  ┌─ Retriever ─────────────▼────────────────────────┐
+  │  cosine-nearest neighbors over real documents     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Reranker / LLM context ▼────────────────────────┐
+  └──────────────────────────────────────────────────┘
 
-Before query rewriting:
-- The raw question embeds near other questions, not near answer documents
-- A multi-part question retrieves a muddled mix matching no single sub-question well
-- Vocabulary mismatch (user words ≠ document words) silently lowers recall
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; classifyIntent is a related but different transform
+  (labels the query, doesn't rewrite for retrieval).
+```
 
-After:
-- The question is expanded/decomposed/transformed into a better retrieval query
-- HyDE embeds a hypothetical answer, landing near real answers
-- Each sub-question retrieves cleanly; recall rises before any reranking
-
-It is the same move as normalizing a search box's raw input — trimming, expanding synonyms, splitting a compound query — before it hits the index, which is the kind of pre-processing the route already does with `.trim()` and `classifyIntent`.
+**Zoom in — narrow to the concept.** The question is: when the user's literal words are a poor match for the documents, how do you transform the query so retrieval finds the right ones? Users phrase questions in their vocabulary, documents are written in theirs, and the gap means the literal query embeds far from any answer that would satisfy it. Embedding a *hypothetical answer* (HyDE) lands near real answers because answers look like answers. How it works walks four transforms — synonym expansion, decomposition, step-back, and HyDE — and the cost/recall tradeoff each makes.
 
 ---
 
@@ -276,3 +287,4 @@ What query-understanding does blooming insights do today, and why is retrieval-q
 
 → 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

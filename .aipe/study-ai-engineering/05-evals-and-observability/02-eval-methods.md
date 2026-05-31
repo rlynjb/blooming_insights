@@ -8,25 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You compare two values in a test. For a number you write `toBe(42)`. For an object you reach for `toEqual({...})`. For a string that varies in whitespace you normalize first, then compare. For a string whose *exact* form you cannot predict you fall back to `toMatch(/regex/)` or `expect(s).toContain('...')`. You already pick the comparison method to fit the shape of the thing being compared — a stricter method for predictable output, a looser one for variable output.
+**Zoom out — the bigger picture.** Eval methods are the *scoring* side of the eval band — the function that consumes a per-agent output and emits a score. Each band's output has its own shape and so needs its own method: monitoring emits a typed `Anomaly[]` (exact-match scoring works), diagnostic emits a `Diagnosis` paragraph (rubric or LLM-judge), recommendation emits a `Recommendation[]` array (set overlap + per-item rubric). The scorer slots into the offline eval flow from `01-eval-set-types.md`.
 
-Eval scoring is that same decision, scaled up. An anomaly classification is a single enum value (`'critical' | 'warning' | 'info' | 'positive'`) — predictable, so `toBe`-style exact-match works. A diagnosis is a paragraph of reasoning — unpredictable, so exact-match is useless and you need a rubric or a model to judge it. The question this file answers is: **for each surface in blooming insights, which scoring method is strict enough to catch real regressions but loose enough not to fail correct-but-differently-worded answers?**
+```
+  Zoom out — match the scorer to the per-agent surface
 
-**Why answering it matters: the wrong method makes your eval set lie to you.** Score free-form diagnosis prose with exact-match and every run "fails" because the wording shifts — the eval is noise. Score an anomaly's severity with an LLM-judge and you have spent a model call and introduced judge bias to grade what `===` would have graded for free and correctly. Method choice is what makes the score *trustworthy*; a number from the wrong method is worse than no number, because you will act on it.
+  ┌─ Per-agent output ───────────────────────────────┐
+  │  Anomaly[]    Diagnosis (prose)   Recommendation[]│
+  └────┬──────────────┬──────────────────┬───────────┘
+       │ enum         │ free-form        │ array
+       │ typed        │ JSON-with-prose  │ JSON
+       ▼              ▼                  ▼
+  ┌─ Eval band — scoring methods ────────────────────┐  ← we are here
+  │  ★ exact-match / F1 (cheap, deterministic) ★      │
+  │    for enum/typed surfaces                        │
+  │  ★ rubric / LLM-judge (tolerant of wording) ★     │
+  │    for prose surfaces                             │
+  │  set overlap + per-item rubric                    │
+  │    for array surfaces                             │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Score, tracked over time ▼──────────────────────┐
+  │  noise-free numbers a team will actually act on   │
+  └──────────────────────────────────────────────────┘
 
-Before matching method to surface:
-- Diagnosis evals fail constantly on wording → the team ignores the score → evals are abandoned
-- Anomaly-class evals run an expensive judge → slow, costs money, adds bias for no benefit
-- "The eval is flaky" becomes the reason nobody trusts evals
+  Currently in this codebase: 169 Vitest tests exist but
+  none of them score answer quality. The methods this file
+  describes are not yet wired into a quality eval.
+```
 
-After:
-- Anomaly classification scored by exact-match / F1 — fast, free, deterministic, correct
-- Diagnosis and recommendation prose scored by rubric or LLM-judge — tolerant of wording, sensitive to substance
-- Each score means what it says, so the team acts on it
-
-It is the same instinct as choosing `toBe` vs. `toMatch` — applied to a non-deterministic model and a far richer space of "correct."
+**Zoom in — narrow to the concept.** The question is: for each surface in blooming insights, which scoring method is strict enough to catch real regressions but loose enough not to fail correct-but-differently-worded answers? The wrong method makes your eval set lie — exact-match on prose creates noise, LLM-judge on enums is expensive and biased. Method choice is what makes the score *trustworthy*. How it works walks each method, the surface it fits, and the trap of using a single scorer for everything.
 
 ---
 
@@ -340,3 +353,4 @@ What does `classifyIntent` (`lib/agents/intent.ts` L17–L31) return, and which 
 ---
 Updated: 2026-05-28 — Test count 125→157; re-derived `MonitoringAgent.scan` (monitoring.ts L68–L103) and `Diagnosis` (types.ts L64–L73) refs. `classifyIntent` (intent.ts L17–L31), `propose` (recommendation.ts L36–L77), and Severity (types.ts L3) unchanged. Still Case B.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

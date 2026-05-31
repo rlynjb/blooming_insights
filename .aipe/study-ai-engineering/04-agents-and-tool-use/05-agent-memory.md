@@ -8,24 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have two kinds of state in a React app. The first lives in a component's `useState` — it accumulates while the component is mounted and vanishes on unmount; it is *working* state, scoped to one interaction. The second lives in a `localStorage` key or a database row — it survives reloads, sessions, and deploys; it is *durable* state, retrieved by a key. An agent has the exact same split: working memory that lives for one run, and durable memory that survives across runs. Confusing the two — expecting a run's working memory to persist, or treating a durable store as if it adapts within a run — is where agent systems leak and surprise.
-
-The question this file answers: what does an agent remember within a single run, what does it remember across runs, and how is each stored?
-
-**Answering it matters because the kind of memory you have determines the kind of behavior you can build.** Short-term memory is what lets the agent build a diagnosis over six tool calls instead of re-querying from scratch each turn — it is the substrate of multi-step reasoning. Long-term memory is what lets a second visit to an investigation be instant instead of re-running the whole agent. But the *shape* of the long-term store decides what is possible: blooming insights stores exact snapshots keyed by `insightId`, so it can replay a known investigation perfectly — and it cannot answer "have we seen an anomaly like this before?" because that requires semantic recall, which it does not have. Knowing which memory you have, and which you do not, is the difference between promising a feature and shipping one.
+**Zoom out — the bigger picture.** Agent memory splits across two layers. Short-term memory is the `messages` array inside `runAgentLoop` (`lib/agents/base.ts` L79–L81, grows through L105 and L171) — working state for one run. Long-term memory is the keyed snapshot store: `saveInvestigation`/`getCachedInvestigation` in `lib/state/investigations.ts` plus the mem→file→seed lookup chain — exact replay across runs. Semantic memory ("have we seen an anomaly like this before?") would need an embedding store and does not exist.
 
 ```
-Short-term (working)                    Long-term (durable)
-────────────────────────────────       ──────────────────────────────────
-useState while mounted                  localStorage / DB row by key
-= messages[] in one runAgentLoop        = getCachedInvestigation(insightId)
-gone when the run returns               survives across runs (mem → file → seed)
-substrate of multi-step reasoning       exact replay, NOT semantic recall
+  Zoom out — where each memory tier lives
+
+  ┌─ Agent loop (SHORT-TERM, one run) ───────────────┐  ← we are here
+  │  ★ messages[] grows turn by turn ★               │
+  │    init L79–81, asst L105, tool_results L171     │
+  │  gone when runAgentLoop returns                  │
+  └─────────────────────────┬────────────────────────┘
+                            │  saveInvestigation(insightId, events)
+  ┌─ State layer (LONG-TERM, exact replay) ──────────┐  ← we are here
+  │  ★ mem Map → file snapshot → seed ★               │
+  │  lib/state/investigations.ts                     │
+  │  retrieved by exact insightId only                │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ (Semantic memory — would-be) ───────────────────┐
+  │  embedding index of past investigations / lessons │
+  │  "have we seen this before?"  ← NOT implemented   │
+  │  see → ../03-retrieval-and-rag/                   │
+  └──────────────────────────────────────────────────┘
 ```
 
-One-line summary: **short-term memory is the `messages` array within one run; long-term memory is exact-keyed snapshot replay; there is no semantic memory, and that is an honest, deliberate gap.**
+**Zoom in — narrow to the concept.** The question is: what does an agent remember within a single run, what does it remember across runs, and how is each stored? Short-term is the substrate of multi-step reasoning (six tool calls building one diagnosis); long-term is what makes re-opening an investigation instant. The shape of each store decides what behavior is possible — exact-key snapshot replay can replay a known run perfectly but cannot answer "similar to" questions. How it works walks each tier, the mem→file→seed lookup chain, and the honest gap where semantic memory would go.
 
 ---
 
@@ -372,3 +381,4 @@ Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: re
 ---
 Updated: 2026-05-29 — Added a "cross-step memory" sub-section (with diagram) on the two-step investigation's diagnosis handoff: step 2 serializes to `sessionStorage['bi:diag:<id>']` (useInvestigation.ts L138–139), step 3 re-hydrates via `parseDiagnosis` (route.ts L227); demo path replays the snapshot `filterByStep` (route.ts L129). Framed as memory carried across HTTP requests, distinct from in-loop message memory.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

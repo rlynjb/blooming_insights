@@ -8,28 +8,30 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have written two kinds of async control flow. The first is a fixed pipeline you wrote by hand: `const a = await stepOne(input); const b = await stepTwo(a); return stepThree(b)` — the order is hard-coded in your TypeScript, and you, the author, decided every step at write-time. The second is a `while` loop whose continuation depends on data you do not have until runtime: paginating until the server stops returning a `nextPageToken`, where the *response* decides whether you loop again. Both are valid. The difference is **who owns the control flow** — your code, or the data coming back.
-
-The question this file answers: when do you let the LLM decide the next step (an agent), and when do you fix the sequence in code (a chain)?
-
-**Answering it matters because the two failure modes are opposite, and choosing wrong is expensive in both directions.** A chain is predictable, debuggable, and cheap — but it cannot adapt; if the next step depends on what the previous step *found*, a chain forces you to either over-fetch everything up front or build a combinatorial tree of `if` branches. An agent adapts — it reads the evidence and decides what to query next — but it can loop forever, burn tokens exploring dead ends, and produce non-deterministic traces that are hard to test. The right architecture is almost never "all agent" or "all chain." It is a chain of agents: a deterministic spine where each vertebra is a bounded agent.
-
-Before naming the two shapes, here is the same investigation expressed each way:
+**Zoom out — the bigger picture.** Agents-vs-chains is the *topology decision* — who owns the control flow at each layer. blooming insights is a **chain of agents**: the Pipeline coordinator + Route own the outer order (chain), and inside each step the Agent loop lets the model pick the next tool (agent, bounded). The chain spine is enforced by the route's `step` param (`?step=diagnose` then `?step=recommend`); inside each step, `runAgentLoop` (`lib/agents/base.ts` L48–L176) is the bounded agent.
 
 ```
-Pure chain (no model decides anything):           Pure agent (model decides everything):
-─────────────────────────────────────────         ─────────────────────────────────────────
-run query_funnels  (always)                        loop:
-run query_events   (always)                          model: "which tool next? when do I stop?"
-run query_segments (always)                          run whatever it picked
-synthesize(all three results)                        feed result back
-                                                     until model says "done"
-adaptive? NO — same 3 queries every time           adaptive? YES — but unbounded, untestable
+  Zoom out — chain on the outside, agent on the inside
+
+  ┌─ Route + client (CHAIN — code owns the order) ───┐  ← we are here (outer)
+  │  ?step=diagnose ──[bi:diag handoff]──▶ ?step=recommend │
+  │  route.ts L224–249                                 │
+  └─────────────────────────┬────────────────────────┘
+                            │ one bounded agent per step
+  ┌─ Per-agent + Agent loop (AGENT — model picks next) ┐  ← we are here (inner)
+  │  ★ runAgentLoop  base.ts L48–176 ★                  │
+  │  model: "which tool next? when do I stop?"          │
+  │  bounded by maxToolCalls + forceFinal (L90–91)      │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Tools + Provider ──────▼────────────────────────┐
+  │  the model's chosen tool fires → result back      │
+  └──────────────────────────────────────────────────┘
 ```
 
-blooming insights picks neither extreme. It runs a 2-step chain (`investigate` then `propose`) where each step is an agent that runs a *bounded* loop. The two steps are even split across two HTTP requests — `step=diagnose` runs only the diagnostic agent, `step=recommend` runs only the recommendation agent on the diagnosis handed over from step 2 — so the chain order is enforced by the route's `step` param, not just by code sequencing. One-line summary: **the topology is a chain; the nodes are agents; the boundary between them is the source of both predictability and adaptivity.**
+**Zoom in — narrow to the concept.** The question is: when do you let the model decide the next step (an agent), and when do you fix the sequence in code (a chain)? Chains are predictable, debuggable, cheap, but cannot adapt; agents adapt, but can loop forever, burn tokens, and produce non-deterministic traces. The two failure modes are opposite. blooming insights picks neither extreme: chain-of-agents — a deterministic spine where each vertebra is a bounded agent. How it works walks the topology trade and the budgets (`maxToolCalls`, `forceFinal`) that turn an unbounded agent into a bounded one.
 
 ---
 
@@ -365,3 +367,4 @@ Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`
 ---
 Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [])` signature (monitoring.ts L69) and per-category checklist; the briefing route gates the list to `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204/223) before the agent runs, so the monitoring node is schema-gated. Cross-ref 07-capability-gating.md.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

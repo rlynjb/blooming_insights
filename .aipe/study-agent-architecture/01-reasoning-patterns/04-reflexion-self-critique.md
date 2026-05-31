@@ -8,29 +8,31 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You've debugged this before: a `fetch` returns a 200, your code parses the JSON, and somewhere downstream the user sees a blank section. You add a `try/catch` around the parse, then a runtime check that the response has the fields you need, then a re-fetch when the validation fails. You've stacked three layers — parse, validate, retry — because "200 OK" isn't the same as "useful data."
+**Zoom out — the bigger picture.** A reflexion / critic loop would sit *between* the Shared agent loop and whatever consumes its output — a second model call grading the first one, deciding whether to accept or retry. In blooming insights, that band is empty; the agent loop returns directly into the Pipeline coordinator with no critic in between. What lives in roughly that slot instead is a *forced synthesis* call inside `runAgentLoop` (when the budget burns out without a final text answer, tools are stripped and the model is asked again) — same model, no critic, just a retry without tools. Not reflexion, but the same architectural seam.
 
-Now picture the same pattern around an LLM call. The model returns a Diagnosis. Your code parses it as JSON. Your code validates it has `conclusion`, `evidence`, `hypothesesConsidered`. If anything fails, you re-ask. That's a *parse-and-retry*. It's the cheapest version of "did we get a useful answer."
+```
+  Zoom out — where reflexion / critic loop WOULD live
 
-Push it one step further: instead of just re-asking the same model with the same prompt, you ask *a different model* (or the same model with a critic prompt) to *grade* the first answer, and only retry when the critic flags a problem. The critic might catch things validation can't — vague reasoning, missing a hypothesis, ungrounded claims. That's the question this file answers: **when does a critic loop pay for itself, and where does its shared-blind-spot limit kill the payoff?**
+  ┌─ Shared agent loop ─────────────────────────────┐
+  │  runAgentLoop (lib/agents/loop.ts)              │
+  │  produces a candidate answer (parsed JSON)      │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Critic / reflexion ────▼────────────────────────┐  ← ★ THIS ★ (absent)
+  │  ★ would grade the answer, decide accept/retry ★ │  ← we are here
+  │  ── absent in blooming insights ──                │
+  │  what's here instead: forced-synthesis retry      │
+  │  (same model, no tools, no critic)                │
+  └─────────────────────────┬────────────────────────┘
+                            │  accepted answer
+  ┌─ Pipeline coordinator ──▼────────────────────────┐
+  │  pipeline.ts hands result to the next stage      │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because self-critique looks like rigor but is structurally suspect. The critic shares the producer's training and biases. If the producer wrote a wrong conclusion confidently, the critic — same model family, similar priors — reads it confidently and approves it. The win is real on *format and recognition errors* (missing fields, wrong shape, obvious omissions); the win is small or negative on *substantive reasoning errors* (the conclusion was wrong but plausible). Treating critic loops as universally good is how teams ship a 2x token-cost retry layer that catches nothing the parser didn't.
-
-Without naming the limit:
-- A diagnostic conclusion comes back vague
-- "Let's add a critic that reviews diagnoses"
-- The critic — same model — reads the vague diagnosis, finds it "reasonable given the evidence," approves
-- You shipped a critic loop that runs every time, costs 2x tokens, and changes nothing
-
-With the limit named:
-- A diagnostic conclusion comes back vague
-- Ask: is "vague" recognizable to the producing model? Yes — it's structural
-- A *structural* check works (does the conclusion cite numbers? does it name a cause?) — no critic needed; that's a parser
-- A *substantive* check (is the cause *correct*?) needs different evidence, not a same-model second opinion
-
-One-line summary: **a self-critique loop is the runtime equivalent of a code-review you do on yourself — useful for catching typos, structurally limited for catching wrong logic.** In blooming insights, the role critic-loops would play is filled by *forced synthesis* — a same-model retry without tools, not a separate critic.
+**Zoom in — narrow to the concept.** The question is: when does a critic loop catch things parsing/validation can't — and when does it just double your token cost on errors the same-model critic shares the blind spot for? Format/recognition errors (missing fields, wrong shape) are catchable by a parser, no critic needed. Substantive reasoning errors (the conclusion was wrong but plausible) are exactly what a same-model critic *can't* see — it shares the producer's priors. Below, you'll see where critic loops earn their keep, where they don't, and why blooming insights uses forced synthesis instead.
 
 ---
 
@@ -398,3 +400,4 @@ Open and verify. ✓ File + function + the recovery-vs-critic distinction matter
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

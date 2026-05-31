@@ -8,25 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You build a form whose fields are pre-filled from an API. The user edits one field, then a background refetch returns fresh server data. If you naively `setState(serverData)`, the user's edit vanishes — they watch their typing get erased by a refresh they did not ask for. The fix every frontend engineer learns: track which fields the user touched (a `dirty` set) and merge so server data fills only the untouched fields. The user's edits win; the refresh fills the gaps.
+**Zoom out — the bigger picture.** User-override locks would sit at a three-way intersection: the UI (where a human edits or dismisses), the State layer (where a `_overridden_at` marker would live on the record), and the Per-agent regeneration step (where a merge would consult the marker before writing). blooming insights is a read-only analyst — `lib/mcp/types.ts` has only machine-generated fields, `lib/state/insights.ts` exposes no edit/patch path, and the investigate page renders + exports only — so this is the WOULD-BE shape; the current row is empty.
 
-The same conflict appears wherever a machine regenerates a value a human can also change. An LLM that re-runs an investigation and re-proposes recommendations is a refresh. If a user dismissed or edited a recommendation, a re-run must not resurrect or overwrite it.
+```
+  Zoom out — where the override lock would live (WOULD BE)
 
-**The pivot: regeneration and human editing share a field, so you need a rule for who wins — and "last write wins" silently destroys the human's intent.** Without an explicit marker of "a human touched this," the regeneration step cannot tell a user edit from stale machine output, so it overwrites both. The marker — a per-field `_overridden_at` timestamp — is what lets the re-run skip the fields a human owns.
+  ┌─ UI ─────────────────────────────────────────────┐
+  │  edit / dismiss control on a Recommendation      │
+  │     (CURRENT: read-only render + export only)     │
+  └─────────────────────────┬────────────────────────┘
+                            │  PATCH
+  ┌─ State layer ───────────▼────────────────────────┐  ← we are here (WOULD BE)
+  │  ★ _overridden_at / _dismissed on record ★       │
+  │  patch path sets the marker on human edit        │
+  │  (CURRENT: types.ts L85–99 has no edit metadata) │
+  └─────────────────────────┬────────────────────────┘
+                            │  read on re-run
+  ┌─ Per-agent (regenerate) ▼────────────────────────┐
+  │  mergeOnRegenerate(existing, fresh):             │
+  │    _overridden_at set?  yes → KEEP human         │
+  │                          no  → WRITE fresh        │
+  │  (CURRENT: re-run overwrites blindly)            │
+  └──────────────────────────────────────────────────┘
 
-Before the lock:
-- A user edits a recommendation's title; the next investigation re-run overwrites it with fresh machine output
-- A dismissed recommendation reappears on every re-run
-- The user learns the tool does not respect their input and stops editing
+  In this codebase: Not yet implemented — read-only analyst
+  with no user-editable persisted fields, so there is no
+  regeneration-vs-edit conflict to guard yet.
+```
 
-After:
-- An edited field carries `_overridden_at`; the re-run sees it and skips it
-- Dismissed items stay dismissed
-- The machine fills only what the human has not claimed
-
-It is the dirty-field merge from a pre-filled form, persisted to the data model and checked by the regeneration step.
+**Zoom in — narrow to the concept.** The question is: when a machine regenerates a value a human can also edit, who wins? "Last write wins" structurally favors the machine — the re-run is automated and frequent, so the human's edit gets erased silently. The marker (a per-field `_overridden_at` timestamp) breaks the symmetry by flagging the human's claim so the re-run defers to it. How it works walks the marker, where it lives, and the two reconciliation policies (user-wins vs newest-wins).
 
 ---
 
@@ -315,3 +327,4 @@ Does the `Recommendation` type carry any field that records a human edit, and wh
 ---
 Updated: 2026-05-28 — Re-derived the drifted refs (`Recommendation` types.ts L85–L99, `Diagnosis` L64–L73, `insights.ts` surface L29–L57 + Map store L4–L6, investigate-page export L75–L98) and noted the new enrichment fields are agent-emitted/derived, not human-edit metadata — Case B still holds (no `_overridden_at`/`_dismissed`).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

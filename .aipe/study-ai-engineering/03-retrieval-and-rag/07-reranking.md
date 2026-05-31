@@ -8,25 +8,35 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Suppose the schema-term or past-investigation retriever from the earlier files returns the top 20 candidates by cosine. The agent can only afford to put the top 3 in the prompt. Which 3? Cosine similarity got you a *good* set of 20, but its ordering inside that set is rough — the truly-best match might be at position 7, not position 1. And it matters *where* the best match lands: a model reads the start and end of its context far better than the middle (the lost-in-the-middle effect, `../02-context-and-prompts/02-lost-in-the-middle.md`). If the best evidence is buried at position 2-of-3, the model may skim past it.
+**Zoom out — the bigger picture.** Reranking is the *second pass* in a retrieval pipeline — it sits between the fast retriever (or hybrid fusion) and the LLM context. The first stage optimizes recall over thousands; the reranker optimizes precision over the top ~20. blooming insights has neither retriever nor reranker; this is the layer that would directly mitigate lost-in-the-middle (→ ../02-context-and-prompts/02-lost-in-the-middle.md) by ensuring the genuinely-best evidence lands at position 1 of what enters the prompt.
 
-The question reranking answers is: given a good-but-roughly-ordered candidate set from a fast retriever, how do you put the genuinely most relevant item first?
+```
+  Zoom out — where the reranker sits (WOULD BE)
 
-**The pivot: the fast first-stage retriever optimizes recall (get the right docs *into* the set) at the cost of precise ordering, so a second, slower, more accurate scorer is needed to fix the order before the model reads it.** The first stage (embedding cosine, BM25, hybrid) scores query and document *independently* — it embeds each once and compares vectors, which is fast enough to scan thousands but coarse. A reranker (a cross-encoder) scores the query and each candidate *together* in one model pass — far more accurate, far too slow to run over thousands, exactly right over the top 20.
+  ┌─ Retriever / hybrid fusion ──────────────────────┐
+  │  fast first stage → top-20 candidates             │
+  │  scores query and docs INDEPENDENTLY (cheap)      │
+  └─────────────────────────┬────────────────────────┘
+                            │  top-20 (good set, rough order)
+  ┌─ Reranker (second pass) ▼────────────────────────┐  ← we are here
+  │  ★ cross-encoder: score (query, doc) TOGETHER ★   │
+  │  one model pass per candidate                    │
+  │  accurate, but only affordable over a short list  │
+  └─────────────────────────┬────────────────────────┘
+                            │  top-3 (best first)
+  ┌─ LLM context ───────────▼────────────────────────┐
+  │  best evidence at position 1 → not lost-in-middle │
+  └──────────────────────────────────────────────────┘
 
-Before reranking:
-- Retrieval returns 20 candidates; their internal order is rough
-- You truncate to top-3 by cosine; the actual best is at position 5 and gets dropped
-- Or it survives but lands in the lost-in-the-middle dead zone
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead; tool results are appended in tool-call order with
+  no relevance reorder before they enter the model context.
+```
 
-After:
-- A cross-encoder re-scores the 20 with query+doc together
-- The genuinely-best candidate moves to position 1
-- The top-3 you keep are the right 3, ordered best-first
-
-It is `array.sort()` again — but with a comparator accurate enough to be worth running only on a short list.
+**Zoom in — narrow to the concept.** The question is: given a good-but-roughly-ordered candidate set from a fast retriever, how do you put the genuinely most relevant item first before the LLM reads it? Cosine and BM25 score query and document independently — fast but coarse. A reranker (a cross-encoder) scores them *together* in one model pass — far more accurate, far too slow over thousands, exactly right over twenty. How it works walks the bi-encoder/cross-encoder split, why cross-encoding is more accurate, and the lost-in-the-middle payoff of putting the best result first.
 
 ---
 
@@ -272,3 +282,4 @@ Does blooming insights rerank retrieved candidates by query relevance, and what 
 
 → 06-hybrid-retrieval-rrf.md · → 01-embeddings.md · → ../02-context-and-prompts/02-lost-in-the-middle.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

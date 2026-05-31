@@ -8,68 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-### Move 1 — the scenario (lead with the shape — the failure table)
+**Zoom out — the bigger picture.** Coordination failure modes span every band a multi-agent system touches — but they cluster around the Pipeline coordinator (synthesis failure, infinite handoff, cost blowup) and the Shared agent loop (tool-call cascade, context bloat). In blooming insights, several of these are *structurally absent*: no LLM supervisor → no synthesis failure; no peer handoff → no infinite handoff; message-passing instead of shared state → no context bloat. The remaining ones are *mechanically controlled*: tool-call caps in `runAgentLoop`, cost limits via Haiku classifier and per-stage budgets, token-revocation guard via a one-time auto-reconnect.
 
 ```
-The coordination failure table
+  Zoom out — where coordination failures live
 
-  Failure                       Mitigation
-  ────────────────────────      ─────────────────────────────
-  Infinite handoff              handoff counter (MAX_HOPS),
-   (A→B→A→B…)                    force stop or human escalate
-  Tool-call cascade             per-agent + global iteration
-   (one agent triggers a         caps; budget ceiling that
-    storm of calls)              halts the run
-  Context bloat (shared          message passing / context
-    state grows with N agents)   routing instead of blackboard
-  Synthesis failure             validate worker outputs vs
-   (supervisor merges            schema; surface conflicts,
-    contradictory results)       don't average them
-  Cost blowup                   per-run token budget; cheap
-   (2-5x overhead compounds      models for workers, expensive
-    silently)                    only for supervisor
-  Token-revocation mid-run      one-time guarded auto-reconnect
-   (MCP auth expires during      (per-tab, gated by
-    a live agent run)            sessionStorage flag)
+  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
+  │  lib/agents/pipeline.ts                          │
+  │  ★ failures here ★                                │
+  │   ── synthesis failure (no LLM merger here)       │
+  │   ── infinite handoff (no peer transfer here)     │
+  │   ── cost blowup (per-stage budgets cap this)     │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent / message-passing ───▼────────────────┐
+  │  typed Diagnosis as the contract                  │
+  │   ── context bloat (no shared blackboard)         │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop                                     │
+  │   ── tool-call cascade (maxToolCalls 6/6/6/4)     │
+  │   ── forced-final on budget spent                 │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │   ── token-revocation (one-time auto-reconnect)   │
+  └──────────────────────────────────────────────────┘
 ```
 
-You've added a second `useEffect` to a React component. The first effect listens to state A; the second listens to state B. The second effect sets state A. The first effect now fires again, which sets state B. Now the second effect fires again, which sets state A. The browser tab hangs. You forgot the dependency array.
-
-That's the same shape as half the multi-agent failures. Two agents that defer to each other, two stages that loop forever, a context that grows without bound, a synthesis that averages contradictions — all variants of "I forgot to constrain the loop." Multi-agent systems introduce new loops the single-agent shape doesn't have, and each new loop is a new failure mode you have to either *prevent structurally* or *control with a mechanism*.
-
-### Move 2 — name the question
-
-That cluster of failures — the ones that only exist when more than one agent is in play — is what this file names. The question this file answers: **which multi-agent failure modes does blooming insights' design prevent by being deterministic, and which ones does it control with explicit mechanisms?**
-
-The two categories matter. *Structural prevention* is when the failure can't happen because the system shape doesn't allow it (e.g. no infinite-handoff because no agent can hand off). *Control mechanism* is when the failure could happen but a specific mechanism caps it (e.g. tool-call cascade prevented by `maxToolCalls` caps).
-
-### Move 3 — why answering that question matters
-
-**Why you need to answer that question at all:** because the multi-agent failure cluster is where the "2-5x overhead" of multi-agent systems comes from — not just in tokens, but in debugging time, on-call burden, and silent quality degradation. A team that adopts multi-agent without naming the failures ships them all, then debugs them one production incident at a time.
-
-In this codebase: the deterministic orchestration choice (cross-ref `./01-when-not-to-go-multi-agent.md`) eliminates entire categories of failure. There's no LLM supervisor → no synthesis failure. There's no peer handoff → no infinite handoff. There's no shared blackboard → no context bloat from inter-agent state accumulation. The failures the codebase still has to control (tool-call cascade, cost blowup, token revocation) get explicit mechanisms in code.
-
-The thesis this file argues: **deterministic orchestration buys you fewer failure modes — not by being less powerful, but by structurally not allowing the failures autonomous coordination introduces.**
-
-### Move 4 — concrete walk-through
-
-An "all-the-failures-active" system (a hypothetical alternative):
-- LLM supervisor + handoffs + shared state + LLM merge
-- Production incidents: supervisor mis-orders stages (synthesis failure), two peer agents deferr to each other (infinite handoff), cost spikes 5x in a day (cost blowup), context grows past 100k tokens mid-run (context bloat)
-- Each incident requires its own mitigation: handoff counter, supervisor prompt tuning, budget caps, summarization
-- The team's on-call is 20 hours/week on these specific failure modes
-
-blooming insights:
-- Deterministic route, sequential pipeline, message passing, no LLM merge
-- Structurally absent: infinite handoff (no agent emits handoff), synthesis failure (no LLM merger), context bloat (no shared state)
-- Controlled with mechanisms: tool-call cascade (`maxToolCalls` caps 6/6/6/4 + forced final), cost blowup (Haiku classifier + per-stage budgets), token-revocation (one-time guarded auto-reconnect)
-- On-call: minutes per week on these failure modes, because most can't happen
-
-### Move 5 — one-line summary
-
-The coordination failure cluster is where multi-agent systems silently lose 2-5x to their single-agent baselines; blooming insights' deterministic orchestration structurally prevents half of them (no handoff = no infinite handoff; no LLM merge = no synthesis failure; message passing = no shared-state bloat) and controls the remaining ones with explicit mechanisms anchored to specific code. Here's the table, walked.
+**Zoom in — narrow to the concept.** The question is: which multi-agent failures does blooming insights' design prevent by being deterministic, and which does it control with explicit mechanisms? Two categories matter — *structural prevention* (the failure can't happen because the shape doesn't allow it) and *control mechanism* (the failure could happen but a cap stops it). Below, you'll see the full table of failures and which row blooming insights handles in which way.
 
 ---
 
@@ -635,3 +605,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

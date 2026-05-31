@@ -8,25 +8,38 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-Your search input fires a `fetch` on every keystroke. After a few fast keystrokes the API starts returning 429s. You reach for `debounce` to stop the flood, add a `Map` to memoize results you already fetched, and wrap the `fetch` in a retry loop — three separate primitives you wired together yourself.
+**Zoom out — the bigger picture.** Caching + rate-limiting lives entirely inside the Provider wrappers band — `McpClient.callTool` in `lib/mcp/client.ts` is a four-stage funnel (cache check → spacing gate → live call → retry) that every MCP request passes through. Above it sit the Agent loop and the per-agent classes, all calling through the same `McpCaller` interface. Below it sits the `SdkTransport` adapter that talks to Bloomreach's `~1 req/sec` server. This file is about how that one band turns a burst of agent tool calls into a paced, deduplicated stream that the upstream server will actually accept.
 
-The question a backend client faces is the same: how does one client stay under a hard server rate limit while still feeling responsive to the callers above it?
+```
+Zoom out — where caching + rate-limiting lives
 
-**Bloomreach allows ~1 req/sec per user GLOBALLY.** A single briefing agent makes 6–13 sequential EQL calls. Without spacing and a cache, it trips "Too many requests" mid-run and the entire briefing fails with an error the user can't recover from.
+┌─ Pipeline ─────────────────────────────────────┐
+│  MonitoringAgent.scan → runAgentLoop           │
+└─────────────────────┬──────────────────────────┘
+                      │  mcp.callTool(name, args)
+┌─ Provider wrappers ─▼──────────────────────────┐  ← we are here
+│  McpClient.callTool (lib/mcp/client.ts)        │
+│  ┌──────────────────────────────────────────┐  │
+│  │ ★ cache check (TTL Map) ★                │  │
+│  │     ↓ miss                                │  │
+│  │ ★ spacing gate (1100 ms) ★               │  │
+│  │     ↓                                      │  │
+│  │ ★ live transport.callTool ★              │  │
+│  │     ↓                                      │  │
+│  │ ★ rate-limit retry (bounded) ★           │  │
+│  │     ↓                                      │  │
+│  │ cache write (success only)                │  │
+│  └──────────────────────────────────────────┘  │
+└─────────────────────┬──────────────────────────┘
+                      │  HTTPS (~1 req/s limit)
+┌─ External ─────────────────────────────────────┐
+│  Bloomreach MCP server                         │
+└────────────────────────────────────────────────┘
+```
 
-Before:
-- Every `callTool` call hits the network immediately
-- Parallel or back-to-back calls arrive at Bloomreach faster than 1/sec
-- A 429 kills the agent run with no recovery path
-
-After:
-- Identical calls within 60s return in 0 ms from an in-memory cache
-- Live calls are spaced at least 1100 ms apart at the client level
-- A 429 triggers a bounded retry loop before the error surfaces
-
-It is React Query's `staleTime` cache + a `debounce` + a retry, but inside one backend client class.
+**Zoom in — narrow to the concept.** The question is: how does one client class stay under a hard server limit (Bloomreach allows ~1 req/sec per user globally) while a briefing agent makes 6–13 sequential EQL calls in one run, without hand-rolling a retry at every call site? `McpClient` composes three policies in one method — a TTL cache that turns repeat reads into 0 ms hits, a fixed-interval spacing gate that delays each live call until at least 1100 ms have passed, and a bounded retry loop that re-enters the gate on a 429-equivalent response. The next sections walk each policy and the one rule that keeps them composing safely: never cache an error.
 
 ---
 
@@ -434,3 +447,4 @@ A colleague argues: "We should remove the in-memory cache because it makes debug
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now uses a parsed retry-after window / exponential backoff (default `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

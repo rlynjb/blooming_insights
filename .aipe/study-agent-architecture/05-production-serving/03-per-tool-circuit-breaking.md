@@ -8,31 +8,33 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You wrote a page that calls three APIs to render the user's dashboard. One of them — the rarely-used integrations API — is having a bad day. Your code retries on failure: try, wait, try, wait, try, give up. The whole dashboard hangs for 30 seconds before rendering the other two sections. You ship a circuit breaker: after three failures in a row, mark the API "open" for two minutes; fail every call to it instantly during that window; the dashboard renders the broken integrations section as "temporarily unavailable" and the other two sections appear immediately. The user sees a fast page with one degraded panel instead of a slow page with everything stuck behind a sick dependency.
+**Zoom out — the bigger picture.** A per-tool circuit breaker for agents would sit at the seam between the Provider/MCP-transport wrappers and the Shared agent loop — failing fast at the wrapper layer (closed/open/half-open) AND surfacing the open-state back to the loop as an *observation* so the model routes around the dead tool. In blooming insights, the wrapper layer has *bounded retry* (`lib/llm/retry.ts` for the LLM side; per-call backoff inside `lib/mcp/client.ts` for tools) but no per-tool breaker, and nothing is surfaced to the agent as a "this tool is open" observation. The retry layer protects the upstream; what's missing is the feedback loop that would let the model avoid the dead tool on the next turn.
 
-Now picture the same dashboard, but the renderer is a model. Three tools the model can call: `getOrders`, `getInvoices`, `getIntegrations`. The model decides which to call each turn, reads the result, decides what to do next. When `getIntegrations` is sick and you have a circuit breaker on it, the breaker fails the call fast — good. But what does the model *see*? An error result from `getIntegrations`, the same shape as any other failure. So the model thinks "huh, that didn't work, let me try the same call again next turn." The breaker is doing its job (failing fast to protect the upstream), but the agent is still wasting every remaining turn retrying the same dead path.
+```
+  Zoom out — where per-tool circuit breaking WOULD live
 
-That's the question this file answers: **when the agent is the caller, what does the circuit breaker have to do *more than* fail fast?** Not "should we have a breaker" — the ai-eng single-call version covers why. The line is at *who reads the breaker's state*. In a service-to-service breaker, the answer is "the code wrapping the call" — fail fast, throw an error, your handler catches it. In an agent loop, the answer needs to include "the model" — the open-state has to be surfaced as an *observation the agent reasons on*, so the agent's next turn picks a different tool instead of the same one.
+  ┌─ Shared agent loop ─────────────────────────────┐  ← we are here
+  │  runAgentLoop — would read breaker state and     │
+  │  surface "tool X open" as a tool_result obs.     │
+  └─────────────────────────┬────────────────────────┘
+                            │  every model call
+  ┌─ Provider wrappers ─────▼────────────────────────┐
+  │  lib/llm/retry.ts (bounded retry + backoff)      │
+  │  closest analog on the LLM side                   │
+  └─────────────────────────┬────────────────────────┘
+                            │  every tool call
+  ┌─ Tools + MCP transport ─▼────────────────────────┐
+  │  ★ PER-TOOL BREAKER (★ THIS ★, absent):           │
+  │    per-tool closed/open/half-open state           │
+  │    feedback to agent loop as an observation       │
+  │  ── absent in blooming insights ──                │
+  │  what's here today: bounded retry per call only   │
+  └──────────────────────────────────────────────────┘
+```
 
-**Why answering that question matters:** because the failure mode without it is the worst kind of cost blowup — silent, expensive, and productive of nothing. An agent loop with a budget of 6 tool calls, hitting a dead tool, will retry the same tool 6 times (or until retry exhaustion), then synthesize a final answer from no evidence. The user pays for 6 turns of model + 6 retry sequences of HTTP and gets back a diagnosis like "I couldn't determine the cause." The breaker that protects the upstream doesn't change this — the breaker the *agent reads* would. The pattern's whole job is to turn "loop wasted on a dead tool" into "agent routed around the dead tool."
-
-Without a per-tool circuit breaker + agent observation:
-- Diagnostic agent's first EQL hits a rate-limit error from Bloomreach
-- The retry loop in `callTool` runs (10s, 20s, 20s — max 3 retries)
-- After ~50 seconds the call returns an `isError: true` result to the agent
-- The agent's next turn tries... what? Without coverage of which tools are sick, it's a coin flip — likely retries something semantically close
-- 6-call budget gone, ~5 minutes of wall-clock, no diagnosis
-
-With per-tool circuit breaker + agent observation:
-- The first EQL fails; the breaker records one failure for `execute_analytics_eql`
-- N failures in a row → breaker trips OPEN for tool X
-- The next time the agent emits `tool_use` for tool X, the loop intercepts: returns "tool X is currently unavailable" as the `tool_result` without hitting the network
-- The model reads the observation, picks a different tool or abstains
-- 6-call budget intact; the agent at least completes with "I couldn't reach Bloomreach right now" instead of an empty diagnosis
-
-One-line summary: **a per-tool circuit breaker for agents is the same closed/open/half-open shape as a service breaker, plus one critical extra step — feed the open state back to the agent as an observation so the model routes around the dead tool instead of retrying it every turn.** Here's the shape of the pattern, what this codebase has (bounded retry, no breaker), and the specific gap where "feed it to the agent" would slot in.
+**Zoom in — narrow to the concept.** The question is: when the agent is the caller, what does the circuit breaker have to do *more than* fail fast? A service-to-service breaker stops at "fail the call quickly" — your handler catches the error and moves on. An agent breaker has to do that AND surface the open-state as an *observation the model reads*, so the next turn picks a different tool instead of retrying the same dead one. Without the feedback path, the agent burns its whole budget on retries. blooming insights has the retry but not the breaker-as-observation; below, you'll see the closed/open/half-open mechanics and the specific gap where "feed it to the agent" would slot in.
 
 ---
 
@@ -540,3 +542,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

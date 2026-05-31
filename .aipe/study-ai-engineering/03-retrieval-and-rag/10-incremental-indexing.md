@@ -8,25 +8,37 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-`saveInvestigation(insightId, events)` (`lib/state/investigations.ts`) already does keyed in-place updates: `mem.set(insightId, events)` overwrites the entry for that id, leaving every other investigation untouched. It does not rebuild the whole store to save one investigation — it upserts by key. An embedding index needs the identical operation: when one past investigation changes, update *its* vectors and leave the rest, rather than re-embedding all of them. The difference is only that the value is a vector (and its freshness must be tracked, `09-stale-embeddings.md`), not raw events.
+**Zoom out — the bigger picture.** Incremental indexing is the *write path* of a vector store — how new and changed documents enter the index without a full rebuild. blooming insights already uses the exact shape for keyed upserts in `saveInvestigation` (`lib/state/investigations.ts`): `mem.set(insightId, events)` overwrites one entry and leaves the rest untouched. A vector store would do the same with `(id, vector)` rows, plus deletes and a change-feed feeding the indexer.
 
-The question incremental indexing answers is: the index was built from a corpus that keeps changing — how do you keep it current without paying to re-embed everything on every change?
+```
+  Zoom out — where incremental indexing sits (WOULD BE)
 
-**The pivot: re-embedding the entire corpus on every change is correct but O(N) per change, which is unaffordable the moment the corpus or the change-rate grows — so the index must support per-document add/update/delete keyed by id.** A full rebuild for one new investigation re-embeds hundreds of unchanged documents, costs proportional embedding-API calls, and takes the index offline or stale during the rebuild. An incremental upsert touches exactly the changed document: embed it, replace its vector by id, done — O(1) per change, the rest of the index untouched.
+  ┌─ Source corpus (keeps changing) ─────────────────┐
+  │  past investigations, schema, docs                │
+  └─────────────────────────┬────────────────────────┘
+                            │  change feed / version diff
+  ┌─ Indexer (write path) ──▼────────────────────────┐  ← we are here
+  │  ★ upsert (id, vector) — touch ONLY what changed ★│
+  │  parallel to mem.set(insightId, events)           │
+  │  delete-by-id, embed-only-the-new                 │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Vector store ──────────▼────────────────────────┐
+  │  index stays live; cost ∝ change, not corpus      │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Retriever ─────────────▼────────────────────────┐
+  └──────────────────────────────────────────────────┘
 
-Before incremental indexing:
-- One document changes; you re-embed the whole corpus to update the index
-- Cost and latency scale with corpus size, not with what changed
-- The index is stale or offline during each rebuild
+  In this codebase: Not yet implemented — String.includes
+  intent matching in lib/agents/intent.ts is what exists
+  instead. The keyed-upsert shape IS in the codebase (Map.set
+  in lib/state/investigations.ts) — different payload.
+```
 
-After:
-- A change-detector finds the changed document
-- You upsert *its* vector by id; deleted documents are removed by id
-- Cost scales with the *change*, not the corpus; the index stays live
-
-It is `mem.set(insightId, events)` — the keyed upsert the codebase already uses for investigations — applied to vectors.
+**Zoom in — narrow to the concept.** The question is: the index was built from a corpus that keeps changing — how do you keep it current without paying to re-embed everything on every change? Re-embedding the entire corpus is correct but O(N) per change, unaffordable the moment the corpus or change-rate grows. An incremental upsert touches exactly the changed document — O(1) per change, the rest of the index untouched, and the index stays live. How it works walks the add/update/delete operations, change-detection sources (file watchers, DB CDC, version hashes), and the freshness handoff to → 09-stale-embeddings.md.
 
 ---
 
@@ -267,3 +279,4 @@ What keyed in-place update does blooming insights already perform, and what two 
 
 → 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

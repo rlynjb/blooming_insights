@@ -8,25 +8,39 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have built a form validator with two kinds of rules: positive ones ("email must contain @") and negative ones ("reject disposable-domain addresses," "strip script tags"). The negative rules carry more weight per character because they encode *the specific bad thing that happened* — someone pasted a script tag once, it broke something, and now there is a rule with that exact shape. A negative constraint is scar tissue; it names a failure you already paid for.
+**Zoom out — the bigger picture.** Forbidden patterns live inside the Per-agent definitions band, scattered across the Hard rules / method / field-rules sub-sections of each `.md` file — the "do NOT" / "Never" lines that fence off specific drift behaviors. Rotating formulas would live in the same band but in a hypothetical future prompt (`digest.md`) that does not exist yet. The concept marks two sub-regions of the same band: where negative constraints are used pervasively (all four prompts) and where rotation would *need* to live if a recurring prose feature shipped (nowhere today).
 
-An LLM prompt has the same two kinds of rules, and the question this file answers splits cleanly: blooming insights uses negative constraints heavily — and it does *not* use rotating formulas at all. Both choices are correct, and knowing *why* each is right is the whole concept. Rotating formulas fight a problem (phrasing convergence in repeated generation) that this codebase's output shape does not have.
+```
+  Zoom out — where forbidden patterns live
 
-**The pivot: a "forbidden" instruction is a production incident compressed into one line, and rotating formulas only earn their place when the *same* generation runs repeatedly for the *same* user in prose.** I once shipped a daily-digest feature that emailed users a generated summary every morning. Within a week, every digest opened "Here's what happened today" — the model converged on one phrasing and the feature felt robotic. The fix was a rotating set of opening formulas. But I have also shipped structured extractors that ran millions of times and never needed rotation, because their output was JSON — there is no phrasing to converge. blooming insights is the second kind, and it would be wrong to add rotation to it.
+  ┌─ Pipeline coordinator ──────────────────────────┐
+  │  monitoring → diagnostic → recommendation        │
+  │  classify → query (one-shot per question)        │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
+  │                                                  │
+  │  ★ NEGATIVE CONSTRAINTS (used pervasively) ★     │
+  │   monitoring.md L17 "do NOT re-run variations"  │
+  │   monitoring.md L37 "Never report empty-window" │
+  │   diagnostic.md L35 "Do NOT use customers matching"│
+  │   recommendation.md L82 "Do NOT include an id"  │
+  │   (each fences off a specific past bug)         │
+  │                                                  │
+  │  ★ ROTATING FORMULAS (correctly absent) ★        │
+  │   repeated chains → STRUCTURED output (no phrasing)│
+  │   query agent → PROSE but ONE-SHOT (no repetition)│
+  │   would flip if: recurring prose digest existed │
+  └─────────────────────────┬────────────────────────┘
+                            │
+  ┌─ Provider ──────────────▼────────────────────────┐
+  │  model reads "do NOT" rules every call           │
+  └──────────────────────────────────────────────────┘
+```
 
-Before understanding the split:
-- "Add anti-repetition to the agents" — but the agents emit JSON; there is no phrasing to vary
-- "The forbidden instructions are over-defensive" — but each one is a real incident encoded as a rule
-- "The query agent should rotate its openings" — but it runs once per question, never repeatedly for one user
-
-After:
-- Negative constraints are recognized as scar tissue and read as incident history
-- Rotating formulas are recognized as correctly *absent* — the output shape removes the need
-- The one scenario where rotation *would* be needed (a recurring prose digest) is named precisely
-
-It is the negative-validation-rule discipline, plus the judgment to know when phrasing-convergence is even a problem worth fighting.
+**Zoom in — narrow to the concept.** The question this file answers: blooming insights uses negative constraints heavily and rotating formulas not at all — are both choices right, and why? Negative constraints are scar tissue: each "do NOT" is a production incident compressed into one line (the ±100% swing off an empty window, the unsupported `customers matching` clause, the model inventing an `id` the system owns). Rotating formulas fight phrasing convergence, which only happens when *prose* is generated *repeatedly for the same user over time* — a condition that holds nowhere here, because every repeated chain emits structured output and the one prose agent is one-shot. Below, you'll see why "sameness is the contract" for JSON output, the one feature (a recurring prose digest) that would flip the rotation decision, and the salience-backfire trap that pairing a "do NOT" with a positive alternative defuses.
 
 ---
 
@@ -334,3 +348,4 @@ Name two forbidden ("do NOT" / "Never") instructions in the prompts and the bug 
 Updated: 2026-05-29 — Resynced monitoring.md refs after the `{categories}` shift: "do NOT re-run variations" L11→L17, "Never report … empty window" L31→L37, CRITICAL block L25–31→L31–37, the empty-window narrative L14–31→L20–37, and the structured-output JSON range L50–73→L69–97. (diagnostic.md L33 / recommendation.md L64 left per scope — see note.)
 Updated: 2026-05-29 — Resynced the sibling-prompt refs previously left per scope: diagnostic.md "customers matching" ban L33→L35, recommendation.md id-ban L64→L82, query.md prose L36→L49, and the diagnostic dense-forbidden-block ref L36–42→L38–50 (the "## Common EQL errors" block).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

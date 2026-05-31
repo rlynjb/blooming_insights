@@ -8,22 +8,34 @@
 
 ---
 
-## Why care
+## Zoom out, then zoom in
 
-You have a form that posts to an endpoint expecting a typed body. You do not trust the client — you parse the body, validate every field, and have a defined response for when it's malformed, because the boundary between "bytes from outside" and "typed object inside" is where reliability is won or lost. An LLM that should return structured data is that boundary with one extra hazard: the producer is a probabilistic text model that sometimes wraps your JSON in "Here's the analysis:" prose and a markdown fence it added to be helpful.
+**Zoom out — the bigger picture.** Structured outputs span the `## Output` section of three prompts (Per-agent definitions band) and the validator in `lib/mcp/validate.ts` that handles the model's final text. The prompt sits inside the agent class; the contract sits at the boundary between the agent's `finalText` and whatever consumes it next — `parseAgentJson` + a type guard + a `synthesize()` repair path. The producer-consumer split is what this concept is about: one half in the prompt, one half in the code that reads the response.
 
-The question this file answers: blooming insights instructs JSON *in the prompt text* — `monitoring.md` L69–97, `diagnostic.md` L59–103, `recommendation.md` L47–91 — which is exactly the approach the internet warns against. Does it work, and what does it cost?
+```
+  Zoom out — where structured outputs live
 
-**The pivot: prompt-instructed JSON is fine in production as long as you treat the model's output like an untrusted body — parse leniently, validate strictly, repair on failure — and you accept the cost of doing all three in your own code instead of buying validity from the provider.** Asking for JSON in prose is the cheap, portable request. The contract that turns "usually JSON-ish" into "always a valid typed object or a known default" is the part that matters, and it lives in `lib/mcp/validate.ts`, not in the prompt.
+  ┌─ Per-agent definitions ─────────────────────────┐
+  │  ★ ## Output: "ONLY JSON, fenced" ★              │  ← we are here (request)
+  │  monitoring.md L69 · diagnostic.md L59 · rec L47 │
+  └─────────────────────────┬────────────────────────┘
+                            │  agent loop runs
+  ┌─ Shared agent loop ─────▼────────────────────────┐
+  │  runAgentLoop → finalText (untrusted string)     │
+  └─────────────────────────┬────────────────────────┘
+                            │  hand-off to validator
+  ┌─ Output contract ───────▼────────────────────────┐  ← we are also here (guarantee)
+  │  ★ parseAgentJson + isDiagnosis/isAnomalyArray ★ │
+  │  lib/mcp/validate.ts L3–53                        │
+  │  + synthesize() repair  diagnostic.ts L82–121    │
+  └─────────────────────────┬────────────────────────┘
+                            │ typed value or floor
+  ┌─ Pipeline coordinator ──▼────────────────────────┐
+  │  next agent / UI consumes the typed shape         │
+  └──────────────────────────────────────────────────┘
+```
 
-The internet's advice, stated fairly:
-- "Never instruct JSON in the prompt — use native tool/JSON mode so invalid output is structurally impossible."
-
-What blooming insights does instead, and survives:
-- `monitoring.md` L71: "Return ONLY a JSON array … wrapped in a ```json fenced block"
-- `parseAgentJson` (`validate.ts` L3–13) extracts it; `isAnomalyArray` (`validate.ts` L17–27) proves it; `synthesize()` retries when the loop fails to emit it.
-
-It is the untrusted-body discipline, applied to a producer that occasionally adds a markdown fence as a courtesy.
+**Zoom in — narrow to the concept.** The question is: when the model returns "Here's the analysis:\n```json\n[…]\n```\nHope this helps!" — how do you turn that into a typed value you can trust? The answer is a three-stage funnel — extract, validate, repair — where the prompt asks for the shape (statistical) and your own code guarantees it (enforced). Below, you'll see why the fence regex runs before the bare `JSON.parse`, why the guards skip the `id` field on the recommendation shape, and why `synthesize()` runs on clean context instead of one more loop turn.
 
 ---
 
@@ -383,3 +395,4 @@ In `parseAgentJson`, what are the three extraction strategies in order, and what
 ---
 Updated: 2026-05-29 — Corrected the `## Output` section ranges (monitoring L69–97, diagnostic L59–103, recommendation L47–91) and the dependent in-section refs (fence asks → monitoring L71 / diagnostic L61 / recommendation L49; "Do NOT include an id" → recommendation L82; diagnostic empty-case shape L94–101). No placeholder injection table exists in this file (it lives in 01-anatomy.md), so `{categories}` was added there instead.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
+Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
