@@ -51,63 +51,65 @@ The 4-chars-per-token rule is an average over English prose. Code, JSON, numbers
 
 ---
 
-### What blooming insights actually does: bound by characters
+### What this system actually does: bound by characters
 
-There is no tokenizer call anywhere in the codebase. Every place that could overflow the window is bounded by `string.length`.
+There is no tokenizer call anywhere. Every place that could overflow the window is bounded by string length.
 
-**Tool-result truncation** — the largest source of bloat. `lib/agents/base.ts` L29 and L31–L34:
-
-```typescript
-const MAX_TOOL_RESULT_CHARS = 16_000;
-
-function truncate(s: string): string {
-  if (s.length <= MAX_TOOL_RESULT_CHARS) return s;
-  return s.slice(0, MAX_TOOL_RESULT_CHARS) + '\n…[truncated]';
-}
-```
-
-Every tool result is `JSON.stringify`'d and passed through `truncate` before being fed back as a `tool_result` block (`lib/agents/base.ts` L150). A 60,000-character EQL response becomes 16,000 chars plus a marker. Across a six-tool-call investigation, this caps the cumulative tool-result contribution to ~96,000 characters — roughly 24,000 tokens at the 4:1 estimate.
+**Tool-result truncation** — the largest source of bloat. The shared agent loop holds a constant for the tool-result char cap and a slicer:
 
 ```
-EQL result: 60,000 chars
-      │  truncate()  base.ts L31–34
+  MAX_TOOL_RESULT_CHARS = 16_000
+
+  function truncate(s):
+      if length(s) <= MAX_TOOL_RESULT_CHARS:
+          return s
+      return slice(s, 0, MAX_TOOL_RESULT_CHARS) + "\n…[truncated]"
+```
+
+Every tool result is JSON-serialized and passed through `truncate` before being fed back as a tool-result block. A 60,000-character query response becomes 16,000 chars plus a marker. Across a six-tool-call investigation, this caps the cumulative tool-result contribution to ~96,000 characters — roughly 24,000 tokens at the 4:1 estimate.
+
+```
+query result: 60,000 chars
+      │  truncate()  (the agent-loop cap)
       ▼
 16,000 chars + "\n…[truncated]"
       │
-      ▼  fed back as tool_result   base.ts L150, L171
+      ▼  fed back as tool_result
 conversation stays bounded
 ```
 
-**Route event truncation** — a *separate, smaller* budget for what is streamed to the browser. `app/api/agent/route.ts` L99–L103:
-
-```typescript
-const TRUNC = 4000;
-const trunc = (v: unknown): unknown => {
-  const s = JSON.stringify(v);
-  return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
-};
-```
-
-This `4000` bound is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L192). It is unrelated to the model's window — it keeps the *wire payload to the UI* small. Two different budgets, two different reasons: `16_000` protects the model's context; `4000` protects the stream.
-
-**Schema summary caps** — bounding the prompt's static prefix. `lib/agents/monitoring.ts` L15–L48 builds a compact schema string instead of inlining the full ~112KB workspace schema:
+**Route event truncation** — a *separate, smaller* budget for what is streamed to the browser. The route handler runs a different cap:
 
 ```
-schemaSummary caps  (monitoring.ts L21, L22, L33)
+  TRUNC = 4000
+
+  function trunc(v):
+      s = JSON.serialize(v)
+      if s and length(s) > TRUNC:
+          return slice(s, 0, TRUNC) + "…"
+      return v
+```
+
+This 4,000 bound is applied to each tool-call result before it goes into a streaming UI event. It is unrelated to the model's window — it keeps the *wire payload to the UI* small. Two different budgets, two different reasons: 16,000 protects the model's context; 4,000 protects the stream.
+
+**Schema summary caps** — bounding the prompt's static prefix. The monitoring agent builds a compact schema string instead of inlining the full ~112KB workspace schema:
+
+```
+schemaSummary caps
   MAX_EVENTS          = 20    ← top 20 events only
   MAX_PROPS_PER_EVENT = 10    ← 10 properties each
   MAX_CPROPS          = 30    ← 30 customer properties
 ```
 
-The comment on L14 is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This is the one place the *intent* is named as token-bounding, even though the implementation counts list lengths, not tokens.
+The comment alongside is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This is the one place the *intent* is named as token-bounding, even though the implementation counts list lengths, not tokens.
 
-**Output ceiling** — `max_tokens`, the one real token unit in the codebase. This bounds the *output* (the only place token counts appear directly): `4096` default for agent turns (`lib/agents/base.ts` L74), `2048` for synthesis calls (`lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98), and a deliberate `16` on the intent classifier (`lib/agents/intent.ts` L20) to force a one-word answer.
+**Output ceiling** — `max_tokens`, the one real token unit in the system. This bounds the *output* (the only place token counts appear directly): 4096 default for agent turns, 2048 for synthesis calls, and a deliberate 16 on the intent classifier to force a one-word answer.
 
 ```
 max_tokens (output token cap — the real unit)
-  agent turn        4096   base.ts L74
-  synthesis call    2048   diagnostic.ts L99 / recommendation.ts L98
-  intent classifier   16   intent.ts L20   ← one word, nothing more
+  agent turn        4096
+  synthesis call    2048
+  intent classifier   16   ← one word, nothing more
 ```
 
 ---
@@ -117,9 +119,9 @@ max_tokens (output token cap — the real unit)
 ```
 CURRENT (character proxy)              FUTURE (real token accounting)
 ────────────────────────────────      ────────────────────────────────
-truncate by s.length (16_000)          truncate by tokenizer count
+truncate by string length (16_000)     truncate by tokenizer count
 schemaSummary caps list lengths        cap by measured token budget
-no visibility into actual usage        log res.usage.input/output_tokens
+no visibility into actual usage        log usage.input/output_tokens
 "is the prompt too big?" = guess       "is the prompt too big?" = known
 ```
 
@@ -129,7 +131,7 @@ The character proxy is correct *enough* today because the consequences of loosen
 
 ### The principle
 
-Bound work in the cheapest unit that approximates the unit you actually pay in, and only upgrade to the exact unit when the approximation's error starts to bite. blooming insights pays in tokens but measures in characters because `s.length` is free and the 4:1 rule is good enough at the current scale. The day a payload sits near the window boundary, the proxy's slop becomes the bug, and real token counting earns its cost.
+Bound work in the cheapest unit that approximates the unit you actually pay in, and only upgrade to the exact unit when the approximation's error starts to bite. You pay in tokens but measure in characters because string length is free and the 4:1 rule is good enough at the current scale. The day a payload sits near the window boundary, the proxy's slop becomes the bug, and real token counting earns its cost.
 
 ---
 
@@ -142,12 +144,12 @@ This diagram spans the layers a string crosses before it reaches the model, and 
 │  SERVICE LAYER (bounded in CHARACTERS — the proxy unit)              │
 │                                                                       │
 │  schema (112KB)                                                       │
-│     │ schemaSummary  monitoring.ts L15–48   (20 events/10 props/30)  │
+│     │ schemaSummary  monitoring.ts   (20 events/10 props/30)  │
 │     ▼                                                                 │
 │  compact schema string ──┐                                           │
 │                          │ system prompt                             │
 │  EQL tool result (60KB)  │                                           │
-│     │ truncate  base.ts L31–34  (16_000 chars)                       │
+│     │ truncate  base.ts  (16_000 chars)                       │
 │     ▼                    │                                           │
 │  16,000-char result ─────┤                                           │
 │                          ▼                                           │
@@ -158,7 +160,7 @@ This diagram spans the layers a string crosses before it reaches the model, and 
 │  PROVIDER BOUNDARY (counted in TOKENS — the real unit)              │
 │                                                                       │
 │  anthropic.messages.create({ max_tokens })                          │
-│     agent 4096  base.ts L74 │ synthesis 2048 │ classifier 16        │
+│     agent 4096  base.ts     │ synthesis 2048 │ classifier 16        │
 │     input tokens = tokenizer(messages)  ← never measured here        │
 └────────────────────────────────────────────────────────────────────────┘
 
@@ -323,3 +325,4 @@ Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`T
 Updated: 2026-05-29 — Corrected the two stale diagnostic-synthesis `max_tokens` citations from L94 to L99 (verified against current `diagnostic.ts`: `max_tokens: 2048` is at L99).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

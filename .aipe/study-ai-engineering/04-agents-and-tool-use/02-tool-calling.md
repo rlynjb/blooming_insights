@@ -41,7 +41,7 @@
 
 ## How it works
 
-**Mental model.** Tool calling is a typed function-call boundary where the *caller* is a model and the *dispatcher* is your code. You have written this shape before without an LLM: a message handler that receives `{ type: 'SAVE', payload }` over a `postMessage`, looks up the handler for `type`, runs it, and posts a reply back. The model's `tool_use` block is that message; `filterToolSchemas` is the registry of which messages are legal; `mcp.callTool` is the dispatcher; the `tool_result` block is the reply. The model never touches the dispatcher — it only sends messages the dispatcher understands.
+**Mental model.** Tool calling is a typed function-call boundary where the *caller* is a model and the *dispatcher* is your code. You have written this shape before without an LLM: a message handler that receives `{ type: 'SAVE', payload }` over a `postMessage`, looks up the handler for `type`, runs it, and posts a reply back. The model's `tool_use` block is that message; the tool-schema filter is the registry of which messages are legal; the MCP caller is the dispatcher; the `tool_result` block is the reply. The model never touches the dispatcher — it only sends messages the dispatcher understands.
 
 ```
 ONE round-trip
@@ -58,76 +58,78 @@ The schemas tell the model what is callable; the loop does the calling; the resu
 
 ### The schema: what the model is allowed to request
 
-The model can only request tools it has been *shown*. `filterToolSchemas` (`tool-schemas.ts` L9–L21) takes the full list of Bloomreach MCP tool definitions (`McpToolDef`, L3–L7) and produces the Anthropic `Tool[]` shape the API expects — but only for the names in the `allowed` subset.
+The model can only request tools it has been *shown*. The tool-schema filter takes the full list of MCP tool definitions and produces the provider SDK's `Tool[]` shape the API expects — but only for the names in the `allowed` subset.
 
 ```
-tool-schemas.ts — filterToolSchemas(all, allowed)   (L9–L21)
+the tool-schema filter
 ─────────────────────────────────────────────────────────────
- McpToolDef (from MCP)            Anthropic.Messages.Tool (to model)
+ McpToolDef (from MCP)            ProviderSDK.Tool (to model)
  { name,                          { name,
    description?,        ──map──→     description: description ?? '',
    inputSchema: object }            input_schema: inputSchema }
-                                  filtered to: set.has(t.name)   (L15)
+                                  filtered to: allowed.has(t.name)
 ```
 
-The transform is mechanical: rename `inputSchema` → `input_schema`, default a missing description to `''`, and drop any tool not in the allowed set (L15 `set.has(t.name)`). The *filtering* is the load-bearing part — it is also routing, covered in 04-tool-routing.md. For tool calling itself, the point is: the array handed to the API at `base.ts` L101 (`params.tools = toolSchemas`) is the complete, exhaustive description of every action the model can request this turn.
+The transform is mechanical: rename `inputSchema` → `input_schema`, default a missing description to `''`, and drop any tool not in the allowed set. The *filtering* is the load-bearing part — it is also routing, covered in 04-tool-routing.md. For tool calling itself, the point is: the array handed to the API as `params.tools` is the complete, exhaustive description of every action the model can request this turn.
 
 ---
 
 ### The caller seam: McpCaller
 
-Your code needs a single, typed function that "runs a named tool with arguments and returns a result." That seam is the `McpCaller` interface (`base.ts` L16–L22).
+Your code needs a single, typed function that "runs a named tool with arguments and returns a result." That seam is the `McpCaller` interface.
 
 ```
-base.ts — McpCaller   (L16–L22)
-─────────────────────────────────────────────────────────────
- interface McpCaller {
-   callTool(
-     name: string,
-     args: Record<string, unknown>,
-     opts?: { cacheTtlMs?; skipCache? },
-   ): Promise<{ result; durationMs; fromCache }>;
- }
+  interface McpCaller {
+      callTool(
+          name: string,
+          args: Record<string, unknown>,
+          opts?: { cacheTtlMs?, skipCache? },
+      ): Promise<{ result, durationMs, fromCache }>
+  }
 ```
 
-`runAgentLoop` depends on this interface, not on the concrete `McpClient` class. In production the real `McpClient` (which adds caching, spacing, and retry) is passed in; in tests a fake that returns canned results is passed in. The model's `tool_use` block carries `name` and `input`, which map exactly onto `callTool`'s first two arguments — the interface is shaped to receive a model's request directly. This is the brain/hands seam made concrete: the model produces `name` + `input`, the `McpCaller` is the hand that runs it.
+The shared agent loop depends on this interface, not on the concrete MCP client class. In production the real client (which adds caching, spacing, and retry) is passed in; in tests a fake that returns canned results is passed in. The model's `tool_use` block carries `name` and `input`, which map exactly onto `callTool`'s first two arguments — the interface is shaped to receive a model's request directly. This is the brain/hands seam made concrete: the model produces `name` + `input`, the `McpCaller` is the hand that runs it.
 
 ---
 
 ### The round-trip: request out, result back
 
-The actual execution lives in `runAgentLoop`'s per-tool loop (`base.ts` L129–L171). For each `tool_use` block in the model's response, the loop runs the tool and builds a matching `tool_result` block keyed by `tool_use_id`.
+The actual execution lives in the shared agent loop's per-tool body. For each `tool_use` block in the model's response, the loop runs the tool and builds a matching `tool_result` block keyed by `tool_use_id`.
 
 ```
-base.ts — per-tool loop   (L129–L171)
+the per-tool loop body
 ─────────────────────────────────────────────────────────────
- for tu of toolUses:                              L129
-   tc = { id: tu.id, agent, toolName: tu.name, args: tu.input }  L130
-   onToolCall?.(tc)                               L138  (stream "action")
-   try:
-     { result, durationMs } = await mcp.callTool(tu.name, tu.input)  L144  ← HANDS
-     tc.result = result; tc.durationMs = durationMs                  L148
-     resultContent = truncate(JSON.stringify(result))               L150
-   catch err:
-     tc.error = message; resultContent = {error}                    L153–155
-   toolResults.push({ type:'tool_result', tool_use_id: tu.id, content: resultContent })  L161–167
- messages.push({ role:'user', content: toolResults })   L171  ← result re-enters conversation
+ for tu in toolUses:
+     tc = { id: tu.id, agent, toolName: tu.name, args: tu.input }
+     onToolCall?(tc)                                  # stream "action"
+     try:
+         { result, durationMs } = await mcp.callTool(tu.name, tu.input)   ← HANDS
+         tc.result = result; tc.durationMs = durationMs
+         resultContent = truncate(JSON.stringify(result))
+     catch err:
+         tc.error = err.message; resultContent = { error: err.message }
+     toolResults.push({
+         type:        "tool_result",
+         tool_use_id: tu.id,
+         content:     resultContent,
+     })
+ messages.push({ role: "user", content: toolResults })   ← result re-enters conversation
 ```
 
-Three details make this correct. First, **`tool_use_id` pairing** (L163): the `tool_result` carries the same `id` as the `tool_use` it answers, so the model knows which request this result belongs to when there are multiple parallel tool calls in one turn. Second, **truncation** (L150, `MAX_TOOL_RESULT_CHARS = 16_000` at L29): a giant Bloomreach payload is sliced before it re-enters the context, so one fat result cannot blow the token budget (see context management). Third, **errors are data** (L151–L155): a thrown error becomes a `tool_result` with `is_error: true` rather than crashing the loop — the model sees the failure and can adapt (06-error-recovery.md). The result is pushed as a `role: 'user'` message (L171) because, from the model's perspective, the tool result is new information from the outside world — the same role a human question would occupy.
+Three details make this correct. First, **`tool_use_id` pairing**: the `tool_result` carries the same `id` as the `tool_use` it answers, so the model knows which request this result belongs to when there are multiple parallel tool calls in one turn. Second, **truncation** (the 16,000-char tool-result cap): a giant payload is sliced before it re-enters the context, so one fat result cannot blow the token budget (see context management). Third, **errors are data**: a thrown error becomes a `tool_result` with `is_error: true` rather than crashing the loop — the model sees the failure and can adapt (06-error-recovery.md). The result is pushed as a `role: "user"` message because, from the model's perspective, the tool result is new information from the outside world — the same role a human question would occupy.
 
 ---
 
 ### Every MCP tool carries project_id
 
-Bloomreach MCP tools are multi-tenant: every analytics tool needs a `project_id` to know *which* workspace to query. The model does not invent it — it is injected into the system prompt. Each agent's `system` string runs `.replace(/\{project_id\}/g, this.schema.projectId)` (`diagnostic.ts` L48, `recommendation.ts` L43, `monitoring.ts` L71, `query.ts` L27) before the loop starts, so the model reads the real project id in its instructions and includes it in the `input` of every `tool_use` block. The argument the model emits — `{ eql: "...", project_id: "..." }` — is what `mcp.callTool` forwards verbatim to Bloomreach.
+The MCP tools are multi-tenant: every analytics tool needs a `project_id` to know *which* workspace to query. The model does not invent it — it is injected into the system prompt. Each agent's `system` string runs a `.replace(/{project_id}/g, schema.projectId)` before the loop starts, so the model reads the real project id in its instructions and includes it in the `input` of every `tool_use` block. The argument the model emits — `{ eql: "...", project_id: "..." }` — is what `mcp.callTool` forwards verbatim to the backend.
 
 ```
 schema.projectId ──.replace('{project_id}')──→ system prompt
                                                     │ model reads it
  model: tool_use execute_analytics_eql { eql, project_id }  ← model includes it
                                                     │
- mcp.callTool(name, { eql, project_id }) ──────────→ Bloomreach (correct tenant)
+ mcp.callTool(name, { eql, project_id }) ──────────→ backend (correct tenant)
 ```
 
 ---
@@ -152,15 +154,15 @@ The diagram spans three layers. The Model layer decides; the Loop layer (your co
 └───────────────────────────────┬───────────────────────────────────────┘
             tool_use ↓                          ↑ tool_result
 ┌───────────────────────────────▼───────────────────────────────────────┐
-│  LOOP LAYER (hands — dispatches)   lib/agents/base.ts L129–171        │
+│  LOOP LAYER (hands — dispatches)   lib/agents/base.ts                 │
 │                                                                       │
 │  filterToolSchemas(all, allowed) ──→ toolSchemas (handed up)         │
 │  for tu of toolUses:                                                  │
 │    onToolCall(tc)                          ← stream the action        │
-│    { result, durationMs } = mcp.callTool(tu.name, tu.input)  L144    │
+│    { result, durationMs } = mcp.callTool(tu.name, tu.input)          │
 │    resultContent = truncate(JSON.stringify(result))   (16k cap)      │
 │    tool_result { tool_use_id: tu.id, content }                       │
-│  messages.push(user: toolResults)   L171   ← result re-enters context │
+│  messages.push(user: toolResults)   ← result re-enters context │
 └───────────────────────────────┬───────────────────────────────────────┘
                     mcp.callTool  │  (McpCaller interface — injectable)
 ┌───────────────────────────────▼───────────────────────────────────────┐
@@ -363,3 +365,4 @@ What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps 
 Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTools` (L203) and `hooksFor` (L181–195) refs, and updated the per-agent `project_id`-injection line numbers.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

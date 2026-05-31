@@ -39,17 +39,17 @@
 
 ## How it works
 
-**Mental model.** Three layers stacked in time. Layer 1 is the `.md` file — loaded once at module load, never mutated, the same bytes for every investigation. Layer 2 is per-call injection — `String.replace` stamps the runtime values into the placeholders right before the call. Layer 3 is the forced-final-turn append — `synthesisInstruction` glued onto the end of the system string only on the turn where the model must stop and answer. Read top to bottom, the model sees one coherent system prompt; read by *origin*, every line traces to exactly one of those three layers.
+**Mental model.** Three layers stacked in time. Layer 1 is the versioned markdown prompt file — loaded once at module load, never mutated, the same bytes for every investigation. Layer 2 is per-call injection — a string-replace chain stamps the runtime values into the placeholders right before the call. Layer 3 is the forced-final-turn append — a synthesis instruction glued onto the end of the system string only on the turn where the model must stop and answer. Read top to bottom, the model sees one coherent system prompt; read by *origin*, every line traces to exactly one of those three layers.
 
 ```
-LAYER 1  constant .md file        loaded once at import   (monitoring.ts L12)
+LAYER 1  constant markdown file   loaded once at import
    ## Role · ## Hard rules · method · ## EQL reminders · ## Output · {schema}
             │
-LAYER 2  per-call .replace()      stamped per investigation (diagnostic.ts L45–48)
-   {project_id} → real id   {anomaly} → JSON   {schema} → schemaSummary()
+LAYER 2  per-call replace chain   stamped per investigation
+   {project_id} → real id   {anomaly} → JSON   {schema} → schema summary
             │
-LAYER 3  synthesis append         forced-final turn ONLY    (base.ts L96–98)
-   `${system}\n\n${synthesisInstruction}`
+LAYER 3  synthesis append         forced-final turn ONLY
+   system + "\n\n" + synthesis_instruction
             │
             ▼
    the system prompt the model actually receives this turn
@@ -73,21 +73,21 @@ Every prompt file is the same six blocks in the same order. This is not a coinci
 ## Workspace schema   {schema}   ← the injected data dictionary
 ```
 
-You can lay the four files side by side and the headings line up. `monitoring.md` L3/L13/L20/L49/L69/L99 are Role / Hard rules / method / EQL reminders / Output / schema — note it carries an extra section the other three don't: `## Your category checklist` at L7, with a `{categories}` slot at L11 (covered below). `diagnostic.md` L3/L7/L18/L27/L59/L103 is the same skeleton. `recommendation.md` L3/L7/L29/—/L47/L91 (it swaps EQL reminders for an "Available tools" list at L15). `query.md` L3/L7/L13/L23/L47/L51 — same six, with its Output section saying the opposite of the other three (more on that in → 07-output-mode-mismatch.md).
+You can lay the four prompt files side by side and the headings line up. The monitoring prompt is Role / Hard rules / method / EQL reminders / Output / schema — note it carries an extra section the other three don't: `## Your category checklist`, with a `{categories}` slot (covered below). The diagnostic prompt is the same six-section skeleton. The recommendation prompt swaps EQL reminders for an "Available tools" list. The query prompt has the same six, with its Output section saying the opposite of the other three (more on that in → 07-output-mode-mismatch.md).
 
 ---
 
 ### The one structural exception: monitoring's `## Your category checklist`
 
-`monitoring.md` is not a clean instance of the six-section skeleton. Between `## Role` (L3) and `## Hard rules` (L13) it has a seventh section the other three prompts don't:
+The monitoring prompt is not a clean instance of the six-section skeleton. Between `## Role` and `## Hard rules` it has a seventh section the other three prompts don't:
 
 ```
-## Your category checklist     monitoring.md L7
+## Your category checklist
   "Check each of these — and only these…"
-  {categories}                 monitoring.md L11   ← per-call injection slot
+  {categories}                       ← per-call injection slot
 ```
 
-This matters for two reasons. First, it is a *fourth* per-call injection placeholder, sitting alongside `{schema}`, `{project_id}`, and the per-agent anomaly/diagnosis/intent injections — bringing monitoring's runtime-stamped slots to `{schema}` + `{project_id}` + `{categories}`. Second, `{categories}` is unlike the others: `{schema}` is the same data dictionary for every agent and `{project_id}` is a single id, but `{categories}` is a *runtime-assembled checklist string* — `monitoring.ts` L69–86 builds it from the `AnomalyCategory[]` passed into `scan()` and stamps it in with `.replace('{categories}', checklist)` (~L86), right next to the existing `{schema}` and `{project_id}` replacements. The categories it receives are the schema-runnable subset: `app/api/briefing/route.ts` computes `runnableCategories(schemaCapabilities(schema))` (`lib/agents/categories.ts`) at ~L204 and passes it as `agent.scan(hooks, runnable)` at ~L223. So the section's *body* is data — only the anomaly categories this workspace's events can support — assembled at call time and dropped into a fixed slot. (The gate that decides which categories are runnable is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
+This matters for two reasons. First, it is a *fourth* per-call injection placeholder, sitting alongside `{schema}`, `{project_id}`, and the per-agent anomaly/diagnosis/intent injections — bringing the monitoring agent's runtime-stamped slots to `{schema}` + `{project_id}` + `{categories}`. Second, `{categories}` is unlike the others: `{schema}` is the same data dictionary for every agent and `{project_id}` is a single id, but `{categories}` is a *runtime-assembled checklist string* — the monitoring agent builds it from the anomaly-category list passed into its scan method and stamps it in with a string replace, right next to the existing `{schema}` and `{project_id}` replacements. The categories it receives are the schema-runnable subset: the briefing route handler computes the runnable categories from schema capabilities and passes that list into the scan call. So the section's *body* is data — only the anomaly categories this workspace's events can support — assembled at call time and dropped into a fixed slot. (The gate that decides which categories are runnable is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
 
 The takeaway for anatomy: do not assume all four prompts are the identical six-section shape. Three are; monitoring is six sections **plus** a checklist section whose content is injected per call. When you grep the placeholder set, `{categories}` is the one that's monitoring-only and the one whose value is computed, not constant.
 
@@ -98,41 +98,40 @@ The takeaway for anatomy: do not assume all four prompts are the identical six-s
 Here is the part that separates this from a generic template. Each `## Role` does not just say what the agent does — it explicitly says what it does *not* do, naming the other agents' jobs:
 
 ```
-monitoring.md L5      "You do not diagnose causes. You do not propose actions."
-diagnostic.md  L5     "You do not propose remediation — you diagnose causes only."
-recommendation.md L5  "you do NOT execute anything"
-query.md       L5     "Never invent numbers — only cite figures you genuinely observed"
+monitoring prompt      "You do not diagnose causes. You do not propose actions."
+diagnostic prompt      "You do not propose remediation — you diagnose causes only."
+recommendation prompt  "you do NOT execute anything"
+query prompt           "Never invent numbers — only cite figures you genuinely observed"
 ```
 
-This is decomposition encoded *in prose*. The model has no view of the orchestration in `route.ts` — it cannot know that a separate recommendation agent runs after it. So the monitoring prompt tells it directly: stay in your lane, someone else handles causes. Without the disclaimer, the monitoring agent helpfully diagnoses and recommends in one breath, and now two agents produce overlapping output and the chain's clean handoff (→ 06-single-purpose-chains.md) collapses. I have shipped multi-agent systems where exactly this happened: the "detect" agent started proposing fixes because nothing told it not to, and the downstream "fix" agent's output became redundant noise. The one-line disclaimer is the fix, and it lives in the prompt because that is the only place the model can read it.
+This is decomposition encoded *in prose*. The model has no view of the orchestration in the route handler — it cannot know that a separate recommendation agent runs after it. So the monitoring prompt tells it directly: stay in your lane, someone else handles causes. Without the disclaimer, the monitoring agent helpfully diagnoses and recommends in one breath, and now two agents produce overlapping output and the chain's clean handoff (→ 06-single-purpose-chains.md) collapses. I have shipped multi-agent systems where exactly this happened: the "detect" agent started proposing fixes because nothing told it not to, and the downstream "fix" agent's output became redundant noise. The one-line disclaimer is the fix, and it lives in the prompt because that is the only place the model can read it.
 
 ---
 
-### Layer 2 — per-call injection via `String.replace`
+### Layer 2 — per-call injection via string replace
 
-The injection is mechanically dumb and that is a feature. Each agent runs a short chain of `.replace` calls right before the loop:
+The injection is mechanically dumb and that is a feature. Each agent runs a short chain of replace calls right before the loop:
 
 ```
-diagnostic.ts L45–48
-  const system = PROMPT
-    .replace('{schema}',      schemaSummary(this.schema))
-    .replace(/\{project_id\}/g, this.schema.projectId)   // global — appears many times
-    .replace('{anomaly}',     JSON.stringify(anomaly));
+  system = PROMPT
+    .replace("{schema}",     schema_summary(schema))
+    .replace(/{project_id}/g, schema.project_id)   # global — appears many times
+    .replace("{anomaly}",    serialize(anomaly))
 ```
 
 ```
 placeholder      injected by                  appears in
 ─────────────    ──────────────────────────   ────────────────────────────
-{schema}         schemaSummary(schema)         all four
-{project_id}     schema.projectId  (regex /g)  all four (every Hard rules block)
-{anomaly}        JSON.stringify(anomaly)       diagnostic only  (L48)
-{diagnosis}      JSON.stringify(diagnosis)     recommendation only (recommendation.ts L44)
-{intent}         the classified label (/g)     query only  (query.ts L28)
-{categories}     runtime-built checklist str   monitoring only (monitoring.ts L86)
-userPrompt       a fixed per-agent string      passed separately, NOT in the .md
+{schema}         schema summary                all four
+{project_id}     project id (global replace)   all four (every Hard rules block)
+{anomaly}        serialized anomaly object     diagnostic only
+{diagnosis}      serialized diagnosis object   recommendation only
+{intent}         the classified label          query only
+{categories}     runtime-built checklist str   monitoring only
+user prompt      a fixed per-agent string      passed separately, NOT in the markdown
 ```
 
-Two details worth internalizing. First, `{project_id}` uses the global regex `/\{project_id\}/g` because "Pass `project_id` to every tool call" appears once but the value must replace every literal occurrence — the team got bitten by single-replace leaving a stray `{project_id}` in the text, which the model then dutifully passed *as a literal string* to a tool. Second, `userPrompt` is **not** in the `.md` file at all. It is a separate argument to `runAgentLoop` (`monitoring.ts` L70: `'Scan the workspace…'`) and becomes the first `user` message (`base.ts` L80). System = the constant `.md`; user = the per-call task. That is the system-vs-user boundary made concrete: constant-vs-per-call.
+Two details worth internalizing. First, `{project_id}` uses a global-replace regex because "Pass `project_id` to every tool call" appears once but the value must replace every literal occurrence — the team got bitten by single-replace leaving a stray `{project_id}` in the text, which the model then dutifully passed *as a literal string* to a tool. Second, the user prompt is **not** in the markdown file at all. It is a separate argument to the shared agent loop and becomes the first user message. System = the constant markdown; user = the per-call task. That is the system-vs-user boundary made concrete: constant-vs-per-call.
 
 ---
 
@@ -141,24 +140,24 @@ Two details worth internalizing. First, `{project_id}` uses the global regex `/\
 The `## Output` section already tells the model what shape to emit. So why a second instruction? Because the model, mid-investigation, keeps wanting to query — it reads "Output" as "eventually" not "now." On the forced-final turn the loop appends a hard stop:
 
 ```
-base.ts L96–98
-  system: forceFinal && synthesisInstruction
-    ? `${system}\n\n${synthesisInstruction}`   // ← append, last thing the model reads
-    : system,
+  if force_final AND synthesis_instruction:
+      system = system + "\n\n" + synthesis_instruction   # ← appended, last thing read
+  else:
+      system = system
 ```
 
 ```
 normal turn:        [ Role … Output … {schema} ]                tools available
-forced-final turn:  [ Role … Output … {schema} ] + [ synthesis ] tools REMOVED (base.ts L101)
+forced-final turn:  [ Role … Output … {schema} ] + [ synthesis ] tools REMOVED
 ```
 
-The synthesis text is defined per agent (`monitoring.ts` L75–78, `diagnostic.ts` L62–66) and says, in effect, "You have NO more tool calls. Output ONLY the JSON now." Appending it *last* exploits recency — the final instruction the model reads is the one it weights hardest. This is a fourth structural slot, but it only exists on one turn, which is why it is not a section in the `.md` file.
+The synthesis text is defined per agent inside the per-agent definitions and says, in effect, "You have NO more tool calls. Output ONLY the JSON now." Appending it *last* exploits recency — the final instruction the model reads is the one it weights hardest. This is a fourth structural slot, but it only exists on one turn, which is why it is not a section in the markdown file.
 
 ---
 
 ### The principle
 
-A production prompt is layered in time, not just in sections. The `.md` file is a constant you can version and diff; the placeholders are a closed set you can grep; the synthesis nudge is a single appended string you can change in one place. The discipline is: keep the constant constant, keep the variable visibly injected, and never let a runtime value hide inside the `.md`. When all three layers are legible, "the prompt broke" becomes a question with a fast answer — which layer.
+A production prompt is layered in time, not just in sections. The markdown file is a constant you can version and diff; the placeholders are a closed set you can grep; the synthesis nudge is a single appended string you can change in one place. The discipline is: keep the constant constant, keep the variable visibly injected, and never let a runtime value hide inside the markdown. When all three layers are legible, "the prompt broke" becomes a question with a fast answer — which layer.
 
 ---
 
@@ -168,31 +167,31 @@ This diagram spans three time-layers. Layer 1 is the constant file (shared shape
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 1 — CONSTANT .md FILE   (readFileSync at import, monitoring.ts L12) │
+│  LAYER 1 — CONSTANT MARKDOWN FILE   (loaded at module import)         │
 │                                                                       │
-│   ## Role          ← ONE job + disclaims the other agents' jobs (L5)  │
-│   ## Hard rules    ← project_id every call · ≤N tool calls           │
-│   <method>         ← Period-over-period / Investigation / How to     │
-│   ## EQL reminders ← worked query syntax (format exemplars)          │
+│   ## Role          ← ONE job + disclaims the other agents' jobs       │
+│   ## Hard rules    ← project_id every call · ≤N tool calls            │
+│   <method>         ← Period-over-period / Investigation / How to      │
+│   ## EQL reminders ← worked query syntax (format exemplars)           │
 │   ## Output        ← exact JSON shape + field rules + example         │
-│   ## Workspace schema                                                │
-│       {schema}  {project_id}  {anomaly}/{diagnosis}/{intent}         │
+│   ## Workspace schema                                                 │
+│       {schema}  {project_id}  {anomaly}/{diagnosis}/{intent}          │
 └───────────────────────────┬───────────────────────────────────────────┘
-                            │  .replace() per call
+                            │  string replace per call
 ┌───────────────────────────▼───────────────────────────────────────────┐
-│  LAYER 2 — PER-CALL INJECTION   (diagnostic.ts L45–48)               │
-│   {schema}→schemaSummary  {project_id}→id /g  {anomaly}→JSON          │
-│   userPrompt → SEPARATE first user message (base.ts L80)             │
-│   = the run-stable `system` string                                  │
+│  LAYER 2 — PER-CALL INJECTION                                         │
+│   {schema}→schema_summary  {project_id}→id (global)  {anomaly}→JSON   │
+│   user prompt → SEPARATE first user message                           │
+│   = the run-stable system string                                      │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  forced-final turn only
 ┌───────────────────────────▼───────────────────────────────────────────┐
-│  LAYER 3 — SYNTHESIS APPEND   (base.ts L96–98)                       │
-│   `${system}\n\n${synthesisInstruction}`   + tools removed (L101)    │
-│   = the system prompt the model receives THIS turn                   │
+│  LAYER 3 — SYNTHESIS APPEND                                           │
+│   system + "\n\n" + synthesis_instruction    + tools removed          │
+│   = the system prompt the model receives THIS turn                    │
 └──────────────────────────────────────────────────────────────────────┘
 
-  system = constant (.md) + per-call injection.  user = the per-call task.
+  system = constant (markdown) + per-call injection.  user = the per-call task.
   Constant-vs-per-call IS the system-vs-user split.
 ```
 
@@ -364,3 +363,4 @@ In `lib/agents/base.ts`, what exactly is the `system` value on the forced-final 
 Updated: 2026-05-29 — Corrected stale monitoring.md section line refs (Role L3 / Hard rules L13 / method L20 / EQL reminders L49 / Output L69 / schema L99) and added the `## Your category checklist` section (L7, `{categories}` slot L11) as monitoring's seventh section and a 4th per-call injection placeholder (`monitoring.ts` L69–86).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

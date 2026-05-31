@@ -45,7 +45,7 @@ Zoom out — where caching + rate-limiting lives
 
 ## How it works
 
-Every call to `callTool` passes through the same four-stage funnel before a result reaches the caller.
+Every tool call passes through the same four-stage funnel before a result reaches the caller.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -79,7 +79,7 @@ Every call passes through this funnel. A cache hit exits at stage 1; an error re
 
 ### Cache-aside with TTL
 
-The cache is a `Map<string, { result: unknown; expiresAt: number }>` on the `McpClient` instance. The key is `name:JSON.stringify(args)` — the tool name plus a deterministic serialization of every argument. The entry shape is:
+The cache is a `Map<key, { result, expiresAt }>` held on the provider wrapper instance. The key is `name + ":" + serialize(args)` — the tool name plus a deterministic serialization of every argument. The entry shape:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -89,18 +89,18 @@ The cache is a `Map<string, { result: unknown; expiresAt: number }>` on the `Mcp
 │                                                           │
 │  value: {                                                 │
 │    result:    <the raw MCP response object>               │
-│    expiresAt: 1716825600000   ← Date.now() + ttl (60 s)  │
+│    expiresAt: 1716825600000   ← now + ttl (60 s default) │
 │  }                                                        │
 └──────────────────────────────────────────────────────────┘
 ```
 
-On a cache check (`lib/mcp/client.ts` L105–L110): if `cached.expiresAt > Date.now()`, return the stored result immediately with `fromCache: true` and `durationMs: 0`. The default TTL is `60_000` ms (60 seconds); callers pass `cacheTtlMs` to override. `skipCache: true` bypasses the read but still writes a fresh entry on success — the `/debug` "force refresh" path relies on this write-through behavior.
+On a cache check: if `cached.expiresAt > now`, return the stored result immediately with `fromCache: true` and `durationMs: 0`. The default TTL is 60 seconds; callers pass `cacheTtlMs` to override. `skipCache: true` bypasses the read but still writes a fresh entry on success — the debug "force refresh" path relies on this write-through behavior.
 
 React Query parallel: this is `staleTime` on a query. Within the stale window, the cached data is returned synchronously without hitting the network.
 
-### Inter-call spacing (`liveCall`)
+### Inter-call spacing (the live-call path)
 
-`liveCall` (`lib/mcp/client.ts` L148–L163) is the only place the transport is called. Before calling the transport it computes `elapsed = Date.now() - this.lastCallAt` and waits `minIntervalMs - elapsed` milliseconds if the minimum interval has not yet passed.
+The live-call path is the only place the transport is called. Before calling the transport it computes `elapsed = now - lastCallAt` and waits `minIntervalMs - elapsed` milliseconds if the minimum interval has not yet passed.
 
 ```
 time ──────────────────────────────────────────────────────────▶
@@ -117,11 +117,11 @@ time ─────────────────────────
          │◀──── 1100 ms minimum ────────────▶│    │ lastCallAt = T₁
 ```
 
-`lastCallAt` is a single instance field. Every live call — whether it was a cache miss or a retry — updates it after the transport returns. This means two back-to-back cache misses always have at least `minIntervalMs` between their network calls. In `connect.ts` this is set to 1100 ms.
+`lastCallAt` is a single instance field. Every live call — whether it was a cache miss or a retry — updates it after the transport returns. This means two back-to-back cache misses always have at least `minIntervalMs` between their network calls. The wrapper is constructed with this set to 1100 ms.
 
 ### Retry on rate-limit
 
-After the first live call, `callTool` checks `isRateLimited(result)` (`lib/mcp/client.ts` L18–L22). `isRateLimited` returns `true` when the result has `isError: true` and its JSON representation matches `/rate limit|too many requests/i`. The retry loop (`lib/mcp/client.ts` L121–L132) re-enters `liveCall` (which itself enforces the spacing gap again) up to `maxRetries` times. Each wait honors a window parsed out of the error text (`parseRetryAfterMs`, `lib/mcp/client.ts` L31–L38) when present, else exponential backoff off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), with every wait capped at `retryCeilingMs`. Default values: `maxRetries = 3`, `retryDelayMs = 10_000` ms, `retryCeilingMs = 20_000` ms.
+After the first live call, the wrapper checks `isRateLimited(result)`. The predicate returns `true` when the result has `isError: true` and its JSON representation matches `/rate limit|too many requests/i`. The retry loop re-enters the live-call path (which itself enforces the spacing gap again) up to `maxRetries` times. Each wait honors a window parsed out of the error text when present, else exponential backoff off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), with every wait capped at `retryCeilingMs`. Default values: `maxRetries = 3`, `retryDelayMs = 10_000` ms, `retryCeilingMs = 20_000` ms.
 
 ```
   liveCall → result
@@ -142,7 +142,7 @@ After the first live call, `callTool` checks `isRateLimited(result)` (`lib/mcp/c
 
 ### No-cache-on-error
 
-`lib/mcp/client.ts` L137–L139: when `result.isError === true` the function returns immediately without writing to the cache. This covers all errors, not only rate-limit errors. Caching a 429 for 60 seconds would mean the next 60 seconds of calls return the error from cache without ever retrying the network — the briefing stays broken for a full minute with no way to recover short of a restart. Error results must always be live-retried by the next caller.
+When `result.isError === true` the function returns immediately without writing to the cache. This covers all errors, not only rate-limit errors. Caching a 429 for 60 seconds would mean the next 60 seconds of calls return the error from cache without ever retrying the network — the briefing stays broken for a full minute with no way to recover short of a restart. Error results must always be live-retried by the next caller.
 
 ### The principle
 
@@ -448,3 +448,4 @@ A colleague argues: "We should remove the in-memory cache because it makes debug
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now uses a parsed retry-after window / exponential backoff (default `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -37,12 +37,12 @@
 
 ## How it works
 
-**Mental model.** Think of the route as a `step`-keyed dispatcher and each agent as a `useReducer` whose actions are chosen at runtime by a model instead of by user clicks. The outer flow is deterministic — diagnostic always runs before recommendation, and the `step` param enforces it: `step=diagnose` produces the diagnosis, `step=recommend` consumes it. The inner flow is data-driven — you cannot read `base.ts` and know how many tool calls the model will make, because that depends on what the model sees.
+**Mental model.** Think of the route as a `step`-keyed dispatcher and each agent as a `useReducer` whose actions are chosen at runtime by a model instead of by user clicks. The outer flow is deterministic — diagnostic always runs before recommendation, and the `step` param enforces it: `step=diagnose` produces the diagnosis, `step=recommend` consumes it. The inner flow is data-driven — you cannot read the shared agent loop and know how many tool calls the model will make, because that depends on what the model sees.
 
 ```
 TOP LEVEL = CHAIN (code owns the order)            NODE LEVEL = AGENT (model owns the order)
 ────────────────────────────────────────          ────────────────────────────────────────
-route.ts (split across two calls):                  runAgentLoop (base.ts):
+route handler (split across two calls):             shared agent loop:
   step=diagnose:                                      for turn in maxTurns:
     diagnosis = await diag.investigate(inv)             res = model.create(messages + tools)
     send(diagnosis)  → stashed for step 3              if res has tool_use:
@@ -52,89 +52,93 @@ route.ts (split across two calls):                  runAgentLoop (base.ts):
 fixed: always diagnose → recommend                   variable: 0..6 tool calls, model decides
 ```
 
-There is a THIRD shape hiding inside the second one: when an agent's loop fails to emit valid JSON, the agent runs a dedicated tool-less `synthesize()` call. That `runAgentLoop(...)` then `synthesize(...)` pair is a 2-step **micro-chain** — a fixed sequence inside a single agent. So blooming insights uses all three at once: chain of agents (route), agent loop (base), micro-chain (diagnostic/recommendation synthesize).
+There is a THIRD shape hiding inside the second one: when an agent's loop fails to emit valid JSON, the agent runs a dedicated tool-less `synthesize()` call. That `runAgentLoop(...)` then `synthesize(...)` pair is a 2-step **micro-chain** — a fixed sequence inside a single agent. So this system uses all three at once: chain of agents (route), agent loop (base), micro-chain (diagnostic/recommendation synthesize).
 
 ---
 
-### The chain at the top (route.ts)
+### The chain at the top (the route handler)
 
 The route is the only place agents are sequenced, and it does so with plain `await` gated on the `step` param. There is no graph library, no state machine, no framework — `step=diagnose` runs node 1, `step=recommend` runs node 2 on the handed-over diagnosis, and a `step==null` combined run (dev demo-capture only) runs both back to back.
 
 ```
-app/api/agent/route.ts — start(controller)  (L170–L254)
+the route's stream body
 ─────────────────────────────────────────────────────────
- if (q && !insightId)                          ← branch A: free-form query  (L210)
-   classifyIntent(anthropic, q)                  (one agent, see 04-tool-routing.md)
-   QueryAgent.answer(q, intent)                  L214
-   send(done); return                            L216–217
+ if q present and no insightId:                ← branch A: free-form query
+   classify_intent(provider_sdk, q)              (one agent, see 04-tool-routing.md)
+   QueryAgent.answer(q, intent)
+   send(done); return
 
- else (insightId path)                          ← branch B: investigation chain
-   if (step !== 'recommend')                      ← node 1: diagnose only  (L231)
-     diagnosis = await DiagnosticAgent.investigate(inv)   L238
-     send({ type:'diagnosis', diagnosis })               L239  → stashed for step 3
-   if (step !== 'diagnose')                        ← node 2: recommend only  (L244)
-     diagnosis = parseDiagnosis(diagnosisParam)            (handed over on step 3)
-     recs = await RecommendationAgent.propose(inv, diagnosis)  L247 (consumes node 1)
-     for r of recs: send({ type:'recommendation', recommendation:r })  L248
-   send({ type:'done' })                          L251
-   if (step == null) saveInvestigation(insightId, collected)  L254  ← combined run only
+ else (insightId path):                         ← branch B: investigation chain
+   if step != "recommend":                        ← node 1: diagnose only
+     diagnosis = await DiagnosticAgent.investigate(inv)
+     send({ type: "diagnosis", diagnosis })             → stashed for step 3
+   if step != "diagnose":                         ← node 2: recommend only
+     diagnosis = parse_diagnosis(diagnosisParam)        (handed over on step 3)
+     recs      = await RecommendationAgent.propose(inv, diagnosis)  (consumes node 1)
+     for r in recs:
+         send({ type: "recommendation", recommendation: r })
+   send({ type: "done" })
+   if step is null:
+       save_investigation(insightId, collected)   ← combined run only
 ```
 
-The order is hard-coded. `propose` receives `diagnosis` as an argument (route.ts L247) — the data flows through a function parameter, not a shared blackboard. On the two-step path the diagnosis crosses an HTTP boundary: `step=diagnose` emits the `diagnosis` event, the client stashes it (`bi:diag:<id>` in sessionStorage), and `step=recommend` reads it back via `parseDiagnosis(diagnosisParam)` (route.ts L227) before running node 2. Either way it is a chain in its purest form: step N+1 reads step N's typed output. Note the morning-briefing's *third* agent, monitoring, runs in a different route (`app/api/briefing/route.ts`) and produces the `Insight` rows that become the `insightId` this route investigates — the full briefing pipeline monitoring→diagnostic→recommendation is a chain spread across two routes.
+The order is hard-coded. `propose` receives `diagnosis` as an argument — the data flows through a function parameter, not a shared blackboard. On the two-step path the diagnosis crosses an HTTP boundary: `step=diagnose` emits the `diagnosis` event, the client stashes it (`bi:diag:<id>` in sessionStorage), and `step=recommend` reads it back via a diagnosis parser before running node 2. Either way it is a chain in its purest form: step N+1 reads step N's typed output. Note the morning-briefing's *third* agent, monitoring, runs in a different route and produces the `Insight` rows that become the `insightId` this route investigates — the full briefing pipeline monitoring→diagnostic→recommendation is a chain spread across two routes.
 
-The monitoring node is itself schema-gated by its caller before its loop runs. `MonitoringAgent.scan` now takes a second parameter — `scan(hooks?, categories: AnomalyCategory[] = [])` (`lib/agents/monitoring.ts` L69) — and injects a per-category checklist into its prompt (`{categories}` slot, built L73–L86). The briefing route does not pass the full 10-category registry; it passes `runnable = runnableCategories(schemaCapabilities(schema))` (`app/api/briefing/route.ts` L202–L204) into `agent.scan({…}, runnable)` (L223/L240). So the deterministic spine narrows the monitoring node's adaptive surface *before* the model owns control flow: a cheap in-memory schema check decides which categories the agent is even allowed to explore, and the agent loop then chooses freely within that gated set. It is the same chain-bounds-agent boundary applied one layer up — code shapes the node's option space, the model picks within it. See `07-capability-gating.md` for the full treatment of the gate.
+The monitoring node is itself schema-gated by its caller before its loop runs. The monitoring agent's `scan` now takes a second parameter — `scan(hooks?, categories: AnomalyCategory[] = [])` — and injects a per-category checklist into its prompt (a `{categories}` slot). The briefing route does not pass the full 10-category registry; it passes the runnable subset (`runnable = runnableCategories(schemaCapabilities(schema))`) into `agent.scan({…}, runnable)`. So the deterministic spine narrows the monitoring node's adaptive surface *before* the model owns control flow: a cheap in-memory schema check decides which categories the agent is even allowed to explore, and the agent loop then chooses freely within that gated set. It is the same chain-bounds-agent boundary applied one layer up — code shapes the node's option space, the model picks within it. See `07-capability-gating.md` for the full treatment of the gate.
 
 ---
 
-### The agent at each node (runAgentLoop)
+### The agent at each node (the shared agent loop)
 
-Inside `investigate` and `propose`, control flow inverts. `runAgentLoop` (`base.ts` L48–L176) does not know how many tools will run. It sends the conversation to Claude, and Claude's response decides whether the loop continues.
+Inside `investigate` and `propose`, control flow inverts. The shared agent loop does not know how many tools will run. It sends the conversation to the model, and the response decides whether the loop continues.
 
 ```
-base.ts — for (turn=0; turn<maxTurns; turn++)   (L85–L172)
+the agent loop body
 ─────────────────────────────────────────────────────────
- res = anthropic.messages.create(messages, tools?)   L102
- messages.push(assistant: res.content)               L105
- toolUses = res.content.filter(b => b.type==='tool_use')  L116
- if (toolUses.length === 0) return { finalText }     L121–124  ← MODEL ended the loop
- for tu of toolUses:                                 L129       ← MODEL chose these tools
-   mcp.callTool(tu.name, tu.input)                   L144
- messages.push(user: toolResults)                    L171       ← loop again, model decides next
+ for turn in 0..maxTurns:
+     res       = provider_sdk.messages.create(messages, tools?)
+     messages.push(assistant: res.content)
+     toolUses  = filter(res.content, block.type == "tool_use")
+     if toolUses is empty:
+         return { finalText }                  ← MODEL ended the loop
+     for tu in toolUses:                       ← MODEL chose these tools
+         mcp.callTool(tu.name, tu.input)
+     messages.push(user: toolResults)          ← loop again, model decides next
 ```
 
-The line that makes this an agent and not a chain is L121: `if (toolUses.length === 0) return`. The model, not the code, signals termination by *choosing not to emit a tool-use block*. A chain has no equivalent line — its termination is the last statement in the function.
+The line that makes this an agent and not a chain is the early return `if toolUses is empty`. The model, not the code, signals termination by *choosing not to emit a tool-use block*. A chain has no equivalent line — its termination is the last statement in the function.
 
-The loop is bounded, which is what makes it safe (see 06-error-recovery.md): `maxTurns = 8` (L73), and a per-agent `maxToolCalls` budget (diagnostic 6, recommendation 4) that flips `forceFinal` to strip the tools and force a text-only answer. So the node is an agent — the model owns the path — but a *bounded* one: the budget is the guardrail that a chain does not need because a chain cannot run away.
+The loop is bounded, which is what makes it safe (see 06-error-recovery.md): `maxTurns = 8`, and a per-agent `maxToolCalls` budget (diagnostic 6, recommendation 4) that flips `forceFinal` to strip the tools and force a text-only answer. So the node is an agent — the model owns the path — but a *bounded* one: the budget is the guardrail that a chain does not need because a chain cannot run away.
 
 ---
 
 ### The micro-chain inside an agent (synthesize)
 
-When `runAgentLoop` returns text that does not parse as the required JSON shape, `DiagnosticAgent.investigate` runs a second, dedicated model call: `synthesize()` (`diagnostic.ts` L87–L126). That second call has no tools and no loop — it is a single deterministic step that takes the gathered evidence and asks for JSON only.
+When the loop returns text that does not parse as the required JSON shape, the diagnostic agent runs a second, dedicated model call: `synthesize()`. That second call has no tools and no loop — it is a single deterministic step that takes the gathered evidence and asks for JSON only.
 
 ```
-DiagnosticAgent.investigate  (diagnostic.ts L45–L83)
+the diagnostic agent's investigate()
 ─────────────────────────────────────────────────────────
- step 1 (AGENT):  runAgentLoop(...)         → { finalText, toolCalls }   L51
- step 2 (CHAIN):  tryParseDiagnosis(finalText)        ← parse the loop output  L75
-                  ?? await synthesize(anomaly, toolCalls)  ← fixed fallback call  L75
-                  ?? FALLBACK                          ← static default          L75
- step 3 (DERIVE): diagnosisConfidence(diag), downgraded if any query errored  L80–82
+ step 1 (AGENT):  runAgentLoop(...)         → { finalText, toolCalls }
+ step 2 (CHAIN):  try_parse_diagnosis(finalText)              ← parse the loop output
+                  OR await synthesize(anomaly, toolCalls)      ← fixed fallback call
+                  OR FALLBACK                                  ← static default
+ step 3 (DERIVE): diagnosis_confidence(diag), downgraded if any query errored
 ```
 
-Steps 1→2 are a 2-step micro-chain: a variable-length agent loop followed by a fixed synthesis step (then a deterministic `confidence` derivation appended to the result). `recommendation.ts` L69–L73 has the identical shape minus the confidence step. This is the cleanest demonstration of "chain of agents" at the smallest scale — one agent's public method is itself an agent step chained to a deterministic step.
+Steps 1→2 are a 2-step micro-chain: a variable-length agent loop followed by a fixed synthesis step (then a deterministic `confidence` derivation appended to the result). The recommendation agent has the identical shape minus the confidence step. This is the cleanest demonstration of "chain of agents" at the smallest scale — one agent's public method is itself an agent step chained to a deterministic step.
 
 ---
 
 ### Current state vs future state
 
-Today the chain is exactly two business steps (`investigate → propose`), run as two `step`-gated calls, plus the monitoring step in the sibling route. The `step` param plus a plain `await` per node is the right tool: there is no branching, no parallelism, no conditional skip. The diagnosis now carries a derived `confidence` field (`diagnostic.ts` L80–82), but the route does *not* branch on it — `step=recommend` runs regardless. The moment the chain needs to *branch* — for example, "if `diagnosis.confidence` is low, re-investigate with a different tool subset instead of recommending" — the `step`-gated `if/await` structure becomes a hand-rolled state machine and should move to a graph runner (LangGraph). That breakpoint is named in Tradeoffs; it has not been crossed.
+Today the chain is exactly two business steps (`investigate → propose`), run as two `step`-gated calls, plus the monitoring step in the sibling route. The `step` param plus a plain `await` per node is the right tool: there is no branching, no parallelism, no conditional skip. The diagnosis now carries a derived `confidence` field, but the route does *not* branch on it — `step=recommend` runs regardless. The moment the chain needs to *branch* — for example, "if `diagnosis.confidence` is low, re-investigate with a different tool subset instead of recommending" — the `step`-gated `if/await` structure becomes a hand-rolled state machine and should move to a graph runner (LangGraph). That breakpoint is named in Tradeoffs; it has not been crossed.
 
 ---
 
 ### The principle
 
-**Push control flow down to the model only where adaptivity pays for its unpredictability.** The top-level order (diagnose then recommend) never changes, so it lives in code where it is readable and testable. The query path within a diagnosis *does* change per anomaly, so it lives in the model where it can adapt. The dividing line is not "use agents" or "use chains" — it is "make the deterministic parts deterministic and bound the adaptive parts." Every layer of blooming insights' orchestration restates this: deterministic spine, bounded adaptive nodes.
+**Push control flow down to the model only where adaptivity pays for its unpredictability.** The top-level order (diagnose then recommend) never changes, so it lives in code where it is readable and testable. The query path within a diagnosis *does* change per anomaly, so it lives in the model where it can adapt. The dividing line is not "use agents" or "use chains" — it is "make the deterministic parts deterministic and bound the adaptive parts." Every layer of this orchestration restates this: deterministic spine, bounded adaptive nodes.
 
 ---
 
@@ -160,7 +164,7 @@ The diagram spans three layers. The Route layer is a chain (fixed order). The Ag
 │                                                                       │
 │  investigate() / propose():                                          │
 │   ┌─────────────────────────────────────────────────────────┐        │
-│   │ runAgentLoop (base.ts L85–172)   ← variable # of steps   │        │
+│   │ runAgentLoop   ← variable # of steps   │        │
 │   │   for turn in maxTurns:                                  │        │
 │   │     model decides: emit tool_use?  ──yes──→ run, feed back│        │
 │   │                                    ──no───→ return text   │        │
@@ -368,3 +372,4 @@ Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`
 Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [])` signature (monitoring.ts L69) and per-category checklist; the briefing route gates the list to `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204/223) before the agent runs, so the monitoring node is schema-gated. Cross-ref 07-capability-gating.md.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -44,19 +44,19 @@
 **Mental model.** The model's final text is an untrusted body you must defensively turn into a typed value through a three-stage funnel: *extract* the JSON out of whatever prose surrounds it, *validate* its shape field-by-field, *repair* via a clean-context retry when extract-or-validate fails. The prompt's job is to *ask* for the shape; the funnel's job is to *guarantee* it.
 
 ```
-finalText: "Here's the anomalies:\n```json\n[ … ]\n```\nLet me know!"
+final_text: "Here's the anomalies:\n```json\n[ … ]\n```\nLet me know!"
       │
-  (1) EXTRACT    parseAgentJson   validate.ts L3–13
-      │  fence regex FIRST → bare JSON.parse → first-bracket-to-last scan
+  (1) EXTRACT    parse-agent-json
+      │  fence regex FIRST → bare JSON parse → first-bracket-to-last scan
       ▼
   parsed: unknown
       │
-  (2) VALIDATE   isAnomalyArray / isDiagnosis / isRecommendationArray
-      │  validate.ts L17–53   every required field present & correct type?
+  (2) VALIDATE   is-anomaly-array / is-diagnosis / is-recommendation-array
+      │  every required field present & correct type?
       ▼
   typed value ✓     ─── or ───▶  null / []
                                    │
-  (3) REPAIR     synthesize()   diagnostic.ts L82–121  (clean-context retry)
+  (3) REPAIR     synthesize  (clean-context retry)
                                    │  ?? FALLBACK / []
                                    ▼
                               always a valid typed value
@@ -71,7 +71,7 @@ The model tries to emit JSON; the funnel guarantees a typed result regardless of
 Open any of the three structured prompts and you'll see the format demanded in English, with a concrete example block:
 
 ```
-monitoring.md L69–97
+monitoring prompt — Output section
   ## Output
   Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by
   severity …, wrapped in a ```json fenced block. Each item:
@@ -82,8 +82,8 @@ monitoring.md L69–97
 ```
 
 ```
-diagnostic.md L59–103    ## Output → a ```json {object} of exactly this shape + field rules
-recommendation.md L47–91 ## Output → a ```json [array] of at most 3 objects + field rules
+diagnostic prompt      ## Output → a ```json {object} of exactly this shape + field rules
+recommendation prompt  ## Output → a ```json [array] of at most 3 objects + field rules
 ```
 
 This is the pattern blog folklore warns against: "don't describe JSON in words, the model will drift; use the provider's native mode." And the folklore is not wrong about the *failure modes* — prose-instructed JSON does drift, does get wrapped in fences, does occasionally arrive with a chatty preamble. The disagreement is about whether those failure modes are *handled* or *fatal*. blooming insights treats them as handled.
@@ -95,41 +95,45 @@ This is the pattern blog folklore warns against: "don't describe JSON in words, 
 The prompts don't just describe the shape — they sculpt it, including fields the model must *omit*:
 
 ```
-recommendation.md L82
+recommendation prompt — Output section
   - Do NOT include an `id` field — the system assigns it after validation.
 ```
 
-This is schema-shaping done in English. The model emits id-less recommendations; the type guard validates the id-less shape (`isRecommendationArray`, `validate.ts` L42 — `Omit<Recommendation,'id'>[]`); the code assigns the id after validation (`recommendation.ts` L76, `crypto.randomUUID()`):
+This is schema-shaping done in English. The model emits id-less recommendations; the type guard validates the id-less shape (an `Omit<Recommendation, 'id'>[]` predicate); the code assigns the id after validation with a UUID generator:
 
 ```
-prompt says (L82):           "Do NOT include an id"
-model emits:                 { title, rationale, bloomreachFeature, steps, … }  ← no id
-isRecommendationArray (L42): validates THIS id-less shape
-code assigns (rec.ts L76):   { id: crypto.randomUUID(), ...r }
+prompt says:           "Do NOT include an id"
+model emits:           { title, rationale, bloomreach_feature, steps, … }  ← no id
+shape guard:           validates THIS id-less shape
+code assigns:          { id: random_uuid(), ...r }
 ```
 
-The split is deliberate: the prompt and validator agree on what the *model* controls; the system owns *identity*. Letting the model invent `id`s risks collisions and non-UUID strings. The "Do NOT include an id" line is a prose instruction doing a job a native schema would do with `additionalProperties: false` — and it has to be repeated in the synthesis instruction too (`recommendation.ts` L62: "Do NOT include an id field"), because the synthesis path bypasses the main prompt.
+The split is deliberate: the prompt and validator agree on what the *model* controls; the system owns *identity*. Letting the model invent ids risks collisions and non-UUID strings. The "Do NOT include an id" line is a prose instruction doing a job a native schema would do with `additionalProperties: false` — and it has to be repeated in the recommendation agent's synthesis instruction too, because the synthesis path bypasses the main prompt.
 
 ---
 
 ### The fence-strip-first bug, and why the regex runs first
 
-Here is the production scar. `parseAgentJson` tries the markdown-fence regex *before* a bare `JSON.parse`:
+Here is the production scar. The agent-JSON parser tries the markdown-fence regex *before* a bare JSON parse:
 
 ```
-validate.ts L3–13
-  export function parseAgentJson(text: string): unknown {
-    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);   // ← FENCE FIRST
-    const candidate = (fence ? fence[1] : text).trim();
-    try { return JSON.parse(candidate); } catch { /* fall through */ }
-    const start = candidate.search(/[[{]/);                      // substring scan
-    const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-    if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1));
-    throw new Error('no parseable json in agent output');
-  }
+  parse_agent_json(text):
+    fence     = text.match(/```(?:json)?\s*([\s\S]*?)```/i)   # ← FENCE FIRST
+    candidate = (fence ? fence.group(1) : text).strip()
+    try:
+        return JSON.parse(candidate)
+    except:
+        pass   # fall through
+
+    start = candidate.search(/[[{]/)                          # substring scan
+    end   = max(candidate.last_index_of("]"),
+                candidate.last_index_of("}"))
+    if start >= 0 AND end > start:
+        return JSON.parse(candidate.slice(start, end + 1))
+    raise "no parseable json in agent output"
 ```
 
-Why fence-first? Because the prompts *ask* for a ```json fence (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49) — and the model complies. If you ran a bare `JSON.parse` first, it would throw on the leading ```` ```json ```` and the trailing ```` ``` ````, and you'd be relying on the substring scan to recover — which is the *least* precise strategy. Fence-first means the common case (model did exactly what you asked) is also the most precise extraction.
+Why fence-first? Because the three structured prompts *ask* for a ```json fence in their Output sections — and the model complies. If you ran a bare JSON parse first, it would throw on the leading ```` ```json ```` and the trailing ```` ``` ````, and you'd be relying on the substring scan to recover — which is the *least* precise strategy. Fence-first means the common case (model did exactly what you asked) is also the most precise extraction.
 
 ```
 the bug class this defends against:
@@ -140,45 +144,45 @@ the bug class this defends against:
   here:    fence regex captures group 1 → JSON.parse([…]) → ✓
 ```
 
-I have shipped a feature where a teammate added "be concise and well-formatted" to a prompt that relied on schema mode, and overnight the model started fencing its JSON as a courtesy — well-formatted, to a model, means a code block. The parser that did bare-parse-first broke for every call. The fix was the exact ordering you see here: strip the fence before you trust the body. This is not theoretical; it is the literal reason line 4 comes before line 6.
+I have shipped a feature where a teammate added "be concise and well-formatted" to a prompt that relied on schema mode, and overnight the model started fencing its JSON as a courtesy — well-formatted, to a model, means a code block. The parser that did bare-parse-first broke for every call. The fix was the exact ordering you see here: strip the fence before you trust the body. This is not theoretical; it is the literal reason the fence regex runs before the bare parse.
 
 ---
 
 ### Validate: shape proofs, not casts
 
-`parseAgentJson` returns `unknown` — it has parsed *syntax*, not *shape*. Three `v is T` guards prove the shape field-by-field:
+The parser returns `unknown` — it has parsed *syntax*, not *shape*. Three `v is T` guards prove the shape field-by-field:
 
 ```
-validate.ts L17–27  isAnomalyArray       walks every item: metric:string, scope[],
-                                          change.value:number, change.direction∈{up,down},
-                                          change.baseline:string, severity∈SEVERITIES
-validate.ts L29–35  isDiagnosis          conclusion:string, evidence[], hypothesesConsidered[]
-validate.ts L42–53  isRecommendationArray every item: title, rationale,
-                                          bloomreachFeature∈FEATURES, steps[],
-                                          estimatedImpact, confidence∈CONFIDENCE  (id NOT checked)
+is-anomaly-array         walks every item: metric:string, scope[],
+                         change.value:number, change.direction ∈ {up,down},
+                         change.baseline:string, severity ∈ SEVERITIES
+is-diagnosis             conclusion:string, evidence[], hypothesesConsidered[]
+is-recommendation-array  every item: title, rationale,
+                         bloomreachFeature ∈ FEATURES, steps[],
+                         estimatedImpact, confidence ∈ CONFIDENCE  (id NOT checked)
 ```
 
-A guard returning `false` is not an error — it routes to the repair or the floor. `monitoring.ts` L91: `if (!isAnomalyArray(parsed)) return []`. The guard is the gate that decides whether the model's output is trustworthy enough to ship.
+A guard returning `false` is not an error — it routes to the repair or the floor. The monitoring agent does the simplest thing: `if not is_anomaly_array(parsed): return []`. The guard is the gate that decides whether the model's output is trustworthy enough to ship.
 
 ---
 
-### Repair: the clean-context `synthesize()` retry
+### Repair: the clean-context synthesize retry
 
 When the loop's final text doesn't parse-and-validate, the diagnostic and recommendation agents don't give up — they re-prompt on clean context:
 
 ```
-diagnostic.ts L73–77   return tryParseDiagnosis(finalText)
-                          ?? (await this.synthesize(anomaly, toolCalls))
-                          ?? FALLBACK;
+  return try_parse_diagnosis(final_text)
+         ?? await synthesize(anomaly, tool_calls)
+         ?? FALLBACK
 ```
 
-`synthesize()` (`diagnostic.ts` L82–121) is a *separate* `anthropic.messages.create` (L92) with **no tools and no loop history** — it formats the gathered evidence as text and asks for ONLY the JSON. Why a fresh call instead of one more loop turn: the loop history is full of `tool_use`/`tool_result` pairs and the model has momentum toward "I should query more." A clean single-turn call breaks that momentum. Recommendation has the identical structure (`recommendation.ts` L82–127, call at L96). Monitoring has no `synthesize()` — it degrades straight to `[]` (`monitoring.ts` L88–91), because an empty anomaly list is a safe, honest answer; a missing diagnosis is not.
+The synthesize path is a *separate* call to the provider SDK with **no tools and no loop history** — it formats the gathered evidence as text and asks for ONLY the JSON. Why a fresh call instead of one more loop turn: the loop history is full of `tool_use`/`tool_result` pairs and the model has momentum toward "I should query more." A clean single-turn call breaks that momentum. The recommendation agent has the identical structure. The monitoring agent has no synthesize path — it degrades straight to `[]`, because an empty anomaly list is a safe, honest answer; a missing diagnosis is not.
 
 ---
 
 ### The principle
 
-Prompt-instructed JSON is a defensible production choice when — and only when — you pair it with extract + validate + repair in your own code. The prompt makes the *request*; `parseAgentJson` + the guards + `synthesize()` make the *guarantee*. The cost is real (you own the parser, you pay for repair retries, you get shape-not-correctness), and the benefit is real (portable across any text model, fully unit-testable with fakes, no provider coupling on the output side). The fence-first ordering is the one detail that earns its place by experience, not by theory.
+Prompt-instructed JSON is a defensible production choice when — and only when — you pair it with extract + validate + repair in your own code. The prompt makes the *request*; the parser + the guards + the synthesize retry make the *guarantee*. The cost is real (you own the parser, you pay for repair retries, you get shape-not-correctness), and the benefit is real (portable across any text model, fully unit-testable with fakes, no provider coupling on the output side). The fence-first ordering is the one detail that earns its place by experience, not by theory.
 
 ---
 
@@ -189,31 +193,31 @@ This diagram spans the producer and the contract. The model emits prose-with-fen
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PRODUCER — the prompt requests JSON in PROSE                         │
-│   monitoring.md L69–97 · diagnostic.md L59–103 · recommendation.md L47–91 │
+│   monitoring · diagnostic · recommendation prompts (## Output)        │
 │   "Return ONLY a JSON … wrapped in a ```json fenced block"           │
-│   recommendation.md L82: "Do NOT include an id" (schema-shaping)     │
-│           │                                                          │
-│           ▼  finalText = "Here's …:\n```json\n[…]\n```\nLet me know" │
+│   recommendation: "Do NOT include an id" (schema-shaping)             │
+│           │                                                           │
+│           ▼  final_text = "Here's …:\n```json\n[…]\n```\nLet me know" │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  untrusted string
 ┌───────────────────────────▼───────────────────────────────────────────┐
-│  CONTRACT — extract + validate + repair  (lib/mcp/validate.ts)        │
+│  CONTRACT — extract + validate + repair  (validator module)           │
 │                                                                       │
-│  (1) EXTRACT  parseAgentJson  L3–13                                  │
-│       FENCE REGEX FIRST → bare parse → first-[/{-to-last-]/}-scan    │
-│       (fence-first = fix for courteous markdown-wrapping)            │
-│           │ unknown                                                  │
-│  (2) VALIDATE isAnomalyArray / isDiagnosis / isRecommendationArray   │
-│       L17–53   field-by-field; id intentionally NOT validated        │
-│           │ valid              │ false / threw                       │
-│           ▼                    ▼                                     │
-│      typed value         (3) REPAIR  synthesize()  diagnostic L82–121│
-│                              fresh create, NO tools, NO history      │
-│                                   │ valid        │ null              │
-│                                   ▼              ▼                   │
-│                              typed value   FALLBACK / []  (diag L15) │
+│  (1) EXTRACT  parse-agent-json                                        │
+│       FENCE REGEX FIRST → bare parse → first-[/{-to-last-]/}-scan     │
+│       (fence-first = fix for courteous markdown-wrapping)             │
+│           │ unknown                                                   │
+│  (2) VALIDATE is-anomaly-array / is-diagnosis / is-recommendation-array │
+│       field-by-field; id intentionally NOT validated                  │
+│           │ valid              │ false / threw                        │
+│           ▼                    ▼                                      │
+│      typed value         (3) REPAIR  synthesize  (diagnostic, rec)    │
+│                              fresh create, NO tools, NO history       │
+│                                   │ valid        │ null               │
+│                                   ▼              ▼                    │
+│                              typed value   FALLBACK / []              │
 │                                                                       │
-│  monitoring: NO synthesize → parse?validate? else [] (mon.ts L88–91) │
+│  monitoring: NO synthesize → parse?validate? else []                  │
 └────────────────────────────────────────────────────────────────────────┘
 
   prompt = the REQUEST (statistical).  contract = the GUARANTEE (enforced).
@@ -396,3 +400,4 @@ In `parseAgentJson`, what are the three extraction strategies in order, and what
 Updated: 2026-05-29 — Corrected the `## Output` section ranges (monitoring L69–97, diagnostic L59–103, recommendation L47–91) and the dependent in-section refs (fence asks → monitoring L71 / diagnostic L61 / recommendation L49; "Do NOT include an id" → recommendation L82; diagnostic empty-case shape L94–101). No placeholder injection table exists in this file (it lives in 01-anatomy.md), so `{categories}` was added there instead.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

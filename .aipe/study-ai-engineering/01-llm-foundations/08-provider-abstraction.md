@@ -44,82 +44,81 @@
 **Mental model.** Two narrow interfaces define the *shape* the agent layer depends on; concrete classes implement them for production; the agent layer receives an implementation by parameter and never constructs one. Swapping the implementation (real → fake) is a different argument, not a code change inside the consumer.
 
 ```
-consumer (runAgentLoop) depends on INTERFACES, not classes
+the shared agent loop depends on INTERFACES, not classes
       │
-  ┌───▼─── McpCaller ───────────────┐   ┌── anthropic param ──┐
-  │ callTool(name, args, opts?)      │   │ Anthropic SDK type   │
-  └──────────────────────────────────┘   └──────────────────────┘
+  ┌───▼─── McpCaller ───────────────┐   ┌── provider SDK param ──┐
+  │ callTool(name, args, opts?)      │   │ concrete SDK type       │
+  └──────────────────────────────────┘   └─────────────────────────┘
       ▲                    ▲                  ▲           ▲
-   McpClient          buildFakeMcp        real client   fake client
+   prod MCP client    buildFakeMcp        real client   fake client
    (production)        (tests)            (production)   (tests)
 
-  injection point: runAgentLoop({ anthropic, mcp, ... })
+  injection point: runAgentLoop({ provider_sdk, mcp, ... })
 ```
 
 The consumer is written once against the interface; production and tests differ only in what they pass in. That is dependency injection, and it is the entire mechanism.
 
 ---
 
-### The MCP seam: `McpTransport` and `McpCaller`
+### The MCP seam: the transport and caller interfaces
 
-There are two narrow interfaces, one nested inside the other's stack. `McpTransport` (`lib/mcp/transport.ts` L7–L10) is the minimal surface the *client* depends on — just `callTool` and `listTools`:
-
-```typescript
-export interface McpTransport {
-  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
-  listTools(): Promise<unknown>;
-}
-```
-
-`SdkTransport` (`lib/mcp/transport.ts` L41–L74) is the production implementation that wraps the real MCP SDK `Client`. A test passes a fake `McpTransport` instead. `SdkTransport` also carries an optional `HttpErrorHolder` (`transport.ts` L15–L17) populated by `makeCapturingFetch` (L24–L36) — a `fetch` wrapper handed to the SDK that records the body of any non-OK HTTP response (cloning so the SDK can still read it). On a failed `callTool`/`listTools`, `SdkTransport` attaches that captured body to the thrown error (L52–L58, L66–L72) so callers see the real server message instead of a bare "Unauthorized." This is error-detail plumbing *behind* the same narrow interface — it does not change the seam's shape (`callTool`/`listTools` still return `Promise<unknown>`), so test fakes are unaffected.
-
-`McpCaller` (`lib/agents/base.ts` L16–L22) is the interface the *agent loop* depends on — the richer caller surface with caching/timing metadata:
-
-```typescript
-export interface McpCaller {
-  callTool(
-    name: string,
-    args: Record<string, unknown>,
-    opts?: { cacheTtlMs?: number; skipCache?: boolean },
-  ): Promise<{ result: unknown; durationMs: number; fromCache: boolean }>;
-}
-```
-
-The comment on L11–L14 states the intent explicitly: "Minimal structural interface for an MCP caller so that unit tests can inject a fake without depending on the concrete McpClient class or any network. McpClient structurally satisfies this interface." The production `McpClient` is not even named in the interface — it just *structurally* matches, so a hand-written fake matches too.
+There are two narrow interfaces, one nested inside the other's stack. The transport interface is the minimal surface the *client wrapper* depends on — just `callTool` and `listTools`:
 
 ```
-McpTransport  ── SdkTransport (wraps SDK Client)   ── prod
-              ── fake transport                      ── tests
-McpCaller     ── McpClient (structural match)        ── prod
-              ── buildFakeMcp / scripted object       ── tests
+  interface McpTransport:
+      callTool(name, args)  -> Promise<unknown>
+      listTools()           -> Promise<unknown>
+```
+
+The production transport wraps the real MCP SDK client. A test passes a fake transport instead. The production transport also carries an optional HTTP-error holder populated by a capturing `fetch` wrapper handed to the SDK — it records the body of any non-OK HTTP response (cloning so the SDK can still read it). On a failed call, the transport attaches that captured body to the thrown error so callers see the real server message instead of a bare "Unauthorized." This is error-detail plumbing *behind* the same narrow interface — it does not change the seam's shape (`callTool` / `listTools` still return `Promise<unknown>`), so test fakes are unaffected.
+
+The agent-facing caller interface is what the *agent loop* depends on — the richer caller surface with caching / timing metadata:
+
+```
+  interface McpCaller:
+      callTool(
+        name,
+        args,
+        opts?: { cacheTtlMs?: number, skipCache?: boolean },
+      ) -> Promise<{ result: unknown, durationMs: number, fromCache: boolean }>
+```
+
+The intent is explicit in the comment alongside: "Minimal structural interface for an MCP caller so that unit tests can inject a fake without depending on the concrete MCP client class or any network. The production client structurally satisfies this interface." The production client is not even named in the interface — it just *structurally* matches, so a hand-written fake matches too.
+
+```
+McpTransport  ── production transport (wraps SDK Client)   ── prod
+              ── fake transport                              ── tests
+McpCaller     ── production MCP client (structural match)   ── prod
+              ── buildFakeMcp / scripted object              ── tests
 ```
 
 ---
 
-### The Anthropic seam: an injected parameter
+### The provider seam: an injected parameter
 
-`runAgentLoop` takes `anthropic: Anthropic` as the first field of its options (`lib/agents/base.ts` L48–L49):
-
-```typescript
-export async function runAgentLoop(opts: {
-  anthropic: Anthropic;
-  mcp: McpCaller;
-  ...
-```
-
-The loop never calls `new Anthropic(...)`. It uses the injected instance at the one call site (`lib/agents/base.ts` L102):
-
-```typescript
-const res = await anthropic.messages.create(params);
-```
-
-In production, the route constructs the real client once and passes it down (`app/api/agent/route.ts` L207): `const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })`, then hands it to each agent's constructor. In tests, a fake object with a `messages.create` method that returns scripted content blocks is passed instead — no key, no network. Every agent (`DiagnosticAgent`, `RecommendationAgent`, etc.) takes `anthropic` as a constructor argument, propagating the seam from the route down to the loop.
+The shared agent loop takes the provider SDK client as the first field of its options:
 
 ```
-route: new Anthropic({apiKey})  ──┐
-                                  ├──▶ new DiagnosticAgent(anthropic, mcp, ...)
-test:  fakeAnthropic            ──┘        └──▶ runAgentLoop({ anthropic, mcp, ... })
-                                                       anthropic.messages.create()  L102
+  async function runAgentLoop(opts: {
+      anthropic: ProviderSDK,
+      mcp:       McpCaller,
+      ...
+  })
+```
+
+The loop never constructs the provider SDK. It uses the injected instance at the one call site:
+
+```
+  response = await provider_sdk.messages.create(params)
+```
+
+In production, the route constructs the real client once and passes it down: `new ProviderSDK({ apiKey: env.API_KEY })`, then hands it to each agent's constructor. In tests, a fake object with a `messages.create` method that returns scripted content blocks is passed instead — no key, no network. Every agent takes the provider SDK as a constructor argument, propagating the seam from the route down to the loop.
+
+```
+route: new ProviderSDK({apiKey}) ──┐
+                                   ├──▶ new DiagnosticAgent(sdk, mcp, ...)
+test:  fakeProviderSDK           ──┘        └──▶ runAgentLoop({ sdk, mcp, ... })
+                                                       sdk.messages.create()
 ```
 
 ---
@@ -129,13 +128,13 @@ test:  fakeAnthropic            ──┘        └──▶ runAgentLoop({ ant
 ```
 WHAT EXISTS (testability seam)         WHAT DOES NOT (provider portability)
 ────────────────────────────────      ──────────────────────────────────────
-inject Anthropic by param              a Provider interface (chat/complete)
+inject provider SDK by param           a Provider interface (chat/complete)
 inject McpCaller by param              an OpenAI/Gemini implementation of it
 fakes in tests, no network             a factory: pickProvider(name) → impl
 AGENT_MODEL is a hard-coded const      model/provider chosen at runtime/config
 ```
 
-The injected `anthropic` parameter is typed as the concrete `Anthropic` SDK type — not a vendor-neutral `LLMProvider` interface. The loop calls `anthropic.messages.create` with Anthropic-shaped params (`messages`, `tools`, `tool_use` blocks). Swapping in OpenAI would require translating message shapes, tool-call formats, and response parsing — there is no abstraction over that, and no factory to select a provider. The curriculum's "swap Claude ↔ OpenAI" is a **Case B** capability here: study material and a buildable target, not something the codebase does.
+The injected provider parameter is typed as the *concrete* provider SDK type — not a vendor-neutral `LLMProvider` interface. The loop calls `messages.create` with the provider's specific message / tool / tool-use shapes. Swapping in another vendor would require translating message shapes, tool-call formats, and response parsing — there is no abstraction over that, and no factory to select a provider. The curriculum's "swap one vendor for another" is a **Case B** capability here: study material and a buildable target, not something the codebase does.
 
 What the seam *does* enable, fully and well, is the thing that matters most for a 169-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
 
@@ -143,7 +142,7 @@ What the seam *does* enable, fully and well, is the thing that matters most for 
 
 ### The principle
 
-Inject your dependencies behind a narrow interface and you get testability for free; you get *portability* only if the interface is also vendor-neutral. blooming insights took the first half deliberately — the seam exists to inject fakes, and the interfaces (`McpCaller`, the `anthropic` param) are exactly as wide as the consumer needs — and stopped short of the second half, because there is one provider and no requirement to switch. Naming that boundary honestly is the point: this is a test seam, and a real provider factory is the next step, not a present feature.
+Inject your dependencies behind a narrow interface and you get testability for free; you get *portability* only if the interface is also vendor-neutral. You take the first half deliberately — the seam exists to inject fakes, and the interfaces are exactly as wide as the consumer needs — and stop short of the second half if there is one provider and no requirement to switch. Naming that boundary honestly is the point: this is a test seam, and a real provider factory is the next step, not a present feature.
 
 ---
 
@@ -156,7 +155,7 @@ This diagram spans the route (constructs real clients), the agent layer (depends
 │  ROUTE / TEST (where implementations are chosen)                     │
 │                                                                       │
 │  PRODUCTION  app/api/agent/route.ts                                  │
-│    new Anthropic({apiKey})  L207 ──┐                                 │
+│    new Anthropic({apiKey}) ──┐                                 │
 │    connectMcp → McpClient        ──┤                                 │
 │  TEST                              │                                 │
 │    fakeAnthropic { messages.create }──┤   inject                     │
@@ -166,11 +165,11 @@ This diagram spans the route (constructs real clients), the agent layer (depends
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  AGENT LAYER (depends on INTERFACES, constructs nothing)            │
 │                                                                       │
-│  runAgentLoop({ anthropic: Anthropic, mcp: McpCaller, ... })  L48–62 │
-│     anthropic.messages.create(params)              base.ts L102      │
-│     mcp.callTool(name, args)                       base.ts L144      │
+│  runAgentLoop({ anthropic: Anthropic, mcp: McpCaller, ... })         │
+│     anthropic.messages.create(params)              base.ts           │
+│     mcp.callTool(name, args)                       base.ts           │
 │                                                                       │
-│  interfaces:  McpCaller  base.ts L16–22                              │
+│  interfaces:  McpCaller  base.ts                                     │
 │               McpTransport  transport.ts L7–10                       │
 │  NOTE: `anthropic` is the CONCRETE SDK type — not a vendor-neutral   │
 │         LLMProvider. No factory. Single provider.                    │
@@ -337,3 +336,4 @@ Updated: 2026-05-28 — Documented the transport's `HttpErrorHolder`/`makeCaptur
 Updated: 2026-05-29 — Test count 157→169 (both occurrences).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

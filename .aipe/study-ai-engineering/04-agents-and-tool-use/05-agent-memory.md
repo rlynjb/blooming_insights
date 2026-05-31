@@ -53,27 +53,27 @@ messages: MessageParam[]                 getCachedInvestigation(insightId)
 discarded when runAgentLoop returns      exact-key match, no similarity
 ```
 
-The short-term array is *built fresh* every run (`base.ts` L79) and never persisted as a conversation. The long-term store persists *events* (the streamed trace), not the conversation — so "replaying an investigation" replays the rendered output, not the model's internal `messages`.
+The short-term array is *built fresh* every run and never persisted as a conversation. The long-term store persists *events* (the streamed trace), not the conversation — so "replaying an investigation" replays the rendered output, not the model's internal `messages`.
 
 ---
 
 ### Short-term memory — the messages array within one run
 
-`runAgentLoop` initializes `messages` with the user prompt (`base.ts` L79–L81) and grows it across turns: each assistant turn is appended (L105), and each batch of tool results is appended as a user turn (L171). The model sees the *entire* array on every `anthropic.messages.create` call (L99), which is why it can reason over its own prior queries and their results.
+The shared agent loop initializes `messages` with the user prompt and grows it across turns: each assistant turn is appended, and each batch of tool results is appended as a user turn. The model sees the *entire* array on every `messages.create` call, which is why it can reason over its own prior queries and their results.
 
 ```
-base.ts — messages accumulation
+messages accumulation in the agent loop
 ─────────────────────────────────────────────────────────────
- messages = [{ role:'user', content: userPrompt }]      L79–81  ← born here
+ messages = [{ role: "user", content: userPrompt }]  ← born here
  for turn in maxTurns:
-   res = create({ ..., messages })                      L99/102  ← model sees ALL of it
-   messages.push({ role:'assistant', content: res.content })  L105
+   res = create({ ..., messages })                   ← model sees ALL of it
+   messages.push({ role: "assistant", content: res.content })
    ... run tools ...
-   messages.push({ role:'user', content: toolResults }) L171   ← Observation appended
- return { finalText, toolCalls }                         L123/175 ← messages discarded
+   messages.push({ role: "user", content: toolResults })   ← Observation appended
+ return { finalText, toolCalls }                     ← messages discarded
 ```
 
-The lifecycle is the whole point: `messages` is a local `const` inside `runAgentLoop`. When the function returns, the array is garbage-collected. There is no persistence of the conversation, no carry-over to the next run, no shared scratchpad between agents. The diagnostic agent's `messages` and the recommendation agent's `messages` are entirely separate arrays — the only thing that crosses between them is the `diagnosis` object the route passes as an argument (01-agents-vs-chains.md). Short-term memory is per-run, per-agent, and ephemeral.
+The lifecycle is the whole point: `messages` is a local `const` inside the agent loop. When the function returns, the array is garbage-collected. There is no persistence of the conversation, no carry-over to the next run, no shared scratchpad between agents. The diagnostic agent's `messages` and the recommendation agent's `messages` are entirely separate arrays — the only thing that crosses between them is the `diagnosis` object the route passes as an argument (01-agents-vs-chains.md). Short-term memory is per-run, per-agent, and ephemeral.
 
 ```
 working-memory lifecycle
@@ -87,28 +87,30 @@ working-memory lifecycle
 
 ### Long-term memory — exact-keyed snapshot replay
 
-`lib/state/investigations.ts` is the durable layer. It stores the *streamed event list* of a completed investigation, keyed by `insightId`, and replays it on a later request. `getCachedInvestigation` (L22–L28) is a three-tier fallback lookup:
+The investigations state module is the durable layer. It stores the *streamed event list* of a completed investigation, keyed by `insightId`, and replays it on a later request. The cached-investigation lookup is a three-tier fallback:
 
 ```
-investigations.ts — getCachedInvestigation(insightId)   (L22–L28)
+  function get_cached_investigation(insightId):
+      if mem.has(insightId):                                  ← in-process Map
+          return mem.get(insightId)
+      fromFile = (PERSIST ? readJson(CACHE_FILE)[insightId]   ← dev file, dev only
+                          : undefined)
+      if fromFile:
+          return fromFile
+      return readJson(DEMO_FILE)[insightId] ?? null           ← committed seed, or null
+```
+
+The save path writes to the in-process `Map` always, and to the dev cache file only when `PERSIST` (the dev-mode flag) is true — because serverless filesystems are read-only in production. The route writes the collected events only after the *combined* `step==null` capture run completes (the split live steps hand off via the client's sessionStorage instead) and replays them on a cache hit, filtering the snapshot to the requested step via a per-step filter and pacing each event by `REPLAY_DELAY_MS = 180` so the replayed trace looks like a live run.
+
+```
+the route's replay branch
 ─────────────────────────────────────────────────────────────
- 1. if mem.has(insightId)  return mem.get(insightId)      ← in-process Map (L23)
- 2. fromFile = PERSIST ? readJson(CACHE_FILE)[insightId]  ← dev file, dev only (L24)
- 3. fromDemo = readJson(DEMO_FILE)[insightId]             ← committed seed (L26)
- return fromDemo ?? null                                   ← exact key or nothing (L27)
-```
-
-`saveInvestigation` (L30–L41) writes to the in-process `Map` always, and to the dev cache file only when `PERSIST` (`NODE_ENV === 'development'`, L7) — because serverless filesystems are read-only in production. The route writes the collected events only after the *combined* `step==null` capture run completes (`route.ts` L254 — the split live steps hand off via the client's sessionStorage instead) and replays them on a cache hit (`route.ts` L127–L141), filtering the snapshot to the requested step via `filterByStep(cached, step)` (L129) and pacing each event by `REPLAY_DELAY_MS = 180` (L105) so the replayed trace looks like a live run.
-
-```
-route.ts — replay branch   (L127–L141)
-─────────────────────────────────────────────────────────────
- cached = getCachedInvestigation(insightId)            L127
+ cached = get_cached_investigation(insightId)
  if cached:
-   events = step ? filterByStep(cached, step) : cached  L129  ← per-step slice
-   for e of events:
-     enqueue(encodeEvent(e))                            L134
-     await sleep(REPLAY_DELAY_MS = 180)                 L135  ← paced replay
+     events = step ? filterByStep(cached, step) : cached   ← per-step slice
+     for e in events:
+         enqueue(encode_event(e))
+         await sleep(REPLAY_DELAY_MS = 180)                ← paced replay
 ```
 
 The key property: this is **exact-keyed snapshot replay**. The lookup is `mem.get(insightId)` — a hash lookup on an exact string. There is no notion of "similar" `insightId`s, no ranking, no distance. Either the exact `insightId` was investigated before (hit, instant replay) or it was not (miss, run live). It is `localStorage` semantics, not search semantics.
@@ -117,26 +119,26 @@ The key property: this is **exact-keyed snapshot replay**. The lookup is `mem.ge
 
 ### Cross-step memory — the diagnosis handed across HTTP requests
 
-There is a *third* memory location, distinct from both the per-run `messages` array and the long-term snapshot store: the diagnosis the two-step investigation carries from step 2 (diagnose) to step 3 (recommend). The two steps are separate HTTP requests — `?step=diagnose` then `?step=recommend` — so the diagnosis cannot live in the agent's in-loop `messages` (that array is GC'd when the diagnose request returns) and is not yet in the long-term store (the disk write only fires on the combined `step==null` capture run, `route.ts` L254). It lives, for the span between two requests, in the browser's `sessionStorage`.
+There is a *third* memory location, distinct from both the per-run `messages` array and the long-term snapshot store: the diagnosis the two-step investigation carries from step 2 (diagnose) to step 3 (recommend). The two steps are separate HTTP requests — `?step=diagnose` then `?step=recommend` — so the diagnosis cannot live in the agent's in-loop `messages` (that array is GC'd when the diagnose request returns) and is not yet in the long-term store (the disk write only fires on the combined `step==null` capture run). It lives, for the span between two requests, in the browser's `sessionStorage`.
 
 ```
 cross-step handoff (live two-step path)
 ─────────────────────────────────────────────────────────────────
  REQUEST 1  GET /api/agent?step=diagnose
    route runs DiagnosticAgent.investigate → sends {type:'diagnosis'}
-   client (useInvestigation.ts) on 'done':
-     sessionStorage['bi:diag:<id>'] = JSON.stringify({ diagnosis })   L138–139
+   client (the investigation hook) on 'done':
+     sessionStorage['bi:diag:<id>'] = JSON.stringify({ diagnosis })
                        │  diagnosis serialized, survives route change
                        ▼
  REQUEST 2  GET /api/agent?step=recommend&diagnosis=<…>
-   route: parseDiagnosis(diagnosisParam) ← re-hydrated from the client  L227
+   route: parse_diagnosis(diagnosisParam) ← re-hydrated from the client
    RecommendationAgent.propose(inv, diagnosis)   ← step 3 reads step 2
 
  (demo path) cached snapshot replayed FILTERED to the step:
-   getCachedInvestigation(id) → filterByStep(cached, step)   L127/L129
+   get_cached_investigation(id) → filterByStep(cached, step)
 ```
 
-This is agent memory carried *across HTTP requests and a route change*, not within an agent loop. In-loop message memory (the `messages` array above) is the model reasoning over its own turns inside one request; this is the orchestration layer persisting one node's typed output so the next node — running in a *later* request, after the user has advanced to step 3 — can consume it. On the demo path there is no live agent at all: the cached snapshot is replayed `filterByStep(cached, step)` (`route.ts` L129) so step 3 replays only the recommendation slice. So the diagnosis crosses the step boundary by exactly one of two routes — `sessionStorage` re-hydration on the live path, or a step-filtered snapshot replay on the demo path — neither of which is the agent's working memory. It is the chain's handoff (01-agents-vs-chains.md) made durable across the gap between two requests.
+This is agent memory carried *across HTTP requests and a route change*, not within an agent loop. In-loop message memory (the `messages` array above) is the model reasoning over its own turns inside one request; this is the orchestration layer persisting one node's typed output so the next node — running in a *later* request, after the user has advanced to step 3 — can consume it. On the demo path there is no live agent at all: the cached snapshot is replayed step-filtered so step 3 replays only the recommendation slice. So the diagnosis crosses the step boundary by exactly one of two routes — `sessionStorage` re-hydration on the live path, or a step-filtered snapshot replay on the demo path — neither of which is the agent's working memory. It is the chain's handoff (01-agents-vs-chains.md) made durable across the gap between two requests.
 
 ---
 
@@ -152,19 +154,19 @@ getCachedInvestigation(id)           findSimilarInvestigations(anomaly)
   hit or miss, no ranking              "we saw this on mobile in March…"
 ```
 
-This is the **RAG-inside-an-agent** pattern — giving an agent semantic recall over its own history — and blooming insights deliberately does not have it. The honest framing: the codebase chose live MCP retrieval + exact-key caching over an embedding store, the same "no RAG until a feature needs it" decision documented in ../03-retrieval-and-rag/. Semantic memory is the primary buildable target in the exercises below.
+This is the **RAG-inside-an-agent** pattern — giving an agent semantic recall over its own history — and this system deliberately does not have it. The honest framing: the codebase chose live tool retrieval + exact-key caching over an embedding store, the same "no RAG until a feature needs it" decision documented in ../03-retrieval-and-rag/. Semantic memory is the primary buildable target in the exercises below.
 
 ---
 
 ### Current state vs future state
 
-Today, long-term memory serves one job: make a repeat visit to a known investigation instant and demo-able (the committed `DEMO_FILE` seed means the demo works with no API key). It does not serve learning — the agent does not get smarter from past investigations, because it cannot retrieve them by similarity. The future state is a semantic layer: embed each anomaly + diagnosis, store the vectors, and on a new anomaly retrieve the k most similar past investigations to seed the diagnostic agent's prompt. That turns durable memory from a replay cache into an experience base — and it is exactly the RAG pattern, which is why it lives at the boundary of this section and ../03-retrieval-and-rag/.
+Today, long-term memory serves one job: make a repeat visit to a known investigation instant and demo-able (the committed demo-snapshot seed means the demo works with no API key). It does not serve learning — the agent does not get smarter from past investigations, because it cannot retrieve them by similarity. The future state is a semantic layer: embed each anomaly + diagnosis, store the vectors, and on a new anomaly retrieve the k most similar past investigations to seed the diagnostic agent's prompt. That turns durable memory from a replay cache into an experience base — and it is exactly the RAG pattern, which is why it lives at the boundary of this section and ../03-retrieval-and-rag/.
 
 ---
 
 ### The principle
 
-**Match the memory's storage shape to the access pattern you actually need.** blooming insights needs "show me this exact investigation again, instantly" — an exact-key lookup — so it uses a keyed `Map`/file, the simplest thing that serves that access pattern. It does *not* yet need "find me investigations like this one," so it does not pay for a vector store. The mistake is reaching for semantic memory because it sounds powerful; the discipline is using exact-key storage until a feature genuinely requires similarity. Short-term memory follows the same rule: the `messages` array is the simplest structure that serves multi-step reasoning, and it is discarded the moment the run that needs it ends.
+**Match the memory's storage shape to the access pattern you actually need.** You need "show me this exact investigation again, instantly" — an exact-key lookup — so you use a keyed `Map` / file, the simplest thing that serves that access pattern. You do *not* yet need "find me investigations like this one," so you do not pay for a vector store. The mistake is reaching for semantic memory because it sounds powerful; the discipline is using exact-key storage until a feature genuinely requires similarity. Short-term memory follows the same rule: the `messages` array is the simplest structure that serves multi-step reasoning, and it is discarded the moment the run that needs it ends.
 
 ---
 
@@ -176,11 +178,11 @@ The diagram spans three layers. The Agent layer holds short-term memory (the per
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ROUTE LAYER   app/api/agent/route.ts                                 │
 │                                                                       │
-│  on entry:  cached = getCachedInvestigation(insightId)  L127         │
-│             if hit → filterByStep(cached, step), replay  L129–135     │
+│  on entry:  cached = getCachedInvestigation(insightId)               │
+│             if hit → filterByStep(cached, step), replay               │
 │                      (paced 180ms)                       ← long-term   │
 │             if miss → run agents live (per ?step)                     │
-│  on done:   if step==null: saveInvestigation(id, …)  L254  ← write    │
+│  on done:   if step==null: saveInvestigation(id, …)  ← write    │
 └───────────┬───────────────────────────────────────┬───────────────────┘
    write/read│ (long-term)             run live      │
 ┌───────────▼───────────────────────┐  ┌─────────────▼───────────────────┐
@@ -188,11 +190,11 @@ The diagram spans three layers. The Agent layer holds short-term memory (the per
 │  lib/state/investigations.ts       │  │  lib/agents/base.ts runAgentLoop │
 │                                    │  │                                  │
 │  getCachedInvestigation(insightId):│  │  messages: MessageParam[]        │
-│   1. mem.get(id)   ← process Map   │  │  [0] user prompt        L79      │
-│   2. CACHE_FILE    ← dev file      │  │  [+] assistant turns    L105     │
-│   3. DEMO_FILE     ← committed seed │  │  [+] user tool_results  L171     │
-│   exact key → snapshot OR null     │  │  model sees ALL each turn L99    │
-│                                    │  │  discarded on return    L123/175 │
+│   1. mem.get(id)   ← process Map   │  │  [0] user prompt                 │
+│   2. CACHE_FILE    ← dev file      │  │  [+] assistant turns             │
+│   3. DEMO_FILE     ← committed seed │  │  [+] user tool_results           │
+│   exact key → snapshot OR null     │  │  model sees ALL each turn        │
+│                                    │  │  discarded on return              │
 │  (NO embeddings, NO similarity)    │  │  (per-run, per-agent, ephemeral) │
 └────────────────────────────────────┘  └──────────────────────────────────┘
 ```
@@ -382,3 +384,4 @@ Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: re
 Updated: 2026-05-29 — Added a "cross-step memory" sub-section (with diagram) on the two-step investigation's diagnosis handoff: step 2 serializes to `sessionStorage['bi:diag:<id>']` (useInvestigation.ts L138–139), step 3 re-hydrates via `parseDiagnosis` (route.ts L227); demo path replays the snapshot `filterByStep` (route.ts L129). Framed as memory carried across HTTP requests, distinct from in-loop message memory.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

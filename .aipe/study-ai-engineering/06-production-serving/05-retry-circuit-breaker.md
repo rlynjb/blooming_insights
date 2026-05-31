@@ -53,28 +53,29 @@
  amplifies a real outage             stops the retry flood during outage
 ```
 
-The gap: blooming insights' retry loop is correct for a blip but, with no breaker, turns a sustained Bloomreach outage into N callers each grinding through 3 retries before failing — exactly the amplification a breaker prevents.
+The gap: this system's retry loop is correct for a blip but, with no breaker, turns a sustained backend outage into N callers each grinding through 3 retries before failing — exactly the amplification a breaker prevents.
 
 ---
 
-### Bounded rate-limit retry (`callTool`)
+### Bounded rate-limit retry (the retry loop)
 
-After the first live call, `callTool` checks whether the result is a rate-limit error and, if so, retries up to a bound, computing each wait from the server's stated Retry-After window when present, else exponential backoff.
+After the first live call, the retry loop checks whether the result is a rate-limit error and, if so, retries up to a bound, computing each wait from the server's stated Retry-After window when present, else exponential backoff.
 
 ```
- callTool:                                          lib/mcp/client.ts
-   result = liveCall(name, args)                    L113
-   retries = 0
-   while isRateLimited(result) && retries < maxRetries:   L122
-     retries++                                      L123
-     hintMs   = parseRetryAfterMs(result)           L124  ← parsed "Retry after N s"
-     backoffMs = retryDelayMs · 2^(retries-1)        L125  ← exponential off 10s base
-     waitMs   = min(hintMs ? hintMs+500 : backoffMs, retryCeilingMs)  L126–129
-     await sleep(waitMs)                            L130
-     result = liveCall(name, args)                  L131
+  function callTool(name, args):
+      result  = live_call(name, args)
+      retries = 0
+      while is_rate_limited(result) and retries < maxRetries:
+          retries  += 1
+          hintMs    = parse_retry_after_ms(result)             # parsed "Retry after N s"
+          backoffMs = retryDelayMs * 2 ** (retries - 1)         # exponential off 10s base
+          waitMs    = min(hintMs ? hintMs + 500 : backoffMs,    # capped
+                          retryCeilingMs)
+          await sleep(waitMs)
+          result    = live_call(name, args)
 ```
 
-The loop is at `lib/mcp/client.ts` L122–L132. `isRateLimited` (L18–L22) returns true only when the result has `isError: true` and its text matches `/rate limit|too many requests/i` — so the retry targets exactly the recoverable case, not every error. `maxRetries = 3` (constructor default, `lib/mcp/client.ts` L89) bounds the loop. The wait is computed two ways and the smaller-of-(chosen, ceiling) wins: `parseRetryAfterMs` (L31–L38) pulls a window out of the error text (`"Retry after ~12 second"` → 12_000, `"per 10 second"` → 10_000) and, when present, the loop waits that hint plus a `RETRY_BUFFER_MS = 500` cushion (L16) so the retry lands *after* the penalty clears; when no hint parses, it falls back to exponential backoff `retryDelayMs · 2^(retries-1)` off a 10s base (`retryDelayMs ?? 10_000`, L93). Every wait is capped at `retryCeilingMs = 20_000` (L94). Each retry re-enters `liveCall`, which re-applies the 1100 ms spacing gate (see `04-rate-limiting-backpressure.md`), so a retry never violates the rate limit.
+`isRateLimited` returns true only when the result has `isError: true` and its text matches `/rate limit|too many requests/i` — so the retry targets exactly the recoverable case, not every error. `maxRetries = 3` (constructor default) bounds the loop. The wait is computed two ways and the smaller-of-(chosen, ceiling) wins: `parseRetryAfterMs` pulls a window out of the error text (`"Retry after ~12 second"` → 12_000, `"per 10 second"` → 10_000) and, when present, the loop waits that hint plus a `RETRY_BUFFER_MS = 500` cushion so the retry lands *after* the penalty clears; when no hint parses, it falls back to exponential backoff `retryDelayMs * 2 ** (retries - 1)` off a 10s base (`retryDelayMs ?? 10_000`). Every wait is capped at `retryCeilingMs = 20_000`. Each retry re-enters the live-call path, which re-applies the 1100 ms spacing gate (see `04-rate-limiting-backpressure.md`), so a retry never violates the rate limit.
 
 ```
   liveCall → result
@@ -106,13 +107,13 @@ The wait grows with each retry (the parsed hint is preferred; otherwise 10s, 20s
  attempt 4                           attempt 4
 ```
 
-The backoff is real: the wait doubles off the 10s base and is capped at the 20s ceiling, giving a struggling upstream progressively more room — and the parsed Retry-After window is honored when the server states one, which is better than blind backoff. The one missing refinement is **jitter**: if many callers all hit a 429 at the same moment and all compute the same wait, they wake and retry *simultaneously* — a synchronized burst (thundering herd) that can re-trigger the same rate limit. Jitter (randomizing each delay) desynchronizes them. The `connect.ts` comment (L81–L88) documents the spacing-vs-window tradeoff and the parsed-hint design — backoff and Retry-After are built; jitter is the remaining hardening.
+The backoff is real: the wait doubles off the 10s base and is capped at the 20s ceiling, giving a struggling upstream progressively more room — and the parsed Retry-After window is honored when the server states one, which is better than blind backoff. The one missing refinement is **jitter**: if many callers all hit a 429 at the same moment and all compute the same wait, they wake and retry *simultaneously* — a synchronized burst (thundering herd) that can re-trigger the same rate limit. Jitter (randomizing each delay) desynchronizes them. The connect-MCP helper's comment documents the spacing-vs-window tradeoff and the parsed-hint design — backoff and Retry-After are built; jitter is the remaining hardening.
 
 ---
 
 ### The bigger gap — no circuit breaker
 
-The retry loop assumes the failure is transient. During a *sustained* Bloomreach outage, that assumption is false, and the loop becomes a liability: every `callTool` runs its full 4-attempt sequence — with the exponential backoff capped at 20s, the three waits are ~10s + 20s + 20s, so ≈ 1100 + 50_000 ≈ 51s of waiting — before failing, for every call, of every agent, of every run.
+The retry loop assumes the failure is transient. During a *sustained* backend outage, that assumption is false, and the loop becomes a liability: every tool call runs its full 4-attempt sequence — with the exponential backoff capped at 20s, the three waits are ~10s + 20s + 20s, so ≈ 1100 + 50_000 ≈ 51s of waiting — before failing, for every call, of every agent, of every run.
 
 ```
  NO BREAKER (current):
@@ -127,7 +128,7 @@ The retry loop assumes the failure is transient. During a *sustained* Bloomreach
    after cooldown: half-open → one probe → close if it succeeds
 ```
 
-A circuit breaker tracks recent failures. After a threshold of consecutive failures it **opens** — subsequent calls fail immediately without touching the network or the retry loop. After a cooldown it goes **half-open**, letting one probe through; success **closes** it (resume normal calls), failure re-opens it. This converts a slow, repeated, amplifying failure into a fast, cheap one — and stops the retry flood from worsening the outage. blooming insights has none of this: there is no failure counter, no open/closed state, no fast-fail path.
+A circuit breaker tracks recent failures. After a threshold of consecutive failures it **opens** — subsequent calls fail immediately without touching the network or the retry loop. After a cooldown it goes **half-open**, letting one probe through; success **closes** it (resume normal calls), failure re-opens it. This converts a slow, repeated, amplifying failure into a fast, cheap one — and stops the retry flood from worsening the outage. This system has none of this: there is no failure counter, no open/closed state, no fast-fail path.
 
 ---
 
@@ -151,7 +152,7 @@ One refinement and one new mechanism are missing: jitter (randomize the backoff)
 
 ### The principle
 
-Retry recovers from transient failure; a circuit breaker protects against sustained failure — and a flood of retries without a breaker amplifies an outage instead of surviving it. The bounded, targeted, Retry-After-aware retry blooming insights built — backing off exponentially off a 10s base — is the correct foundation. The remaining refinement (jitter to desynchronize concurrent retries) and the breaker (to fail fast and stop hammering a dead upstream) are what turn a retry that *works for a blip* into one that *survives an outage*. The lesson generalizes: every retry loop needs a bound, and every bounded retry that runs at scale needs a breaker in front of it.
+Retry recovers from transient failure; a circuit breaker protects against sustained failure — and a flood of retries without a breaker amplifies an outage instead of surviving it. The bounded, targeted, Retry-After-aware retry you built — backing off exponentially off a 10s base — is the correct foundation. The remaining refinement (jitter to desynchronize concurrent retries) and the breaker (to fail fast and stop hammering a dead upstream) are what turn a retry that *works for a blip* into one that *survives an outage*. The lesson generalizes: every retry loop needs a bound, and every bounded retry that runs at scale needs a breaker in front of it.
 
 ---
 
@@ -162,7 +163,7 @@ This diagram spans the Agent, Service, and Provider layers. The retry loop (with
 ```
   ┌────────────────────────────────────────────────────────────────────┐
   │  AGENT LAYER   lib/agents/base.ts                                    │
-  │  mcp.callTool(name, args)   L144                                     │
+  │  mcp.callTool(name, args)                                            │
   └───────┼──────────────────────────────────────────────────────────────┘
           │
   ┌───────▼──────────────────────────────────────────────────────────────┐
@@ -171,21 +172,21 @@ This diagram spans the Agent, Service, and Provider layers. The retry loop (with
   │  ╎ BREAKER  (ABSENT): if open → fail fast, skip call entirely ╎       │
   │       │ (no breaker today)                                            │
   │  ┌────▼─────────────────────────────────────────────┐               │
-  │  │  result = liveCall   L113  (applies 1100ms spacing)│               │
+  │  │  result = liveCall  (applies 1100ms spacing)│               │
   │  └────┬─────────────────────────────────────────────┘               │
   │       │                                                               │
   │  ┌────▼──────────────────────────────────────────────────┐          │
   │  │  Retry loop  (BUILT)                                    │          │
-  │  │  while isRateLimited(result) && retries < 3:  L122     │          │
-  │  │    retries++                                  L123      │          │
-  │  │    hint = parseRetryAfterMs(result)           L124      │          │
-  │  │    backoff = 10s · 2^(retries-1)              L125      │          │
+  │  │  while isRateLimited(result) && retries < 3:           │          │
+  │  │    retries++                                            │          │
+  │  │    hint = parseRetryAfterMs(result)                     │          │
+  │  │    backoff = 10s · 2^(retries-1)                        │          │
   │  │    wait = min(hint+500 ?? backoff, 20s)  ── no jitter   │          │
-  │  │    sleep(wait); result = liveCall             L130–131  │          │
+  │  │    sleep(wait); result = liveCall                       │          │
   │  └────┬──────────────────────────────────────────────────┘          │
-  │       │ isRateLimited test: isError && /rate limit/i   L18–L22       │
-  │       │ maxRetries=3 L89, retryDelayMs=10_000 L93, ceiling=20_000 L94│
-  │       │ RETRY_BUFFER_MS=500 L16, parseRetryAfterMs L31–L38           │
+  │       │ isRateLimited test: isError && /rate limit/i                 │
+  │       │ maxRetries=3, retryDelayMs=10_000, ceiling=20_000    │
+  │       │ RETRY_BUFFER_MS=500, parseRetryAfterMs                   │
   └───────┼──────────────────────────────────────────────────────────────┘
           │  NETWORK / PROVIDER BOUNDARY
   ┌───────▼──────────────────────────────────────────────────────────────┐
@@ -357,3 +358,4 @@ How many total transport attempts does `callTool` make in the worst case for a r
 Updated: 2026-05-28 — Corrected the retry framing from "fixed 1200ms delay" to the real exponential backoff (10s base, 20s ceiling) with parsed Retry-After + 500ms buffer; re-derived all client.ts line refs; worst-case retry tax now ~51s and the route budget is 300s.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

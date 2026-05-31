@@ -71,7 +71,7 @@ The raw query may lack the document's vocabulary. Expansion adds synonyms, relat
                      └──▶ now overlaps documents that say "cart abandonment"
 ```
 
-A cheap model (the same tier as `classifyIntent`'s haiku) generates the expansion. Expansion trades precision for recall — too many added terms can pull in noise.
+A cheap model (the same tier as the intent classifier) generates the expansion. Expansion trades precision for recall — too many added terms can pull in noise.
 
 ### Decomposition: split a compound question
 
@@ -86,7 +86,7 @@ A multi-part question retrieves badly because no single document matches all par
                      └──▶ merge results (each sub-query retrieved cleanly)
 ```
 
-This mirrors what the route *already* does at the agent level: `classifyIntent` routes a question to diagnostic *or* recommendation, and a compound question is conceptually two intents. Decomposition is that split applied to retrieval queries.
+This mirrors what the route *already* does at the agent level: the intent classifier routes a question to diagnostic *or* recommendation, and a compound question is conceptually two intents. Decomposition is that split applied to retrieval queries.
 
 ### HyDE: embed a hypothetical answer, not the question
 
@@ -109,7 +109,7 @@ The hypothetical answer is discarded after embedding; only its vector is used. H
 
 ### The codebase's query-understanding analog
 
-blooming insights does query *understanding* — the sibling of query rewriting — without doing retrieval-query rewriting. `classifyIntent` (`lib/agents/intent.ts` L17–L31) is a query *classifier*; the agent then translates the question into EQL/tool args. That is reshaping the user's words into the engine's input form — exactly the spirit of query rewriting, applied to an exact analytics engine (EQL) rather than to embedding retrieval. The difference: EQL translation produces an *exact* query (the schema names are known), so there is no vocabulary-gap recall problem to close — the rewriting levers (expand/HyDE) matter for *fuzzy* retrieval, which the codebase does not yet do.
+This system does query *understanding* — the sibling of query rewriting — without doing retrieval-query rewriting. The intent classifier is a query *classifier*; the agent then translates the question into EQL / tool args. That is reshaping the user's words into the engine's input form — exactly the spirit of query rewriting, applied to an exact analytics engine (EQL) rather than to embedding retrieval. The difference: EQL translation produces an *exact* query (the schema names are known), so there is no vocabulary-gap recall problem to close — the rewriting levers (expand/HyDE) matter for *fuzzy* retrieval, which the codebase does not yet do.
 
 ### The principle
 
@@ -288,3 +288,4 @@ What query-understanding does blooming insights do today, and why is retrieval-q
 → 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -136,7 +136,7 @@ Step 2 runs only the diagnostic agent. Step 3 (`/recommend`) needs the diagnosis
                               │
                               ▼ live mode only:
                               url += "&diagnosis=" + encode(JSON(handedDiagnosis))
-                              ─────────────────────────────────▶ /api/agent
+                              ─────────────────────────────────▶ agent endpoint
                                   (server reads ?diagnosis=, feeds the
                                    recommendation agent — no re-diagnose)
 ```
@@ -145,24 +145,24 @@ In demo (cached) mode the server replays the cached snapshot filtered to the `re
 
 ### The feed's insight handoff
 
-The feed (`app/page.tsx`) stashes every insight under `bi:insight:<id>` the moment the briefing loads. When the user clicks a card and the investigation page fires `/api/agent`, the hook reads `bi:insight:<id>` and sends it as `&insight=`. This is the load-bearing handoff on Vercel.
+The feed page stashes every insight under `bi:insight:<id>` the moment the briefing loads. When the user clicks a card and the investigation page fires the agent endpoint, the hook reads `bi:insight:<id>` and sends it as `&insight=`. This is the load-bearing handoff on a serverless platform.
 
 ```
-  FEED request (Vercel instance A)        INVESTIGATION request (instance B)
+  FEED request (instance A)               INVESTIGATION request (instance B)
   ──────────────────────────────         ──────────────────────────────────
   briefing returns insights
   stashInsights():
     for each i: setItem(
       bi:insight:<i.id>, JSON(i))         hook reads bi:insight:<id>
          │ (lives in the browser)         url += "&insight=" + encode(JSON(insight))
-         └────────────────────────────▶   ───────────────────────────────▶ /api/agent
+         └────────────────────────────▶   ───────────────────────────────▶ agent endpoint
                                           server resolveAnomaly() prefers
                                           ?insight= over its own in-memory
                                           getAnomaly(id) — which is EMPTY on
                                           instance B (never saw the feed run)
 ```
 
-Vercel serverless functions do not share memory between invocations. The anomaly the monitoring agent computed on instance A is not in instance B's `getAnomaly` map. Without the browser carrying it across, the investigation returns "insight not found." The `sessionStorage` round-trip is the cross-instance state channel.
+Serverless functions do not share memory between invocations. The anomaly the monitoring agent computed on instance A is not in instance B's `getAnomaly` map. Without the browser carrying it across, the investigation returns "insight not found." The `sessionStorage` round-trip is the cross-instance state channel.
 
 **Move 3 — the principle.** When the backend cannot hold state between two requests (StrictMode double-invoke, serverless per-instance memory, page navigation), the client must own it. `sessionStorage` is the client's durable map; the started-guard is the client's idempotency key; the query param is the client's way of handing the backend exactly the state it forgot.
 
@@ -389,3 +389,4 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 → 05-streaming-ndjson.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

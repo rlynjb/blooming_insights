@@ -71,11 +71,11 @@ schema summary — three hard caps in one function
 
   full WorkspaceSchema (~112KB JSON)
        │
-       ▼  schemaSummary() — monitoring.ts L16
+       ▼  schema_summary()
   ┌──────────────────────────────────────────────┐
-  │ MAX_EVENTS = 20         events.slice(0, 20)  │  ← L21
-  │ MAX_PROPS_PER_EVENT=10  props.slice(0, 10)   │  ← L22
-  │ MAX_CPROPS = 30         cprops.slice(0, 30)  │  ← L33
+  │ MAX_EVENTS = 20         events.slice(0, 20)  │
+  │ MAX_PROPS_PER_EVENT=10  props.slice(0, 10)   │
+  │ MAX_CPROPS = 30         cprops.slice(0, 30)  │
   └──────────────────────────────────────────────┘
        │
        ▼
@@ -93,9 +93,9 @@ The technical thing: **prompt templating with replacement, where the replacement
 If you're coming from frontend, this is a server-rendered component template: the file on disk has `{children}`, and at request time you compute the children from the request's context (which workspace, which user, which gate-passed categories) and substitute them in. The model sees the assembled string; the template stays declarative.
 
 ```
-prompt injection at run time — monitoring.ts L83–L86
+prompt injection at run time
 
-  prompts/monitoring.md (file on disk)
+  monitoring prompt template (file on disk)
   ┌──────────────────────────────────────────┐
   │ ## Your category checklist               │
   │ {categories}              ◄── slot       │
@@ -105,13 +105,13 @@ prompt injection at run time — monitoring.ts L83–L86
   └──────────────────────────────────────────┘
                   │   .replace(...) × 3
                   ▼
-  system prompt sent to Claude — only categories
+  system prompt sent to the model — only categories
   the workspace's schema can actually support
 ```
 
-The practical consequence: the route runs the *capability gate* (`runnableCategories`, see `05-guardrails-and-control.md`) before the monitoring agent starts, and only the categories whose required events exist in the schema land in `{categories}`. The model is never shown a category like `fraud_detection` if the workspace doesn't emit `payment_failure` — because the category isn't *in the window*. There's nothing to ignore, nothing to misclick.
+The practical consequence: the route runs the *capability gate* (the runnable-categories filter, covered in the guardrails note) before the monitoring agent starts, and only the categories whose required events exist in the schema land in `{categories}`. The model is never shown a category like `fraud_detection` if the workspace doesn't emit `payment_failure` — because the category isn't *in the window*. There's nothing to ignore, nothing to misclick.
 
-The condition under which it works: the gate has to be correct. If `runnableCategories` returns a category the schema can't actually support, the model will dutifully try and spend an EQL call on a query that fails. The substitution is honest because the gate upstream is honest.
+The condition under which it works: the gate has to be correct. If the runnable-categories filter returns a category the schema can't actually support, the model will dutifully try and spend a tool call on a query that fails. The substitution is honest because the gate upstream is honest.
 
 ### Move 3 — Cap every tool result before it goes back in
 
@@ -120,24 +120,24 @@ The technical thing: **truncation at the loop boundary** — the loop never feed
 If you're coming from frontend, this is `String(payload).slice(0, MAX)` on a log-line you ship to your error tracker: the upstream payload can be any size, but the slot you control bounds it. The loop is the slot.
 
 ```
-truncation at the loop seam — base.ts L29 + L150 + L171
+truncation at the loop seam
 
   tool returns JSON of arbitrary size
        │
        ▼
-  resultContent = truncate(JSON.stringify(result))   ◄── L150
+  result_content = truncate(serialize(result))
        │
-       ▼  MAX_TOOL_RESULT_CHARS = 16_000  (base.ts L29)
+       ▼  per-result cap = 16_000 chars
        │
        ▼
-  messages.push({ role: 'user', content: toolResults })  ◄── L171
+  messages.push({ role: 'user', content: tool_results })
        │  next turn sees at most 16KB per tool call,
        │  with "…[truncated]" marker
        ▼
   the model's next turn keeps its budget
 ```
 
-The practical consequence: a `list_customer_events` result with 5,000 events doesn't drown the next turn. The model sees ~16KB of the response — enough to spot a pattern in the head, with an explicit `…[truncated]` marker telling it the result was clipped (so it doesn't reason as if it saw everything). The same `TRUNC = 4000` cap also runs in the streaming layer (`app/api/agent/route.ts` L99–L103) when results are forwarded to the client, so the wire payload stays bounded too.
+The practical consequence: a customer-events tool result with 5,000 events doesn't drown the next turn. The model sees ~16KB of the response — enough to spot a pattern in the head, with an explicit `…[truncated]` marker telling it the result was clipped (so it doesn't reason as if it saw everything). The same kind of truncation (a tighter ~4KB cap) also runs in the streaming layer when results are forwarded to the client, so the wire payload stays bounded too.
 
 The condition under which it works: 16KB has to be enough for the *first* turn's decision. If the model needs more, it can call a more specific tool with narrower args — and the next result will also be capped. If 16KB is *never* enough for a particular tool, that tool's contract is wrong and should return summaries, not blobs.
 
@@ -150,17 +150,17 @@ If you're coming from frontend, this is a manager's standup posture — every re
 ```
 who sees what (per-agent context routing)
 
-   monitoring.ts ◄── monitoringTools  (13 tools, detect-shaped)
-   diagnostic.ts ◄── diagnosticTools  (17 tools, investigate-shaped)
-   recommend.ts  ◄── recommendationTools (7 tools, propose-shaped)
-   query.ts      ◄── queryTools  (union, free-form)
+   monitoring agent ◄── monitoring tool set  (13 tools, detect-shaped)
+   diagnostic agent ◄── diagnostic tool set  (17 tools, investigate-shaped)
+   recommend agent  ◄── recommendation tool set (7 tools, propose-shaped)
+   query agent      ◄── query tool set  (union, free-form)
 
    one MCP server, one tool list — filtered per agent at
    the prompt boundary, so the wrong tool is never in
    the wrong agent's window
 ```
 
-The practical consequence: the recommendation agent doesn't have `execute_analytics_eql` in its window — so it can't burn its 4-call budget re-running monitoring queries when its job is to propose actions. The mechanism is `filterToolSchemas(allTools, recommendationTools)` (`tool-schemas.ts` L15), but the *discipline* is context engineering: the surface each agent sees is curated to its job. This is covered as a mechanism in `03-tool-calling-and-mcp.md`; here it's the per-agent-context-routing pattern from the multi-agent-orchestration sub-section.
+The practical consequence: the recommendation agent doesn't have analytics tools in its window — so it can't burn its 4-call budget re-running monitoring queries when its job is to propose actions. The mechanism is a per-agent tool-schema filter, but the *discipline* is context engineering: the surface each agent sees is curated to its job. This is covered as a mechanism in the tool-calling-and-mcp note; here it's the per-agent-context-routing pattern from the multi-agent-orchestration sub-section.
 
 The condition under which it works: the per-agent tool list has to match the per-agent prompt. If you give the recommendation agent the diagnostic tool subset but a recommendation prompt, the model gets confused by mismatched affordances. The two slots — tools and prompt — are curated together.
 
@@ -178,30 +178,30 @@ The full picture is below.
 The window for ONE monitoring turn (blooming insights)
 
   ┌─────────────────────────── SYSTEM PROMPT ───────────────────────────┐
-  │ prompts/monitoring.md (file on disk, ~3KB)                          │
+  │ monitoring prompt template (file on disk, ~3KB)                     │
   │                                                                      │
   │   role + hard rules    ◄── stable, prefix-cacheable                  │
   │   {categories}    ──────── injected: runnable-only list (gated)     │
-  │   {schema}        ──────── injected: schemaSummary (3 caps applied) │
+  │   {schema}        ──────── injected: schema summary (3 caps applied)│
   │   {project_id}    ──────── injected: workspace id                    │
   │                                                                      │
   └──────────────────────────────────────────────────────────────────────┘
   ┌────────────────────────── TOOL DEFINITIONS ─────────────────────────┐
-  │ filterToolSchemas(allTools, monitoringTools)                         │
+  │ filter_tool_schemas(all_tools, monitoring_tool_set)                  │
   │ → 13 tools, monitoring-shaped only (recommendation tools absent)     │
   └──────────────────────────────────────────────────────────────────────┘
   ┌───────────────────────── USER + MESSAGES[] ─────────────────────────┐
   │ user: "Work through your category checklist..."                      │
-  │ assistant: tool_use → execute_analytics_eql                          │
-  │ user: tool_result (truncated to 16KB, base.ts L150/L171)            │
-  │ assistant: tool_use → execute_analytics_eql                          │
+  │ assistant: tool_use → analytics tool                                 │
   │ user: tool_result (truncated to 16KB)                                │
-  │   ... up to maxToolCalls = 6 ...                                     │
-  │ assistant: final JSON (tools removed on forced-final turn, L90)      │
+  │ assistant: tool_use → analytics tool                                 │
+  │ user: tool_result (truncated to 16KB)                                │
+  │   ... up to the per-loop tool-call cap = 6 ...                       │
+  │ assistant: final JSON (tools removed on forced-final turn)           │
   └──────────────────────────────────────────────────────────────────────┘
 
-  CURATION points: schema cap (L21–L33) · {categories} gate · per-agent
-  tool subset · 16KB tool-result cap · 4KB stream cap (route.ts L99)
+  CURATION points: schema cap · {categories} gate · per-agent
+  tool subset · 16KB tool-result cap · 4KB stream cap
 ```
 
 ---
@@ -404,3 +404,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -49,123 +49,116 @@ A caller asks for behaviour through an interface it owns. The real implementatio
 ```
 ┌────────────────────────────────────────────────┐
 │                   Caller                        │
-│  (McpClient, runAgentLoop, your component)      │
+│  (provider wrapper, agent loop, your component) │
 └──────────────────────┬─────────────────────────┘
                        │ depends on interface only
                        ▼
           ┌────────────────────────┐
           │     Owned interface    │
-          │  McpTransport          │
-          │  McpCaller             │
-          │  (fetchUsers prop)     │
+          │  Transport             │
+          │  Caller                │
           └────────┬───────────────┘
                    │
        ┌───────────┴────────────┐
        ▼                        ▼
 ┌──────────────┐       ┌──────────────────┐
 │  Real impl   │       │   Fake / test    │
-│  SdkTransport│       │   fakeTransport  │
-│  McpClient   │       │   buildFakeMcp   │
+│  SDK adapter │       │   plain object   │
 │  (prod)      │       │   (tests)        │
 └──────┬───────┘       └──────────────────┘
        │
        ▼
  Vendor SDK / network
- (@modelcontextprotocol/sdk, @anthropic-ai/sdk)
 ```
 
 The interface sits between the caller and the vendor. Tests plug in the right branch; production plugs in the left.
 
-### The McpTransport interface
+### The transport interface
 
-`McpTransport` is the two-method surface defined in `lib/mcp/transport.ts` L7–L10:
-
-```typescript
-export interface McpTransport {
-  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
-  listTools(): Promise<unknown>;
-}
-```
-
-Two methods. No import from `@modelcontextprotocol/sdk`. `McpClient` imports this interface, not the SDK class. Any object with those two signatures satisfies it — the TypeScript compiler enforces nothing more.
+The transport is a two-method surface defined in this codebase, not imported from the vendor SDK:
 
 ```
-McpTransport interface
+interface Transport:
+    callTool(name, args)  → Promise<result>
+    listTools()           → Promise<tool_list>
+```
+
+Two methods. No vendor SDK import here. The provider wrapper imports this interface, not the SDK class. Any object with those two signatures satisfies it — the type system enforces nothing more.
+
+```
+Transport interface
 ┌─────────────────────────────────────────────────┐
 │  callTool(name, args) → Promise<unknown>         │
 │  listTools()          → Promise<unknown>         │
 └─────────────────────────────────────────────────┘
          ▲                         ▲
          │ implements               │ structurally satisfies
-  SdkTransport               fakeTransport (test)
+  SDK adapter                  fake transport (test)
 ```
 
-### SdkTransport, the real implementation
+### The SDK adapter, the real implementation
 
-`SdkTransport` (`lib/mcp/transport.ts` L41–L74) holds a `Client` from the MCP SDK and delegates. Its constructor also accepts an optional `httpErrors?: HttpErrorHolder` (L42–L45): the transport pairs with a capturing fetch (`makeCapturingFetch`, L24–L36) that records the body of any non-OK HTTP response into the holder, so a failed tool call can throw the *real* server error text instead of a generic "Unauthorized":
+The SDK adapter holds a `Client` from the vendor SDK and delegates. Its constructor also accepts an optional error-capture holder: the adapter pairs with a capturing `fetch` that records the body of any non-OK HTTP response into the holder, so a failed tool call can throw the *real* server error text instead of a generic "Unauthorized":
 
-```typescript
-export class SdkTransport implements McpTransport {
-  constructor(private client: Client) {}
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    const res = await this.client.callTool({ name, arguments: args });
-    return res;
-  }
-  async listTools(): Promise<unknown> {
-    return this.client.listTools();
-  }
-}
+```
+class SdkAdapter implements Transport:
+    constructor(client):
+        self.client = client
+
+    callTool(name, args):
+        return await self.client.callTool({ name, arguments: args })
+
+    listTools():
+        return await self.client.listTools()
 ```
 
-The `implements McpTransport` clause is belt-and-suspenders — TypeScript would also accept structural matching without the keyword. The keyword is documentation: it declares intent and makes the compiler tell you immediately if the SDK changes a method signature.
+The `implements Transport` clause is belt-and-suspenders — TypeScript's structural typing would also accept the same shape without the keyword. The keyword is documentation: it declares intent and makes the compiler tell you immediately if the SDK changes a method signature.
 
 ### The fake in tests
 
-`test/mcp/client.test.ts` L5–L12 defines a plain-object fake that satisfies `McpTransport`:
+A test fake is a plain object that satisfies the transport interface:
 
-```typescript
-function fakeTransport(impl: (name: string) => unknown): McpTransport & { calls: number } {
-  const t = {
-    calls: 0,
-    async callTool(name: string) { t.calls++; return impl(name); },
-    async listTools() { return { tools: [] }; },
-  };
-  return t;
-}
+```
+fakeTransport(impl):
+    t = {
+      calls: 0,
+      callTool(name)  ─▶  t.calls += 1; return impl(name),
+      listTools()     ─▶  return { tools: [] },
+    }
+    return t
 ```
 
-It is not a class. It is not a mock created by `vi.mock`. It is a plain object that happens to have the right shape. It also counts calls so tests can assert how many times the transport was hit — handy for verifying cache behaviour.
+It is not a class. It is not a mock created by a mocking framework. It is a plain object that happens to have the right shape. It also counts calls so tests can assert how many times the transport was hit — handy for verifying cache behaviour.
 
 ```
 fakeTransport({ calls: 0, callTool, listTools })
          │
          │  passed to constructor
          ▼
-new McpClient(fakeTransport)   ← no SDK, no network
+new ProviderWrapper(fakeTransport)   ← no SDK, no network
          │
          │  test calls
          ▼
-c.callTool('whoami', {})       ← hits the fake's counter
+wrapper.callTool('whoami', {})       ← hits the fake's counter
 ```
 
-### McpCaller — the same trick one layer up
+### Caller — the same trick one layer up
 
-Agents need to call MCP tools, but they should not be coupled to the full `McpClient` class with its cache, retry logic, and rate-limiter. `lib/agents/base.ts` L16–L22 defines a one-method surface:
-
-```typescript
-export interface McpCaller {
-  callTool(
-    name: string,
-    args: Record<string, unknown>,
-    opts?: { cacheTtlMs?: number; skipCache?: boolean },
-  ): Promise<{ result: unknown; durationMs: number; fromCache: boolean }>;
-}
-```
-
-`McpClient` never says `implements McpCaller`. It does not need to — TypeScript's structural typing means any object whose `callTool` signature is a superset of what `McpCaller` demands is accepted without ceremony. In production, `McpClient` is passed; in tests, a hand-written fake is passed.
+Agents need to call tools, but they should not be coupled to the full provider wrapper class with its cache, retry logic, and rate-limiter. A one-method surface lives in the agent module:
 
 ```
-McpCaller interface    McpClient (prod)
+interface Caller:
+    callTool(
+      name,
+      args,
+      opts?: { cacheTtlMs?, skipCache? },
+    ) → Promise<{ result, durationMs, fromCache }>
+```
+
+The provider wrapper never explicitly says `implements Caller`. It does not need to — structural typing means any object whose `callTool` signature is a superset of what `Caller` demands is accepted without ceremony. In production, the real wrapper is passed; in tests, a hand-written fake is passed.
+
+```
+Caller interface       Provider wrapper (prod)
 ┌────────────┐         ┌───────────────────┐
 │ callTool   │◀────────│ callTool + cache  │  structurally satisfies
 │            │         │ + retry + rate    │
@@ -173,47 +166,45 @@ McpCaller interface    McpClient (prod)
       ▲
       │  also satisfies (structurally)
 ┌─────────────────────────┐
-│ buildFakeMcp (test)     │
+│ fake caller (test)      │
 │ { callTool: async fn }  │
 └─────────────────────────┘
 ```
 
-`test/agents/base.test.ts` L76–L83:
+A test fake matching the `Caller` shape:
 
-```typescript
-function buildFakeMcp(impl: (name: string, args: Record<string, unknown>) => Promise<unknown>): McpCaller {
-  return {
-    async callTool(name, args) {
-      const result = await impl(name, args);
-      return { result, durationMs: 1, fromCache: false };
-    },
-  };
-}
+```
+buildFakeMcp(impl):
+    return {
+      callTool(name, args):
+          result = await impl(name, args)
+          return { result, durationMs: 1, fromCache: false }
+    }
 ```
 
-### Injecting Anthropic as a parameter
+### Injecting the provider SDK as a parameter
 
-`runAgentLoop` takes `anthropic: Anthropic` as a named parameter (`lib/agents/base.ts` L48–L62). There is no singleton import, no module-level `new Anthropic()`. The parameter type is the SDK's own `Anthropic` class — but TypeScript structural typing means tests can pass any object that satisfies the shape the loop actually uses.
+The shared agent loop takes the provider SDK client as a named parameter. There is no singleton import, no module-level `new Provider()`. The parameter type is the SDK's own client class — but structural typing means tests can pass any object that satisfies the shape the loop actually uses.
 
-`test/agents/base.test.ts` L16–L56 builds a scripted fake and casts it:
+A scripted fake, cast to the SDK type at the call site:
 
-```typescript
-const anthropic = {
-  messages: { create },   // vi.fn() returning scripted responses
-};
+```
+anthropic = {
+  messages: { create },   # spy returning scripted responses
+}
 // ...
-await runAgentLoop({
+runAgentLoop({
   anthropic: anthropic as unknown as Anthropic,
   mcp,
   // ...
-});
+})
 ```
 
-The `as unknown as Anthropic` cast is honest: the fake only implements the slice of the Anthropic SDK that `runAgentLoop` actually calls (`messages.create`). The double cast (`as unknown` first) tells the compiler "I know what I'm doing." This is standard practice when injecting narrow fakes for a complex third-party type.
+The `as unknown as Anthropic` cast is honest: the fake only implements the slice of the SDK that the agent loop actually calls (`messages.create`). The double cast (`as unknown` first) tells the compiler "I know what I'm doing." This is standard practice when injecting narrow fakes for a complex third-party type.
 
 ### The principle
 
-Depend on interfaces you own, not on vendors. Every interface in this codebase (`McpTransport`, `McpCaller`) is defined in the codebase itself, not re-exported from the SDK. The codebase controls the surface. If the SDK changes, exactly one file changes — the adapter — and all callers are unaffected.
+Depend on interfaces you own, not on vendors. Every interface in this pattern (`Transport`, `Caller`) is defined inside the codebase, not re-exported from the SDK. The codebase controls the surface. If the SDK changes, exactly one file changes — the adapter — and all callers are unaffected.
 
 ---
 
@@ -485,3 +476,4 @@ A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is 
 Updated: 2026-05-28 — refreshed code references to current line numbers; added a note on the capturing-fetch error seam (`HttpErrorHolder`/`makeCapturingFetch`) and `McpToolError`
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

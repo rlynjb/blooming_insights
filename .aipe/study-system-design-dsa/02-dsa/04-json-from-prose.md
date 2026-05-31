@@ -88,34 +88,34 @@ The ladder is short-circuit: the moment any step succeeds, the later steps never
 
 ### The fenced-block regex
 
-```ts
-const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+```
+fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
 ```
 
-The regex matches an opening triple-backtick, an optional `json` label, optional whitespace, then captures everything up to the closing triple-backtick. The capture group `([\s\S]*)` uses `[\s\S]` — not `.` — because `.` does not match newlines by default in JavaScript without the `s` flag. The `?` after `*` makes it non-greedy so it stops at the first closing fence rather than consuming multiple blocks.
+The regex matches an opening triple-backtick, an optional `json` label, optional whitespace, then captures everything up to the closing triple-backtick. The capture group uses `[\s\S]` — not `.` — because `.` does not match newlines by default in JavaScript without the `s` flag. The `?` after `*` makes it non-greedy so it stops at the first closing fence rather than consuming multiple blocks.
 
 If the match exists, `fence[1]` is the captured content (the JSON text only, without backticks). If no match, the full `text` is the candidate. Either way the candidate is trimmed before any parse attempt.
 
 ### Bare parse
 
-```ts
-try { return JSON.parse(candidate); } catch { /* fall through */ }
+```
+try:    return JSON.parse(candidate)
+catch:  pass     # fall through to substring scan
 ```
 
 This is a standard `JSON.parse` in a try/catch. If the candidate is already well-formed JSON (e.g. the fenced block contained only JSON, no prose), this succeeds and returns immediately. The catch block does nothing — it intentionally falls through to the substring scan.
 
 ### The substring scan
 
-```ts
-const start = candidate.search(/[[{]/);
-const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-if (start >= 0 && end > start) {
-  return JSON.parse(candidate.slice(start, end + 1));
-}
-throw new Error('no parseable json in agent output');
+```
+start = candidate.search(/[[{]/)
+end   = max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'))
+if start >= 0 and end > start:
+    return JSON.parse(candidate.slice(start, end + 1))
+throw Error('no parseable json in agent output')
 ```
 
-`String.prototype.search` returns the index of the first match of the regex `[[{]` — either `[` or `{`, whichever appears first. `lastIndexOf` finds the last occurrence of the closing bracket or brace. Slicing `[start, end + 1)` pulls out the substring that starts at the outermost bracket and ends at the outermost closing bracket.
+The `search(regex)` call returns the index of the first match of the character class `[[{]` — either `[` or `{`, whichever appears first. `lastIndexOf` finds the last occurrence of the closing bracket or brace. Slicing `[start, end + 1)` pulls out the substring that starts at the outermost bracket and ends at the outermost closing bracket.
 
 Sample string to make the indices concrete:
 
@@ -137,23 +137,25 @@ Parsing succeeds → value is `unknown`. TypeScript accepts `unknown` in no type
 
 `isAnomalyArray` is an `is` predicate — it returns `v is Anomaly[]`, which tells TypeScript the value is that type inside the `if` branch:
 
-```ts
-export function isAnomalyArray(v: unknown): v is Anomaly[] {
-  return Array.isArray(v) && v.every((a) =>
-    !!a && typeof a === 'object' &&
-    typeof (a as any).metric === 'string' &&
-    Array.isArray((a as any).scope) &&
-    !!(a as any).change && typeof (a as any).change.value === 'number' &&
-    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
-    typeof (a as any).change.baseline === 'string' &&
-    SEVERITIES.includes((a as any).severity)
-  );
-}
+```
+isAnomalyArray(v: unknown) returns v is Anomaly[]:
+    return Array.isArray(v)
+       AND v.every(a =>
+              a != null
+          AND typeof a == 'object'
+          AND typeof a.metric == 'string'
+          AND Array.isArray(a.scope)
+          AND a.change != null
+          AND typeof a.change.value == 'number'
+          AND (a.change.direction == 'up' OR a.change.direction == 'down')
+          AND typeof a.change.baseline == 'string'
+          AND SEVERITIES.includes(a.severity)
+          )
 ```
 
-The guard is a chain of `&&` predicates. The moment any predicate is false, JavaScript short-circuits and returns `false` without evaluating the rest — no try/catch needed.
+The guard is a chain of `AND` predicates. The moment any predicate is false, the language short-circuits and returns `false` without evaluating the rest — no try/catch needed.
 
-`isDiagnosis` (`lib/mcp/validate.ts` L29–L35) checks three fields: `conclusion` is a string, `evidence` is an array, `hypothesesConsidered` is an array. `isRecommendationArray` (`lib/mcp/validate.ts` L42–L57) checks six fields per element including enum membership via `Array.includes`. One field, `estimatedImpact`, accepts a union shape: an `impactOk` check (L46–L48) admits the value when it is EITHER a plain string (the legacy form) OR an object whose `range` is a string (the richer `{ range, rangeUsd?, assumption }` form) — so both encodings pass the guard.
+`isDiagnosis` checks three fields: `conclusion` is a string, `evidence` is an array, `hypothesesConsidered` is an array. `isRecommendationArray` checks six fields per element including enum membership via `Array.includes`. One field, `estimatedImpact`, accepts a union shape: an `impactOk` check admits the value when it is EITHER a plain string (the legacy form) OR an object whose `range` is a string (the richer `{ range, rangeUsd?, assumption }` form) — so both encodings pass the guard.
 
 ### Step-by-step execution trace
 
@@ -535,3 +537,4 @@ A teammate argues: "We should replace `parseAgentJson` with Zod's `z.array(Anoma
 Updated: 2026-05-28 — refreshed code references to current line numbers; noted that `isRecommendationArray` now accepts `estimatedImpact` as either a string or a `{ range, ... }` object (the `impactOk` union check)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

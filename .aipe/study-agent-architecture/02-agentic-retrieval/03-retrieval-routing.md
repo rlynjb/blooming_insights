@@ -100,7 +100,7 @@ The condition under which it works: the rules have to be cheaper *and* mostly ri
 
 ### What routing is NOT — the relevance grader's other job
 
-The technical distinction: routing decides *which source to ask*; the relevance grader (`02-self-corrective-rag.md`) decides *whether the answer that came back is any good*. They sit at different layers of the same retrieval loop, and conflating them is a common mistake.
+The technical distinction: routing decides *which source to ask*; the relevance grader (covered in the self-corrective RAG note) decides *whether the answer that came back is any good*. They sit at different layers of the same retrieval loop, and conflating them is a common mistake.
 
 If you're coming from frontend, routing is the URL the request goes to. The grader is "the response came back, was its body shape what the UI needs." Both can fail; their fixes are different.
 
@@ -126,7 +126,7 @@ The practical consequence: a router miss puts you at the wrong source (the answe
 
 ### What blooming insights has — one source, no source router
 
-The technical thing: there is exactly one knowledge source in this codebase — Bloomreach via the MCP transport (`lib/mcp/client.ts`, `lib/mcp/tools.ts`). Every agent retrieves through the same `execute_analytics_eql` (or its siblings) against the same backend. There's nothing to route *between* at the source layer.
+The technical thing: there is exactly one knowledge source in this codebase — Bloomreach via the MCP transport (the MCP client wrapper and its tool schemas). Every agent retrieves through the same analytics tool (or its siblings) against the same backend. There's nothing to route *between* at the source layer.
 
 If you're coming from frontend, this is the case where your `useUser()` hook reads from `/api/me` and only `/api/me`. You don't need a router because there's no fork.
 
@@ -144,11 +144,11 @@ Source layer — one source, no fork
 
 The practical consequence: the source-routing pattern this file teaches doesn't apply to this codebase *yet*. The day a second knowledge source goes in — a vector store over past investigations, a web search for fresh PR mentions, a local SQL cache — the router becomes necessary; until then, dispatching to one source is a no-op.
 
-The condition under which the absence is okay: the one source covers the question surface. EQL against Bloomreach can answer every analytics question the agents currently ask. The day a question shape lands that EQL can't express (free-text similarity, real-world freshness), the source-routing pattern earns its place beside what's already here.
+The condition under which the absence is okay: the one source covers the question surface. The typed analytics query language can answer every analytics question the agents currently ask. The day a question shape lands that it can't express (free-text similarity, real-world freshness), the source-routing pattern earns its place beside what's already here.
 
 ### What blooming insights has *adjacent* — the coverage gate, a capability route
 
-The technical thing: there's a different kind of routing here — a pre-retrieval *capability* gate (`lib/agents/categories.ts`) that filters the monitoring agent's anomaly checklist to the categories the workspace's schema can support before any retrieval happens. It's not picking *which source* (there's one); it's picking *which questions the source can answer* before the agent spends its budget.
+The technical thing: there's a different kind of routing here — a pre-retrieval *capability* gate that filters the monitoring agent's anomaly checklist to the categories the workspace's schema can support before any retrieval happens. It's not picking *which source* (there's one); it's picking *which questions the source can answer* before the agent spends its budget.
 
 If you're coming from frontend, this is feature-flag gating before render. You don't ship the feature into a UI whose dependencies aren't available — you check the schema (or the user's permissions, or the workspace's plan) first and only show the entry points that work. The gate is *upstream* of the loop, and it prunes the input space before the loop runs.
 
@@ -160,30 +160,30 @@ The coverage gate — capability routing, not source routing
   └────────────────────┬────────────────────────────┘
                        ▼
   ┌─────────────────────────────────────────────────┐
-  │ schemaCapabilities()    L121–127                │
+  │ schema_capabilities()                            │
   │ → Set<string>: events + 'catalog:<name>'         │
   └────────────────────┬────────────────────────────┘
                        ▼
   ┌─────────────────────────────────────────────────┐
-  │ coverageFor(cat, available)  L131–136            │
+  │ coverage_for(cat, available)                     │
   │ → 'full' | 'limited' | 'unavailable'             │
   └────────────────────┬────────────────────────────┘
                        ▼
   ┌─────────────────────────────────────────────────┐
-  │ runnableCategories()   L158–160                  │
+  │ runnable_categories()                            │
   │ → only full + limited categories                 │
   └────────────────────┬────────────────────────────┘
                        ▼
-  monitoring agent loop spends its 6-call budget on
-  RUNNABLE categories only
-   (briefing/route.ts L203–L204)
+  monitoring agent loop spends its tool-call budget
+  on RUNNABLE categories only
+   (briefing route hands the gate's result to the agent)
 ```
 
 The practical consequence: the coverage gate prunes the monitoring agent's question space *before* the agentic-RAG loop spends a turn. The agent never wastes a tool call asking about `view_item` in a workspace that doesn't emit `view_item` — the gate already filtered that category out. This is routing in the broader sense (pick the right next action based on a pre-check), at the *capability* layer rather than the *source* layer.
 
-The condition under which the gate works: the schema has to be authoritative about what's queryable. Bloomreach's MCP returns the workspace's events and catalogs; if the workspace genuinely emits an event but the schema is stale, the gate falsely marks the category unavailable. The mitigation is treating the schema bootstrap as the route's premise check (it runs once per investigation at `bootstrapSchema`).
+The condition under which the gate works: the schema has to be authoritative about what's queryable. The MCP server returns the workspace's events and catalogs; if the workspace genuinely emits an event but the schema is stale, the gate falsely marks the category unavailable. The mitigation is treating the schema bootstrap as the route's premise check (it runs once per investigation).
 
-Cross-reference: the broader capability-gating pattern (capabilities → permitted actions) lives in `study-ai-engineering`'s `04-agents-and-tool-use/07-capability-gating.md`. This file covers it specifically as an *adjacent* shape to retrieval routing, named because it's the closest thing to routing the codebase has.
+Cross-reference: the broader capability-gating pattern (capabilities → permitted actions) lives in the ai-engineering capability-gating note. This file covers it specifically as an *adjacent* shape to retrieval routing, named because it's the closest thing to routing the codebase has.
 
 ### Phase A vs Phase B — where source routing would slot in
 
@@ -198,7 +198,7 @@ Right now the agents retrieve from one source via one MCP transport. Naming wher
 │   ▼                              │  │   ▼                                   │
 │ agentic loop                     │  │ SOURCE ROUTER (new!)                  │ ←
 │   ▼                              │  │   ├─ exact analytics? → Bloomreach MCP│
-│ execute_analytics_eql            │  │   ├─ semantic match? → vector store   │
+│ analytics tool call              │  │   ├─ semantic match? → vector store   │
 │   (one source)                   │  │   └─ freshness? → web search          │
 │                                  │  │   ▼                                   │
 │                                  │  │ agentic loop with selected retriever  │
@@ -213,7 +213,7 @@ Right now the agents retrieve from one source via one MCP transport. Naming wher
 
 The takeaway: **the coverage gate is the routing this codebase needs; source routing is the routing it would need if it added a second source.** Naming both makes the pattern's absence honest — there's no source router because there's no fork to route to.
 
-This is what people mean when they say "a single vector store is rarely the whole answer." Production retrieval is often a mix of vector for semantic, SQL for exact, and web for fresh, and the router is what makes the mix work without each query trying every source. blooming insights doesn't need that yet because it sits at the other end of the spectrum: one source, structurally fitted to the question shape (analytics) it serves.
+This is what people mean when they say "a single vector store is rarely the whole answer." Production retrieval is often a mix of vector for semantic, SQL for exact, and web for fresh, and the router is what makes the mix work without each query trying every source. blooming insights doesn't need that yet because it sits at the other end of the spectrum: one source, structurally fitted to the question shape it serves.
 
 The full picture is below.
 
@@ -229,7 +229,7 @@ Canonical retrieval routing (multi-source) — and where this codebase sits
      ▼
   ┌──────────────────────────────────────────────────────────────┐
   │ CAPABILITY GATE (this codebase)                              │
-  │   coverage gate (`lib/agents/categories.ts`)                 │
+  │   coverage gate (workspace-schema-aware capability route)    │
   │   prunes the agent's question space against the workspace    │
   │   schema BEFORE the agentic loop spends its budget           │
   └────────────────────────────┬─────────────────────────────────┘
@@ -249,15 +249,15 @@ Canonical retrieval routing (multi-source) — and where this codebase sits
   └────────────────────────────┬─────────────────────────────────┘
                                ▼
   ┌──────────────────────────────────────────────────────────────┐
-  │ AGENTIC-RAG LOOP (`runAgentLoop`, `base.ts` L48–L176)         │
+  │ AGENTIC-RAG LOOP (the shared agent loop)                      │
   │   model picks tool_use against the SELECTED retriever         │
   │   observes the result, decides next call or stops             │
   └──────────────────────────────────────────────────────────────┘
 
   WHAT THIS CODEBASE HAS:
-    capability gate (categories.ts) — runs ONCE before the loop;
-                                       prunes which anomaly categories
-                                       are runnable against this workspace
+    capability gate — runs ONCE before the loop;
+                      prunes which anomaly categories are runnable
+                      against this workspace
     one retriever (Bloomreach via MCP) — no source fork to route between
 
   WHAT IT DOESN'T HAVE:
@@ -466,3 +466,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

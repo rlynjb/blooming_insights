@@ -45,13 +45,13 @@
 **Mental model.** Each agent is a producer with a declared output mode; each agent's caller is a consumer with an assumed mode. The two must agree. The declaration is a line (or block) in the prompt's `## Output` section; the enforcement is the code that reads `finalText`. Picture a switch in each agent's `## Output`: flip it to JSON and the output flows into `parseAgentJson` + guard; flip it to prose and the output flows straight into `.trim()`. A mismatch is the switch declared one way and the consumer wired the other.
 
 ```
-PRODUCER (prompt ## Output)          CONSUMER (the .ts that reads finalText)
+PRODUCER (prompt ## Output)          CONSUMER (the code that reads final_text)
 ─────────────────────────────        ──────────────────────────────────────
-monitoring "JSON array, fenced"   →  parseAgentJson + isAnomalyArray  (mon.ts L85–92)
-diagnostic "JSON object, fenced"  →  parseAgentJson + isDiagnosis     (diag.ts L73–77)
-recommend  "JSON array, fenced"   →  parseAgentJson + isRecommend…    (rec.ts L69–76)
-query      "No JSON required,      →  finalText.trim()                 (query.ts L47)
-            just the answer text"      (NEVER parseAgentJson)
+monitoring "JSON array, fenced"   →  parse_agent_json + is_anomaly_array
+diagnostic "JSON object, fenced"  →  parse_agent_json + is_diagnosis
+recommend  "JSON array, fenced"   →  parse_agent_json + is_recommendation_array
+query      "No JSON required,      →  final_text.trim()
+            just the answer text"      (NEVER parse_agent_json)
 ```
 
 Three switches point at the JSON path; one points at the prose path. The mismatch bug is any switch whose declaration and consumer disagree.
@@ -63,12 +63,12 @@ Three switches point at the JSON path; one points at the prose path. The mismatc
 The structured agents each declare JSON mode unambiguously in `## Output`, with "ONLY" and a fenced example:
 
 ```
-monitoring.md   L71  "Return ONLY a JSON array of anomaly objects … wrapped in a ```json fenced block"
-diagnostic.md   L61  "Return ONLY a JSON object (in a ```json fenced block) of exactly this shape"
-recommendation.md L49 "Return ONLY a JSON array (in a ```json fenced block) of at most 3 objects"
+monitoring prompt      "Return ONLY a JSON array of anomaly objects … wrapped in a ```json fenced block"
+diagnostic prompt      "Return ONLY a JSON object (in a ```json fenced block) of exactly this shape"
+recommendation prompt  "Return ONLY a JSON array (in a ```json fenced block) of at most 3 objects"
 ```
 
-"ONLY" is doing real work — it tells the model the *entire* response is the artifact, no prose around it. The fence is the extraction anchor (→ 02-structured-outputs.md). These three feed the parse-validate-repair funnel: their `finalText` goes into `parseAgentJson` and a type guard, and a `synthesize()` retry exists for diagnostic and recommendation when the JSON doesn't materialize.
+"ONLY" is doing real work — it tells the model the *entire* response is the artifact, no prose around it. The fence is the extraction anchor (→ 02-structured-outputs.md). These three feed the parse-validate-repair funnel: their final text goes into the agent-JSON parser and a type guard, and a synthesize retry exists for the diagnostic and recommendation agents when the JSON doesn't materialize.
 
 ---
 
@@ -77,7 +77,7 @@ recommendation.md L49 "Return ONLY a JSON array (in a ```json fenced block) of a
 The query agent's `## Output` says the opposite, and the opposite-ness is the whole point:
 
 ```
-query.md L49
+query prompt — ## Output
   Give a clear, concise answer in plain prose — a few sentences; you may use
   short markdown bullets. Cite the key numbers you found. If you couldn't get
   the data, say so plainly. No JSON shape is required — just the answer text.
@@ -86,11 +86,10 @@ query.md L49
 "No JSON shape is required — just the answer text" is the mode declaration. The query agent answers a free-form human question; forcing that through a JSON schema would be the wrong contract — the consumer (the UI) wants prose to show the user, not a typed object. So its consumer reads the output as a string and trims it:
 
 ```
-query.ts L47
-  return finalText.trim() || 'I was unable to find enough data to answer that question.';
+  return final_text.trim() || "I was unable to find enough data to answer that question."
 ```
 
-No `parseAgentJson`. No type guard. No `synthesize()` returning a typed shape (the query agent's synthesis instruction at `query.ts` L42–44 says "answer the user question directly and concisely in plain prose," not "emit JSON"). The prose path is a deliberately *separate* consumer from the JSON path — the modes don't share enforcement code, which is exactly what keeps the mismatch from happening.
+No JSON parser. No type guard. No synthesize retry returning a typed shape — the query agent's synthesis instruction says "answer the user question directly and concisely in plain prose," not "emit JSON." The prose path is a deliberately *separate* consumer from the JSON path — the modes don't share enforcement code, which is exactly what keeps the mismatch from happening.
 
 ---
 
@@ -99,18 +98,18 @@ No `parseAgentJson`. No type guard. No `synthesize()` returning a typed shape (t
 The declaration is necessary but not sufficient — the model honors "Return ONLY JSON" statistically (→ 02-structured-outputs.md). The *enforcement* is the validator at the consuming boundary:
 
 ```
-JSON mode enforcement (mon.ts L85–92):
-  parsed = parseAgentJson(finalText)      ← extract
-  if (!isAnomalyArray(parsed)) return []  ← REJECT wrong-mode output, floor to []
+JSON mode enforcement (monitoring consumer):
+  parsed = parse_agent_json(final_text)         ← extract
+  if NOT is_anomaly_array(parsed): return []   ← REJECT wrong-mode output, floor to []
 
-prose mode "enforcement" (query.ts L47):
-  finalText.trim() || '<fallback sentence>'  ← accept any text; floor to a sentence
+prose mode "enforcement" (query consumer):
+  final_text.trim() || "<fallback sentence>"   ← accept any text; floor to a sentence
 ```
 
 The JSON consumers *reject* output that isn't valid JSON of the right shape — that rejection is the enforcement. The prose consumer accepts any text (prose can't be "wrong shape"), flooring only to a default sentence when the text is empty. So the two modes have two different enforcement disciplines: JSON mode validates and rejects; prose mode accepts and defaults. The mismatch danger is asymmetric — feed prose to the JSON consumer and it rejects everything to `[]`; feed JSON to the prose consumer and it cheerfully returns the raw JSON string to the user as if it were an answer.
 
 ```
-prose → JSON consumer:  parseAgentJson throws / guard false → [] (silent empty)
+prose → JSON consumer:  parser throws / guard false → [] (silent empty)
 JSON → prose consumer:  .trim() returns "[{...}]" → user sees raw JSON (silent ugly)
 ```
 
@@ -125,25 +124,25 @@ The mismatch is invisible in the prompt alone — you have to read the prompt's 
 ```
 for each agent:
   1. read ## Output — what mode does the prompt DECLARE?   (JSON-fenced? prose?)
-  2. read the .ts that reads finalText — what does it ASSUME?
-       parseAgentJson + guard  → it assumes JSON
-       .trim()                  → it assumes prose
+  2. read the code that reads final_text — what does it ASSUME?
+       parse_agent_json + guard  → it assumes JSON
+       .trim()                    → it assumes prose
   3. do (1) and (2) agree?
-       monitoring: JSON ↔ parseAgentJson ✓
-       diagnostic: JSON ↔ parseAgentJson ✓
-       recommend:  JSON ↔ parseAgentJson ✓
-       query:      prose ↔ .trim()       ✓   ← the one that MUST NOT use parseAgentJson
-  4. check the synthesisInstruction too — does the forced-final nudge declare
-       the SAME mode as ## Output?  (query.ts L42–44 says prose; the others say JSON)
+       monitoring: JSON ↔ parse_agent_json ✓
+       diagnostic: JSON ↔ parse_agent_json ✓
+       recommend:  JSON ↔ parse_agent_json ✓
+       query:      prose ↔ .trim()         ✓   ← MUST NOT use parse_agent_json
+  4. check the synthesis_instruction too — does the forced-final nudge declare
+       the SAME mode as ## Output?  (query says prose; the others say JSON)
 ```
 
-Step 4 is the subtle one: the mode is declared *twice* — in `## Output` and in the `synthesisInstruction` (→ 01-anatomy.md) — and they must agree. If a refactor changed query's `## Output` to demand JSON but left the synthesis nudge saying "plain prose," the model would get conflicting mode instructions on the final turn. The reviewer's job is to check that an agent's declared mode is consistent across both places *and* matches its consumer.
+Step 4 is the subtle one: the mode is declared *twice* — in `## Output` and in the synthesis instruction (→ 01-anatomy.md) — and they must agree. If a refactor changed query's `## Output` to demand JSON but left the synthesis nudge saying "plain prose," the model would get conflicting mode instructions on the final turn. The reviewer's job is to check that an agent's declared mode is consistent across both places *and* matches its consumer.
 
 ---
 
 ### The principle
 
-Output mode is a contract with two ends — the prompt declares it, the consumer enforces it — and the contract is only sound when both ends agree, in both the `## Output` section and the synthesis nudge. blooming insights keeps three agents on the JSON path (declare-fenced-JSON → parseAgentJson → guard → reject-on-mismatch) and one agent on the prose path (declare-prose → trim → default), with *separate* consumer code so the modes can't accidentally share enforcement. A mismatch never crashes; it silently degrades — which is why you catch it by reading the declaration and the consumer side by side, not by waiting for an exception.
+Output mode is a contract with two ends — the prompt declares it, the consumer enforces it — and the contract is only sound when both ends agree, in both the `## Output` section and the synthesis nudge. blooming insights keeps three agents on the JSON path (declare-fenced-JSON → parse → guard → reject-on-mismatch) and one agent on the prose path (declare-prose → trim → default), with *separate* consumer code so the modes can't accidentally share enforcement. A mismatch never crashes; it silently degrades — which is why you catch it by reading the declaration and the consumer side by side, not by waiting for an exception.
 
 ---
 
@@ -155,19 +154,19 @@ This diagram spans producers (four prompts, two modes) and consumers (two enforc
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PRODUCERS — each prompt's ## Output declares a MODE                  │
 │                                                                       │
-│   monitoring.md L71   "ONLY a JSON array … ```json fenced"   ─┐       │
-│   diagnostic.md  L61  "ONLY a JSON object … ```json fenced"   ├─JSON  │
-│   recommendation.md L49 "ONLY a JSON array … ```json fenced" ─┘       │
+│   monitoring prompt      "ONLY a JSON array … ```json fenced"   ─┐    │
+│   diagnostic prompt      "ONLY a JSON object … ```json fenced"   ├─JSON│
+│   recommendation prompt  "ONLY a JSON array … ```json fenced"  ─┘     │
 │                                                                       │
-│   query.md L49  "No JSON shape is required — just the answer text" ─ PROSE │
+│   query prompt  "No JSON shape is required — just the answer text" ─ PROSE │
 └───────────────┬───────────────────────────────────────────┬───────────┘
        JSON mode │                                  prose mode │
 ┌────────────────▼──────────────────────────┐  ┌──────────────▼───────────┐
 │  JSON CONSUMER (validate + REJECT)         │  │  PROSE CONSUMER (accept) │
-│   parseAgentJson  (validate.ts L3–13)      │  │   finalText.trim()       │
-│   + isAnomalyArray/isDiagnosis/isRecommend │  │   (query.ts L47)         │
-│   wrong shape → [] / FALLBACK              │  │   empty → default sentence│
-│   mon.ts L85–92 · diag.ts L73–77 · rec L69 │  │   NO parseAgentJson      │
+│   parse_agent_json                          │  │   final_text.trim()      │
+│   + shape guards (anomaly/diagnosis/rec)    │  │                          │
+│   wrong shape → [] / FALLBACK               │  │   empty → default sentence│
+│   monitoring · diagnostic · recommendation  │  │   NO parser path          │
 └────────────────────────────────────────────┘  └──────────────────────────┘
 
   MISMATCH (silent, never throws):
@@ -347,3 +346,4 @@ Updated: 2026-05-29 — Corrected the monitoring.md JSON-output fence reference 
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an earlier prompt-file revision): diagnostic.md output fence L46→L61, recommendation.md output fence L46→L49, query.md prose-output L36→L49, across all prose + diagram citations.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

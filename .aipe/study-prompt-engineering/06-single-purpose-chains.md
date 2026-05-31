@@ -53,14 +53,14 @@ detect ──▶ diagnose ──▶ recommend          answer (separate entry)
    │            │             │                 │
    │ "do not    │ "diagnose   │ "do NOT         │ "Never invent
    │  diagnose,  │  causes      │  execute"        │  numbers"
-   │  do not     │  only"       │  (rec.md L5)     │  (query.md L5)
-   │  propose"   │  (diag.md L5)│                 │
-   │ (mon.md L5) │             │                 │
+   │  do not     │  only"       │                  │
+   │  propose"   │              │                  │
+   │             │              │                  │
    ▼            ▼             ▼                 ▼
  each Role disclaims the others' jobs = the typed boundary between links
 ```
 
-The wiring lives in `route.ts`; the scoping lives in each prompt's Role. The model never decides "now I'll diagnose" — the code calls the diagnostic agent, and the diagnostic prompt tells the model to do *only* that.
+The wiring lives in the route handler; the scoping lives in each prompt's Role. The model never decides "now I'll diagnose" — the code calls the diagnostic agent, and the diagnostic prompt tells the model to do *only* that.
 
 ---
 
@@ -69,12 +69,12 @@ The wiring lives in `route.ts`; the scoping lives in each prompt's Role. The mod
 Read the first five lines of each prompt and you have the decomposition:
 
 ```
-monitoring.md   L5  "You do not diagnose causes. You do not propose actions.
-                     You detect, measure, and report changes — nothing more."
-diagnostic.md   L5  "You do not propose remediation — you diagnose causes only."
-recommendation.md L5 "You are read-only: you do NOT execute anything —
-                     your recommendations are suggestions for a human to act on."
-query.md        L5  "Never invent numbers — only cite figures you genuinely observed"
+monitoring prompt      "You do not diagnose causes. You do not propose actions.
+                        You detect, measure, and report changes — nothing more."
+diagnostic prompt      "You do not propose remediation — you diagnose causes only."
+recommendation prompt  "You are read-only: you do NOT execute anything —
+                        your recommendations are suggestions for a human to act on."
+query prompt           "Never invent numbers — only cite figures you genuinely observed"
 ```
 
 Each agent's job is one verb: **detect**, **diagnose**, **recommend**, **answer**. The disclaimers are load-bearing. Without "You do not diagnose causes," the monitoring agent — being a helpful model — would notice a revenue drop and immediately explain it, then suggest a fix, producing one blob that overlaps the next two agents' jobs. The disclaimer is what keeps the link's output narrow enough to hand to the next link cleanly.
@@ -85,25 +85,28 @@ This is the same decomposition rule from → 01-anatomy.md, viewed through the c
 
 ### The chain is wired in code, not chosen by the model
 
-The diagnose→recommend chain is plain control flow in the route, not an agent deciding what to do next:
+The diagnose→recommend chain is plain control flow in the route handler, not an agent deciding what to do next:
 
 ```
-route.ts L145–162  (investigation flow)
-  L152  const diagAgent = new DiagnosticAgent(...);
-  L153  const diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-  L154  send({ type: 'diagnosis', diagnosis });
-  L156  stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-  L157  const recAgent = new RecommendationAgent(...);
-  L158  const recommendations = await recAgent.propose(inv, diagnosis, hooksFor('recommendation'));
-  L159  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
-  L162  saveInvestigation(insightId!, collected);
+  # investigation flow (in the route handler)
+  diag_agent      = DiagnosticAgent(...)
+  diagnosis       = await diag_agent.investigate(inv, hooks_for("diagnostic"))
+  send({ type: "diagnosis", diagnosis })
+
+  step_for("recommendation", "thought", "proposing actions based on the diagnosis…")
+  rec_agent       = RecommendationAgent(...)
+  recommendations = await rec_agent.propose(inv, diagnosis, hooks_for("recommendation"))
+  for r in recommendations:
+      send({ type: "recommendation", recommendation: r })
+
+  save_investigation(insight_id, collected)
 ```
 
-The diagnosis (a typed `Diagnosis`) is the output of link one and the input to link two — `recAgent.propose(inv, diagnosis, …)` at L158. That handoff is a typed value, not a free-text blob: the diagnostic agent's structured output (→ 02-structured-outputs.md) *is* the boundary the recommendation agent consumes. The query agent is a separate entry point (`route.ts` L135–143), not part of the diagnose→recommend chain — it answers a one-off free-form question.
+The diagnosis (a typed `Diagnosis`) is the output of link one and the input to link two — the recommendation agent's propose method takes it as a positional argument. That handoff is a typed value, not a free-text blob: the diagnostic agent's structured output (→ 02-structured-outputs.md) *is* the boundary the recommendation agent consumes. The query agent is a separate entry point in the route handler, not part of the diagnose→recommend chain — it answers a one-off free-form question.
 
 ```
-investigation:  resolveAnomaly ─▶ diagnose ─(Diagnosis)─▶ recommend ─▶ save
-query:          classifyIntent ─▶ answer   (standalone, prose out)
+investigation:  resolve_anomaly ─▶ diagnose ─(Diagnosis)─▶ recommend ─▶ save
+query:          classify_intent ─▶ answer   (standalone, prose out)
 ```
 
 Wiring the chain in code (rather than letting one agent orchestrate the others) means the orchestration is deterministic, inspectable, and testable — you can unit-test each agent in isolation with a fake MCP caller, and the chain order is a code path, not a model decision.
@@ -112,7 +115,7 @@ Wiring the chain in code (rather than letting one agent orchestrate the others) 
 
 ### Benefit 1 — debugging: you know which link failed
 
-When a final recommendation is wrong, the trace tells you which link produced what. Every streamed event is tagged with its `agent` (`route.ts` L116–131): `reasoning_step`, `tool_call_start`, `tool_call_end` all carry the agent name. So a bad recommendation has a readable upstream trail:
+When a final recommendation is wrong, the trace tells you which link produced what. Every streamed event is tagged with its agent name through a per-agent hooks factory in the route handler: `reasoning_step`, `tool_call_start`, `tool_call_end` all carry the agent name. So a bad recommendation has a readable upstream trail:
 
 ```
 trace (agent-tagged):
@@ -134,11 +137,11 @@ In a monolith, the same wrong recommendation would be buried in one undifferenti
 Single-purpose links let you match each job to the cheapest model that can do it. blooming insights routes the trivial classification to Haiku and the heavy agents to Sonnet:
 
 ```
-classifyIntent  → claude-haiku-4-5  (intent.ts L14)   max_tokens 16, ONE word
-the four agents → claude-sonnet-4-6 (base.ts L9)      max_tokens 4096, tool loops
+classify_intent → "claude-haiku-4-5"   max_tokens 16, ONE word
+the four agents → "claude-sonnet-4-6"  max_tokens 4096, tool loops
 ```
 
-The intent classifier (`intent.ts` L17–31) has one job — map a question to `monitoring | diagnostic | recommendation` — and it's a one-word output, so it runs on the cheap fast model with `max_tokens: 16`. The agents reason over tool results and emit structured artifacts, so they run on the more capable model. If "be an analyst" were one prompt, the trivial classification would ride along on the expensive model for no reason. Decomposition is what makes per-job model selection *possible* — you can't route a job you haven't separated.
+The intent classifier has one job — map a question to `monitoring | diagnostic | recommendation` — and it's a one-word output, so it runs on the cheap fast model with `max_tokens: 16`. The agents reason over tool results and emit structured artifacts, so they run on the more capable model. If "be an analyst" were one prompt, the trivial classification would ride along on the expensive model for no reason. Decomposition is what makes per-job model selection *possible* — you can't route a job you haven't separated.
 
 ```
 one prompt:        everything on Sonnet  → pay top-tier for the 16-token classify
@@ -166,7 +169,7 @@ The third is subtle and worth holding onto: the three structured agents emit thr
 
 ### The principle
 
-One job per link is what turns a probabilistic feature into a debuggable, routable system. The disclaimers in each `## Role` are the typed boundaries between links; the wiring in `route.ts` makes the order deterministic and testable; the structured handoff (`Diagnosis` from link one to link two) is the typed value crossing the boundary. The payoff is operational, not aesthetic: failures localize to a named link, and each link runs on the cheapest model that can do its one job.
+One job per link is what turns a probabilistic feature into a debuggable, routable system. The disclaimers in each `## Role` are the typed boundaries between links; the wiring in the route handler makes the order deterministic and testable; the structured handoff (`Diagnosis` from link one to link two) is the typed value crossing the boundary. The payoff is operational, not aesthetic: failures localize to a named link, and each link runs on the cheapest model that can do its one job.
 
 ---
 
@@ -178,28 +181,28 @@ This diagram spans the prompt layer (four scoped Roles) and the orchestration la
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PROMPT LAYER — four single-job Roles, each disclaiming the others    │
 │                                                                       │
-│  monitoring.md L5   detect    "not diagnose, not propose"            │
-│  diagnostic.md L5   diagnose  "diagnose causes only"                 │
-│  recommendation.md L5 recommend "do NOT execute"                     │
-│  query.md L5        answer    "never invent numbers"                 │
+│  monitoring prompt      detect    "not diagnose, not propose"         │
+│  diagnostic prompt      diagnose  "diagnose causes only"              │
+│  recommendation prompt  recommend "do NOT execute"                    │
+│  query prompt           answer    "never invent numbers"              │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  wired in code (not model-chosen)
 ┌───────────────────────────▼───────────────────────────────────────────┐
-│  ORCHESTRATION LAYER — app/api/agent/route.ts                        │
+│  ORCHESTRATION LAYER — the route handler                              │
 │                                                                       │
-│   INVESTIGATION (L145–162):                                          │
-│     resolveAnomaly ─▶ DiagnosticAgent.investigate  L153             │
-│                         │ Diagnosis (typed handoff)                  │
-│                         ▼                                            │
-│                       RecommendationAgent.propose  L158             │
-│                         │ Recommendation[]                          │
-│                         ▼  saveInvestigation  L162                  │
+│   INVESTIGATION:                                                      │
+│     resolve_anomaly ─▶ diagnostic_agent.investigate                   │
+│                         │ Diagnosis (typed handoff)                   │
+│                         ▼                                             │
+│                       recommendation_agent.propose                    │
+│                         │ Recommendation[]                            │
+│                         ▼  save_investigation                         │
 │                                                                       │
-│   QUERY (L135–143, standalone):                                     │
-│     classifyIntent (Haiku, intent.ts L14) ─▶ QueryAgent.answer     │
+│   QUERY (standalone):                                                 │
+│     classify_intent (Haiku) ─▶ query_agent.answer                     │
 │                                                                       │
-│   every event tagged with `agent` (L116–131) → failure localizes    │
-│   model routing: classify→Haiku · agents→Sonnet (base.ts L9)        │
+│   every event tagged with `agent` → failure localizes                 │
+│   model routing: classify→Haiku · agents→Sonnet                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -375,3 +378,4 @@ In the investigation flow, what is the typed value passed from the diagnostic li
 → 01-anatomy.md · → 07-output-mode-mismatch.md · → 02-structured-outputs.md · → 09-chain-of-thought.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

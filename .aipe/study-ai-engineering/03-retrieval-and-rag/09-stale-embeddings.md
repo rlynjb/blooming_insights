@@ -42,10 +42,10 @@
 
 ## How it works
 
-**Mental model.** An embedding index *is* a cache: `Map<docId, vector>` where each vector is a derived value computed from a source document. Every truth you know about caches applies — cache invalidation is the hard part, stale reads are silent, and you need an expiry or invalidation rule. The codebase's `McpClient.cache` (`Map<key, {result, expiresAt}>`, `lib/mcp/client.ts` L18) is the same structure with the same problem already solved for tool results.
+**Mental model.** An embedding index *is* a cache: `Map<docId, vector>` where each vector is a derived value computed from a source document. Every truth you know about caches applies — cache invalidation is the hard part, stale reads are silent, and you need an expiry or invalidation rule. This codebase's TTL cache (`Map<key, {result, expiresAt}>` inside the MCP client wrapper) is the same structure with the same problem already solved for tool results.
 
 ```
-  McpClient cache (tool results)        embedding index (vectors)
+  TTL cache (tool results)              embedding index (vectors)
   ──────────────────────────────        ──────────────────────────────
   Map<key, {result, expiresAt}>         Map<docId, {vector, staleAt?}>
   serve if expiresAt > Date.now()       trust if source unchanged
@@ -72,12 +72,12 @@ A vector is computed once from a document's text. Three independent events make 
 
 Case 1 is the everyday one; case 2 is catastrophic (the *whole* index is stale — a model swap means re-embed everything, the breakpoint from `02`); case 3 happens on any re-chunking. The danger across all three: the vector still *works* (cosine returns a number), so there is no error — just a wrong answer.
 
-### Policy A: TTL (exactly `McpClient`'s approach)
+### Policy A: TTL (exactly the TTL cache's approach)
 
 The simplest policy is the one the codebase already runs for tool results: stamp each vector with an expiry and re-embed on read after it lapses. `embedding_stale_at` is the literal analog of `expiresAt`.
 
 ```
-  embed doc → { vector, embedding_stale_at: now + TTL }   ← like expiresAt L65
+  embed doc → { vector, embedding_stale_at: now + TTL }   ← like expiresAt
   on read:
     embedding_stale_at > now ?  → trust the vector
                                 → else re-embed before use
@@ -100,7 +100,7 @@ Change-detection re-embeds the minimum — only genuinely changed documents — 
 
 ### Policy C: no-stale-on-error (the codebase's other half)
 
-`McpClient` does not only expire — it refuses to cache errors (`lib/mcp/client.ts` L58–L60) so a failure cannot poison future reads. The embedding analog: if re-embedding fails (the embedding API errors), do *not* overwrite the existing vector with a bad/empty one and do *not* mark it fresh — keep the last-good vector and leave it marked stale to retry. A failed re-embed must not corrupt the index, exactly as a failed tool call must not corrupt the cache.
+The TTL cache does not only expire — it refuses to cache errors so a failure cannot poison future reads. The embedding analog: if re-embedding fails (the embedding API errors), do *not* overwrite the existing vector with a bad/empty one and do *not* mark it fresh — keep the last-good vector and leave it marked stale to retry. A failed re-embed must not corrupt the index, exactly as a failed tool call must not corrupt the cache.
 
 ```
   re-embed attempt fails (API error)
@@ -112,7 +112,7 @@ Change-detection re-embeds the minimum — only genuinely changed documents — 
 
 ### The principle
 
-An embedding index is a cache of derived values, so it inherits every caching discipline: invalidation is the hard part, stale reads are silent and dangerous, and you need an explicit freshness policy — a TTL, a change-detector, or both — plus a no-poison-on-error rule. blooming insights already implemented all of this for tool results in `McpClient`; an embedding index would re-implement the identical pattern, with `embedding_stale_at` playing the exact role of `expiresAt`.
+An embedding index is a cache of derived values, so it inherits every caching discipline: invalidation is the hard part, stale reads are silent and dangerous, and you need an explicit freshness policy — a TTL, a change-detector, or both — plus a no-poison-on-error rule. You already implemented all of this for tool results in the TTL cache; an embedding index would re-implement the identical pattern, with `embedding_stale_at` playing the exact role of `expiresAt`.
 
 ---
 
@@ -124,7 +124,7 @@ This diagram spans the State layer (the index as a cache) and shows the direct p
 ┌──────────────────────────────────────────────────────────────────────┐
 │  STATE LAYER  — the index IS a cache (parallel to McpClient.cache)  │
 │                                                                      │
-│  McpClient.cache (lib/mcp/client.ts L18, L40, L58–60, L65)         │
+│  McpClient.cache         │
 │    Map<key, {result, expiresAt}>                                    │
 │    read:  expiresAt > now ? serve : refetch                        │
 │    error: NOT cached (no poison)                                    │
@@ -282,3 +282,4 @@ What freshness/staleness mechanism does blooming insights already implement, and
 → 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

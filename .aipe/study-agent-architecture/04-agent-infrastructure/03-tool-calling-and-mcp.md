@@ -75,20 +75,20 @@ The technical thing: **the `tool_use` → execute → `tool_result` cycle, with 
 If you're coming from frontend, this is the `useFetch` round trip — except the consumer is the LLM, the URL is a tool name, and the protocol is JSON-RPC over an HTTP stream instead of REST.
 
 ```
-the round trip — base.ts L102–L171
+the round trip — pseudocode
 
   turn N:
   ┌────────────────────────────────────────────────┐
-  │ anthropic.messages.create({ tools, messages }) │  ← model emits
-  │   → res.content includes ToolUseBlock          │     tool_use
-  │     { name: 'execute_analytics_eql', input }   │
+  │ model.create({ tools, messages })              │  ← model emits
+  │   → res.content includes a tool_use block      │     tool_use
+  │     { name: 'analytics_tool', input }          │
   └─────────────────────┬──────────────────────────┘
                         ▼
   ┌────────────────────────────────────────────────┐
   │ for each tool_use:                              │
-  │   mcp.callTool(name, input)                     │  ← MCP boundary
-  │     → { result, durationMs, fromCache }         │
-  │   resultContent = truncate(JSON.stringify(...)) │
+  │   mcp_client.call_tool(name, input)             │  ← MCP boundary
+  │     → { result, duration_ms, from_cache }       │
+  │   result_content = truncate(serialize(...))     │
   └─────────────────────┬──────────────────────────┘
                         ▼
   ┌────────────────────────────────────────────────┐
@@ -99,9 +99,9 @@ the round trip — base.ts L102–L171
   └────────────────────────────────────────────────┘
 ```
 
-The practical consequence: the model writes the call, your loop executes it, the result becomes the model's *next* observation. The model never executes code — that's the contract — so any guardrail you want lives in the loop's `callTool` step (read-only servers, rate-limit retries, schema-validated args). The model writes; your code dispatches.
+The practical consequence: the model writes the call, your loop executes it, the result becomes the model's *next* observation. The model never executes code — that's the contract — so any guardrail you want lives in the loop's tool-call step (read-only servers, rate-limit retries, schema-validated args). The model writes; your code dispatches.
 
-The condition under which it works: the model's `tool_use.input` has to match the tool's `input_schema`. Schemas mismatched → tool call fails → loop feeds the error back as a `tool_result` with `is_error: true` (`base.ts` L141–L156), the model adapts on the next turn.
+The condition under which it works: the model's `tool_use.input` has to match the tool's `input_schema`. Schemas mismatched → tool call fails → loop feeds the error back as a `tool_result` with `is_error: true`, the model adapts on the next turn.
 
 ### Move 2 — One discovery, sliced per agent
 
@@ -110,55 +110,55 @@ The technical thing: **the tools come from the server (`listTools()`), and a per
 If you're coming from frontend, this is the codegen pattern in a typed RPC client — one schema source generates one full client, and each consumer imports only the methods it uses. The methods are shared; the import surface is per-consumer.
 
 ```
-discovery + slicing — route.ts L203 + tool-schemas.ts L15
+discovery + slicing — pseudocode
 
-  one listTools() per request
+  one list_tools() per request
   ┌─────────────────────────────────────────────────┐
-  │ rawTools = await conn.mcp.listTools()           │  ← from MCP server
-  │   → ~27 tools, with description + inputSchema    │
+  │ raw_tools = await mcp_client.list_tools()       │  ← from MCP server
+  │   → ~27 tools, with description + input_schema   │
   └──────────────────────┬──────────────────────────┘
                          │ filter at the boundary
                          ▼
-  filterToolSchemas(allTools, monitoringTools)        ← per-agent slice
-  filterToolSchemas(allTools, diagnosticTools)
-  filterToolSchemas(allTools, recommendationTools)
-  filterToolSchemas(allTools, queryTools)
+  filter_tool_schemas(all_tools, monitoring_tool_set) ← per-agent slice
+  filter_tool_schemas(all_tools, diagnostic_tool_set)
+  filter_tool_schemas(all_tools, recommendation_tool_set)
+  filter_tool_schemas(all_tools, query_tool_set)
                          │
                          ▼
-  each agent's runAgentLoop receives only its tools
+  each agent's loop receives only its tools
 ```
 
-The practical consequence: the monitoring agent sees 13 monitoring-shaped tools (`monitoringTools` in `lib/mcp/tools.ts` L5). The recommendation agent sees 7 propose-shaped tools (`recommendationTools` at L27). When the monitoring agent's loop sends `tools` to Claude, the recommendation tools aren't even in the schema — the model can't choose them, can't hallucinate them. The slice is enforced by absence, not by a prompt instruction asking the model "please don't."
+The practical consequence: the monitoring agent sees 13 monitoring-shaped tools. The recommendation agent sees 7 propose-shaped tools. When the monitoring agent's loop sends its tool list to the model, the recommendation tools aren't even in the schema — the model can't choose them, can't hallucinate them. The slice is enforced by absence, not by a prompt instruction asking the model "please don't."
 
-The condition under which it works: the allow-list per agent has to match the agent's actual job. The four lists in `lib/mcp/tools.ts` are hand-curated against the agent prompts in `lib/agents/prompts/`; the day a prompt change adds a job the tool list doesn't support, the model will reason about a tool it doesn't have and either fail gracefully or hallucinate one.
+The condition under which it works: the allow-list per agent has to match the agent's actual job. The four lists are hand-curated against the agent prompts; the day a prompt change adds a job the tool list doesn't support, the model will reason about a tool it doesn't have and either fail gracefully or hallucinate one.
 
 ### Move 3 — One client, one connection, one place for cross-cutting concerns
 
-The technical thing: **`McpClient` is the single dispatcher** — it owns auth (via the OAuth provider), proactive spacing (`minIntervalMs = 1100` from `connect.ts` L92), rate-limit retry with parsed hints + exponential backoff (`client.ts` L122–L132), a 60-second TTL response cache (`client.ts` L80, L143), and the no-cache-on-error rule (L137).
+The technical thing: **the MCP client wrapper is the single dispatcher** — it owns auth (via the OAuth provider), proactive spacing (~1.1s minimum interval between live calls), rate-limit retry with parsed hints + exponential backoff, a 60-second TTL response cache, and the no-cache-on-error rule.
 
 If you're coming from frontend, this is the `httpClient` wrapper your team writes once and shares — base URL, auth header, retry interceptor, response cache, all in one place — so individual `useFetch` callers don't each implement them.
 
 ```
-one client, all the cross-cutting concerns — client.ts L79–L172
+one client, all the cross-cutting concerns — pseudocode
 
-  callTool(name, args)
+  call_tool(name, args)
       │
-      ├── 1. cache check (60s TTL by key=`${name}:${JSON.stringify(args)}`)
-      │      └── hit → return { result, fromCache: true }                  L105
+      ├── 1. cache check (60s TTL by key = name + ':' + serialize(args))
+      │      └── hit → return { result, from_cache: true }
       │
-      ├── 2. proactive spacing — sleep if < 1100ms since last live call    L149
+      ├── 2. proactive spacing — sleep if < 1100ms since last live call
       │
-      ├── 3. liveCall (transport.callTool)
+      ├── 3. live_call (transport.call_tool)
       │
-      ├── 4. if rate-limited → parse "per N second" hint, sleep, retry     L122
-      │       (capped at maxRetries=3, ceiling=20s per wait)
+      ├── 4. if rate-limited → parse "per N second" hint, sleep, retry
+      │       (capped at max_retries=3, ceiling=20s per wait)
       │
-      └── 5. no-cache on error (isError === true) → return uncached        L137
+      └── 5. no-cache on error (is_error == true) → return uncached
 ```
 
-The practical consequence: every agent and every turn benefits from the same retries, the same cache, the same spacing. The monitoring agent's third call to `execute_analytics_eql` with identical args is a 0ms cache hit (`durationMs: 0, fromCache: true`). A 429 on the recommendation agent's `list_scenarios` waits exactly the window Bloomreach told it to wait, then retries automatically — the loop above doesn't know it happened. The agent's only contract with MCP is "I call `mcp.callTool(name, args)` and get back `{ result, durationMs, fromCache }`."
+The practical consequence: every agent and every turn benefits from the same retries, the same cache, the same spacing. The monitoring agent's third call to an analytics tool with identical args is a 0ms cache hit (`duration_ms: 0, from_cache: true`). A 429 on the recommendation agent's scenarios-list call waits exactly the window the server told it to wait, then retries automatically — the loop above doesn't know it happened. The agent's only contract with MCP is "I call `call_tool(name, args)` and get back `{ result, duration_ms, from_cache }`."
 
-The condition under which it works: the cache key has to match the *intent* of the call. `JSON.stringify(args)` works because the args fully determine the result for read-only tools. If a tool's output depended on time-of-call or external state, the 60s cache would serve stale results — which is why this codebase's MCP tools are all read-only-by-contract (covered in `05-guardrails-and-control.md`).
+The condition under which it works: the cache key has to match the *intent* of the call. Serializing the args works because the args fully determine the result for read-only tools. If a tool's output depended on time-of-call or external state, the 60s cache would serve stale results — which is why this codebase's MCP tools are all read-only-by-contract (covered in the guardrails note).
 
 ### Move 4 — Auth as a first-class concern (OAuth PKCE + DCR)
 
@@ -167,22 +167,22 @@ The technical thing: **the MCP transport speaks OAuth — Dynamic Client Registr
 If you're coming from frontend, this is the OAuth dance you do for a "Sign in with X" flow — except the *agent's host* is the client, the *user's session* is the credential store, and the protocol is wired through the MCP SDK rather than your own code.
 
 ```
-auth wiring — lib/mcp/connect.ts (BloomreachAuthProvider)
+auth wiring — the MCP auth provider
 
   per request:
-   1. transport = new StreamableHTTPClientTransport(mcpUrl, {authProvider})
+   1. transport = new streamable_http_transport(mcp_url, { auth_provider })
    2. client.connect(transport)
         │
         ├── if no token → provider redirects to authorize URL
         │     → /api/mcp/callback completes the code exchange
-        │     → provider.saveTokens persists to encrypted cookie
+        │     → provider.save_tokens persists to encrypted cookie
         │
         └── if token present → JSON-RPC over HTTP, tokens on requests
 ```
 
-The practical consequence: the agent never sees credentials. The route opens an authenticated `McpClient`, passes it down to each agent constructor (`new MonitoringAgent(anthropic, mcp, schema, allTools)` at `route.ts`), and the agent just calls `mcp.callTool(...)`. Refresh, code exchange, token persistence, and the one-time auto-reconnect on a revoked token (`app/page.tsx`, guarded by `sessionStorage['bi:reconnecting']`) all live below the agent's contract.
+The practical consequence: the agent never sees credentials. The route opens an authenticated MCP client, passes it down to each agent's constructor, and the agent just calls `call_tool(...)`. Refresh, code exchange, token persistence, and the one-time auto-reconnect on a revoked token (a UI-side handler guarded by a session-storage flag) all live below the agent's contract.
 
-The condition under which it works: the provider's `saveTokens` must persist across requests *for the same session*. That's done via session-cookie-keyed storage (the `withAuthCookies` wrapper, `connect.ts`), so each user's tokens travel with their session, and a serverless instance that gets a different user's request reads that user's tokens — no cross-user leakage.
+The condition under which it works: the provider's `save_tokens` must persist across requests *for the same session*. That's done via session-cookie-keyed storage, so each user's tokens travel with their session, and a serverless instance that gets a different user's request reads that user's tokens — no cross-user leakage.
 
 ### Move 5 — The shape MCP buys vs the alternatives
 
@@ -205,7 +205,7 @@ There are three real shapes for "how does the model do things":
                                        rate limits + many tools
 ```
 
-The reframe to hand the reader: **MCP earns its layer when the tool host imposes auth and rate limits, when tool surfaces are shared across multiple agents/hosts, and when tool discovery has to be runtime (not compile-time).** All three are true here. Bloomreach's loomi connect MCP owns the auth flow (OAuth, PKCE, DCR), enforces a multi-second rate limit window per user, and exposes ~27 tools that four agents need slices of. Inlining tool defs would mean re-implementing each of those concerns in agent code; a gateway would add an extra hop without a clear payoff against this single host.
+The reframe to hand the reader: **MCP earns its layer when the tool host imposes auth and rate limits, when tool surfaces are shared across multiple agents/hosts, and when tool discovery has to be runtime (not compile-time).** All three are true here. The Bloomreach MCP server owns the auth flow (OAuth, PKCE, DCR), enforces a multi-second rate limit window per user, and exposes ~27 tools that four agents need slices of. Inlining tool defs would mean re-implementing each of those concerns in agent code; a gateway would add an extra hop without a clear payoff against this single host.
 
 ### The principle
 
@@ -222,46 +222,45 @@ The full substrate — what every reasoning pattern stands on
 
   ┌──────────────────── AGENTS (4 of them) ──────────────────────┐
   │ monitoring · diagnostic · recommendation · query              │
-  │   all call: runAgentLoop({ anthropic, mcp, toolSchemas, ... })│
+  │   all call: shared agent loop({ model, mcp, tool_schemas, …}) │
   └────────────┬───────────────────────────────────┬─────────────┘
                │                                   │
                ▼                                   ▼
   ┌─────────────────────────┐         ┌──────────────────────────┐
-  │ filterToolSchemas       │         │ runAgentLoop (base.ts)   │
-  │ (tool-schemas.ts L15)    │         │   model.tool_use   ──┐    │
-  │ per-agent slice:        │         │      ▼               │    │
-  │   monitoringTools (13)   │         │   mcp.callTool ◄────┘    │
-  │   diagnosticTools (17)   │         │      ▼                   │
-  │   recommendationTools (7)│         │   tool_result → messages │
-  │   queryTools (union)    │         └──────────┬────────────────┘
-  └─────────────────────────┘                    │
+  │ filter_tool_schemas     │         │ the shared agent loop    │
+  │ per-agent slice:        │         │   model.tool_use   ──┐    │
+  │   monitoring set (13)   │         │      ▼               │    │
+  │   diagnostic set (17)   │         │   mcp.call_tool ◄────┘    │
+  │   recommendation (7)    │         │      ▼                   │
+  │   query set (union)     │         │   tool_result → messages │
+  └─────────────────────────┘         └──────────┬────────────────┘
+                                                  │
                                                   ▼
                 ┌───────────────────────────────────────────────┐
-                │ McpClient (lib/mcp/client.ts)                 │
-                │   60s TTL cache (L80, L143)                    │
-                │   minIntervalMs=1100 spacing (L149)            │
-                │   parsed-hint retry + backoff (L122)           │
-                │   no-cache-on-error (L137)                     │
-                │   McpToolError on transport failure (L68)      │
+                │ MCP client wrapper                            │
+                │   60s TTL cache                                │
+                │   ~1.1s minimum spacing                        │
+                │   parsed-hint retry + backoff                  │
+                │   no-cache-on-error                            │
+                │   typed error on transport failure             │
                 └────────────────────────┬─────────────────────────┘
                                           │
                                           ▼
                 ┌───────────────────────────────────────────────┐
-                │ SdkTransport (lib/mcp/transport.ts)            │
-                │   wraps @modelcontextprotocol/sdk's            │
-                │   StreamableHTTPClientTransport                 │
+                │ SDK transport                                  │
+                │   wraps an MCP SDK's streamable HTTP transport │
                 └────────────────────────┬─────────────────────────┘
                                           │
                                           ▼
                 ┌───────────────────────────────────────────────┐
-                │ BloomreachAuthProvider (lib/mcp/connect.ts)    │
+                │ OAuth provider                                 │
                 │   OAuth: PKCE + Dynamic Client Registration    │
                 │   tokens persisted to encrypted session cookie │
                 └────────────────────────┬─────────────────────────┘
                                           │  authenticated HTTP
                                           ▼
                 ┌───────────────────────────────────────────────┐
-                │ Bloomreach loomi connect MCP server            │
+                │ Bloomreach MCP server                          │
                 │   exposes ~27 tools, lists them via JSON-RPC    │
                 │   enforces per-user rate limit (~1 req/N sec)  │
                 └───────────────────────────────────────────────┘
@@ -485,3 +484,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

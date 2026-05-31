@@ -84,7 +84,7 @@ for turn in maxTurns:                                ─┐
   messages.push({ role:'user', content: results })   ─┘
 ```
 
-Four load-bearing pieces: (1) the **bounded turn loop**, (2) the **`tool_use` → execute → `tool_result` back** observation cycle, (3) the **`maxToolCalls` budget**, and (4) the **forced-final escape hatch** (strip `tools` so the model must write text). The wire-level mechanics — what a turn looks like in the Messages API, the difference between `text` and `tool_use` blocks, how `messages.push` accumulates — are covered in `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`. This file's kernel is about *placement*: what makes this an agent loop and not its predecessor or its replacement.
+Four load-bearing pieces: (1) the **bounded turn loop**, (2) the **`tool_use` → execute → `tool_result` back** observation cycle, (3) the **per-loop tool-call budget**, and (4) the **forced-final escape hatch** (strip `tools` so the model must write text). The wire-level mechanics — what a turn looks like in the Messages API, the difference between `text` and `tool_use` blocks, how the message history accumulates — are covered in the ai-engineering ReAct pattern note. This file's kernel is about *placement*: what makes this an agent loop and not its predecessor or its replacement.
 
 ---
 
@@ -106,13 +106,13 @@ tool_use → tool_result feedback    The "Re" in ReAct is gone — the model
                                    running plan-and-execute without the
                                    plan: blind execution.
 
-maxToolCalls budget                The loop has no upper bound. Cost and
+per-loop tool-call budget          The loop has no upper bound. Cost and
                                    latency become unpredictable. This is
                                    the specific property the multi-agent
-                                   escalation gate (→ `../03-multi-agent-
-                                   orchestration/01-when-not-to-go-multi-
-                                   agent.md`) tests against — without it,
-                                   "ReAct hit its ceiling" is unmeasurable.
+                                   escalation gate (→ the "when not to go
+                                   multi-agent" note) tests against —
+                                   without it, "ReAct hit its ceiling" is
+                                   unmeasurable.
 
 forced-final escape hatch          Budget hits but the model still has
                                    tools. It keeps calling them. The loop
@@ -132,33 +132,33 @@ The placement consequence of each removal: drop the loop and you're below ReAct 
 The kernel is the minimum that makes a ReAct agent. Everything else is hardening that turns one ReAct agent into a *production* ReAct agent. In this codebase, the four agents share the kernel and vary only at the hardening layer.
 
 ```
-SKELETON (in runAgentLoop — required)         HARDENING (placement-relevant)
-────────────────────────────────────          ──────────────────────────────────
-bounded turn loop (maxTurns = 8)              ┌ per-agent tool SUBSETS via
-tool_use → execute → tool_result back         │   filterToolSchemas (→ this
-maxToolCalls budget per agent                 │   folder's 06-routing.md)
-forced-final: tools omitted on last turn      ├ streamed trace as a product
-synthesisInstruction appended on the          │   surface (→ ai-eng 05-streaming;
-  forced-final turn                           │   the trace makes the loop
-                                              │   inspectable to the user)
-                                              ├ output validators on finalText
-                                              │   (parseAgentJson + type guards)
-                                              ├ a tool-less synthesize() retry
-                                              │   on parse failure (diagnostic +
-                                              │   recommendation)
-                                              ├ a deterministic supervisor
-                                              │   composing multiple ReAct
-                                              │   nodes (→ 03/03-sequential-
-                                              │   pipeline.md — the actual
-                                              │   topology this codebase uses)
-                                              └ self-critique, planning,
-                                                  branch exploration
-                                                  (absent — every escalation
-                                                  on the ladder is hardening
-                                                  layered on this kernel)
+SKELETON (in the shared agent loop — required)   HARDENING (placement-relevant)
+────────────────────────────────────────────     ──────────────────────────────────
+bounded turn loop (max-turns ceiling)            ┌ per-agent tool SUBSETS via
+tool_use → execute → tool_result back            │   a schema filter (→ this
+per-loop tool-call budget                        │   folder's routing note)
+forced-final: tools omitted on last turn         ├ streamed trace as a product
+synthesis instruction appended on the            │   surface (→ ai-eng streaming;
+  forced-final turn                              │   the trace makes the loop
+                                                 │   inspectable to the user)
+                                                 ├ output validators on finalText
+                                                 │   (JSON parse + type guards)
+                                                 ├ a tool-less synthesize retry
+                                                 │   on parse failure (diagnostic +
+                                                 │   recommendation)
+                                                 ├ a deterministic supervisor
+                                                 │   composing multiple ReAct
+                                                 │   nodes (→ sequential-pipeline
+                                                 │   — the actual topology this
+                                                 │   codebase uses)
+                                                 └ self-critique, planning,
+                                                   branch exploration
+                                                   (absent — every escalation
+                                                   on the ladder is hardening
+                                                   layered on this kernel)
 ```
 
-All four agents in this codebase share the kernel — that's why one `runAgentLoop` function powers them (`lib/agents/base.ts` L48–L176). The variations are at the hardening layer: which tool subset (`lib/mcp/tools.ts`), which synthesisInstruction, which validator. The agents themselves are the same loop. And the next escalation on the ladder — plan-and-execute, reflexion, etc. — is *another layer of hardening* on the same kernel, not a different kernel.
+All four agents in this codebase share the kernel — that's why one shared loop function powers them. The variations are at the hardening layer: which tool subset, which synthesis instruction, which validator. The agents themselves are the same loop. And the next escalation on the ladder — plan-and-execute, reflexion, etc. — is *another layer of hardening* on the same kernel, not a different kernel.
 
 ---
 
@@ -188,7 +188,7 @@ The escalation ladder
        (multi-agent), not another reasoning pattern
 ```
 
-The principle: every escalation step has a measured failure mode it fixes, and a token/latency cost it adds. If you can't name the failure mode, the escalation isn't earning its keep. blooming insights is at the bottom of this ladder — four agents, all pure ReAct, no planner, no critic loop (the diagnostic and recommendation agents have a *forced synthesis* call on failure, which looks like a critic but isn't — see `04-reflexion-self-critique.md`).
+The principle: every escalation step has a measured failure mode it fixes, and a token/latency cost it adds. If you can't name the failure mode, the escalation isn't earning its keep. blooming insights is at the bottom of this ladder — four agents, all pure ReAct, no planner, no critic loop (the diagnostic and recommendation agents have a *forced synthesis* call on failure, which looks like a critic but isn't — see the reflexion note).
 
 The full picture is below.
 
@@ -197,43 +197,43 @@ The full picture is below.
 ## ReAct — diagram
 
 ```
-runAgentLoop — the baseline reused four times
+the shared agent loop — the baseline reused four times
 
   caller (Diagnostic / Recommendation / Monitoring / Query):
-    runAgentLoop({ system, userPrompt, toolSchemas,
-                   maxTurns: 8, maxToolCalls: 4 or 6,
-                   synthesisInstruction })
+    run_agent_loop({ system, user_prompt, tool_schemas,
+                     max_turns, per_loop_tool_budget,
+                     synthesis_instruction })
 
-  ┌─ LOOP (base.ts L85–L172) ────────────────────────────────────────┐
+  ┌─ LOOP ───────────────────────────────────────────────────────────┐
   │                                                                   │
-  │   ┌────────── for turn = 0…maxTurns-1 ──────────┐                │
+  │   ┌────────── for turn = 0…max_turns-1 ─────────┐                │
   │   │                                              │                │
   │   │   ┌──────────────────────────────────────┐  │                │
-  │   │   │ forceFinal = lastTurn || budgetSpent │  │ L90–L91         │
+  │   │   │ force_final = last_turn OR           │  │                │
+  │   │   │               budget_spent           │  │                │
   │   │   └──────────────────────────────────────┘  │                │
   │   │                  │                            │                │
   │   │                  ▼                            │                │
   │   │   ┌──────────────────────────────────────┐  │                │
-  │   │   │ anthropic.messages.create({          │  │                │
-  │   │   │   model: claude-sonnet-4-6,          │  │ L9 / L102       │
+  │   │   │ model.create({                       │  │                │
   │   │   │   system, messages,                  │  │                │
-  │   │   │   tools: forceFinal ? omit : tools,  │  │ L101            │
+  │   │   │   tools: force_final ? omit : tools, │  │                │
   │   │   │ })                                   │  │                │
   │   │   └──────────────────────────────────────┘  │                │
   │   │                  │                            │                │
   │   │     ┌────────────┴────────────┐               │                │
   │   │     ▼ no tool_use             ▼ has tool_use  │                │
   │   │   RETURN finalText           for each:        │                │
-  │   │   (L121)                       mcp.callTool   │ L144            │
+  │   │   (natural stop)              run a tool call │                │
   │   │                                push result    │                │
   │   │                                                │                │
-  │   │   messages.push(tool_results as user turn)    │ L171            │
+  │   │   messages.push(tool_results as user turn)    │                │
   │   └────────────────────────────────────────────────┘               │
   │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 
        4 callers, 1 loop. The per-caller knobs are just
-       (system prompt, tool subset, maxToolCalls, synthesisInstruction).
+       (system prompt, tool subset, tool-call budget, synthesis instruction).
 ```
 
 ---
@@ -420,3 +420,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

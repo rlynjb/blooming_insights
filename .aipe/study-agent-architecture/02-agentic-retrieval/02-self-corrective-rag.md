@@ -142,11 +142,11 @@ The condition under which the grader earns its overhead: the answer's stakes hav
 
 ### What blooming insights has instead — premise checks, not relevance checks
 
-The technical thing: there's no relevance grader between `execute_analytics_eql` and the model's next reasoning step. The agentic-RAG loop (`runAgentLoop`, `base.ts` L48–L176) runs the EQL, feeds the JSON result back, and the model reasons on it — no per-chunk scoring sits in between. But two adjacent checks exist, and naming them honestly matters.
+The technical thing: there's no relevance grader between the analytics tool call and the model's next reasoning step. The agentic-RAG loop runs the query, feeds the JSON result back, and the model reasons on it — no per-chunk scoring sits in between. But two adjacent checks exist, and naming them honestly matters.
 
-**Adjacent check 1: the monitoring agent's volume check.** The monitoring prompt (`lib/agents/prompts/monitoring.md` around L31, the `CRITICAL: verify your windows actually contain data` block) instructs the agent to spend its *first* query on a volume probe — `select count event purchase in last 90 days` — before running any anomaly recipes. If the count is empty or tiny, the agent shifts `execution_time` to a populated range or widens the window. This is a *premise* check: it validates that retrieval will be meaningful before doing it, not that a retrieved chunk is relevant to the question. Closest analog to a self-corrective gate, but at the wrong layer — it gates the *window*, not the *result*.
+**Adjacent check 1: the monitoring agent's volume check.** The monitoring prompt instructs the agent to spend its *first* query on a volume probe — a count of purchase events over the last 90 days — before running any anomaly recipes. If the count is empty or tiny, the agent shifts the execution time to a populated range or widens the window. This is a *premise* check: it validates that retrieval will be meaningful before doing it, not that a retrieved chunk is relevant to the question. Closest analog to a self-corrective gate, but at the wrong layer — it gates the *window*, not the *result*.
 
-**Adjacent check 2: the diagnostic agent's hypothesis testing.** The diagnostic prompt (`lib/agents/prompts/diagnostic.md`) frames investigation as "generate 2–3 competing hypotheses, then query to falsify each." This is *answer-side validity* — the model is forced to check whether the evidence supports or rules out its candidate explanation, which is a groundedness check applied to its own reasoning, not to retrieved chunks.
+**Adjacent check 2: the diagnostic agent's hypothesis testing.** The diagnostic prompt frames investigation as "generate 2–3 competing hypotheses, then query to falsify each." This is *answer-side validity* — the model is forced to check whether the evidence supports or rules out its candidate explanation, which is a groundedness check applied to its own reasoning, not to retrieved chunks.
 
 ```
 What this codebase has vs the self-corrective RAG pattern
@@ -176,9 +176,9 @@ Right now no grader sits on the retrieval path. Naming where one *would* sit cla
 ```
         Phase A (now)                Phase B (with grader)
 ┌─────────────────────────┐  ┌─────────────────────────────────┐
-│ model picks EQL         │  │ model picks EQL                 │
+│ model picks query       │  │ model picks query               │
 │   ▼                     │  │   ▼                             │
-│ execute_analytics_eql   │  │ execute_analytics_eql           │
+│ analytics tool call     │  │ analytics tool call             │
 │   ▼                     │  │   ▼                             │
 │ result fed back         │  │ GRADER: result vs question      │ ←
 │   ▼                     │  │   ├─ relevant?                  │
@@ -186,7 +186,7 @@ Right now no grader sits on the retrieval path. Naming where one *would* sit cla
 │   ▼                     │  │      hypothesis?                │
 │ next turn               │  │   ▼                             │
 │                         │  │ pass → feed back to model       │
-│                         │  │ fail → rewrite EQL / widen      │
+│                         │  │ fail → rewrite query / widen    │
 │                         │  │        window / abstain         │
 └─────────────────────────┘  └─────────────────────────────────┘
    no gate; the model    │   one extra model call per retrieval
@@ -194,9 +194,9 @@ Right now no grader sits on the retrieval path. Naming where one *would* sit cla
    comes back            │   adds 1× LLM tax per turn
 ```
 
-*Phase A (now):* trust EQL's structured shape and the monitoring volume-check; treat retrieval results as ground truth and let the diagnostic agent's hypothesis testing catch downstream inconsistency. Cheap, simple, occasionally wrong.
+*Phase A (now):* trust the typed query language's structured shape and the monitoring volume-check; treat retrieval results as ground truth and let the diagnostic agent's hypothesis testing catch downstream inconsistency. Cheap, simple, occasionally wrong.
 
-*Phase B (with grader):* add a relevance/groundedness check on every `tool_result` before it's fed back to the model. Catches "wrong numbers from wrong query" earlier. Pays 1× extra model call per turn (so ~6 extra calls per investigation), bounded by the existing `maxToolCalls` budget.
+*Phase B (with grader):* add a relevance/groundedness check on every tool result before it's fed back to the model. Catches "wrong numbers from wrong query" earlier. Pays 1× extra model call per turn (so ~6 extra calls per investigation), bounded by the existing per-loop tool-call budget.
 
 The takeaway: **the grader is a checkpoint, not a topology change.** The agentic-RAG loop's shape (`reason → retrieve → observe → repeat`) doesn't change; one extra step (`grade`) sits between `retrieve` and `observe`, and the fallback path replaces the "observe → reason" arrow with a "observe → fallback → retrieve again" arrow when the grade fails. The day the answer's stakes go up — a feature ships to customers with no human review in the loop — that's the day the grader earns its cost.
 
@@ -219,8 +219,9 @@ The self-corrective RAG pattern (canonical, with where this codebase sits)
   │   model picks next retrieval                                  │
   │              ▼ tool_use                                       │
   │   ┌─────────────────────────────┐                             │
-  │   │ retriever (EQL / vector /   │                             │
-  │   │ SQL / web / live API)        │                             │
+  │   │ retriever (typed query /    │                             │
+  │   │ vector / SQL / web / live   │                             │
+  │   │ API)                         │                             │
   │   └─────────────┬───────────────┘                             │
   │                 ▼ chunks / rows / result                       │
   │   ┌─────────────────────────────┐                             │
@@ -241,16 +242,16 @@ The self-corrective RAG pattern (canonical, with where this codebase sits)
 
   WHAT THIS CODEBASE HAS INSTEAD (adjacent checks):
     1. Pre-retrieval premise check: monitoring volume-check
-       (`prompts/monitoring.md` ~L31 CRITICAL block)
+       (a CRITICAL block in the monitoring prompt)
        → validates the window has data BEFORE running recipes
     2. Post-reasoning groundedness check: diagnostic hypothesis testing
-       (`prompts/diagnostic.md` hypothesis-falsification structure)
+       (hypothesis-falsification structure in the diagnostic prompt)
        → validates the ANSWER against evidence, not the retrieval
        against the question
 
-  THE GAP: no per-tool_result relevance grader between EQL and
-  the model's next turn. "We retrieved" is silently equated with
-  "we have the right numbers" on the retrieval path itself.
+  THE GAP: no per-tool-result relevance grader between the query
+  and the model's next turn. "We retrieved" is silently equated
+  with "we have the right numbers" on the retrieval path itself.
 ```
 
 ---
@@ -442,3 +443,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

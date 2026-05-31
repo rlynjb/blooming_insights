@@ -67,35 +67,34 @@ The strategy in plain English: **prefer structural prevention; fall back to mech
 
 ### Layer 1 — Tool-call cascade (controlled mechanically)
 
-The technical thing: an agent loop emits more tool calls per turn or stays in the loop longer than you intended, burning the budget on calls instead of arriving at an answer. The single-agent shape (cross-ref `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`) has this risk; multi-agent amplifies it (N agents, N times the risk).
+The technical thing: an agent loop emits more tool calls per turn or stays in the loop longer than you intended, burning the budget on calls instead of arriving at an answer. The single-agent shape (cross-ref the ai-engineering agents-vs-chains note) has this risk; multi-agent amplifies it (N agents, N times the risk).
 
-The mitigation in blooming insights: a *hard `maxToolCalls` cap per agent* plus a *forced-final-turn mechanic* in `runAgentLoop` (`lib/agents/base.ts` L90–L101).
+The mitigation in blooming insights: a *hard per-loop tool-call cap per agent* plus a *forced-final-turn mechanic* in the shared agent loop.
 
 ```
-The mechanism (base.ts L90–L101)
+The mechanism, pseudocode
 
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const budgetSpent = maxToolCalls !== undefined
-      && toolCalls.length >= maxToolCalls;
-    const forceFinal = turn === maxTurns - 1 || budgetSpent;
-    const params = { ... };
-    if (!forceFinal) params.tools = toolSchemas;
-    //              ▲ tools STRIPPED on forced-final
-    //              ▲ model literally cannot emit more tool calls
-    const res = await anthropic.messages.create(params);
+  for turn in 0..max_turns:
+    budget_spent = tool_calls.length >= per_loop_tool_budget
+    force_final  = turn == max_turns - 1 OR budget_spent
+    params = { ... }
+    if not force_final:
+        params.tools = tool_schemas
+        # ▲ tools STRIPPED on forced-final
+        # ▲ model literally cannot emit more tool calls
+    res = await model.create(params)
     ...
-  }
 ```
 
 Per-agent caps:
-- monitoring: `maxToolCalls: 6` (`monitoring.ts` L101)
-- diagnostic: `maxToolCalls: 6` (`diagnostic.ts` L62)
-- recommendation: `maxToolCalls: 4` (`recommendation.ts` L57)
-- query: `maxToolCalls: 6` (`query.ts` L41)
+- monitoring: 6 tool calls
+- diagnostic: 6 tool calls
+- recommendation: 4 tool calls
+- query: 6 tool calls
 
 The practical consequence: the cascade is *structurally impossible past the cap*. Once the budget is spent, the loop strips tools from the API request — the model literally cannot emit another tool_use. It's forced to emit text. The cascade can't run longer than the cap allows.
 
-The condition under which this works: the cap is set conservatively. 6 turns is enough for the diagnostic agent's typical 3–5 EQL investigation; 4 is enough for the recommendation agent's typical 2–3 feature lookups. If a future agent's job genuinely needed 12 turns, the cap would need to be raised — at the cost of larger blast radius if the cascade fires.
+The condition under which this works: the cap is set conservatively. 6 turns is enough for the diagnostic agent's typical 3–5 query investigation; 4 is enough for the recommendation agent's typical 2–3 feature lookups. If a future agent's job genuinely needed 12 turns, the cap would need to be raised — at the cost of larger blast radius if the cascade fires.
 
 ### Layer 2 — Cost blowup (controlled mechanically)
 
@@ -106,13 +105,11 @@ The mitigation in blooming insights: a *mixed-model strategy* (cheap classifier,
 ```
 Mixed-model + bounded budgets
 
-  intent classifier:  Haiku (~$0.25/MTok input)
-   lib/agents/intent.ts L14: 'claude-haiku-4-5-20251001'
+  intent classifier:  cheap classifier model (~$0.25/MTok input)
    one call per query; ~150ms; tiny prompt
 
-  agent workers:      Sonnet (~$3/MTok input)
-   lib/agents/base.ts L9: 'claude-sonnet-4-6'
-   bounded by maxToolCalls per stage:
+  agent workers:      expensive worker model (~$3/MTok input)
+   bounded by per-loop tool-call budget per stage:
      monitoring     6 turns max → ~$0.30 typical
      diagnostic     6 turns max → ~$0.40 typical
      recommendation 4 turns max → ~$0.20 typical
@@ -125,14 +122,14 @@ The condition under which this works: the per-stage budgets are calibrated to ty
 
 ### Layer 3 — Infinite handoff (structurally absent)
 
-The technical thing: in swarm/handoff systems (cross-ref `./06-swarm-handoff.md`), peer agents transfer control to each other; the failure mode is A → B → A → B forever, with each agent thinking the other should handle the task.
+The technical thing: in swarm/handoff systems (cross-ref the swarm-handoff note), peer agents transfer control to each other; the failure mode is A → B → A → B forever, with each agent thinking the other should handle the task.
 
-The prevention in blooming insights: *no agent has a `transfer_to_<peer>` tool*. The pipeline transitions are owned by the route file (`app/api/agent/route.ts` L237–L247), not by the agents. The agents have no capability to hand off.
+The prevention in blooming insights: *no agent has a `transfer_to_<peer>` tool*. The pipeline transitions are owned by the route handler, not by the agents. The agents have no capability to hand off.
 
 ```
 Why infinite handoff cannot happen here
 
-  ┌─ Per-agent tool subsets (lib/mcp/tools.ts) ─┐
+  ┌─ Per-agent tool subsets ────────────────────┐
   │  diagnostic:       analytics, segments,      │
   │                    funnel, comparison        │
   │                    (NO transfer_to_*)         │
@@ -147,7 +144,7 @@ Why infinite handoff cannot happen here
 
   No tool means no capability. The model in any agent
   cannot emit a transfer_to_* tool_use because the tool
-  schema isn't in its toolSchemas array. The runtime
+  schema isn't in its tool_schemas array. The runtime
   never sees a handoff to process.
 ```
 
@@ -157,21 +154,21 @@ The condition under which this works: the prevention is permanent unless someone
 
 ### Layer 4 — Synthesis failure (structurally absent)
 
-The technical thing: in supervisor-worker with an LLM supervisor (cross-ref `./02-supervisor-worker.md`), the supervisor reads multiple workers' outputs and *merges them into a final answer*. When workers contradict, an LLM supervisor tends to *average* the contradictions into a confident-sounding compromise — losing the signal that the disagreement existed.
+The technical thing: in supervisor-worker with an LLM supervisor (cross-ref the supervisor-worker note), the supervisor reads multiple workers' outputs and *merges them into a final answer*. When workers contradict, an LLM supervisor tends to *average* the contradictions into a confident-sounding compromise — losing the signal that the disagreement existed.
 
-The prevention in blooming insights: *no LLM supervisor exists, and no LLM merge step exists*. The route's "merge" between diagnostic and recommendation is a function call carrying the typed `Diagnosis` — no model intermediates. The recommendation agent receives the diagnosis as a typed argument and operates on it directly.
+The prevention in blooming insights: *no LLM supervisor exists, and no LLM merge step exists*. The route's "merge" between diagnostic and recommendation is a function call carrying the typed Diagnosis — no model intermediates. The recommendation agent receives the diagnosis as a typed argument and operates on it directly.
 
 ```
 Why synthesis failure cannot happen here
 
-  ┌─ The route's "synthesis" (route.ts L247) ──┐
+  ┌─ The route's "synthesis" ──────────────────┐
   │                                             │
-  │   const recommendations = await             │
-  │     recAgent.propose(                       │
+  │   recommendations = await                   │
+  │     rec_agent.propose(                      │
   │       inv,                                  │
-  │       diagnosis!,    ◄── typed arg          │
-  │       hooksFor('recommendation')            │
-  │     );                                      │
+  │       diagnosis,    ◄── typed arg           │
+  │       hooks                                 │
+  │     )                                       │
   │                                             │
   │   No model is consulted to "merge" diag and │
   │   recommendation. No averaging of           │
@@ -182,13 +179,13 @@ Why synthesis failure cannot happen here
 
 The practical consequence: there is no path where two agents' outputs could be averaged into a wrong answer by a third LLM. The recommendation agent reads the diagnosis as-is and proposes based on it. If the diagnosis is wrong, the recommendation will propose from a wrong premise — but that's a single-agent quality issue (the diagnostic agent's), not a multi-agent synthesis failure.
 
-The condition under which this works: the codebase avoids adopting an LLM supervisor and an LLM merge. The cross-ref `./01-when-not-to-go-multi-agent.md` documents the architectural commitment.
+The condition under which this works: the codebase avoids adopting an LLM supervisor and an LLM merge. The "when not to go multi-agent" note documents the architectural commitment.
 
 ### Layer 5 — Context bloat (structurally absent)
 
-The technical thing: when agents share a blackboard (cross-ref `./08-shared-state-and-message-passing.md`), each agent's context window grows with every other agent's output. At 6+ agents, "lost in the middle" becomes the dominant failure mode — the model can't find the signal in the noise.
+The technical thing: when agents share a blackboard (cross-ref the shared-state-and-message-passing note), each agent's context window grows with every other agent's output. At 6+ agents, "lost in the middle" becomes the dominant failure mode — the model can't find the signal in the noise.
 
-The prevention in blooming insights: *message passing*. The recommendation agent's context is the anomaly + the typed `Diagnosis` + its own prompt + its own tool subset. It does NOT include the diagnostic agent's messages, scratchpad, or intermediate tool calls.
+The prevention in blooming insights: *message passing*. The recommendation agent's context is the anomaly + the typed Diagnosis + its own prompt + its own tool subset. It does NOT include the diagnostic agent's messages, scratchpad, or intermediate tool calls.
 
 ```
 Why context bloat cannot happen here
@@ -205,35 +202,35 @@ Why context bloat cannot happen here
   no overlap, no shared accumulator
 ```
 
-The practical consequence: each agent's context window stays small and focused. Adding a future agent (e.g. a hypothetical `SummarizationAgent`) doesn't bloat the existing agents' windows — it gets its own scoped context.
+The practical consequence: each agent's context window stays small and focused. Adding a future agent (e.g. a hypothetical summarization agent) doesn't bloat the existing agents' windows — it gets its own scoped context.
 
-The condition under which this works: the message schema (`Diagnosis`) is expressive enough that the recommendation agent doesn't need more than what's passed. If the schema grew past ~15 fields, the message itself would start to feel like shared state, at which point the cross-ref `./07-graph-orchestration.md`'s graph-runtime curated-state model becomes the next step.
+The condition under which this works: the message schema (Diagnosis) is expressive enough that the recommendation agent doesn't need more than what's passed. If the schema grew past ~15 fields, the message itself would start to feel like shared state, at which point the graph-orchestration note's graph-runtime curated-state model becomes the next step.
 
 ### Layer 6 — Token revocation mid-run (controlled mechanically)
 
 The technical thing: blooming insights' MCP server uses OAuth tokens for the Bloomreach connection. Tokens can be revoked mid-run (admin action, expiration); when that happens, MCP calls start failing 401.
 
-The mitigation in blooming insights: a *one-time guarded auto-reconnect* triggered on 401, with a `sessionStorage` flag to prevent infinite reconnect loops.
+The mitigation in blooming insights: a *one-time guarded auto-reconnect* triggered on 401, with a session-storage flag to prevent infinite reconnect loops.
 
 ```
-The mechanism (app/page.tsx L394–L427)
+The mechanism, pseudocode
 
   on MCP 401 response in agent run:
-    alreadyTried = sessionStorage.getItem('bi:reconnecting') === '1';
-    if (alreadyTried) {
-      // tried once, still failing — give up, surface error
-      sessionStorage.removeItem('bi:reconnecting');
-      showError(...);
-    } else {
-      sessionStorage.setItem('bi:reconnecting', '1');
-      // redirect to OAuth flow to refresh token
-      window.location = authUrl;
-    }
+    already_tried = session_storage.get('bi:reconnecting') == '1'
+    if already_tried:
+      # tried once, still failing — give up, surface error
+      session_storage.remove('bi:reconnecting')
+      show_error(...)
+    else:
+      session_storage.set('bi:reconnecting', '1')
+      # redirect to OAuth flow to refresh token
+      window.location = auth_url
+
   on successful reconnect:
-    sessionStorage.removeItem('bi:reconnecting');
+    session_storage.remove('bi:reconnecting')
 ```
 
-The practical consequence: the user gets one automatic reconnect attempt per failure. If the reconnect also fails (e.g. token genuinely revoked, admin policy), the system surfaces an error rather than looping. The `sessionStorage` flag is the bound.
+The practical consequence: the user gets one automatic reconnect attempt per failure. If the reconnect also fails (e.g. token genuinely revoked, admin policy), the system surfaces an error rather than looping. The session-storage flag is the bound.
 
 The condition under which this works: the failure is transient (a revoked token can be re-authorized via the OAuth flow). If the failure were truly terminal, the auto-reconnect would still try once and then surface the error — graceful degradation.
 
@@ -243,16 +240,17 @@ The condition under which this works: the failure is transient (a revoked token 
         Structurally absent (retired)      Mechanically controlled (accepted)
 ┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
 │ Infinite handoff                    │  │ Tool-call cascade                    │
-│   no agent has transfer_to_* tools  │  │   maxToolCalls caps per agent +     │
-│   ▼                                 │  │   forced-final-turn in base.ts L90  │
+│   no agent has transfer_to_* tools  │  │   per-loop tool-call caps per agent  │
+│   ▼                                 │  │   + forced-final-turn in shared loop│
 │ Synthesis failure                   │  │                                      │
 │   no LLM merge step; route handoff  │  │ Cost blowup                          │
-│   is a function call with typed     │  │   Haiku for classifier, Sonnet for  │
-│   Diagnosis                         │  │   workers; per-stage budgets        │
-│                                     │  │                                      │
-│ Context bloat                       │  │ Token revocation mid-run             │
-│   no shared blackboard; each agent  │  │   one-time guarded auto-reconnect    │
-│   sees only what's handed           │  │   via sessionStorage 'bi:reconnecting'│
+│   is a function call with typed     │  │   cheap model for classifier,        │
+│   Diagnosis                         │  │   expensive model for workers;       │
+│                                     │  │   per-stage budgets                  │
+│ Context bloat                       │  │                                      │
+│   no shared blackboard; each agent  │  │ Token revocation mid-run             │
+│   sees only what's handed           │  │   one-time guarded auto-reconnect    │
+│                                     │  │   via a session-storage flag         │
 └─────────────────────────────────────┘  └─────────────────────────────────────┘
    Retired: zero on-call burden — the          Accepted: explicit mechanisms,
    failure simply cannot happen.                 grep-able in code, bounded
@@ -278,8 +276,7 @@ The full failure-mode landscape
 
   ┌─ SINGLE-AGENT failures (inherited, not new) ─────────────────┐
   │  - hallucination, prompt injection, tool misuse, etc.        │
-  │  - covered in ../../study-ai-engineering/04-agents-and-tool- │
-  │    use/01-agents-vs-chains.md                                │
+  │  - covered in the ai-engineering agents-vs-chains note        │
   └──────────────────────────────────────────────────────────────┘
 
   ┌─ MULTI-AGENT failures (the new cluster) ─────────────────────┐
@@ -289,7 +286,6 @@ The full failure-mode landscape
   │  ─────────────────    ┼───────────────────────┼──────────────│
   │  Infinite handoff     │ ✓ no transfer_to_*    │              │
   │                       │   tools anywhere       │              │
-  │                       │   (lib/mcp/tools.ts)   │              │
   │  ─────────────────    ┼───────────────────────┼──────────────│
   │  Synthesis failure    │ ✓ no LLM merge;       │              │
   │                       │   route handoff is     │              │
@@ -300,24 +296,22 @@ The full failure-mode landscape
   │                       │   (Diagnosis as msg)   │              │
   │                       │   not shared state     │              │
   │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Tool-call cascade    │                       │ ✓ maxToolCalls│
-  │                       │                       │   6/6/6/4 +   │
-  │                       │                       │   forced-final│
-  │                       │                       │   (base.ts L90)│
+  │  Tool-call cascade    │                       │ ✓ per-loop    │
+  │                       │                       │   tool-call    │
+  │                       │                       │   caps 6/6/6/4 │
+  │                       │                       │   + forced-final│
   │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Cost blowup          │                       │ ✓ Haiku for    │
-  │                       │                       │   classifier;  │
-  │                       │                       │   Sonnet for   │
-  │                       │                       │   workers; per-│
-  │                       │                       │   stage budgets│
+  │  Cost blowup          │                       │ ✓ cheap model  │
+  │                       │                       │   for classifier│
+  │                       │                       │   expensive for │
+  │                       │                       │   workers; per- │
+  │                       │                       │   stage budgets │
   │  ─────────────────    ┼───────────────────────┼──────────────│
   │  Token revocation     │                       │ ✓ one-time     │
   │   mid-run              │                       │   guarded      │
   │                       │                       │   auto-reconnect│
-  │                       │                       │   (page.tsx +   │
-  │                       │                       │   sessionStorage│
-  │                       │                       │   'bi:reconnect-│
-  │                       │                       │    ing')        │
+  │                       │                       │   via session-  │
+  │                       │                       │   storage flag  │
   └──────────────────────────────────────────────────────────────┘
 
   Thesis: 3 failures structurally absent (zero on-call cost)
@@ -606,3 +600,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

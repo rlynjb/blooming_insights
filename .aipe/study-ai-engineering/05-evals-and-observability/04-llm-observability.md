@@ -47,7 +47,7 @@
 
 ## How it works
 
-**Mental model.** A trace is a sequence of typed events emitted in execution order; each tool call is a span bracketed by a `start` and an `end` that carries its `durationMs`. blooming insights defines this as a discriminated union (`AgentEvent`), encodes each event as one NDJSON line, and streams the lines to the client as the agent runs. The client reads the stream and the cache stores the captured events — so the same event list is a *live* trace while running and a *replayable* trace afterward.
+**Mental model.** A trace is a sequence of typed events emitted in execution order; each tool call is a span bracketed by a `start` and an `end` that carries its `durationMs`. You define this as a discriminated union (`AgentEvent`), encode each event as one NDJSON line, and stream the lines to the client as the agent runs. The client reads the stream and the cache stores the captured events — so the same event list is a *live* trace while running and a *replayable* trace afterward.
 
 ```
 agent execution                 →  trace (ordered AgentEvent stream)
@@ -65,29 +65,28 @@ Each event is one line of NDJSON; the ordered list is the trace; a `tool_call_st
 
 ---
 
-### The event union is the trace schema (`lib/mcp/events.ts`)
+### The event union is the trace schema
 
-`AgentEvent` (`lib/mcp/events.ts` L4–L12) is a discriminated union — the typed schema of everything that can appear in a trace. The trace-relevant members are:
-
-```
-AgentEvent (events.ts L4–L12)
-─────────────────────────────────────────────────────────────
-| { type:'reasoning_step'; step: ReasoningStep }              ← annotation
-| { type:'tool_call_start'; toolName; agent }                 ← span OPEN
-| { type:'tool_call_end'; toolName; agent; durationMs;        ← span CLOSE
-                          result?; error? }                     + timing
-| { type:'insight' | 'diagnosis' | 'recommendation' }         ← outputs
-| { type:'done' } | { type:'error'; message }                 ← terminal
-```
-
-`tool_call_start` opens a span; `tool_call_end` closes it and carries `durationMs`, the optional `result`, and an optional `error` (L6–L7). This is the OpenTelemetry span shape — a start, an end, a duration, attributes, and a status — expressed as two events in a stream instead of one span object. `encodeEvent` (L15–L17) serializes each as `JSON.stringify(e) + '\n'`; `decodeEvent` (L20–L22) parses one line back. NDJSON-per-event is what makes the trace *streamable*: each event is independently emittable and parseable the instant it occurs.
-
-### The span data carriers (`lib/mcp/types.ts`)
-
-Two types carry the span and annotation payloads. `ToolCall` (`lib/mcp/types.ts` L34–L42) is the span record:
+`AgentEvent` is a discriminated union — the typed schema of everything that can appear in a trace. The trace-relevant members are:
 
 ```
-ToolCall (types.ts L34–L42)            ReasoningStep (types.ts L44–L50)
+  AgentEvent =
+    | { type: "reasoning_step",  step: ReasoningStep }              ← annotation
+    | { type: "tool_call_start", toolName, agent }                  ← span OPEN
+    | { type: "tool_call_end",   toolName, agent, durationMs,      ← span CLOSE
+                                 result?, error? }                    + timing
+    | { type: "insight" | "diagnosis" | "recommendation" }          ← outputs
+    | { type: "done" } | { type: "error", message }                 ← terminal
+```
+
+`tool_call_start` opens a span; `tool_call_end` closes it and carries `durationMs`, the optional `result`, and an optional `error`. This is the OpenTelemetry span shape — a start, an end, a duration, attributes, and a status — expressed as two events in a stream instead of one span object. The event encoder serializes each as `JSON.stringify(e) + "\n"`; the decoder parses one line back. NDJSON-per-event is what makes the trace *streamable*: each event is independently emittable and parseable the instant it occurs.
+
+### The span data carriers
+
+Two types carry the span and annotation payloads. `ToolCall` is the span record:
+
+```
+ToolCall                              ReasoningStep
 ─────────────────────────────────     ─────────────────────────────────
 id: string                            id: string
 agent: AgentName                      agent: AgentName
@@ -98,80 +97,78 @@ durationMs?: number   ← the timing    toolCall?: ToolCall
 error?: string
 ```
 
-`ToolCall` is the span: identity (`id`), the operation (`toolName`, `args`), the outcome (`result` or `error`), and the duration (`durationMs`). `ReasoningStep` is the annotation: a typed `kind` (`thought`/`tool_call`/`hypothesis`/`conclusion`, L47) plus `content`. Together they are the trace's vocabulary — spans and the reasoning between them.
+`ToolCall` is the span: identity (`id`), the operation (`toolName`, `args`), the outcome (`result` or `error`), and the duration (`durationMs`). `ReasoningStep` is the annotation: a typed `kind` (`thought` / `tool_call` / `hypothesis` / `conclusion`) plus `content`. Together they are the trace's vocabulary — spans and the reasoning between them.
 
-### Where duration is measured (`lib/agents/base.ts`)
+### Where duration is measured
 
-The `durationMs` is captured at the single choke-point where every tool call runs, inside `runAgentLoop` (`lib/agents/base.ts` L144–L149):
+The `durationMs` is captured at the single choke-point where every tool call runs, inside the shared agent loop:
 
 ```
-base.ts L144–L149  (inside runAgentLoop's per-tool block)
-─────────────────────────────────────────────────────────────
-const { result, durationMs } = await mcp.callTool(   ← L144
-  tu.name,
-  tu.input as Record<string, unknown>,
-);
-tc.result = result;                                  ← L148
-tc.durationMs = durationMs;                           ← L149  the span's duration
+  # inside the agent loop's per-tool block
+  { result, durationMs } = await mcp.callTool(
+      tu.name,
+      tu.input as Record<string, unknown>,
+  )
+  tc.result      = result
+  tc.durationMs  = durationMs   ← the span's duration
 ```
 
-`mcp.callTool` returns `{ result, durationMs, fromCache }` (the `McpCaller` contract, `lib/agents/base.ts` L16–L22), and the loop copies `durationMs` onto the `ToolCall` span record. Because every agent's tool calls flow through this one loop, *every* span is timed by construction — there is no instrumentation to forget. The loop then notifies the caller via `onToolResult?.(tc)` (L159), which is how the route turns the span into a streamed `tool_call_end` event (next section).
+`mcp.callTool` returns `{ result, durationMs, fromCache }` (the `McpCaller` contract), and the loop copies `durationMs` onto the `ToolCall` span record. Because every agent's tool calls flow through this one loop, *every* span is timed by construction — there is no instrumentation to forget. The loop then notifies the caller via `onToolResult?(tc)`, which is how the route turns the span into a streamed `tool_call_end` event (next section).
 
 ### Trace as live product surface (the route + UI)
 
-`app/api/agent/route.ts` is where the span records become a streamed trace. `hooksFor(agent)` (L181–L195) wires the loop's callbacks to `send()` calls that enqueue NDJSON events:
+The route handler is where the span records become a streamed trace. A `hooksFor(agent)` helper wires the loop's callbacks to `send()` calls that enqueue NDJSON events:
 
 ```
-route.ts L181–L195  (hooksFor)
+the per-agent hooks
 ─────────────────────────────────────────────────────────────
-onText       → reasoning_step {kind:'thought'}      (L182–184)
-onToolCall   → tool_call_start {toolName, agent}    (L185)      span OPEN
-onToolResult → tool_call_end {toolName, agent,      (L186–194)  span CLOSE
-                 durationMs: tc.durationMs ?? 0,
-                 result: trunc(tc.result), error}
+onText       → reasoning_step {kind:'thought'}                  
+onToolCall   → tool_call_start {toolName, agent}                 span OPEN
+onToolResult → tool_call_end {toolName, agent, durationMs,       span CLOSE
+                              result: trunc(tc.result), error}
 ```
 
-`send` (L172–L175) does two things on every event: pushes it into a `collected` array (L173) *and* enqueues it onto the `ReadableStream` (L174). So the trace streams to the client live (the user watches the agent work — this is the ReAct-rendered-as-UI pattern, `../04-agents-and-tool-use/03-react-pattern.md`) and is simultaneously captured for storage. The client reads the NDJSON over a `fetch` body reader (the `useInvestigation` hook, next section) and renders each event as it arrives. Observability here is not a sidecar dashboard — it is the primary UI.
+The `send` choke-point does two things on every event: pushes it into a `collected` array *and* enqueues it onto the `ReadableStream`. So the trace streams to the client live (the user watches the agent work — this is the ReAct-rendered-as-UI pattern, `../04-agents-and-tool-use/03-react-pattern.md`) and is simultaneously captured for storage. The client reads the NDJSON over a `fetch` body reader (the investigation hook, next section) and renders each event as it arrives. Observability here is not a sidecar dashboard — it is the primary UI.
 
 ### Trace narration in the briefing route (`describeToolCall`)
 
-The briefing route streams the *same* span events as `/api/agent` but adds one observability touch: it labels each tool call with the real query the agent ran rather than the bare tool name. `describeToolCall(tc)` (`app/api/briefing/route.ts` L28–L33) pulls the EQL/query text out of the call's args:
+The briefing route streams the *same* span events as the agent route but adds one observability touch: it labels each tool call with the real query the agent ran rather than the bare tool name. `describeToolCall(tc)` pulls the EQL / query text out of the call's args:
 
 ```
-describeToolCall (briefing route.ts L28–L33)
-─────────────────────────────────────────────────────────────
-a = tc.args
-q = a.eql ?? a.query ?? a.analysis ?? a.expression
-text = (typeof q === 'string' && q.trim()) ? q.trim() : tc.toolName
-return text.length > 120 ? text.slice(0,117)+'…' : text
+  function describe_tool_call(tc):
+      a    = tc.args
+      q    = a.eql ?? a.query ?? a.analysis ?? a.expression
+      text = (type_of(q) == "string" and q.trim() != "")
+               ? q.trim()
+               : tc.toolName
+      return text.length > 120 ? text.slice(0, 117) + "…" : text
 ```
 
-It is wired into the monitoring scan's `onToolCall` hook (L110–L113): each tool call emits a `tool_call_start` span event *and* a `reasoning_step` whose content is the human-readable query (`step(describeToolCall(tc))`). The `onToolResult` hook (L114–L122) closes the span with `tool_call_end{durationMs, result: trunc(tc.result), error}`. So the briefing trace is the same span stream as `/api/agent`, with the live status line showing the real EQL the agent issued — the "how this briefing was gathered" view on the feed. (There is no longer a separate `summarizeTrace` reduction; the trace is the per-event stream, narrated in place.)
+It is wired into the monitoring scan's `onToolCall` hook: each tool call emits a `tool_call_start` span event *and* a `reasoning_step` whose content is the human-readable query (`step(describe_tool_call(tc))`). The `onToolResult` hook closes the span with `tool_call_end{durationMs, result: trunc(tc.result), error}`. So the briefing trace is the same span stream as the agent route, with the live status line showing the real EQL the agent issued — the "how this briefing was gathered" view on the feed. (There is no longer a separate `summarizeTrace` reduction; the trace is the per-event stream, narrated in place.)
 
 ### The trace's rendering surface (the UI components + the hook)
 
 The client side of the trace is four pieces that turn the NDJSON span stream into the visible "work."
 
-**`useInvestigation` (`lib/hooks/useInvestigation.ts`)** is the stream reader. It opens `GET /api/agent?insightId=…&step=…`, reads the NDJSON body line by line (L184–L201), and on each `AgentEvent` mutates a `TraceItem[]`: a `reasoning_step` pushes a `step` item, a `tool_call_start` pushes a `tool` item with `status:'running'`, and a `tool_call_end` flips the matching running tool to `done` with its `durationMs`/`result`/`error` (`replaceRunningTool`, L86–L95). It stamps each item with `ts: Date.now()` as it arrives (L106, L113) and stashes the finished trace in `sessionStorage` (L132–L143) so a re-visit hydrates instantly. The hook is **StrictMode-safe by design**: a `startedRef` guard runs the fetch once per mount, and it deliberately does *not* cancel the fetch on effect cleanup — the comment at L31–L36 records why (StrictMode's mount → cleanup → re-mount, combined with the started-guard, otherwise aborts the stream and leaves the logs empty; setState-after-unmount is a safe no-op).
+**The investigation hook** is the stream reader. It opens `GET /api/agent?insightId=…&step=…`, reads the NDJSON body line by line, and on each `AgentEvent` mutates a `TraceItem[]`: a `reasoning_step` pushes a `step` item, a `tool_call_start` pushes a `tool` item with `status:'running'`, and a `tool_call_end` flips the matching running tool to `done` with its `durationMs` / `result` / `error`. It stamps each item with `ts: Date.now()` as it arrives and stashes the finished trace in `sessionStorage` so a re-visit hydrates instantly. The hook is **StrictMode-safe by design**: a started-once ref guards the fetch to run once per mount, and it deliberately does *not* cancel the fetch on effect cleanup — the comment alongside records why (StrictMode's mount → cleanup → re-mount, combined with the started-guard, otherwise aborts the stream and leaves the logs empty; setState-after-unmount is a safe no-op).
 
-**`StatusLog` (`components/shared/StatusLog.tsx`)** is the sticky-sidebar wrapper shown on **both investigate steps** (`app/investigate/[id]/page.tsx` L214, `…/recommend/page.tsx` L181), titled "how this was figured out." It renders the `TraceItem[]` through `ReasoningTrace`, with a `scanning` progress bar and an `emptyMessage` while the stream is still connecting. The **feed** (`app/page.tsx` L744) renders the same `ReasoningTrace` directly in an inline "how this briefing was gathered" panel rather than the `StatusLog` chrome — so the *trace component* is shared across feed and investigate, while `StatusLog` itself is the investigate-step sidebar.
+**The status-log wrapper** is the sticky-sidebar component shown on **both investigate steps**, titled "how this was figured out." It renders the `TraceItem[]` through the reasoning-trace component, with a `scanning` progress bar and an `emptyMessage` while the stream is still connecting. The **feed** renders the same reasoning-trace directly in an inline "how this briefing was gathered" panel rather than the status-log chrome — so the *trace component* is shared across feed and investigate, while the status-log itself is the investigate-step sidebar.
 
-**`ReasoningTrace` (`components/investigation/ReasoningTrace.tsx`)** renders the timeline and owns the `TraceItem` type (exported at L6–L24 — there is no separate `TraceItem.ts`; `StatusLog`, `useInvestigation`, the feed, and the markdown exporter all import the type from here). Each item now carries an optional `ts?` (epoch ms, L13/L23); `fmtTs` (L39–L46) renders it as a `HH:MM:SS` log timestamp beside each step (L87–L89) and each tool block (L95) — so the trace reads like a timestamped log, not an undated list.
+**The reasoning-trace component** renders the timeline and owns the `TraceItem` type (exported from the same module — there is no separate `TraceItem.ts`; the status-log, the hook, the feed, and the markdown exporter all import the type from here). Each item carries an optional `ts?` (epoch ms); a `fmtTs` helper renders it as a `HH:MM:SS` log timestamp beside each step and each tool block — so the trace reads like a timestamped log, not an undated list.
 
-**`TraceContent` (`components/investigation/TraceContent.tsx`)** pretty-prints each reasoning step's `content`. It splits on ` ```lang … ``` ` fences (L104), pretty-prints fenced JSON in a scrollable code box (`prettyIfJson`, L93–L100), and renders the prose between fences as light markdown — `**bold**` and `` `inline code` `` via `renderInline` (L34–L53) and `- ` bullets grouped into a `<ul>` via `Prose` (L56–L91). This is a deliberately tiny renderer (no markdown dependency). Note for the threat model: this renders **model-authored** reasoning text — it is an output-rendering surface, but a safe one (React text nodes / `<strong>` / `<code>` / `<li>`; **no `dangerouslySetInnerHTML`**), so the agent's text cannot inject markup. See `../06-production-serving/03-prompt-injection.md`.
+**The trace-content renderer** pretty-prints each reasoning step's `content`. It splits on ` ```lang … ``` ` fences, pretty-prints fenced JSON in a scrollable code box (`prettyIfJson`), and renders the prose between fences as light markdown — `**bold**` and `` `inline code` `` via a small inline renderer and `- ` bullets grouped into a `<ul>` via a prose component. This is a deliberately tiny renderer (no markdown dependency). Note for the threat model: this renders **model-authored** reasoning text — it is an output-rendering surface, but a safe one (React text nodes / `<strong>` / `<code>` / `<li>`; **no `dangerouslySetInnerHTML`**), so the agent's text cannot inject markup. See `../06-production-serving/03-prompt-injection.md`.
 
-### Trace replay from the cache (`lib/state/investigations.ts`)
+### Trace replay from the cache
 
-The captured event list is also the unit of replay. `saveInvestigation(insightId, collected)` (`lib/state/investigations.ts` L30–L41, called at `route.ts` L254) stores the full `AgentEvent[]` for an investigation; `getCachedInvestigation(insightId)` (L22–L28) retrieves it. On a cache hit, the route *re-streams the stored events* (`route.ts` L127–L141) with a small delay between them:
+The captured event list is also the unit of replay. The save call stores the full `AgentEvent[]` for an investigation; the cached-investigation lookup retrieves it. On a cache hit, the route *re-streams the stored events* with a small delay between them:
 
 ```
-trace replay (route.ts L127–L141)
+the trace-replay branch
 ─────────────────────────────────────────────────────────────
-cached = getCachedInvestigation(insightId)        ← stored AgentEvent[]
-for (const e of cached) {
-  controller.enqueue(encodeEvent(e))              ← re-emit each event
-  await sleep(REPLAY_DELAY_MS)                     ← 180ms (L105), paced
-}
+cached = get_cached_investigation(insightId)      ← stored AgentEvent[]
+for e in cached:
+    controller.enqueue(encode_event(e))            ← re-emit each event
+    await sleep(REPLAY_DELAY_MS)                    ← 180ms, paced
 ```
 
 This is trace replay in the literal sense: the exact event sequence a live run produced is played back event-for-event, so a cached investigation reproduces the original agent's visible work without re-calling the model or MCP. The trace is stored as the trace, retrieved as the trace, and replayed as the trace.
@@ -181,16 +178,16 @@ This is trace replay in the literal sense: the exact event sequence a live run p
 ```
 PRESENT (Case A — implemented)            ABSENT (honest gaps)
 ──────────────────────────────────        ──────────────────────────────────
-typed event union (events.ts L4–12)        no Langfuse/LangSmith/Phoenix
-span start/end + durationMs (base L144)     no third-party trace platform
-live NDJSON stream to UI (route L181)       no span aggregation (p50/p95)
+typed event union                          no Langfuse/LangSmith/Phoenix
+span start/end + durationMs                 no third-party trace platform
+live NDJSON stream to UI                    no span aggregation (p50/p95)
 timestamped StatusLog + TraceContent        no queryable trace store
-manual /debug harness (debug page)          traces not persisted to a DB
-event-for-event replay (investig. L22–41)   replay re-emits SAME events only —
+manual /debug harness                       traces not persisted to a DB
+event-for-event replay                      replay re-emits SAME events only —
                                              no replay-with-a-different-prompt
 ```
 
-blooming insights has the *shape* of observability — typed spans, durations, a live trace, replay — built by hand. What it lacks is the *infrastructure* around it: a platform, persistence to a queryable store, and aggregate metrics across runs.
+This system has the *shape* of observability — typed spans, durations, a live trace, replay — built by hand. What it lacks is the *infrastructure* around it: a platform, persistence to a queryable store, and aggregate metrics across runs.
 
 ### The principle
 
@@ -207,34 +204,34 @@ This diagram spans the Service layer (where spans are created and timed), the St
 │  SERVICE LAYER  (lib/agents/base.ts — runAgentLoop)                 │
 │                                                                       │
 │   for each tool_use:                                                   │
-│     { result, durationMs } = await mcp.callTool(...)   ← L144         │
-│     tc.durationMs = durationMs                          ← L149  SPAN   │
-│     onToolCall(tc)   / onToolResult(tc)                ← L138 / L159  │
+│     { result, durationMs } = await mcp.callTool(...)         │
+│     tc.durationMs = durationMs  SPAN   │
+│     onToolCall(tc)   / onToolResult(tc) /       │
 └────────────────────────────────┬──────────────────────────────────────┘
-                                 │ hooks → events (route.ts L181–195)
+                                 │ hooks → events
 ┌────────────────────────────────▼──────────────────────────────────────┐
 │  EVENT SCHEMA  (lib/mcp/events.ts L4–22)                            │
 │   AgentEvent union: reasoning_step | tool_call_start |                 │
 │                     tool_call_end{durationMs} | diagnosis | done       │
 │   encodeEvent = JSON + '\n'  (NDJSON, one event per line)             │
 └──────────┬───────────────────────────────────┬───────────────────────┘
-           │ send() pushes BOTH ways (route L172–175)                    │
+           │ send() pushes BOTH ways                    │
    ┌───────▼────────────────────┐     ┌────────▼───────────────────────┐
    │  STATE LAYER (capture)     │     │  UI LAYER (live)               │
    │  collected: AgentEvent[]   │     │  useInvestigation reads NDJSON │
-   │  saveInvestigation L30–41  │     │  → TraceItem[] (timestamped) → │
-   │    (route.ts L254)         │     │  StatusLog/ReasoningTrace/      │
+   │  saveInvestigation         │     │  → TraceItem[] (timestamped) → │
+   │         │     │  StatusLog/ReasoningTrace/      │
    │                            │     │  TraceContent (the visible work)│
    └───────┬────────────────────┘     └────────────────────────────────┘
-           │ getCachedInvestigation L22–28
+           │ getCachedInvestigation
    ┌───────▼─────────────────────────────────────────────────────────┐
-   │  REPLAY  (route.ts L127–141)                                      │
-   │  re-emit stored events, paced REPLAY_DELAY_MS=180 (L105)          │
+   │  REPLAY                                      │
+   │  re-emit stored events, paced REPLAY_DELAY_MS=180          │
    └──────────────────────────────────────────────────────────────────┘
 
    SECONDARY VIEWS:
-   describeToolCall (briefing route.ts L28–33) → live status = real EQL
-   /debug (app/debug/page.tsx) → one manual tool call, shows durationMs L253–261
+   describeToolCall → live status = real EQL
+   /debug (app/debug/page.tsx) → one manual tool call, shows durationMs
 ```
 
 One captured `AgentEvent[]` stream feeds three consumers — the live UI (read by `useInvestigation` into a timestamped `TraceItem[]`, rendered by `StatusLog`/`ReasoningTrace`/`TraceContent`), the cache/replay, and (in the briefing route) the per-call `describeToolCall` status line. Every span is timed at the single `mcp.callTool` choke-point, so the trace is complete by construction.
@@ -428,3 +425,4 @@ Where is a tool call's `durationMs` captured, and why does capturing it there gu
 Updated: 2026-05-28 — Replaced the dead `summarizeTrace` view with the real briefing narration (`describeToolCall`, route L28–L33); documented the grown UI surface (StatusLog sticky sidebar on both investigate steps, ReasoningTrace per-line timestamps via the `TraceItem` type in ReasoningTrace.tsx, TraceContent markdown/JSON renderer with no `dangerouslySetInnerHTML`, the StrictMode-safe `useInvestigation` hook); re-derived all route.ts/types.ts/investigations.ts refs. NDJSON + AgentEvent contract unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

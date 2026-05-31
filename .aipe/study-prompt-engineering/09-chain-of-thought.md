@@ -50,7 +50,7 @@ two shapes of chain-of-thought
  STRUCTURED CoT         "generate 2–3 hypotheses, return each as
    │                     { hypothesis, supported, reasoning }"
    │                    reasoning is a TYPED FIELD, kept and validated
-   └─ diagnostic.md lives here: CoT captured in hypothesesConsidered[]
+   └─ the diagnostic prompt lives here: CoT captured in hypothesesConsidered[]
 ```
 
 The diagnostic agent combines two reasoning scaffolds: structured CoT (hypotheses up front) layered on top of the ReAct loop (which externalizes thought as Thought→Action→Observation, → 06-single-purpose-chains.md). One shapes the output; the other shapes the exploration.
@@ -59,19 +59,19 @@ The diagnostic agent combines two reasoning scaffolds: structured CoT (hypothese
 
 ### Force breadth before depth — hypotheses before the first tool call
 
-The instruction is precise about *ordering*: reason first, act second. diagnostic.md L20 and the Role at L5 both require it:
+The instruction is precise about *ordering*: reason first, act second. Both the diagnostic prompt's Role and its first investigation step require it:
 
 ```
-diagnostic.md — reason before act   (L5, L20)
+diagnostic prompt — reason before act
 ─────────────────────────────────────────────────────────────
- Role:  "generate 2–3 competing hypotheses, query the data to
-         test each, and conclude"                              L5
- Step1: "Generate 2–3 hypotheses before your first tool call
-         (e.g. device-specific regression, seasonal/geographic
-         shift, campaign traffic change, ...)"                 L20
+ Role:   "generate 2–3 competing hypotheses, query the data to
+          test each, and conclude"
+ Step 1: "Generate 2–3 hypotheses before your first tool call
+          (e.g. device-specific regression, seasonal/geographic
+          shift, campaign traffic change, ...)"
 ```
 
-"Before your first tool call" is the load-bearing phrase. It forces the model to enumerate *competing* explanations while its context is still clean — before any query result biases it toward the first thing it sees. This is CoT as anti-anchoring: generate the hypothesis space first, then test it, instead of querying once and rationalizing whatever came back. L21–L24 then instruct "design queries to falsify each hypothesis" — the reasoning is not decoration, it directs the exploration.
+"Before your first tool call" is the load-bearing phrase. It forces the model to enumerate *competing* explanations while its context is still clean — before any query result biases it toward the first thing it sees. This is CoT as anti-anchoring: generate the hypothesis space first, then test it, instead of querying once and rationalizing whatever came back. The next lines then instruct "design queries to falsify each hypothesis" — the reasoning is not decoration, it directs the exploration.
 
 ```
 WITHOUT: query → see result → conclude (anchored on first result)
@@ -83,22 +83,22 @@ WITH:    enumerate 2–3 hypotheses → query to falsify each → conclude
 
 ### Capture the reasoning as a typed field — `hypothesesConsidered[]`
 
-The hypotheses do not stay in the model's head; they come back in the output schema. The `## Output` block requires `hypothesesConsidered` as an array of typed objects (`diagnostic.md` L69–L75):
+The hypotheses do not stay in the model's head; they come back in the output schema. The `## Output` block requires `hypothesesConsidered` as an array of typed objects:
 
 ```
-diagnostic.md — structured CoT field   (L69–L75)
+diagnostic prompt — structured CoT field
 ─────────────────────────────────────────────────────────────
  "hypothesesConsidered": [
    {
-     "hypothesis": "string — what you tested",        L56
-     "supported": true,                                L57
+     "hypothesis": "string — what you tested",
+     "supported": true,
      "reasoning": "string — why the data supports
-                   or rules this out"                  L58
+                   or rules this out"
    }
  ]
 ```
 
-This is the textbook recommendation made real: *put the reasoning in a thinking field, not free-form prose.* Each hypothesis carries its own `reasoning` string and a boolean `supported` — so the chain of thought is queryable (which hypotheses were ruled out?), assertable (a test can check `hypothesesConsidered.length >= 2`), and renderable (the UI can show ruled-out alternatives, not just the winner). The field-rules at L71 close the loop: "include all 2–3 hypotheses you tested. `supported: true` means this hypothesis best explains the data." The reasoning is part of the contract `isDiagnosis` enforces (`validate.ts` requires `hypothesesConsidered` to be an array).
+This is the textbook recommendation made real: *put the reasoning in a thinking field, not free-form prose.* Each hypothesis carries its own `reasoning` string and a boolean `supported` — so the chain of thought is queryable (which hypotheses were ruled out?), assertable (a test can check `hypotheses_considered.length >= 2`), and renderable (the UI can show ruled-out alternatives, not just the winner). The field rules close the loop: "include all 2–3 hypotheses you tested. `supported: true` means this hypothesis best explains the data." The reasoning is part of the contract the diagnosis guard enforces (the guard requires `hypothesesConsidered` to be an array).
 
 ```
 reasoning as prose:   one blob, unparseable, untestable, unrenderable
@@ -110,14 +110,14 @@ reasoning as field:   hypothesesConsidered[{ hypothesis, supported, reasoning }]
 
 ### The ReAct loop externalizes thought too
 
-Structured CoT shapes the *output*; the ReAct loop shapes the *process*, and it externalizes reasoning a second way. Each turn of `runAgentLoop` emits the model's text blocks via `onText` (`base.ts` L108–L113) — that text *is* the model's interleaved reasoning between tool calls. So the diagnostic agent has two reasoning artifacts: the live Thought stream (ReAct, surfaced as `reasoning_step` events) and the final structured `hypothesesConsidered` array (CoT, in the output).
+Structured CoT shapes the *output*; the ReAct loop shapes the *process*, and it externalizes reasoning a second way. Each turn of the shared agent loop emits the model's text blocks through an on-text hook — that text *is* the model's interleaved reasoning between tool calls, surfaced into the live reasoning trace. So the diagnostic agent has two reasoning artifacts: the live Thought stream (ReAct, surfaced as `reasoning_step` events) and the final structured `hypothesesConsidered` array (CoT, in the output).
 
 ```
 two reasoning artifacts in one diagnostic run
 ─────────────────────────────────────────────────────────────
- PROCESS (ReAct)   onText → reasoning_step   base.ts L108–113
+ PROCESS (ReAct)   on-text hook → reasoning_step events
    model's text between tool calls — live, streamed, transient
- OUTPUT  (CoT)     hypothesesConsidered[]    diagnostic.md L69–75
+ OUTPUT  (CoT)     hypothesesConsidered[] in the structured output
    final typed hypotheses — kept, validated, part of the contract
 ```
 
@@ -127,9 +127,9 @@ The Thought stream is transient (great for watching the run, → 06); the `hypot
 
 ### Move 2.5 — why CoT here is about structure, not hidden reasoning
 
-The classic CoT result (Wei et al., 2022) was that "think step by step" *unlocked* reasoning the model otherwise skipped — on a 2022-era model, the scaffolding changed the answer. That is no longer the live reason to use it here. sonnet-4-6 (`base.ts` L9) does substantial reasoning internally without being told to; "think step by step" does not unlock hidden capability the way it did on davinci.
+The classic CoT result (Wei et al., 2022) was that "think step by step" *unlocked* reasoning the model otherwise skipped — on a 2022-era model, the scaffolding changed the answer. That is no longer the live reason to use it here. The frontier Sonnet-class model the agents run on does substantial reasoning internally without being told to; "think step by step" does not unlock hidden capability the way it did on davinci.
 
-So what is the explicit scaffolding *for* in 2026? Output structure. "Generate 2–3 hypotheses" does not make sonnet smarter — it makes sonnet produce a `hypothesesConsidered` array of length 2–3 instead of a single conclusion. The value migrated from *eliciting* reasoning to *shaping and capturing* it.
+So what is the explicit scaffolding *for* in 2026? Output structure. "Generate 2–3 hypotheses" does not make Sonnet smarter — it makes Sonnet produce a `hypothesesConsidered` array of length 2–3 instead of a single conclusion. The value migrated from *eliciting* reasoning to *shaping and capturing* it.
 
 ```
 2022 (davinci):  "think step by step" → unlocks reasoning → better answer
@@ -146,9 +146,9 @@ This is why the scaffolding sits in the *output schema* (`hypothesesConsidered`)
 
 CoT is not free and not always right. Three places in this codebase deliberately omit it:
 
-- **Monitoring** returns an anomaly array (`monitoring.md` L69–L97) with an `evidence` field but *no* per-item reasoning field. It detects and measures; free-form reasoning would bloat the output without improving the numbers. CoT would be cost without payoff.
-- **Recommendation** returns actions (`recommendation.md` L49–L74) with a `rationale` field — one line per action, not a hypothesis-falsification chain. It reasons *from* the diagnosis, so the heavy CoT already happened upstream; repeating it would duplicate work.
-- **The intent classifier** would be *wrecked* by CoT. `classifyIntent` has `max_tokens: 16` (`intent.ts` L20) and demands "ONLY the one word." Tell it to "think step by step" and it spends its 16-token budget on "Let me consider…" and never reaches the label. CoT and a one-word output are directly incompatible.
+- **Monitoring** returns an anomaly array with an `evidence` field but *no* per-item reasoning field. It detects and measures; free-form reasoning would bloat the output without improving the numbers. CoT would be cost without payoff.
+- **Recommendation** returns actions with a `rationale` field — one line per action, not a hypothesis-falsification chain. It reasons *from* the diagnosis, so the heavy CoT already happened upstream; repeating it would duplicate work.
+- **The intent classifier** would be *wrecked* by CoT. It has `max_tokens: 16` and demands "ONLY the one word." Tell it to "think step by step" and it spends its 16-token budget on "Let me consider…" and never reaches the label. CoT and a one-word output are directly incompatible.
 
 ```
 CoT fit by agent
@@ -175,31 +175,31 @@ This diagram spans the diagnostic flow. The Prompt layer forces hypotheses befor
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  PROMPT LAYER  lib/agents/prompts/diagnostic.md                      │
+│  PROMPT LAYER  the diagnostic prompt                                  │
 │                                                                       │
-│  "Generate 2–3 hypotheses BEFORE your first tool call"  L20         │
-│  "design queries to falsify each hypothesis"            L21–24      │
-│           │  breadth committed before any result biases it          │
-└───────────┼────────────────────────────────────────────────────────────┘
+│  "Generate 2–3 hypotheses BEFORE your first tool call"                │
+│  "design queries to falsify each hypothesis"                          │
+│           │  breadth committed before any result biases it            │
+└───────────┼───────────────────────────────────────────────────────────┘
             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  LOOP LAYER  lib/agents/base.ts  (ReAct externalizes PROCESS thought)│
+│  LOOP LAYER  the shared agent loop  (ReAct externalizes process thought)│
 │                                                                       │
-│  per turn: onText → reasoning_step (Thought)   L108–113             │
-│  sonnet-4-6 reasons internally; text between calls is streamed       │
-│           │  transient — great for watching, not the durable artifact│
-└───────────┼────────────────────────────────────────────────────────────┘
+│  per turn: on-text hook → reasoning_step (Thought)                    │
+│  Sonnet reasons internally; text between calls is streamed            │
+│           │  transient — great for watching, not the durable artifact │
+└───────────┼───────────────────────────────────────────────────────────┘
             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  OUTPUT LAYER  diagnostic.md L69–75 + validate.ts (isDiagnosis)      │
+│  OUTPUT LAYER  the diagnostic prompt's Output + the diagnosis guard   │
 │                                                                       │
-│  hypothesesConsidered: [ { hypothesis, supported, reasoning } ]      │
-│    ← STRUCTURED CoT: reasoning in a typed field, not free prose      │
-│  isDiagnosis requires the array → CoT is part of the contract        │
-│    queryable · assertable · renderable · durable                    │
+│  hypothesesConsidered: [ { hypothesis, supported, reasoning } ]       │
+│    ← STRUCTURED CoT: reasoning in a typed field, not free prose       │
+│  the diagnosis guard requires the array → CoT is part of the contract │
+│    queryable · assertable · renderable · durable                      │
 └──────────────────────────────────────────────────────────────────────┘
 
-  CoT's modern job: not eliciting reasoning (sonnet reasons anyway) but
+  CoT's modern job: not eliciting reasoning (Sonnet reasons anyway) but
   forcing it into a typed, inspectable shape — and only where it pays.
 ```
 
@@ -380,3 +380,4 @@ In which output field does the diagnostic agent capture its chain-of-thought, an
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md `hypothesesConsidered` shape L54–60→L69–75, field-rules ref L71→L90, monitoring output L50–73→L69–97, recommendation output L46–65→L49–74. (`diagnostic.md` L20 "generate 2–3 hypotheses" verified still correct — left unchanged.)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -55,25 +55,25 @@ The default (when you set nothing) is the provider's chosen middle: enough rando
 
 ---
 
-### What blooming insights sets: only `max_tokens`
+### What this system sets: only `max_tokens`
 
-Grepping every `anthropic.messages.create` call confirms the honest fact: no `temperature`, no `top_p`, no `top_k` is passed anywhere. The only decoding-adjacent parameter set is `max_tokens`, which is a *length* cap, not a *randomness* control.
+Scan every model-call site and the honest fact lands: no `temperature`, no `top_p`, no `top_k` is passed anywhere. The only decoding-adjacent parameter set is `max_tokens`, which is a *length* cap, not a *randomness* control.
 
-The agent loop's call (`lib/agents/base.ts` L92–L100) carries exactly four params — `model`, `max_tokens`, `system`, `messages` — plus `tools` on non-final turns:
-
-```typescript
-const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-  model: AGENT_MODEL,
-  max_tokens: maxTokens,
-  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-  messages,
-};
-```
-
-No `temperature` field. Same for both synthesis calls (`lib/agents/diagnostic.ts` L97–L116, `lib/agents/recommendation.ts` L96–L122) and the intent classifier (`lib/agents/intent.ts` L18–L25).
+The agent loop's call carries exactly four params — `model`, `max_tokens`, `system`, `messages` — plus `tools` on non-final turns:
 
 ```
-every create() call in the codebase:
+  params = {
+    model:       AGENT_MODEL,
+    max_tokens:  maxTokens,
+    system:      forceFinal ? base + synthesisInstruction : base,
+    messages:    messages,
+  }
+```
+
+No `temperature` field. Same for both synthesis calls and the intent classifier.
+
+```
+every model-call site:
   model        ✓ set
   max_tokens   ✓ set        (length, not randomness)
   system       ✓ set
@@ -88,31 +88,31 @@ every create() call in the codebase:
 
 ### The one deliberate decoding choice: `max_tokens: 16` on the classifier
 
-`max_tokens` is tuned per call, and the most pointed value is on the intent classifier (`lib/agents/intent.ts` L18–L25):
-
-```typescript
-const res = await anthropic.messages.create({
-  model: CLASSIFIER_MODEL,
-  max_tokens: 16,
-  system:
-    'Classify the user query as exactly one word: monitoring ... ' +
-    'diagnostic ... recommendation .... Reply with ONLY the one word.',
-  messages: [{ role: 'user', content: query }],
-});
-```
-
-`16` tokens is enough for one word and nothing else. The classifier physically cannot ramble — the length cap enforces what the system prompt requests. The full ladder of `max_tokens` values:
+`max_tokens` is tuned per call, and the most pointed value is on the intent classifier:
 
 ```
-max_tokens by call          value   purpose
-──────────────────────────  ─────   ──────────────────────────────
-agent turn   base.ts L74     4096    room for tool-use + JSON output
-synthesis    diagnostic L99  2048    one structured artifact, no exploration
-synthesis    recommend.  L98 2048    one structured array
-classifier   intent.ts L20     16    one word — bound the answer hard
+  response = provider_sdk.messages.create({
+    model:       CLASSIFIER_MODEL,
+    max_tokens:  16,
+    system:      "Classify the user query as exactly one word: "
+                 "monitoring ... diagnostic ... recommendation. "
+                 "Reply with ONLY the one word.",
+    messages:    [{ role: "user", content: query }],
+  })
 ```
 
-This is the codebase being deliberate about *length* while leaving *randomness* at default. The classifier would, ideally, also pin temperature to 0 (a classification has one right answer) — but it does not, relying instead on a sharp prompt plus the tiny `max_tokens` to make the output stable in practice.
+16 tokens is enough for one word and nothing else. The classifier physically cannot ramble — the length cap enforces what the system prompt requests. The full ladder of `max_tokens` values:
+
+```
+max_tokens by call    value   purpose
+──────────────────    ─────   ──────────────────────────────
+agent turn             4096    room for tool-use + JSON output
+diagnostic synthesis   2048    one structured artifact, no exploration
+recommendation synth.  2048    one structured array
+classifier               16    one word — bound the answer hard
+```
+
+This is the system being deliberate about *length* while leaving *randomness* at default. The classifier would, ideally, also pin temperature to 0 (a classification has one right answer) — but it does not, relying instead on a sharp prompt plus the tiny `max_tokens` to make the output stable in practice.
 
 ---
 
@@ -132,7 +132,7 @@ Two calls have a determinism interest that default temperature does not serve: t
 
 ### The principle
 
-Sampling randomness is a per-task setting, not a global default: classification and structured synthesis want determinism (temperature 0); open-ended generation tolerates or wants variety. blooming insights accepts the provider default everywhere — defensible for the analytical, JSON-extracting agents, slightly suboptimal for the two calls that have one right answer. Tuning `max_tokens` but not `temperature` shows the team controlled *length* (the cost and shape lever) and left *randomness* alone (the determinism lever) — a reasonable but incomplete set of decoding decisions.
+Sampling randomness is a per-task setting, not a global default: classification and structured synthesis want determinism (temperature 0); open-ended generation tolerates or wants variety. You can accept the provider default everywhere — defensible for the analytical, JSON-extracting agents, slightly suboptimal for the two calls that have one right answer. Tuning `max_tokens` but not `temperature` shows the team controlled *length* (the cost and shape lever) and left *randomness* alone (the determinism lever) — a reasonable but incomplete set of decoding decisions.
 
 ---
 
@@ -144,13 +144,13 @@ This diagram shows where decoding controls would act in the call path, and what 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  SERVICE LAYER (what this codebase sets per call)                    │
 │                                                                       │
-│  classifier  intent.ts L18–25   model, max_tokens:16,  system, msgs  │
-│  agent turn  base.ts L92–100    model, max_tokens:4096, system, msgs │
-│  synthesis   diagnostic L97–116 model, max_tokens:2048, system, msgs │
+│  classifier  intent.ts   model, max_tokens:16,  system, msgs  │
+│  agent turn  base.ts    model, max_tokens:4096, system, msgs │
+│  synthesis   diagnostic model, max_tokens:2048, system, msgs │
 │       │                                                              │
 │       │  NO temperature / top_p / top_k on any call                  │
 └───────┼────────────────────────────────────────────────────────────────┘
-        │  params → create()  base.ts L102
+        │  params → create()  base.ts
 ┌───────▼────────────────────────────────────────────────────────────────┐
 │  PROVIDER LAYER (Anthropic — owns the sampling step)                 │
 │                                                                       │
@@ -324,3 +324,4 @@ How many sampling-randomness parameters does any `anthropic.messages.create` cal
 Updated: 2026-05-28 — Re-derived the drifted synthesis-call ranges (diagnostic L97–L116 / `max_tokens` L99, recommendation L96–L122); the no-temperature finding and `base.ts`/`intent.ts` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

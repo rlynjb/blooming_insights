@@ -43,43 +43,43 @@
 ```
 The boundary in one picture
 
-  CHAIN (route.ts writes the order)
+  CHAIN (route handler writes the order)
   ┌──────────┐      ┌──────────┐      ┌──────────────┐
   │monitoring│ ───► │diagnostic│ ───► │recommendation│
   └──────────┘      └────┬─────┘      └──────────────┘
    engineer-written order; the route picks the next stage
                          │
                          ▼  zoom into ONE stage
-  AGENT (runAgentLoop, model drives)
+  AGENT (shared agent loop, model drives)
   ┌─────────────────────────────────────────┐
   │  reason → call tool → observe → repeat   │
   │  the MODEL decides each next call & stop  │
   └─────────────────────────────────────────┘
 ```
 
-The strategy in plain English: **fix the order where you know it, free the steps where you don't.** The order of the three analyst stages is knowable up front (you always detect before you diagnose, diagnose before you recommend), so the route hardcodes it. What each stage *does* — which EQL to run, when it has enough evidence — is not knowable up front, so each stage gets a loop.
+The strategy in plain English: **fix the order where you know it, free the steps where you don't.** The order of the three analyst stages is knowable up front (you always detect before you diagnose, diagnose before you recommend), so the route hardcodes it. What each stage *does* — which query to run, when it has enough evidence — is not knowable up front, so each stage gets a loop.
 
 ### The chain half — control flow the engineer wrote
 
 The technical thing: a *deterministic pipeline*. The next stage is selected by branching code, not by a model.
 
-If you're coming from frontend, this is your multi-step form's `if (step === 1) … else if (step === 2)` — except the "steps" are whole agents. The route reads a `step` query param (`diagnose` or `recommend`) and a `q` param, and a plain `if`/`else` decides which agent constructor to call. No model is consulted about ordering.
+If you're coming from frontend, this is your multi-step form's `if (step === 1) … else if (step === 2)` — except the "steps" are whole agents. The route handler reads a step query param (`diagnose` or `recommend`) and a free-form `q` param, and a plain if/else decides which agent to construct. No model is consulted about ordering.
 
 ```
-route.ts — the chain is an if-ladder (not an LLM)
+route handler — the chain is an if-ladder (not an LLM)
 
-  q && !insightId   ──►  QueryAgent          (free-form question)
-  step === 'recommend' ─►  RecommendationAgent (skip diagnose)
-  else (diagnose)   ──►  DiagnosticAgent
-                         then, if step !== 'diagnose':
-                              RecommendationAgent
+  q AND no insightId   ──►  query agent           (free-form question)
+  step == 'recommend'  ──►  recommendation agent  (skip diagnose)
+  else (diagnose)      ──►  diagnostic agent
+                            then, if step != 'diagnose':
+                                 recommendation agent
 
   the SUPERVISOR here is code — an if-ladder, not a model
 ```
 
-The practical consequence: the diagnostic agent's output is handed to the recommendation agent by the *route*, not by either agent deciding to. In `route.ts` the diagnosis object flows `diagAgent.investigate(...)` → `recAgent.propose(inv, diagnosis!, ...)` — a function passing a return value to the next function, exactly like `a().then(x => b(x))`. (Across the two-step UI, the handoff is the client's `sessionStorage` key `bi:diag:<id>`, but the principle is identical: code carries the value, not a model.)
+The practical consequence: the diagnostic agent's output is handed to the recommendation agent by the *route*, not by either agent deciding to. The diagnosis object flows out of `investigate(...)` and into `propose(inv, diagnosis, ...)` — a function passing a return value to the next function, exactly like `a().then(x => b(x))`. (Across the two-step UI, the handoff is a client-side session-storage key, but the principle is identical: code carries the value, not a model.)
 
-The condition under which this works: the order has to be genuinely fixed. It is here — there is no anomaly you'd recommend-before-you-diagnose. The moment the order needed to depend on what an agent found, this `if`-ladder would become an LLM supervisor (covered in `06-routing.md` and the multi-agent section).
+The condition under which this works: the order has to be genuinely fixed. It is here — there is no anomaly you'd recommend-before-you-diagnose. The moment the order needed to depend on what an agent found, this if-ladder would become an LLM supervisor (covered in the routing section and the multi-agent section).
 
 ### The agent half — control flow the model wrote
 
@@ -88,21 +88,21 @@ The technical thing: an *autonomous ReAct loop*. Inside one stage, the model emi
 If you're coming from frontend, this is a `.then()` chain whose *length you don't know in advance*, because each link inspects its result and picks the next call. You can't write `a().then(b).then(c)` because you don't know there will be exactly three, or that `b` comes after `a`. The model writes that chain at runtime.
 
 ```
-runAgentLoop (base.ts L85) — the model writes the chain
+shared agent loop — the model writes the chain
 
-  turn 0:  model: "check purchase volume"  → execute_analytics_eql
+  turn 0:  model: "check purchase volume"  → run analytics tool
            observe: { count: 42000 }
-  turn 1:  model: "revenue too — compare windows" → execute_analytics_eql
+  turn 1:  model: "revenue too — compare windows" → run analytics tool
            observe: { current: 42000, prior: 51500 }
-  turn 2:  model: no tool_use → DONE, emits JSON
-           (base.ts L121: zero tool_use blocks = natural stop)
+  turn 2:  model: no tool_use block → DONE, emits JSON
+           (zero tool_use blocks = natural stop)
 
   the loop wrote itself — 3 turns this time, maybe 5 next time
 ```
 
 The practical consequence: two runs of the same diagnostic agent on the same anomaly can take a different number of turns and call different tools, because the model re-decides after every observation. That's the upside (it adapts to what the data shows) and the cost (variable latency, variable token spend, a trajectory you have to replay to debug).
 
-The condition under which it works — and the safety rail: an unbounded model-driven loop can run forever. `runAgentLoop` caps it two ways: `maxTurns` (default 8) and `maxToolCalls` (6 for monitoring/diagnostic/query, 4 for recommendation). When the budget is spent, the loop forces a final tool-less turn (`base.ts` L90–L101) — it strips the tools from the request so the model *must* produce an answer instead of another call.
+The condition under which it works — and the safety rail: an unbounded model-driven loop can run forever. The shared agent loop caps it two ways: a per-loop turn limit (default 8) and a per-loop tool-call limit (6 for monitoring/diagnostic/query, 4 for recommendation). When the budget is spent, the loop forces a final tool-less turn — it strips the tools from the request so the model *must* produce an answer instead of another call.
 
 ### Phase A vs Phase B — where the boundary could move
 
@@ -111,7 +111,7 @@ Right now the boundary sits between the route (chain) and the agents (loops). It
 ```
         Now (chain of agents)            If quality forced it (LLM supervisor)
 ┌──────────────────────────────┐  ┌──────────────────────────────────┐
-│ route.ts if-ladder picks the │  │ a supervisor AGENT picks the next │ ←
+│ route if-ladder picks the    │  │ a supervisor AGENT picks the next │ ←
 │ next stage (deterministic)   │  │ stage at runtime (model-decided)  │
 │   ▼                          │  │   ▼                               │
 │ each stage = a ReAct loop    │  │ each stage = a ReAct loop         │
@@ -123,7 +123,7 @@ Right now the boundary sits between the route (chain) and the agents (loops). It
 
 *Now:* the order is fixed and the route enforces it. Cheap, fully debuggable, the order can't drift.
 
-*If quality forced it:* if some anomalies needed to skip diagnosis, or loop diagnosis twice, or pick a fourth specialist, the `if`-ladder would become a supervisor agent that *reasons* about which stage runs next. The inner loops wouldn't change at all — only the outer control-flow owner moves from code to model.
+*If quality forced it:* if some anomalies needed to skip diagnosis, or loop diagnosis twice, or pick a fourth specialist, the if-ladder would become a supervisor agent that *reasons* about which stage runs next. The inner loops wouldn't change at all — only the outer control-flow owner moves from code to model.
 
 The takeaway: **the inner agent loops don't have to change for the outer chain to become an agent.** That's the whole reason the boundary is worth naming — it's the one seam you'd move, and everything on either side of it stays put.
 
@@ -138,11 +138,11 @@ The full picture is below.
 ```
 blooming insights: a chain of agents
 
-  ┌─────────────────────── CHAIN LAYER (route.ts, code) ───────────────────────┐
+  ┌─────────────────────── CHAIN LAYER (route handler, code) ──────────────────┐
   │                                                                             │
-  │   ?q=  ──► classifyIntent ──► QueryAgent ──────────────┐                    │
+  │   ?q=  ──► classify intent ──► query agent ────────────┐                    │
   │                                                         │                   │
-  │   ?insightId=  ──► resolveAnomaly                       │                   │
+  │   ?insightId=  ──► resolve anomaly                      │                   │
   │        │                                                │                   │
   │        ▼  (deterministic if-ladder; the CODE is the supervisor)            │
   │   ┌──────────┐   diagnosis    ┌──────────────┐                            │
@@ -152,15 +152,15 @@ blooming insights: a chain of agents
   └────────│──────────────────────────────│──────────────────────────────────┘
            │ zoom in: each box is an...    │
            ▼                               ▼
-  ┌─────────────────────── AGENT LAYER (runAgentLoop, model) ──────────────────┐
+  ┌─────────────────────── AGENT LAYER (shared agent loop, model) ─────────────┐
   │   ┌─────────┐                                                              │
   │   │ reason  │ ◄──────────────────────┐                                     │
-  │   └────┬────┘                         │ observation fed back (base.ts L171)│
+  │   └────┬────┘                         │ observation fed back               │
   │        ▼                              │                                     │
   │   ┌─────────┐   ┌──────────────┐      │                                     │
   │   │  act    │──►│ run MCP tool │ ─────┘   loop until: no tool_use (done)    │
   │   └─────────┘   └──────────────┘          OR budget spent → forced final    │
-  │                                            turn (base.ts L90, tools removed) │
+  │                                            turn (tools removed)             │
   └─────────────────────────────────────────────────────────────────────────────┘
 
   CHAIN owns the order of stages · AGENT owns what happens inside a stage
@@ -339,3 +339,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

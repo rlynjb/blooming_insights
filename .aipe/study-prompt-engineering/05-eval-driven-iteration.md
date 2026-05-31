@@ -44,7 +44,7 @@
 ```
 EVAL LOOP
 ─────────────────────────────────────────────────────────────
-   edit prompt  (monitoring.md / diagnostic.md / …)
+   edit prompt  (monitoring / diagnostic / …)
         │
         ▼
    ┌─────────── DATASET ───────────┐
@@ -85,10 +85,10 @@ WHAT YOU OWN
 
 For blooming insights the cases are obvious because the prompts already name them. Every "CRITICAL"/"Never"/"Do NOT" block is a case waiting to be written down:
 
-- `monitoring.md` L31–37: a workspace whose recent 90 days are empty. Expected: agent anchors `execution_time` or returns `[]` — NOT a ±100% swing.
-- `monitoring.md` L29: a metric with a prior value < 500 events. Expected: agent ignores it, does not report a "swing."
-- `diagnostic.md` L38–50: queries for recent windows return 0. Expected: conclusion honestly states data is historical — NOT an invented cause.
-- `diagnostic.md` L35: a hypothesis that would need `customers matching`. Expected: agent uses `by <attribute>` and does not waste a call.
+- monitoring prompt — empty-window block: a workspace whose recent 90 days are empty. Expected: agent anchors `execution_time` or returns `[]` — NOT a ±100% swing.
+- monitoring prompt — small-baseline caution: a metric with a prior value < 500 events. Expected: agent ignores it, does not report a "swing."
+- diagnostic prompt — historical-data block: queries for recent windows return 0. Expected: conclusion honestly states data is historical — NOT an invented cause.
+- diagnostic prompt — `customers matching` ban: a hypothesis that would need that filter shape. Expected: agent uses `by <attribute>` and does not waste a call.
 
 Each of those is a regression fix that currently lives only as a sentence in a prompt. The dataset turns each sentence into an enforceable case.
 
@@ -96,7 +96,7 @@ Each of those is a regression fix that currently lives only as a sentence in a p
 
 ### Part 2 — the runner feeds the REAL path
 
-The runner must exercise the actual production path — the loaded `.md` prompt, the real model, `runAgentLoop`, `parseAgentJson`, the type guards — not a hand-mocked approximation. A harness that scores a prompt against a different parser than production uses is measuring fiction.
+The runner must exercise the actual production path — the loaded markdown prompt, the real model, the shared agent loop, the agent-JSON parser, the type guards — not a hand-mocked approximation. A harness that scores a prompt against a different parser than production uses is measuring fiction.
 
 ```
 RUNNER must use the SAME path as production
@@ -104,16 +104,16 @@ RUNNER must use the SAME path as production
  case input
     │
     ▼
- DiagnosticAgent.investigate(anomaly)   ← real class, real prompt
-    │  runAgentLoop → real model → parseAgentJson → isDiagnosis
+ diagnostic_agent.investigate(anomaly)   ← real class, real prompt
+    │  loop → real model → parse → shape guard
     ▼
- Diagnosis | FALLBACK                    ← exactly what prod returns
+ Diagnosis | FALLBACK                     ← exactly what prod returns
     │
     ▼
  scorer reads THIS, not a mock
 ```
 
-The seam that makes this cheap already exists. `runAgentLoop` injects both the Anthropic client and the `McpCaller` (`lib/agents/base.ts` L48–L62, L16–L22) — the same seam the 169 unit tests use to pass fakes. For evals you do the opposite of the unit tests: you keep the real Anthropic client (you want real model behavior) and inject a *deterministic* `McpCaller` that returns canned tool results per case, so the case's "empty 90-day window" is reproducible run to run.
+The seam that makes this cheap already exists. The shared agent loop injects both the provider SDK client and an MCP-caller dependency — the same seam the 169 unit tests use to pass fakes. For evals you do the opposite of the unit tests: you keep the real provider client (you want real model behavior) and inject a *deterministic* MCP caller that returns canned tool results per case, so the case's "empty 90-day window" is reproducible run to run.
 
 ---
 
@@ -124,16 +124,16 @@ This is the distinction the brief demands be named plainly. blooming insights ha
 ```
 UNIT TEST (exists)                  EVAL (does not exist)
 ──────────────────────────────     ──────────────────────────────
-inject fake anthropic + fake mcp    real anthropic, canned mcp results
-assert: parseAgentJson returns      assert: the diagnosis is CORRECT
+inject fake provider + fake mcp     real provider, canned mcp results
+assert: the parser returns          assert: the diagnosis is CORRECT
         an object of the right       for THIS anomaly given THIS data
-        shape; isDiagnosis true
+        shape; shape guard passes
 ─────────────────────────────────────────────────────────────
 "does the contract hold?"           "is the answer any good?"
 deterministic, no model call        non-deterministic, real model call
 ```
 
-`test/agents/diagnostic.test.ts` proves that when the fake model returns fenced JSON, `investigate` returns a typed `Diagnosis`, and when it returns garbage, the chain falls to `FALLBACK`. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 169 tests. The eval is the layer that would catch it, and it is the layer that does not exist.
+The diagnostic agent's unit tests prove that when the fake model returns fenced JSON, the investigate path returns a typed `Diagnosis`, and when it returns garbage, the chain falls to a fallback value. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 169 tests. The eval is the layer that would catch it, and it is the layer that does not exist.
 
 So the honest framing of the current state: the prompts ARE iterated against real failures — the dense warning blocks prove it — but the iteration loop runs in someone's head, manually, one case at a time, with no record of the case and no automated re-check. It is a regression suite with no harness. That works until the person who remembers all the edge cases changes a prompt and forgets one.
 
@@ -172,27 +172,26 @@ This diagram spans the loop. The Engineer edits a prompt; the Harness layer runs
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ENGINEER                                                             │
-│   edits lib/agents/prompts/<name>.md  (e.g. tighten the empty-window  │
-│   rule in monitoring.md L31–37)                                       │
+│   edits a prompt file (e.g. tightens the empty-window rule            │
+│   in the monitoring prompt)                                           │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  HARNESS LAYER   evals/  (does not exist yet)                         │
 │                                                                       │
-│  DATASET   evals/cases/*.json  — 20–50 cases                         │
-│    each: { input anomaly/query, canned mcp results, grader }         │
-│           │                                                          │
-│  RUNNER   evals/run.ts                                               │
-│    real Anthropic client + injected deterministic McpCaller          │
-│    → DiagnosticAgent.investigate / QueryAgent.answer (REAL path)     │
-│           │  output                                                  │
-│  SCORER   field assertion (JSON agents) | LLM-judge (query prose)    │
-│           │  pass/fail or 0–1 per case                               │
+│  DATASET   cases dir holding 20–50 JSON cases                         │
+│    each: { input anomaly/query, canned mcp results, grader }          │
+│           │                                                           │
+│  RUNNER   real provider client + injected deterministic mcp caller    │
+│    → diagnostic_agent.investigate / query_agent.answer (REAL path)    │
+│           │  output                                                   │
+│  SCORER   field assertion (JSON agents) | LLM-judge (query prose)     │
+│           │  pass/fail or 0–1 per case                                │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  results table
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  GATE                                                                 │
-│   aggregate ↑ ?    AND    per-case regressions == 0 ?                │
+│   aggregate ↑ ?    AND    per-case regressions == 0 ?                 │
 │        │ yes & yes                    │ no                            │
 │        ▼                              ▼                               │
 │      SHIP                       reject / investigate the regression   │
@@ -354,3 +353,4 @@ Updated: 2026-05-29 — Updated the Vitest test count from 125 to 169 across all
 Updated: 2026-05-29 — Resynced stale prompt-line refs (the {categories} shift + earlier prompt revisions): monitoring.md CRITICAL block L25–31→L31–37, small-baseline caution L23→L29; diagnostic.md historical-data block L36–42→L38–50, "customers matching" ban L33→L35; recommendation.md id-ban L64→L82; query.md prose L36→L49.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

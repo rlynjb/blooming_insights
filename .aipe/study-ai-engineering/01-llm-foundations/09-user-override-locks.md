@@ -99,7 +99,7 @@ interface Recommendation {
   rationale: string;
   bloomreachFeature: ...;
   steps: string[];
-  estimatedImpact: EstimatedImpact;  // string | { range, rangeUsd?, assumption } (types.ts L77–L79)
+  estimatedImpact: EstimatedImpact;  // string | { range, rangeUsd?, assumption }
   confidence: ...;
   effort?: ...; timeToSetUpMinutes?: number; ...  // current optional, agent-emitted fields
   // override metadata (NEW — none of the above is human-edit metadata)
@@ -328,3 +328,4 @@ Does the `Recommendation` type carry any field that records a human edit, and wh
 Updated: 2026-05-28 — Re-derived the drifted refs (`Recommendation` types.ts L85–L99, `Diagnosis` L64–L73, `insights.ts` surface L29–L57 + Map store L4–L6, investigate-page export L75–L98) and noted the new enrichment fields are agent-emitted/derived, not human-edit metadata — Case B still holds (no `_overridden_at`/`_dismissed`).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

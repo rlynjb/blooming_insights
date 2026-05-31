@@ -50,7 +50,7 @@
 the spectrum, and where blooming insights sits
 ─────────────────────────────────────────────────────────────
  ZERO-SHOT          describe the task           "classify as one word"
-   │                                            ← classifyIntent lives here
+   │                                            ← intent classifier lives here
  FORMAT EXEMPLAR    show the output SHAPE        a worked EQL line, a JSON block
    │                (not labeled in→out pairs)   ← the four prompts live here
  FEW-SHOT (k-shot)  show k labeled in→out pairs  "Q: ... → billing"  ×3–5
@@ -63,21 +63,21 @@ The distinction matters: a format exemplar shapes *how the answer looks*; a true
 
 ### Format exemplars for EQL — showing the supported syntax
 
-The prompts do not describe EQL grammar; they show it. The `## EQL reminders` blocks are worked one-liners (`monitoring.md` L49–L54, `diagnostic.md` L27–L37):
+The prompts do not describe EQL grammar; they show it. The `## EQL reminders` blocks are worked one-liners:
 
 ```
-diagnostic.md — EQL reminders   (L27–L37)
+diagnostic prompt — EQL reminders
 ─────────────────────────────────────────────────────────────
- Count one event:   select count event purchase in last 7 days        L28
- Sum a property:    select sum event purchase.total_price ...          L29
- Segment by dim:    select count event purchase by customer.country... L30
- Segment by device: ... by customer.device_type grouping top 5 ...     L31
- Multiple metrics:  select count event view_item, count event ...      L32
- NEGATIVE example:  Do NOT use a `customers matching ...` clause       L33
- Funnels:           funnel view_item followed by purchase ... end      L34
+ Count one event:   select count event purchase in last 7 days
+ Sum a property:    select sum event purchase.total_price ...
+ Segment by dim:    select count event purchase by customer.country...
+ Segment by device: ... by customer.device_type grouping top 5 ...
+ Multiple metrics:  select count event view_item, count event ...
+ NEGATIVE example:  Do NOT use a `customers matching ...` clause
+ Funnels:           funnel view_item followed by purchase ... end
 ```
 
-These are exemplars, not grammar. The model is shown six *correct* query shapes and one *forbidden* one (L33 — a negative example, the scar tissue of the model repeatedly inventing an unsupported clause). The model copies the demonstrated forms. This is few-shot applied to format: the examples constrain the *syntax* of the queries the model writes, without being labeled examples of "given anomaly X, write query Y."
+These are exemplars, not grammar. The model is shown six *correct* query shapes and one *forbidden* one (a negative example — the scar tissue of the model repeatedly inventing an unsupported clause). The model copies the demonstrated forms. This is few-shot applied to format: the examples constrain the *syntax* of the queries the model writes, without being labeled examples of "given anomaly X, write query Y."
 
 ```
 six correct shapes shown  →  model emits queries matching them
@@ -88,17 +88,17 @@ one forbidden shape shown →  model avoids `customers matching`
 
 ### A worked end-to-end exemplar — the monitoring query plan
 
-monitoring.md goes further: it shows a worked *sequence* of calls, not just isolated lines. The `## Suggested query plan` (`monitoring.md` L39–L47) is a five-step exemplar of an entire investigation:
+The monitoring prompt goes further: it shows a worked *sequence* of calls, not just isolated lines. The `## Suggested query plan` section is a five-step exemplar of an entire investigation:
 
 ```
-monitoring.md — Suggested query plan   (L39–L47)
+monitoring prompt — Suggested query plan
 ─────────────────────────────────────────────────────────────
- 1. select count event purchase, sum ...total_price in last 90 days  L41
- 2. select ... in last 180 days                                       L42
- 3. select count event view_item, cart_update, checkout, purchase...  L43
- 4. select ... in last 180 days                                       L44
- 5. select count event session_start in last 90 days                  L45
- "Derive: purchase count & revenue change, the conversion-rate ..."   L47
+ 1. select count event purchase, sum ...total_price in last 90 days
+ 2. select ... in last 180 days
+ 3. select count event view_item, cart_update, checkout, purchase...
+ 4. select ... in last 180 days
+ 5. select count event session_start in last 90 days
+ "Derive: purchase count & revenue change, the conversion-rate ..."
 ```
 
 This is the strongest exemplar in the codebase — a full worked example of *which queries to run in what order to produce a briefing*. It shapes the agent's whole exploration trajectory, not just one query's syntax. It is still format/process-shaping, not a labeled "input anomaly → output anomaly-array" pair, but it is the closest the prompts get to demonstrating the task end to end.
@@ -107,10 +107,10 @@ This is the strongest exemplar in the codebase — a full worked example of *whi
 
 ### The JSON output block IS a few-shot of the output form
 
-The single clearest few-shot pattern is the output example block in each prompt. The model is handed a fully-populated instance of the exact shape it must return (`monitoring.md` L73–L85, `diagnostic.md` L63–L85, `recommendation.md` L49–L74):
+The single clearest few-shot pattern is the output example block in each prompt. The model is handed a fully-populated instance of the exact shape it must return:
 
 ```
-monitoring.md — output exemplar   (L73–L85)
+monitoring prompt — output exemplar
 ─────────────────────────────────────────────────────────────
  [
    {
@@ -123,11 +123,11 @@ monitoring.md — output exemplar   (L73–L85)
  ]
 ```
 
-This is a one-shot example of the output. The model sees a real, filled-in object — `18.5`, `"down"`, `"critical"` — and produces the same shape with its own values. This interacts directly with structured outputs (→ 02-structured-outputs.md): the example *is* the contract's request side. `parseAgentJson` + `isAnomalyArray` enforce the shape, but the output exemplar is what makes the model *emit* the shape in the first place. recommendation.md even shapes a field through the example plus a prose rule: the exemplar shows no `id` and L64 says "Do NOT include an `id` field — the system assigns it" — the example demonstrates the id-less shape the validator (`validate.ts` `isRecommendationArray`) expects.
+This is a one-shot example of the output. The model sees a real, filled-in object — `18.5`, `"down"`, `"critical"` — and produces the same shape with its own values. This interacts directly with structured outputs (→ 02-structured-outputs.md): the example *is* the contract's request side. The agent-JSON parser + the anomaly-array guard enforce the shape, but the output exemplar is what makes the model *emit* the shape in the first place. The recommendation prompt even shapes a field through the example plus a prose rule: the exemplar shows no `id` and a sibling rule says "Do NOT include an `id` field — the system assigns it" — the example demonstrates the id-less shape the recommendation guard expects.
 
 ```
 output exemplar (the request)  →  model emits matching shape
-parseAgentJson + type guard (the guarantee)  →  shape enforced
+parser + type guard (the guarantee)  →  shape enforced
 the example and the validator describe the SAME shape from two sides
 ```
 
@@ -135,23 +135,23 @@ the example and the validator describe the SAME shape from two sides
 
 ### The classifier is zero-shot, not few-shot
 
-Here is the honest split. The component whose *whole job* is classification — `classifyIntent` (`intent.ts` L17–L31) — uses **no examples at all**. Its system prompt is a description, inline in the code, of the three labels (`intent.ts` L21–L23):
-
-```typescript
-system:
-  'Classify the user query as exactly one word: monitoring (what changed / what is new), ' +
-  'diagnostic (why did something happen), or recommendation (what should I do). ' +
-  'Reply with ONLY the one word.',                          // intent.ts L21–L23
-```
-
-That is a zero-shot prompt: label *definitions*, no labeled query→label pairs. query.md's `## Framing` section (`query.md` L15–L21) mirrors the same three definitions for the answering agent — again definitions, not examples:
+Here is the honest split. The component whose *whole job* is classification — the intent classifier — uses **no examples at all**. Its system prompt is a description, inline in the code, of the three labels:
 
 ```
-query.md — Framing   (L15–L21)
+  system:
+    "Classify the user query as exactly one word: monitoring (what changed / what is new), "
+    "diagnostic (why did something happen), or recommendation (what should I do). "
+    "Reply with ONLY the one word."
+```
+
+That is a zero-shot prompt: label *definitions*, no labeled query→label pairs. The query prompt's `## Framing` section mirrors the same three definitions for the answering agent — again definitions, not examples:
+
+```
+query prompt — Framing
 ─────────────────────────────────────────────────────────────
- monitoring     = what changed / what's new          L17
- diagnostic     = why did something happen            L18
- recommendation = what should I do                    L19
+ monitoring     = what changed / what's new
+ diagnostic     = why did something happen
+ recommendation = what should I do
 ```
 
 So the classifier defines its labels and trusts the model to map a query onto one. There is no `"refund status?" → monitoring` exemplar anywhere. This is a deliberate-by-omission choice: zero-shot is cheaper (the classifier's `max_tokens` is 16, → 04-token-budgeting.md) and the three categories are distinct enough that a capable model handles them from definitions. Whether it would be *more accurate* with three labeled examples is an open, measurable question — and the project exercise below is exactly that experiment.
@@ -178,27 +178,27 @@ This diagram spans the prompt's example use. The Format-exemplar layer shows sha
 ┌──────────────────────────────────────────────────────────────────────┐
 │  FORMAT EXEMPLARS (syntax/process shaping)                           │
 │                                                                       │
-│  EQL reminders        monitoring.md L49–54 · diagnostic.md L27–37    │
-│    6 correct query shapes + 1 forbidden (customers matching, L35)    │
-│  Suggested query plan monitoring.md L39–47                           │
-│    5-step worked investigation (shapes the whole trajectory)         │
-│           │ model imitates the demonstrated shapes                   │
-└───────────┼────────────────────────────────────────────────────────────┘
+│  EQL reminders        monitoring + diagnostic prompts                 │
+│    6 correct query shapes + 1 forbidden (customers matching clause)   │
+│  Suggested query plan monitoring prompt                               │
+│    5-step worked investigation (shapes the whole trajectory)          │
+│           │ model imitates the demonstrated shapes                    │
+└───────────┼───────────────────────────────────────────────────────────┘
             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  OUTPUT EXEMPLARS = few-shot of the OUTPUT FORM                      │
 │                                                                       │
-│  filled JSON block   monitoring.md L73–85 · diagnostic.md L63–85     │
-│                      recommendation.md L49–74 (id-less, L82)         │
-│    ── this is the REQUEST side of the structured-output contract ──  │
-│       (parseAgentJson + type guard = the GUARANTEE side, → 02)       │
+│  filled JSON block   monitoring · diagnostic · recommendation prompts │
+│                      (recommendation: id-less + "Do NOT include id")  │
+│    ── this is the REQUEST side of the structured-output contract ──   │
+│       (parser + type guard = the GUARANTEE side, → 02)                │
 └──────────────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────────┐
 │  CLASSIFIER = ZERO-SHOT (no examples)                                │
 │                                                                       │
-│  classifyIntent  intent.ts L17–31   system = label DEFINITIONS L21–23│
-│  query.md Framing L15–21            same three definitions, no pairs │
-│    ← few-shot would add "query → label" examples here (the exercise) │
+│  intent classifier   system = label DEFINITIONS                       │
+│  query prompt Framing   same three definitions, no pairs              │
+│    ← few-shot would add "query → label" examples here (the exercise)  │
 └──────────────────────────────────────────────────────────────────────┘
 
   Format: shown and imitated.  Output form: shown (one-shot).
@@ -384,3 +384,4 @@ Updated: 2026-05-29 — Resynced monitoring.md exemplar refs after the `{categor
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md EQL reminders L26–34→L27–37 and negative-example L33→L35, diagnostic.md output exemplar L48–66→L63–85, recommendation.md output exemplar L49–59→L49–74 and id-ban L64→L82.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

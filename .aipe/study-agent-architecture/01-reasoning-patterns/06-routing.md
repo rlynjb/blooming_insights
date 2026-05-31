@@ -111,60 +111,60 @@ The condition under which it works: the classifier has to be reliable enough tha
 
 ### Move 2.3 — Where this routing lives in the codebase
 
-The technical thing: a heuristic `parseIntent` function (`lib/agents/intent.ts` L6–L12) and an LLM-backed `classifyIntent` function (L17–L31) that runs the Haiku call and then runs its output back through `parseIntent` to extract the label.
+The technical thing: a heuristic intent parser and an LLM-backed classifier that runs the cheap-model call and then runs its output back through the same parser to extract the label.
 
-If you're coming from frontend, the structure is: `parseIntent` is the URL parser; `classifyIntent` is the wrapper that asks "you weren't a clean URL — what did you mean?" and then runs the answer through the URL parser again to normalize. The fallback in `parseIntent` (`return 'diagnostic'`) is the default route when nothing matched.
+If you're coming from frontend, the structure is: the intent parser is the URL parser; the classifier is the wrapper that asks "you weren't a clean URL — what did you mean?" and then runs the answer through the URL parser again to normalize. The parser's `return 'diagnostic'` fallback is the default route when nothing matched.
 
 ```
-The two functions in this repo — lib/agents/intent.ts
+The two functions, pseudocode shape
 
-  parseIntent(raw): Intent                    ← deterministic, L6–L12
-    if raw.toLowerCase() includes "monitoring"    → 'monitoring'
-    if raw.toLowerCase() includes "recommendation"→ 'recommendation'
-    if raw.toLowerCase() includes "diagnostic"    → 'diagnostic'
+  parse_intent(raw): Intent                   ← deterministic
+    if raw.lower() includes "monitoring"      → 'monitoring'
+    if raw.lower() includes "recommendation"  → 'recommendation'
+    if raw.lower() includes "diagnostic"      → 'diagnostic'
     return 'diagnostic'  // default
 
-  classifyIntent(anthropic, query): Promise<Intent>  ← LLM, L17–L31
-    res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',           ← L14
+  classify_intent(model, query): Promise<Intent>  ← LLM
+    res = await model.create({
+      model: cheap-classifier-model,
       max_tokens: 16,
       system: '...classify... one word...',
       messages: [{ role: 'user', content: query }],
     })
-    return parseIntent(extractText(res))            ← reuse the heuristic!
+    return parse_intent(extract_text(res))    ← reuse the heuristic!
 ```
 
-The practical consequence: the LLM call exists only on the `?q=` path (free-form question). The investigation flow (`?insightId=…`) skips routing entirely — the route knows it's a diagnosis regardless of words. Routing is paid for only when the input is genuinely ambiguous.
+The practical consequence: the LLM call exists only on the free-form question path. The investigation flow (when an existing anomaly is referenced) skips routing entirely — the route knows it's a diagnosis regardless of words. Routing is paid for only when the input is genuinely ambiguous.
 
-The condition under which it works: the heuristic and LLM agree on the output vocabulary (`'monitoring' | 'diagnostic' | 'recommendation'`). They both produce the same labels because `classifyIntent` parses the LLM's text through `parseIntent` — so anything the LLM emits gets normalized to one of three values. There's no third label vocabulary to maintain.
+The condition under which it works: the heuristic and LLM agree on the output vocabulary (`'monitoring' | 'diagnostic' | 'recommendation'`). They both produce the same labels because the classifier parses the LLM's text through the heuristic — so anything the LLM emits gets normalized to one of three values. There's no third label vocabulary to maintain.
 
 ### Move 2.4 — Where the routing fires (and where it doesn't)
 
-The technical thing: the route handler at `app/api/agent/route.ts` only invokes `classifyIntent` on the free-form query path. The investigation path uses code-deterministic dispatch (the `if`-ladder from `01-chains-vs-agents.md`).
+The technical thing: the route handler only invokes the classifier on the free-form query path. The investigation path uses code-deterministic dispatch (the if-ladder from the chains-vs-agents note).
 
 ```
-Where routing fires — app/api/agent/route.ts
+Where routing fires — the route handler
 
   GET /api/agent?q=...      ← free-form question
     │
-    ▼  L199–L218
-  classifyIntent(anthropic, q)            ← THE LLM ROUTER FIRES HERE
-    │                                       (cheap haiku call)
     ▼
-  new QueryAgent(...).answer(q, intent)   ← intent flows INTO the agent's prompt
+  classify_intent(model, q)               ← THE LLM ROUTER FIRES HERE
+    │                                       (cheap classifier call)
+    ▼
+  new query_agent(...).answer(q, intent)  ← intent flows INTO the agent's prompt
 
   GET /api/agent?insightId=...&step=...   ← investigation flow
     │
-    ▼  L224–L249
-  if step === 'recommend' → RecommendationAgent
-  else                    → DiagnosticAgent (then RecommendationAgent)
+    ▼
+  if step == 'recommend' → recommendation agent
+  else                   → diagnostic agent (then recommendation agent)
     │
     NO LLM ROUTER — the chain layer's if-ladder is the dispatcher
 ```
 
-The practical consequence: classification cost is paid only when needed. Investigations don't pay because the route already knows which agent runs (it's encoded in `?step=`). Free-form questions pay one Haiku call (~1 cent of cost, ~200–500ms latency) because the question text is the only signal we have.
+The practical consequence: classification cost is paid only when needed. Investigations don't pay because the route already knows which agent runs (it's encoded in the step query param). Free-form questions pay one cheap-model call (a fraction of a cent, ~200–500ms latency) because the question text is the only signal we have.
 
-The condition under which it works: the heuristics-then-LLM split is *appropriate to the input distribution*. If most free-form questions could be heuristic-matched (e.g. they reliably start with "what is" or "why did"), you could front-load more matches in `parseIntent` and skip the LLM call entirely. The current `parseIntent` does almost no work on raw user input (it only matches when the input literally contains the word "monitoring", etc.) — most real questions fall through to `classifyIntent`. That's the explicit cost choice: pay the small LLM cost rather than build/maintain a brittle keyword classifier.
+The condition under which it works: the heuristics-then-LLM split is *appropriate to the input distribution*. If most free-form questions could be heuristic-matched (e.g. they reliably start with "what is" or "why did"), you could front-load more matches in the heuristic and skip the LLM call entirely. The current heuristic does almost no work on raw user input (it only matches when the input literally contains the word "monitoring", etc.) — most real questions fall through to the classifier. That's the explicit cost choice: pay the small LLM cost rather than build/maintain a brittle keyword classifier.
 
 ### Move 2.5 — Why this is the bridge to multi-agent (the load-bearing insight)
 
@@ -175,25 +175,26 @@ If you're coming from frontend, the lift from "URL routing inside an app" to "AP
 ```
 The same shape, two levels of granularity
 
-  Single-agent (this repo's QueryAgent loop):
+  Single-agent (this repo's free-form query loop):
   ┌────────────────────────────────────────────────────┐
   │ inside one ReAct loop, the MODEL picks the next     │
-  │ tool from a list (execute_analytics_eql, …)         │
+  │ tool from a list (analytics, segmentation, …)       │
   │ — that's tool routing, mediated by the model        │
   └────────────────────────────────────────────────────┘
 
-  Multi-agent (this repo's GET /api/agent?q=):
+  Multi-agent (this repo's free-form ?q= request):
   ┌────────────────────────────────────────────────────┐
   │ before any loop, the ROUTER picks which agent runs  │
   │ (Monitoring / Diagnostic / Recommendation / Query)  │
-  │ — that's agent routing, mediated by haiku + heuristic│
+  │ — that's agent routing, mediated by a cheap         │
+  │   classifier + heuristic                            │
   └────────────────────────────────────────────────────┘
 
   Both are "given an input, pick a handler."
   The granularity scales; the pattern stays.
 ```
 
-The principle: **routing is the abstraction that bridges single-agent and multi-agent.** A single-agent system has a router picking tools (often the model itself, inside ReAct). A multi-agent system has a router picking agents (often a supervisor, sometimes a classifier). The supervisor pattern in SECTION C is "this router, with the destinations being agents that each have their own ReAct loop." Once you see the router shape, the multi-agent supervisor stops being a new concept — it's the router at a higher level.
+The principle: **routing is the abstraction that bridges single-agent and multi-agent.** A single-agent system has a router picking tools (often the model itself, inside ReAct). A multi-agent system has a router picking agents (often a supervisor, sometimes a classifier). The supervisor pattern in the multi-agent section is "this router, with the destinations being agents that each have their own ReAct loop." Once you see the router shape, the multi-agent supervisor stops being a new concept — it's the router at a higher level.
 
 The full picture is below.
 
@@ -204,35 +205,35 @@ The full picture is below.
 ```
 The router in blooming insights — and what it bridges to
 
-  ┌─ Free-form query path (`?q=...`) ──────────────────────────────┐
+  ┌─ Free-form query path (?q=...) ────────────────────────────────┐
   │                                                                 │
   │  user query                                                     │
   │      │                                                          │
   │      ▼                                                          │
   │  ┌─────────────────────────────────────┐                       │
-  │  │ classifyIntent (intent.ts L17–L31)  │ ← THE ROUTER          │
-  │  │   model: claude-haiku-4-5            │                       │
+  │  │ classify_intent                     │ ← THE ROUTER          │
+  │  │   model: cheap classifier            │                       │
   │  │   prompt: "one word: monitoring /    │                       │
   │  │            diagnostic / recommendation"│                      │
-  │  │   then: parseIntent(text)            │ ← deterministic       │
-  │  │         (intent.ts L6–L12)            │   normalizer           │
+  │  │   then: parse_intent(text)           │ ← deterministic       │
+  │  │                                       │   normalizer           │
   │  └────────────────┬────────────────────┘                       │
   │                   │ Intent label                                 │
   │                   ▼                                              │
   │  ┌─────────────────────────────────────┐                       │
-  │  │ QueryAgent.answer(q, intent)         │ ← intent flows INTO   │
+  │  │ query_agent.answer(q, intent)        │ ← intent flows INTO   │
   │  │   (prompt is templated on intent)    │   the prompt           │
   │  └─────────────────────────────────────┘                       │
   └─────────────────────────────────────────────────────────────────┘
 
   ┌─ The bridge to multi-agent ────────────────────────────────────┐
   │                                                                 │
-  │  Today: classifyIntent picks an INTENT, the QueryAgent runs.    │
-  │  Tomorrow: classifyIntent could pick AN AGENT and dispatch:     │
+  │  Today: classify_intent picks an INTENT, the query agent runs.  │
+  │  Tomorrow: classify_intent could pick AN AGENT and dispatch:    │
   │                                                                 │
-  │    "what changed last week"   → MonitoringAgent.scan()           │
-  │    "why did revenue drop"     → DiagnosticAgent.investigate()    │
-  │    "what should I do"         → RecommendationAgent.propose()    │
+  │    "what changed last week"   → monitoring_agent.scan()          │
+  │    "why did revenue drop"     → diagnostic_agent.investigate()   │
+  │    "what should I do"         → recommendation_agent.propose()   │
   │                                                                 │
   │  Same router shape, destinations are agents instead of an        │
   │  intent string. This is the supervisor pattern in SECTION C.    │
@@ -430,3 +431,4 @@ Open and verify. ✓ Files + function names + the path-firing rule matter; line 
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

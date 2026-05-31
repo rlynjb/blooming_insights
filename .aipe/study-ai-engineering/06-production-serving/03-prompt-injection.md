@@ -69,17 +69,17 @@ The free-form query path is the untrusted surface. The route reads `q`, trims wh
 ```
  GET /api/agent?q=<user text>
         │
-        ├─ q = searchParams.get('q')?.trim() || null   ← route.ts L115  (only sanitization)
+        ├─ q = searchParams.get('q')?.trim() || null   ← only sanitization
         ▼
-   classifyIntent(anthropic, q)                          ← route.ts L211
+   classify_intent(provider_sdk, q)
         │
         ▼
-   queryAgent.answer(q, intent, hooks)                   ← route.ts L214
+   queryAgent.answer(q, intent, hooks)
         │
-        └─ runAgentLoop({ ..., userPrompt: query })      ← query.ts L35  (verbatim to model)
+        └─ runAgentLoop({ ..., userPrompt: query })    ← verbatim to model
 ```
 
-At `app/api/agent/route.ts` L115 the only transformation is `.trim()`. The query then flows to `classifyIntent` (L211) and into `QueryAgent.answer` (L214), which passes it as `userPrompt: query` to `runAgentLoop` at `lib/agents/query.ts` L35. From there it becomes the first user message (`lib/agents/base.ts` L80) — sitting in the same token stream as the system prompt, with no marker telling the model "this part is data, not instruction."
+The only transformation is `.trim()`. The query then flows to the intent classifier and into the query agent's `answer`, which passes it as `userPrompt: query` to the shared agent loop. From there it becomes the first user message — sitting in the same token stream as the system prompt, with no marker telling the model "this part is data, not instruction."
 
 ```
  attacker query:
@@ -90,16 +90,16 @@ At `app/api/agent/route.ts` L115 the only transformation is `.trim()`. The query
    userPrompt → model → may comply (no privilege boundary)
 ```
 
-This is the honest security finding: there is no input guard, no instruction-data delimiter, no allow-list of query shapes. The classifier (`classifyIntent`) routes the query but does not filter it.
+This is the honest security finding: there is no input guard, no instruction-data delimiter, no allow-list of query shapes. The intent classifier routes the query but does not filter it.
 
 ---
 
 ### The first structural mitigation — the app is read-only
 
-What makes this gap *contained* rather than catastrophic is that the model cannot take a destructive action. Every MCP tool the agents can call is a read against Bloomreach analytics; none of them mutate state.
+What makes this gap *contained* rather than catastrophic is that the model cannot take a destructive action. Every MCP tool the agents can call is a read against the analytics backend; none of them mutate state.
 
 ```
- model emits tool_use → mcp.callTool(name, args)        lib/agents/base.ts L144
+ model emits tool_use → mcp.callTool(name, args)
         │
         ▼
  tools available (all read-only):
@@ -111,7 +111,7 @@ What makes this gap *contained* rather than catastrophic is that the model canno
  NO write/delete/update tool exists in the tool set
 ```
 
-The tool subsets are defined in `lib/mcp/tools.ts`; `queryTools` is the union handed to the QueryAgent. There is no tool that writes, deletes, or sends. So even if an injected instruction convinces the model to "do" something, the only "doing" available is reading analytics — the same thing the legitimate feature does. The classic injection nightmares (delete the records, email the data out, transfer the funds) have no tool to ride.
+The tool subsets are declared in the tool catalog; `queryTools` is the union handed to the query agent. There is no tool that writes, deletes, or sends. So even if an injected instruction convinces the model to "do" something, the only "doing" available is reading analytics — the same thing the legitimate feature does. The classic injection nightmares (delete the records, email the data out, transfer the funds) have no tool to ride.
 
 ---
 
@@ -121,23 +121,23 @@ The other half of containment: nothing the model *says* causes a side effect. Th
 
 ```
  model output path:
-   QueryAgent.answer → finalText → NDJSON to UI         route.ts L214–L216
-   DiagnosticAgent   → diagnosis → validated, streamed  route.ts L238–L239
-   RecommendationAgent → recs    → validated, streamed  route.ts L247–L248
+   QueryAgent.answer → finalText → NDJSON to UI
+   DiagnosticAgent   → diagnosis → validated, streamed
+   RecommendationAgent → recs    → validated, streamed
         │
         ▼
  NO branch does: if (model says X) then writeDatabase(X)
 ```
 
-The diagnosis is validated by `isDiagnosis` and the recommendations by `isRecommendationArray` (`lib/mcp/validate.ts`) into fixed shapes before they are streamed; an injected payload that does not fit those shapes is rejected by the validator, and even one that fits only produces *displayed text*, never an action. `saveInvestigation` (`app/api/agent/route.ts` L254) persists the event stream — but it persists what the agents *produced*, not an arbitrary command from the user, and the persisted form is the validated artifact.
+The diagnosis is validated by `isDiagnosis` and the recommendations by `isRecommendationArray` into fixed shapes before they are streamed; an injected payload that does not fit those shapes is rejected by the validator, and even one that fits only produces *displayed text*, never an action. The save call persists the event stream — but it persists what the agents *produced*, not an arbitrary command from the user, and the persisted form is the validated artifact.
 
-One nuance worth naming: the agent's free-form *reasoning* text (the `reasoning_step` content) is rendered in the UI by `TraceContent` (`components/investigation/TraceContent.tsx`) as light markdown/JSON — `**bold**`, `` `code` ``, bullets, and pretty-printed fenced JSON. That makes it a model-authored *output-rendering* surface, but a safe one: `TraceContent` builds React text nodes (`<strong>`/`<code>`/`<li>`/`<pre>`) and never uses `dangerouslySetInnerHTML`, so an injected instruction cannot escape into executable markup — the worst it can do is render as styled text the user sees, which is the same exfiltration-via-display ceiling as the answer itself.
+One nuance worth naming: the agent's free-form *reasoning* text (the `reasoning_step` content) is rendered in the UI by the trace-content renderer as light markdown / JSON — `**bold**`, `` `code` ``, bullets, and pretty-printed fenced JSON. That makes it a model-authored *output-rendering* surface, but a safe one: the renderer builds React text nodes (`<strong>` / `<code>` / `<li>` / `<pre>`) and never uses `dangerouslySetInnerHTML`, so an injected instruction cannot escape into executable markup — the worst it can do is render as styled text the user sees, which is the same exfiltration-via-display ceiling as the answer itself.
 
 ---
 
 ### The remaining real risk — data exfiltration via crafted answers
 
-Containment is not immunity. The model *can* read all analytics the connected Bloomreach session can see, and it *can* be steered by an injected query to surface data the UI would not normally foreground — schema details, raw customer property names, prediction scores for specific cohorts. The exfiltration channel is the answer text itself.
+Containment is not immunity. The model *can* read all analytics the connected backend session can see, and it *can* be steered by an injected query to surface data the UI would not normally foreground — schema details, raw customer property names, prediction scores for specific cohorts. The exfiltration channel is the answer text itself.
 
 ```
  bounded risk:
@@ -152,7 +152,7 @@ Containment is not immunity. The model *can* read all analytics the connected Bl
    (no mutation, no destruction — exfiltration via answer)
 ```
 
-This is the true residual threat after the two structural mitigations: not destruction, but over-disclosure. It matters because the Bloomreach session may have access to data the product intends to keep behind specific views.
+This is the true residual threat after the two structural mitigations: not destruction, but over-disclosure. It matters because the backend session may have access to data the product intends to keep behind specific views.
 
 ---
 
@@ -161,9 +161,9 @@ This is the true residual threat after the two structural mitigations: not destr
 ```
             present                         absent
             ──────────────────────          ────────────────────────────
-input       .trim() only (route.ts L115)     input guard / allow-list
+input       .trim() only                     input guard / allow-list
 boundary    none                             instruction-data delimiter
-action      read-only tools (tools.ts)       (already safe — no fix needed)
+action      read-only tools                  (already safe — no fix needed)
 output      validated structured shapes      output filter for exfiltration
 ```
 
@@ -173,7 +173,7 @@ The two structural mitigations (read-only, validated output) are real and alread
 
 ### The principle
 
-You cannot make a model perfectly distinguish instruction from data, so you defend at the edges and bound the blast radius. Guard the input (detect and reject obvious injection at the boundary) and constrain the output's power (read-only tools, validated shapes, no output-triggered writes). blooming insights got the second edge right by architecture — its read-only, structured-output design caps the damage — and left the first edge open. The lesson generalizes: an injection's severity is set by what the model can *do*, so the most durable mitigation is to give it less to do.
+You cannot make a model perfectly distinguish instruction from data, so you defend at the edges and bound the blast radius. Guard the input (detect and reject obvious injection at the boundary) and constrain the output's power (read-only tools, validated shapes, no output-triggered writes). You got the second edge right by architecture — your read-only, structured-output design caps the damage — and left the first edge open. The lesson generalizes: an injection's severity is set by what the model can *do*, so the most durable mitigation is to give it less to do.
 
 ---
 
@@ -187,20 +187,20 @@ This diagram spans the Route, Agent, Provider, and Output layers, marking the op
   │                                                                     │
   │  GET /api/agent?q=<untrusted user text>                             │
   │       │                                                             │
-  │  ╎ GAP  q = q.trim()   L115 — no input guard, no delimiter ╎        │
+  │  ╎ GAP  q = q.trim() — no input guard, no delimiter ╎        │
   │       │                                                             │
-  │       ▼  classifyIntent (routes, does not filter)  L211             │
+  │       ▼  classifyIntent (routes, does not filter)                   │
   └───────┼──────────────────────────────────────────────────────────────┘
-          │  userPrompt: query  (verbatim)   query.ts L35
+          │  userPrompt: query  (verbatim)   query.ts
   ┌───────▼──────────────────────────────────────────────────────────────┐
   │  AGENT LAYER   lib/agents/                                            │
   │                                                                       │
-  │  messages[0] = { role:'user', content: query }   base.ts L80         │
+  │  messages[0] = { role:'user', content: query }   base.ts             │
   │  system + query → ONE token stream (no privilege boundary)           │
   │       │                                                               │
   │       ▼  model may comply with injected instruction                  │
   └───────┼──────────────────────────────────────────────────────────────┘
-          │  tool_use → mcp.callTool   base.ts L144
+          │  tool_use → mcp.callTool   base.ts
   ┌───────▼──────────────────────────────────────────────────────────────┐
   │  PROVIDER / MCP LAYER   lib/mcp/tools.ts                              │
   │                                                                       │
@@ -372,3 +372,4 @@ What is the only transformation applied to `?q=` before it reaches the model, an
 Updated: 2026-05-28 — Re-derived the `?q=` path refs (trim L115, classifyIntent L211, answer L214, diagnosis/recommendation send L238–L239/L247–L248, saveInvestigation L254); added the `TraceContent` output-rendering note (model reasoning rendered as light markdown/JSON via React text nodes, no `dangerouslySetInnerHTML` — a safe surface).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

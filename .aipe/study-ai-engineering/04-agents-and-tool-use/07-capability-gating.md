@@ -60,15 +60,18 @@ The gate decides *what the agent is allowed to attempt*; the agent decides *what
 
 ### Building the capability set
 
-`schemaCapabilities` (`lib/agents/categories.ts` L116–L127) flattens the workspace schema into one flat `Set<string>` whose only job is fast membership. Three token shapes: an event name (`"purchase"`), an event property (`"session_start.utm_source"`), and a catalog (`"catalog:inventory_level"`).
+The `schemaCapabilities` helper flattens the workspace schema into one flat `Set<string>` whose only job is fast membership. Three token shapes: an event name (`"purchase"`), an event property (`"session_start.utm_source"`), and a catalog (`"catalog:inventory_level"`).
 
 ```
-schemaCapabilities(schema)   (categories.ts L116–127)
-─────────────────────────────────────────────────────────────
- for each event e:   set.add(e.name)                  "purchase"
-                     for each property p:  set.add(`${e.name}.${p}`)
- for each catalog c: set.add(`catalog:${c.name}`)     "catalog:inventory_level"
- → Set<string>   (event names + event.property + catalog:<name>)
+  function schema_capabilities(schema):
+      set = new Set()
+      for each event e in schema.events:
+          set.add(e.name)                          # "purchase"
+          for each property p in e.properties:
+              set.add(e.name + "." + p)            # "session_start.utm_source"
+      for each catalog c in schema.catalogs:
+          set.add("catalog:" + c.name)              # "catalog:inventory_level"
+      return set
 ```
 
 One pass over the schema. The output is the haystack every category's dependencies are tested against with O(1) `has()`.
@@ -77,39 +80,37 @@ One pass over the schema. The output is the haystack every category's dependenci
 
 ### Classifying each category
 
-The ten categories live in `CATEGORIES` (L19–L112). Each declares `requires` (hard deps — event names) and optional `enriches` (soft deps — properties/catalogs that improve the check). `coverageFor` (L131–L136) is the whole gate in three lines: miss any hard dep → `unavailable`; have the hard deps but miss a soft one → `limited`; all present → `full`.
+The ten categories live in a `CATEGORIES` registry. Each declares `requires` (hard deps — event names) and optional `enriches` (soft deps — properties / catalogs that improve the check). The gate itself is three lines: miss any hard dep → `unavailable`; have the hard deps but miss a soft one → `limited`; all present → `full`.
 
 ```
-coverageFor(cat, caps)   (categories.ts L131–136)
-─────────────────────────────────────────────────────────────
- if NOT cat.requires.every(in caps):                    → 'unavailable'
- if cat.enriches?.length AND NOT enriches.every(in caps): → 'limited'
- else:                                                   → 'full'
+  function coverage_for(cat, caps):
+      if not cat.requires.every(in caps):                    return 'unavailable'
+      if cat.enriches?.length and not cat.enriches.every(in caps):
+                                                              return 'limited'
+      return 'full'
 
  conversion_drop  requires[view_item,checkout,purchase] ✓        → full
  campaign_perf    requires[session_start]✓ enriches[utm_source]✗ → limited
  search_failure   requires[search]✗                              → unavailable
 ```
 
-`coverageReport` (L144–L155) maps this over all ten in registry order (stable for the UI grid). `runnableCategories` (L158–L160) is the same walk filtered to the non-`unavailable` set — the list handed to the agent.
+`coverageReport` maps this over all ten in registry order (stable for the UI grid). `runnableCategories` is the same walk filtered to the non-`unavailable` set — the list handed to the agent.
 
 ---
 
 ### Feeding the agent only the runnable set
 
-`app/api/briefing/route.ts` runs the gate immediately after bootstrapping the schema, before constructing or running the monitoring agent (L202–L204), then passes the runnable subset into `agent.scan` (L223).
+The briefing route runs the gate immediately after bootstrapping the schema, before constructing or running the monitoring agent, then passes the runnable subset into `agent.scan`.
 
 ```
-app/api/briefing/route.ts   (L202–223)
-─────────────────────────────────────────────────────────────
- const capabilities = schemaCapabilities(schema);        L202
- const coverage     = coverageReport(capabilities);      L203  → streamed to the grid
- const runnable     = runnableCategories(capabilities);  L204
-   … emit one coverage_item per category (the grid) …
- const anomalies = await agent.scan(hooks, runnable);    L223  ← gated work
+  capabilities = schema_capabilities(schema)
+  coverage     = coverage_report(capabilities)        ← streamed to the grid
+  runnable     = runnable_categories(capabilities)
+  … emit one coverage_item per category (the grid) …
+  anomalies    = await agent.scan(hooks, runnable)    ← gated work
 ```
 
-`MonitoringAgent.scan(hooks?, categories: AnomalyCategory[] = [])` (`lib/agents/monitoring.ts` L69) takes that list and builds it into the prompt as a per-category checklist (L73–L86, via a `{categories}` slot in `prompts/monitoring.md`). So the agent is gated twice over: it's told to check only these categories *and* it only has the tools `monitoringTools` allows (`04-tool-routing.md`). The gate is upstream of `runAgentLoop` — it changes *what* the agent is asked to do, not *how* the shared loop runs.
+The monitoring agent's `scan(hooks?, categories: AnomalyCategory[] = [])` takes that list and builds it into the prompt as a per-category checklist (via a `{categories}` slot in the prompt template). So the agent is gated twice over: it is told to check only these categories *and* it only has the tools the monitoring subset allows (`04-tool-routing.md`). The gate is upstream of the shared agent loop — it changes *what* the agent is asked to do, not *how* the shared loop runs.
 
 ---
 
@@ -133,14 +134,14 @@ The diagram spans three layers. The Route layer runs the gate. The Agent layer r
                                 │  coverage (all 10, incl. ghosts)
 ┌───────────────────────────────┴───────────────────────────────────────┐
 │  ROUTE LAYER   app/api/briefing/route.ts                             │
-│   schema ──schemaCapabilities──→ Set<string>   (categories.ts L116)  │
-│            ──coverageReport────→ CoverageItem[10]  L203 ─► UI         │
-│            ──runnableCategories→ AnomalyCategory[]  L204 ─┐           │
+│   schema ──schemaCapabilities──→ Set<string>  │
+│            ──coverageReport────→ CoverageItem[10] ─► UI         │
+│            ──runnableCategories→ AnomalyCategory[] ─┐           │
 └───────────────────────────────────────────────────────────│───────────┘
                                                             │ runnable (full+limited)
 ┌───────────────────────────────────────────────────────────▼───────────┐
 │  AGENT LAYER   lib/agents/monitoring.ts                              │
-│   scan(hooks, runnable)  L69  ── builds {categories} checklist L73-86 │
+│   scan(hooks, runnable)  ── builds {categories} checklist        │
 │     → runAgentLoop spends ~1 req/s MCP budget ONLY on runnable        │
 │       (never queries the 3 categories the schema can't support)      │
 └──────────────────────────────────────────────────────────────────────┘
@@ -325,3 +326,4 @@ What two outputs does the gate produce from a single `coverageReport`, and who c
 Updated: 2026-05-29 — created (the anomaly-coverage schema gate: scope the monitoring agent's category checklist against the live schema before spending the rate-limited budget)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

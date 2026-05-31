@@ -41,7 +41,7 @@
 
 ## How it works
 
-**Mental model.** Strip RAG to its essence and it is two steps: *retrieve* relevant context, then *generate* an answer conditioned on that context. The famous version uses an embedding index as the retriever. But "retriever" is an interface, not an implementation — anything that returns relevant context for a query qualifies. A live tool call is a retriever. So is an embedding index. blooming insights swapped the retriever implementation, not the RAG shape.
+**Mental model.** Strip RAG to its essence and it is two steps: *retrieve* relevant context, then *generate* an answer conditioned on that context. The famous version uses an embedding index as the retriever. But "retriever" is an interface, not an implementation — anything that returns relevant context for a query qualifies. A live tool call is a retriever. So is an embedding index. This system swapped the retriever implementation, not the RAG shape.
 
 ```
   RAG, abstractly
@@ -50,7 +50,7 @@
                   │
         ┌─────────┴──────────────────────────┐
         ▼                                     ▼
-  embedding index (classic RAG)         live tool call (blooming insights)
+  embedding index (classic RAG)         live tool call (this system)
   embed + nearest chunks                execute_analytics_eql → result
   cached snapshot                       fresh source query
 ```
@@ -74,13 +74,12 @@ The textbook pipeline (the subject of files 01–10 in this section): chunk a do
 
 This is the right tool when the knowledge lives in a *static document corpus* — manuals, past tickets, policy docs — that the model was not trained on and that does not change every second. The index makes retrieval fast and semantic.
 
-### blooming insights' RAG: the live-tool retriever
+### This system's RAG: the live-tool retriever
 
-blooming insights replaces the embedding index with a live query. The agent loop (`../04-agents-and-tool-use/02-tool-calling.md`) lets the model emit a `tool_use` block; the loop runs `execute_analytics_eql` against Bloomreach (`lib/mcp/tools.ts` L11/L16) and feeds the *fresh result* back as the grounding context. There is no index, no embedding, no chunk — just a live read of the source.
+This system replaces the embedding index with a live query. The shared agent loop (→ ../04-agents-and-tool-use/02-tool-calling.md) lets the model emit a `tool_use` block; the loop runs the analytics query tool against the source and feeds the *fresh result* back as the grounding context. There is no index, no embedding, no chunk — just a live read of the source.
 
 ```
-  query ──▶ model decides EQL ──▶ loop runs execute_analytics_eql ──▶ fresh result
-                                       (lib/mcp/tools.ts, base.ts loop)
+  query ──▶ model decides EQL ──▶ loop runs the analytics query tool ──▶ fresh result
                                             │
                                        result → next prompt turn → grounded answer
 ```
@@ -115,7 +114,7 @@ The decision is not "RAG is bad." It is "RAG earns its place only when a feature
 
 ### The principle
 
-RAG is retrieve-then-generate, and "retrieve" is an interface with two implementations: a live source query and a pre-built embedding index. Choose the retriever by the data's shape — fresh, exact, queryable data wants a live query; static, fuzzy, free-text data wants an embedding index. blooming insights chose live retrieval because its data is a fresh, exact, queryable API, where an embedding index would be a stale, lossy copy to maintain. The discipline is to add the embedding index only when a feature's data is the kind an index is actually for.
+RAG is retrieve-then-generate, and "retrieve" is an interface with two implementations: a live source query and a pre-built embedding index. Choose the retriever by the data's shape — fresh, exact, queryable data wants a live query; static, fuzzy, free-text data wants an embedding index. You chose live retrieval because the data is a fresh, exact, queryable API, where an embedding index would be a stale, lossy copy to maintain. The discipline is to add the embedding index only when a feature's data is the kind an index is actually for.
 
 ---
 
@@ -297,3 +296,4 @@ Does blooming insights do RAG, and what is its retriever? (Answer: yes — it do
 Updated: 2026-05-28 — corrected one stale ref: `maxDuration: 60` → `maxDuration = 300`. Case-B rationale (live tool retrieval over embedding-RAG) unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

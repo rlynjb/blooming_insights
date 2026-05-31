@@ -41,7 +41,7 @@
 
 ## How it works
 
-**Mental model.** Rate limiting is "don't send faster than X." There are two sub-problems. **Spacing** answers "how do I slow one caller down?" — track the last send time, wait until enough has passed. **Backpressure** answers "what do I do when more demand arrives than the limit allows?" — queue it (with a bound), reject it (load-shed), or block the producer. blooming insights implements spacing and skips backpressure, because its deployment target is one user at a time.
+**Mental model.** Rate limiting is "don't send faster than X." There are two sub-problems. **Spacing** answers "how do I slow one caller down?" — track the last send time, wait until enough has passed. **Backpressure** answers "what do I do when more demand arrives than the limit allows?" — queue it (with a bound), reject it (load-shed), or block the producer. You implement spacing and skip backpressure, because the deployment target is one user at a time.
 
 ```
  spacing (built)                     backpressure (absent)
@@ -55,21 +55,21 @@ The gap matters because spacing assumes calls arrive *one at a time*. The instan
 
 ---
 
-### Fixed-interval spacing (`liveCall`)
+### Fixed-interval spacing (the spacing gate)
 
-Every live MCP call goes through `liveCall`, which is the single place the transport is touched. Before each call it measures how long since the last one and sleeps the remainder of the minimum interval.
+Every live MCP call goes through the spacing gate, which is the single place the transport is touched. Before each call it measures how long since the last one and sleeps the remainder of the minimum interval.
 
 ```
- liveCall(name, args):                          lib/mcp/client.ts L148–L163
-   elapsed = Date.now() - lastCallAt            L149
-   if elapsed < minIntervalMs:                  L150
-     await sleep(minIntervalMs - elapsed)       L151
-   result = transport.callTool(name, args)      L154
-   lastCallAt = Date.now()                       L155
-   return result
+  function live_call(name, args):
+      elapsed = Date.now() - lastCallAt
+      if elapsed < minIntervalMs:
+          await sleep(minIntervalMs - elapsed)
+      result      = transport.callTool(name, args)
+      lastCallAt  = Date.now()
+      return result
 ```
 
-`lastCallAt` is a single instance field on `McpClient` (`lib/mcp/client.ts` L81). Every live call — whether a cache miss or a retry — updates it after the transport returns, so two back-to-back calls always have at least `minIntervalMs` between their network hits.
+`lastCallAt` is a single instance field on the MCP client wrapper. Every live call — whether a cache miss or a retry — updates it after the transport returns, so two back-to-back calls always have at least `minIntervalMs` between their network hits.
 
 ```
 time ─────────────────────────────────────────────────────────────▶
@@ -87,23 +87,25 @@ This is a *strict* throttle: at most one call per `minIntervalMs`. Unlike a toke
 
 ---
 
-### The interval — 1100 ms for Bloomreach's ~1 req/s
+### The interval — 1100 ms for the backend's ~1 req/s
 
-The interval is set where the client is constructed. The default in `McpClient` is 200 ms (`lib/mcp/client.ts` L88), but `connectMcp` overrides it to 1100 ms for the real Bloomreach connection.
+The interval is set where the client is constructed. The default in the wrapper is 200 ms, but the connect-MCP helper overrides it to 1100 ms for the real backend connection.
 
 ```
- connectMcpInner(sessionId):                    lib/mcp/connect.ts L66–L107
-   ...
-   // Bloomreach rate-limits per user GLOBALLY  L81–L88 (comment)
-   return {
-     ok: true,
-     mcp: new McpClient(new SdkTransport(client, httpErrors),
-                        { minIntervalMs: 1100, retryDelayMs: 10_000,
-                          retryCeilingMs: 20_000, maxRetries: 3 }),  ← L91–L96
-   };
+  function connect_mcp_inner(sessionId):
+      ...
+      # Bloomreach rate-limits per user GLOBALLY
+      return {
+          ok:  true,
+          mcp: new McpClient(
+              new SdkTransport(client, httpErrors),
+              { minIntervalMs: 1100, retryDelayMs: 10_000,
+                retryCeilingMs: 20_000, maxRetries: 3 },
+          ),
+      }
 ```
 
-The 1100 ms (just over one second) is deliberate headroom over Bloomreach's documented ~1 req/s/user ceiling. Combined with the 60s tool cache (`01-llm-caching.md`), this keeps a single user's agent run under the limit: even a 13-call briefing spaces out to ~14 seconds of network time, comfortably inside the `maxDuration = 300` route budget (`app/api/agent/route.ts` L20).
+The 1100 ms (just over one second) is deliberate headroom over the documented ~1 req/s/user ceiling. Combined with the 60s tool cache (`01-llm-caching.md`), this keeps a single user's agent run under the limit: even a 13-call briefing spaces out to ~14 seconds of network time, comfortably inside the route's `maxDuration = 300` budget.
 
 ```
   Bloomreach limit:  ~1 req / 1 sec / user
@@ -129,7 +131,7 @@ Spacing assumes a *serial* caller. The agent loop is serial within one run — i
                                        no bound on how many wait
 ```
 
-There is no request queue. If N call chains run concurrently against one `McpClient`, they all contend on the same `lastCallAt` field — each `liveCall` waits, but there is no ordering, no fairness, and no bound on how many can pile up waiting. Worse, each `connectMcp` call creates a *new* `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L91–L96), so two concurrent users get two independent spacers and can both hit Bloomreach at once — 2 req/s against a 1 req/s per-user limit if they share a quota, or simply uncoordinated load.
+There is no request queue. If N call chains run concurrently against one MCP client wrapper, they all contend on the same `lastCallAt` field — each spacing-gate call waits, but there is no ordering, no fairness, and no bound on how many can pile up waiting. Worse, each `connect_mcp` call creates a *new* wrapper with its own `lastCallAt`, so two concurrent users get two independent spacers and can both hit the backend at once — 2 req/s against a 1 req/s per-user limit if they share a quota, or simply uncoordinated load.
 
 And there is no **load shedding**: under a burst, the system does not reject excess work or signal backpressure to the producer. It just makes everyone wait, unbounded.
 
@@ -154,7 +156,7 @@ The absent pieces are all about *contention*: a queue to serialize concurrent ca
 
 ### The principle
 
-Spacing controls one caller's rate; backpressure controls a *system's* behavior under contention. A timestamp-and-sleep throttle is the right tool when calls are serial and single-tenant — which is exactly blooming insights' deployment shape. It stops being sufficient the moment multiple callers share one limit: then you need a queue (to order them), a bound (to cap pending work), and a shedding policy (to fail fast instead of letting latency grow unbounded). The lesson generalizes: rate limiting is easy for one; the engineering is in what happens to the (N-1)th caller.
+Spacing controls one caller's rate; backpressure controls a *system's* behavior under contention. A timestamp-and-sleep throttle is the right tool when calls are serial and single-tenant — which is exactly this system's deployment shape. It stops being sufficient the moment multiple callers share one limit: then you need a queue (to order them), a bound (to cap pending work), and a shedding policy (to fail fast instead of letting latency grow unbounded). The lesson generalizes: rate limiting is easy for one; the engineering is in what happens to the (N-1)th caller.
 
 ---
 
@@ -177,11 +179,11 @@ This diagram spans the Agent, Service (McpClient), and Provider layers. The spac
   │                                                                       │
   │  ┌──────────────────────────────────────────────────┐               │
   │  │  liveCall — spacing gate  (BUILT)                  │               │
-  │  │  elapsed = now - lastCallAt   L149                 │               │
-  │  │  elapsed < 1100 ? await (1100 - elapsed) L150–151  │               │
-  │  │  lastCallAt = now   L155                           │               │
+  │  │  elapsed = now - lastCallAt                        │               │
+  │  │  elapsed < 1100 ? await (1100 - elapsed)           │               │
+  │  │  lastCallAt = now                                  │               │
   │  └──────────────────────────────────────────────────┘               │
-  │       │ minIntervalMs = 1100 set in connectMcp L91–L96               │
+  │       │ minIntervalMs = 1100 set in connectMcp                       │
   │                                                                       │
   │  ╎ GAP  no backpressure: under burst everyone waits, unbounded ╎      │
   │  ╎ GAP  lastCallAt is per-instance — concurrent users uncoordinated ╎ │
@@ -189,7 +191,7 @@ This diagram spans the Agent, Service (McpClient), and Provider layers. The spac
           │  NETWORK / PROVIDER BOUNDARY
   ┌───────▼──────────────────────────────────────────────────────────────┐
   │  PROVIDER   Bloomreach MCP server                                     │
-  │  limit: ~1 req / 1 sec / user GLOBALLY  (connect.ts L81–L88 comment)  │
+  │  limit: ~1 req / 1 sec / user GLOBALLY  │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -357,3 +359,4 @@ What value is `minIntervalMs` set to for the live Bloomreach connection, and on 
 Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived liveCall refs (client.ts L148–L163, lastCallAt L81) and connectMcp construction (connect.ts L91–L96, comment L81–L88); added the pre-stream setup try/catch note (both routes return real error JSON, not a bare 500).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

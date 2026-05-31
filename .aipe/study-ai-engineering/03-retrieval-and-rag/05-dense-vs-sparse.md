@@ -61,7 +61,7 @@ The body walks each side and where each breaks.
 
 ### Sparse retrieval: exact terms (EQL, BM25, keyword)
 
-Sparse retrieval scores documents by the query terms they contain, classically with BM25 (term frequency, weighted by how rare the term is across the corpus). Its structured cousin — and the only retrieval blooming insights does — is a query language that filters by exact field values. EQL (`execute_analytics_eql`, `lib/mcp/tools.ts` L11/L16) is exactly this: you name the event, the properties, the window, and the engine returns the rows that *exactly* match.
+Sparse retrieval scores documents by the query terms they contain, classically with BM25 (term frequency, weighted by how rare the term is across the corpus). Its structured cousin — and the only retrieval this system does — is a query language that filters by exact field values. The analytics query tool (`execute_analytics_eql`) is exactly this: you name the event, the properties, the window, and the engine returns the rows that *exactly* match.
 
 ```
   EQL-style sparse query
@@ -105,9 +105,9 @@ Dense retrieval is fuzzy, captures intent, and survives spelling/vocabulary mism
 
 Where one column has a ✓ the other tends to have an ✗. This mirror-image property is the entire motivation for hybrid retrieval (`06-hybrid-retrieval-rrf.md`): run both and fuse, so a query gets the exact-term hits *and* the meaning hits.
 
-### Why EQL alone is the right call for blooming insights' data
+### Why EQL alone is the right call for this data
 
-blooming insights queries *analytics* — counts, conversion rates, funnels over named events in a known schema. Those questions are exact by nature: "how many `checkout_started` on mobile in the last 90 days" has one correct answer, retrievable only by exact-term filtering. There is no "documents similar to this count." Dense retrieval has nothing to add to an exact aggregate, and would *hurt* (a "close" event is the wrong event). Sparse/structured EQL is not a limitation here — it is the correct match for the data.
+This system queries *analytics* — counts, conversion rates, funnels over named events in a known schema. Those questions are exact by nature: "how many `checkout_started` on mobile in the last 90 days" has one correct answer, retrievable only by exact-term filtering. There is no "documents similar to this count." Dense retrieval has nothing to add to an exact aggregate, and would *hurt* (a "close" event is the wrong event). Sparse/structured EQL is not a limitation here — it is the correct match for the data.
 
 ```
   analytics question          retrieval that fits
@@ -121,7 +121,7 @@ The dense side only becomes relevant for a *different* feature — semantic sear
 
 ### The principle
 
-Retrieval has two axes — exact terms and meaning — and they fail on opposite inputs, so the method must match the query's nature: identifiers, enums, and filters want exact (sparse) matching; synonyms and paraphrase want meaning (dense) matching. blooming insights' analytics questions are exact, so sparse EQL is not a gap to fill but the correct tool; the dense side is reserved for the genuinely fuzzy question — "what past work resembles this?" — and added only when that feature exists.
+Retrieval has two axes — exact terms and meaning — and they fail on opposite inputs, so the method must match the query's nature: identifiers, enums, and filters want exact (sparse) matching; synonyms and paraphrase want meaning (dense) matching. Analytics questions are exact, so sparse EQL is not a gap to fill but the correct tool; the dense side is reserved for the genuinely fuzzy question — "what past work resembles this?" — and added only when that feature exists.
 
 ---
 
@@ -297,3 +297,4 @@ What kind of retrieval does blooming insights do, and which tool is the evidence
 → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

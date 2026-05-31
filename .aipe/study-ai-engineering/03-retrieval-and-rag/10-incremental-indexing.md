@@ -44,7 +44,7 @@
 
 ## How it works
 
-**Mental model.** Treat the index as a keyed store you mutate, not a build artifact you regenerate. The codebase already has the right instinct in `saveInvestigation`: `Map.set(key, value)` updates one entry in place. Incremental indexing is the three CRUD-by-key operations — upsert (add or replace), delete — over vectors, gated by change-detection so you only touch what changed.
+**Mental model.** Treat the index as a keyed store you mutate, not a build artifact you regenerate. The codebase already has the right instinct in its in-process state map for investigations: `Map.set(key, value)` updates one entry in place. Incremental indexing is the three CRUD-by-key operations — upsert (add or replace), delete — over vectors, gated by change-detection so you only touch what changed.
 
 ```
   full rebuild (O(N) per change)        incremental (O(changes))
@@ -62,7 +62,7 @@ The body walks the operations and the change-detection that drives them.
 
 ### The three operations, keyed by id
 
-An incremental index supports add/update (unified as *upsert*) and delete, each addressed by document id — exactly the key-addressing `saveInvestigation` uses.
+An incremental index supports add/update (unified as *upsert*) and delete, each addressed by document id — exactly the key-addressing the in-process state map uses for investigations.
 
 ```
   ADD     new document        → embed → index.set(docId, {vector, hash, staleAt})
@@ -104,11 +104,11 @@ If documents are chunked (`03-chunking-strategies.md`), a changed document may h
 
 ### The codebase's keyed-upsert analog
 
-`saveInvestigation` (`lib/state/investigations.ts`) is the pattern in miniature: `mem.set(insightId, events)` upserts one investigation by key into an in-memory `Map`, and (in dev) merges into a JSON file by key (`all[insightId] = events`) rather than rewriting unrelated entries. That is incremental indexing's core move — write by key, update in place, leave the rest — already present for raw investigation events. An embedding index would do the same with vectors plus change-detection.
+The in-process state map for investigations is the pattern in miniature: a `set(insightId, events)` upserts one investigation by key into an in-memory `Map`, and (in dev) merges into a JSON file by key (`all[insightId] = events`) rather than rewriting unrelated entries. That is incremental indexing's core move — write by key, update in place, leave the rest — already present for raw investigation events. An embedding index would do the same with vectors plus change-detection.
 
 ### The principle
 
-Keep the index current by mutating it in place — upsert and delete keyed by document id, gated by change-detection so cost scales with what changed, not with corpus size. A full rebuild is the correct semantics and the wrong economics; the keyed-upsert the codebase already uses for `saveInvestigation` is the right shape, extended with a content hash to skip the unchanged and a delete path to evict ghosts.
+Keep the index current by mutating it in place — upsert and delete keyed by document id, gated by change-detection so cost scales with what changed, not with corpus size. A full rebuild is the correct semantics and the wrong economics; the keyed-upsert the codebase already uses for its state map is the right shape, extended with a content hash to skip the unchanged and a delete path to evict ghosts.
 
 ---
 
@@ -132,7 +132,7 @@ This diagram spans the Service layer (change-detection + the three operations) a
 │  STATE LAYER  (lib/state/ — keyed index, like investigations.ts)    │
 │   Map<docId, {vector, hash, staleAt}>                               │
 │   set(id,..) = upsert (add/update)   delete(id) = evict             │
-│   ◀── exactly the saveInvestigation `mem.set(insightId, events)` shape │
+│   ◀── exactly the in-process state map's set-by-id shape              │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -280,3 +280,4 @@ What keyed in-place update does blooming insights already perform, and what two 
 → 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

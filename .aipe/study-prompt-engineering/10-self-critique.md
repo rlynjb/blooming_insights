@@ -85,7 +85,7 @@ VERIFY PASS on a diagnosis (would-be flow)
         ▼  THEN stream to the user
 ```
 
-This is exactly what blooming insights does NOT have. The diagnosis produced by `DiagnosticAgent.investigate` streams to the user the moment it validates (`route.ts` L153–154) — there is no second call that reads it back against the evidence. The natural insertion point is between `investigate` returning and `send({ type: 'diagnosis' })` firing.
+This is exactly what blooming insights does NOT have. The diagnosis produced by the diagnostic agent streams to the user the moment it validates — there is no second call that reads it back against the evidence. The natural insertion point is between the investigate call returning and the diagnosis event firing into the stream.
 
 The high-value target here is specific: catching the diagnosis that concludes "mobile checkout regressed" when the evidence rows actually show desktop moved. The type guard accepts it (`conclusion` is a string), the user sees a confident wrong cause. A verify pass that re-reads conclusion-against-evidence is the layer that catches the well-formed-but-wrong output the validators cannot.
 
@@ -100,7 +100,7 @@ N-RUN VOTE on the intent classifier (would-be flow)
 ─────────────────────────────────────────────────────────────
  query: "did mobile drop and what do I do about it?"  ← ambiguous
 
- run 1 ─▶ diagnostic       (intent.ts classifier, temp default)
+ run 1 ─▶ diagnostic       (classifier, temperature default)
  run 2 ─▶ diagnostic
  run 3 ─▶ recommendation
  run 4 ─▶ diagnostic
@@ -110,24 +110,24 @@ N-RUN VOTE on the intent classifier (would-be flow)
  vote ─▶ diagnostic  (4 of 5)   ← stable decision on a borderline query
 ```
 
-blooming insights' classifier (`classifyIntent`, `intent.ts` L17–31) is a single call: one Haiku request, `max_tokens: 16`, one word, parsed by `parseIntent`. It is cheap (the whole point of the Haiku-vs-Sonnet routing) so N-run voting is affordable here in a way it would not be on the Sonnet agents. This is the natural place self-consistency would earn its keep: a borderline question that flips between `diagnostic` and `recommendation` between runs would settle on a majority instead of a coin flip.
+The intent classifier is a single call: one Haiku request, `max_tokens: 16`, one word, parsed by a small intent parser. It is cheap (the whole point of the Haiku-vs-Sonnet routing) so N-run voting is affordable here in a way it would not be on the Sonnet agents. This is the natural place self-consistency would earn its keep: a borderline question that flips between `diagnostic` and `recommendation` between runs would settle on a majority instead of a coin flip.
 
 ---
 
-### Why `synthesize()` is NOT self-critique
+### Why `synthesize` is NOT self-critique
 
-This must be said plainly because it is the obvious thing to mistake. blooming insights has a second model call in the diagnostic and recommendation paths — `synthesize()` (`diagnostic.ts` L82–121, `recommendation.ts` L82–127) — and it is **not** a critique or verify step.
+This must be said plainly because it is the obvious thing to mistake. blooming insights has a second model call in the diagnostic and recommendation paths — the synthesize retry — and it is **not** a critique or verify step.
 
 ```
-synthesize()  IS a clean-context RETRY        NOT a critique
+synthesize  IS a clean-context RETRY          NOT a critique
 ─────────────────────────────────────────────────────────────
- trigger:  tryParseDiagnosis(finalText) == null   (no usable JSON)
- input:    the EVIDENCE, freshly formatted        NOT the first output
- ask:      "produce the diagnosis JSON now"        NOT "is v1 correct?"
- goal:     RECOVER a parseable artifact            NOT verify a good one
+ trigger:  try_parse_diagnosis(final_text) == null  (no usable JSON)
+ input:    the EVIDENCE, freshly formatted          NOT the first output
+ ask:      "produce the diagnosis JSON now"          NOT "is v1 correct?"
+ goal:     RECOVER a parseable artifact              NOT verify a good one
 ```
 
-The trigger tells the whole story. `synthesize()` only runs when the loop produced no parseable JSON — `tryParseDiagnosis(finalText) ?? (await this.synthesize(...)) ?? FALLBACK` (`diagnostic.ts` L73–77). When the loop *does* produce a valid diagnosis, `synthesize()` never runs and nothing checks that diagnosis. It is a recovery mechanism for the structured-output contract (→ 02-structured-outputs.md), aimed at "the model kept wanting to query and never emitted JSON." It does not read a first answer and ask "is this right?" — it never even sees the first answer; it re-derives from evidence in a clean context. A critique pass would do the opposite: it would run *on the successful path*, take the valid diagnosis as input, and evaluate it.
+The trigger tells the whole story. The synthesize path only runs when the loop produced no parseable JSON — `try_parse_diagnosis(final_text) ?? await synthesize(...) ?? FALLBACK`. When the loop *does* produce a valid diagnosis, synthesize never runs and nothing checks that diagnosis. It is a recovery mechanism for the structured-output contract (→ 02-structured-outputs.md), aimed at "the model kept wanting to query and never emitted JSON." It does not read a first answer and ask "is this right?" — it never even sees the first answer; it re-derives from evidence in a clean context. A critique pass would do the opposite: it would run *on the successful path*, take the valid diagnosis as input, and evaluate it.
 
 So the honest current state: blooming insights has a clean-context retry (recovery), zero self-critique (verification), and zero self-consistency (voting).
 
@@ -146,8 +146,8 @@ This diagram spans the decision. The Generation layer produces a first output; f
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  GENERATION LAYER                                                     │
-│   DiagnosticAgent.investigate → Diagnosis v1   (diagnostic.ts L44)   │
-│   classifyIntent → one word                    (intent.ts L17)       │
+│   diagnostic_agent.investigate → Diagnosis v1                         │
+│   intent classifier → one word                                        │
 └───────────────┬──────────────────────────────────────────────────────┘
                 │ first output
         ┌───────┴────────────────────────────┐
@@ -155,21 +155,21 @@ This diagram spans the decision. The Generation layer produces a first output; f
         ▼  (TODAY's path — both flows)        ▼  (NOT built)
 ┌─────────────────────┐         ┌──────────────────────────────────────┐
 │ ship as-is          │         │  VERIFICATION LAYER                  │
-│ route.ts L153–154   │         │                                      │
-│ (no second look)    │         │  self-critique (sequential):         │
+│ (no second look)    │         │                                      │
+│                     │         │  self-critique (sequential):         │
 └─────────────────────┘         │   critique(v1, evidence) → v2        │
                                 │   ⚠ shared blind spot: same model    │
-                                │      approves its own systematic err  │
+                                │      approves its own systematic err │
                                 │                                      │
                                 │  self-consistency (parallel):        │
                                 │   run N → vote   (cheap on classifier)│
-                                │   cost: N× tokens                     │
+                                │   cost: N× tokens                    │
                                 └──────────────────┬───────────────────┘
                                                    ▼
                                             ship verified output
 
-  (separate) synthesize()  diagnostic.ts L82–121 — runs ONLY when v1
-  failed to parse; a clean-context RETRY, NOT a critique of a good v1.
+  (separate) synthesize — runs ONLY when v1 failed to parse; a
+  clean-context RETRY, NOT a critique of a good v1.
 ```
 
 A reader who sees only this should grasp: verification is conditional on stakes, self-critique is sequential and self-consistency is parallel, both cost extra tokens, and the existing `synthesize()` sits outside this entirely — it is recovery, not verification.
@@ -318,3 +318,4 @@ What is the exact trigger condition under which `synthesize()` runs in the diagn
 → 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

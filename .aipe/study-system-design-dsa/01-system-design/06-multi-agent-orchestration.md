@@ -51,7 +51,7 @@ Zoom out — where multi-agent orchestration lives
 
 ## How it works
 
-**Mental model.** Think of `runAgentLoop` as the `while` loop in your paginator, except the "next-page token" is replaced by tool-use blocks in the model's response. Each iteration: ask the model → if the response contains tool-use blocks, execute them and push their results back as the next user message → if no tool-use blocks, the loop is done and you return whatever text the model produced.
+**Mental model.** Think of the shared agent loop as the `while` loop in your paginator, except the "next-page token" is replaced by tool-use blocks in the model's response. Each iteration: ask the model → if the response contains tool-use blocks, execute them and push their results back as the next user message → if no tool-use blocks, the loop is done and you return whatever text the model produced.
 
 The loop iterates until one of three conditions:
 - the model returns a response with no `tool_use` blocks (natural end)
@@ -85,11 +85,11 @@ The caller receives `{ finalText, toolCalls }` and then decides whether `finalTe
 
 ---
 
-### The shared loop (`runAgentLoop`)
+### The shared loop
 
-`runAgentLoop` in `lib/agents/base.ts` (L48–L176) is the only place where Claude API calls happen inside the agent system. Every specialist agent calls it; none of them drive the Anthropic client directly.
+The shared agent loop is the only place where provider API calls happen inside the agent system. Every specialist agent calls it; none of them drive the provider SDK client directly.
 
-The message accumulation pattern mirrors what you do when managing form state in a reducer: each action produces a new entry appended to the array, and the full array is always passed to the next render. Here the array is `messages: Anthropic.Messages.MessageParam[]`, starting with the initial user prompt (L79–L81) and growing with each assistant turn (L105) and each batch of tool results (L171).
+The message accumulation pattern mirrors what you do when managing form state in a reducer: each action produces a new entry appended to the array, and the full array is always passed to the next render. Here the array is `messages: MessageParam[]`, starting with the initial user prompt and growing with each assistant turn and each batch of tool results.
 
 ```
 messages array grows across turns
@@ -109,9 +109,9 @@ The model sees the full conversation on every call — it reads its own previous
 
 ### The tool-call budget + forced-final turn
 
-`maxToolCalls` (L60) is a hard cap on the total number of tool calls across all turns. `budgetSpent` (L90) is `true` as soon as `toolCalls.length >= maxToolCalls`. `forceFinal` (L91) is `true` when either the budget is spent or the turn counter is at `maxTurns - 1`.
+`maxToolCalls` is a hard cap on the total number of tool calls across all turns. `budgetSpent` is `true` as soon as `toolCalls.length >= maxToolCalls`. `forceFinal` is `true` when either the budget is spent or the turn counter is at `maxTurns - 1`.
 
-On a `forceFinal` turn, `params.tools` is not set (L101: `if (!forceFinal) params.tools = toolSchemas`). The model receives a request with no tool definitions, so it cannot emit `tool_use` blocks — it must produce text. This is the "omit the next-page token and the loop must stop" equivalent.
+On a `forceFinal` turn, `params.tools` is not set (the pseudocode rule is `if not forceFinal: params.tools = toolSchemas`). The model receives a request with no tool definitions, so it cannot emit `tool_use` blocks — it must produce text. This is the "omit the next-page token and the loop must stop" equivalent.
 
 The turn timeline for the diagnostic agent (`maxTurns: 8, maxToolCalls: 6`) looks like this:
 
@@ -132,20 +132,13 @@ Even if the natural loop would have continued, `forceFinal` stops further explor
 
 ### The `synthesisInstruction` nudge
 
-`synthesisInstruction` (L61) is a string that is appended to the `system` prompt on the `forceFinal` turn only (L98: `system: forceFinal && synthesisInstruction ? \`${system}\n\n${synthesisInstruction}\` : system`).
+`synthesisInstruction` is an optional string that is appended to the `system` prompt on the `forceFinal` turn only (the rule is: if `forceFinal && synthesisInstruction`, `system = system + "\n\n" + synthesisInstruction`).
 
-It is the equivalent of appending a final instruction to a prompt mid-conversation: "you have what you need now, stop asking for more, give me the answer". For the diagnostic agent (L62–L66 of `diagnostic.ts`) the instruction text is:
+It is the equivalent of appending a final instruction to a prompt mid-conversation: "you have what you need now, stop asking for more, give me the answer". For the diagnostic agent the instruction reads roughly:
 
-```
-You have NO more tool calls available. Stop investigating now and output
-your final answer. Respond with ONLY a single JSON object in a ```json
-fence matching the diagnosis shape (conclusion, evidence,
-hypothesesConsidered). Base it on the evidence you have already gathered
-— state your best-supported explanation, even if partial. Do not say you
-need more queries.
-```
+> You have NO more tool calls available. Stop investigating now and output your final answer. Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape (conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — state your best-supported explanation, even if partial. Do not say you need more queries.
 
-This nudge is why `forceFinal` usually produces valid JSON: the system prompt explicitly tells the model what shape to emit and prohibits further exploration. When it works, `tryParseDiagnosis(finalText)` returns a valid `Diagnosis` and the `synthesize()` call is never reached.
+This nudge is why `forceFinal` usually produces valid JSON: the system prompt explicitly tells the model what shape to emit and prohibits further exploration. When it works, the parse helper returns a valid `Diagnosis` and the dedicated synthesis call is never reached.
 
 ---
 
@@ -153,26 +146,27 @@ This nudge is why `forceFinal` usually produces valid JSON: the system prompt ex
 
 The model sometimes emits partial JSON, reasoning prose, or a hybrid on the `forceFinal` turn even with `synthesisInstruction`. When `tryParseDiagnosis(finalText)` returns `null`, a fresh, tool-less call is made.
 
-`DiagnosticAgent.synthesize()` (L82–L121 of `diagnostic.ts`) is a completely separate `anthropic.messages.create` call — not part of `runAgentLoop`. It takes the `toolCalls` array (the complete log), formats each as `Query N: toolName args\nResult: payload`, and sends a single-turn prompt to the model with the instruction to emit ONLY the structured JSON. There is no conversation history from the loop — no tool definitions, no accumulated messages. The model sees the gathered evidence as plain text and is asked for exactly one thing.
+The diagnostic agent's `synthesize()` is a completely separate provider call — not part of the shared loop. It takes the `toolCalls` array (the complete log), formats each as `"Query N: toolName args\nResult: payload"`, and sends a single-turn prompt to the model with the instruction to emit ONLY the structured JSON. There is no conversation history from the loop — no tool definitions, no accumulated messages. The model sees the gathered evidence as plain text and is asked for exactly one thing.
 
-The fallback chain in `DiagnosticAgent.investigate` (L74–L75) is:
+The fallback chain inside `investigate()` is:
 
 ```
-tryParseDiagnosis(finalText)   ← loop produced valid JSON?
-  ?? (await this.synthesize(anomaly, toolCalls))  ← dedicated call
-  ?? FALLBACK                  ← { conclusion: 'Insufficient data…', evidence: [] }
+tryParseDiagnosis(finalText)                       # loop produced valid JSON?
+  ?? (await synthesize(anomaly, toolCalls))         # dedicated call
+  ?? FALLBACK                                       # { conclusion: 'Insufficient data…', evidence: [] }
 ```
 
-After the chain resolves a `Diagnosis`, the agent **derives a confidence** before returning (L80–L82): `diagnosisConfidence(diag)` (`lib/insights/derive.ts` L54–L63) reads `hypothesesConsidered` — `'high'` when at least one hypothesis is supported AND every hypothesis was tested, `'medium'` when at least one is supported, `'low'` otherwise. It then downgrades a `'high'` to `'medium'` if any tool call errored (`toolCalls.some((tc) => tc.error)`, L81) so the surfaced confidence reflects the data actually gathered (rate-limited queries shouldn't read as high confidence).
+After the chain resolves a `Diagnosis`, the agent **derives a confidence** before returning. A `diagnosisConfidence(diag)` helper reads `hypothesesConsidered` — `'high'` when at least one hypothesis is supported AND every hypothesis was tested, `'medium'` when at least one is supported, `'low'` otherwise. It then downgrades a `'high'` to `'medium'` if any tool call errored (`toolCalls.some(tc => tc.error)`), so the surfaced confidence reflects the data actually gathered (rate-limited queries shouldn't read as high confidence).
 
-`RecommendationAgent.propose` (L69–L71 of `recommendation.ts`) uses the same chain:
+The recommendation agent's `propose()` uses the same chain:
 
 ```
 tryParseRecommendations(finalText)
-  ?? (await this.synthesize(anomaly, diagnosis, toolCalls))
+  ?? (await synthesize(anomaly, diagnosis, toolCalls))
+  ?? []                                             # safe empty array
 ```
 
-with `[]` as the final fallback (L73). This is a three-tier reliability guarantee: the loop's nudged final turn, the dedicated synthesis call, and the safe empty-array fallback. The recommendation shape the agent emits is now richer than `{ title, rationale, steps }`: each recommendation also carries `effort` (`'low'|'medium'|'high'`), `timeToSetUpMinutes`, `readResultInDays`, `prerequisites` (`{ label, satisfied }[]`), `successMetric`, and an `estimatedImpact` with a dollar `rangeUsd: { low, high }` computed from affected-customer count × AOV × a reactivation % range (the synthesis prompt spells this out at `recommendation.ts` L109–L119).
+This is a three-tier reliability guarantee: the loop's nudged final turn, the dedicated synthesis call, and the safe empty-array fallback. The recommendation shape the agent emits is richer than `{ title, rationale, steps }`: each recommendation also carries `effort` (`'low'|'medium'|'high'`), `timeToSetUpMinutes`, `readResultInDays`, `prerequisites` (`{ label, satisfied }[]`), `successMetric`, and an `estimatedImpact` with a dollar `rangeUsd: { low, high }` computed from affected-customer count × AOV × a reactivation % range (the synthesis prompt spells this out).
 
 The reason for a dedicated call rather than extending the loop is that the loop's message history contains partial reasoning and tool_use/tool_result pairs. The model "knows" it was in investigation mode and tends to continue that mode. A fresh single-turn call with no prior context and no tool definitions breaks the mode — the model sees only evidence + instruction and reliably produces JSON.
 
@@ -180,11 +174,11 @@ The reason for a dedicated call rather than extending the loop is that the loop'
 
 ### Four agents, one loop
 
-Each specialist agent is a class that builds a system prompt, selects a subset of MCP tool schemas via `filterToolSchemas`, and delegates to `runAgentLoop`. The only differences between agents are the prompt, the tool subset, the validator (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`), and the budget numbers.
+Each specialist agent is a class that builds a system prompt, selects a subset of MCP tool schemas via a `filterToolSchemas` helper, and delegates to the shared agent loop. The only differences between agents are the prompt, the tool subset, the validator (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`), and the budget numbers.
 
 ```
 MonitoringAgent.scan(hooks, categories)
-  system = monitoring.md + schema summary + per-category checklist
+  system = monitoring prompt + schema summary + per-category checklist
            (checklist built from the passed `categories` — the
             route's runnable set; empty array → "scan for any change")
   tools  = monitoringTools subset
@@ -193,14 +187,14 @@ MonitoringAgent.scan(hooks, categories)
   fallback = []
 
 DiagnosticAgent.investigate()
-  system = diagnostic.md + schema + anomaly JSON
+  system = diagnostic prompt + schema + anomaly JSON
   tools  = diagnosticTools subset
   budget = maxTurns:8, maxToolCalls:6
   valid  = isDiagnosis → derive confidence → return
   fallback chain: tryParse ?? synthesize() ?? FALLBACK
 
 RecommendationAgent.propose()
-  system = recommendation.md + schema + diagnosis JSON
+  system = recommendation prompt + schema + diagnosis JSON
   tools  = recommendationTools subset
   budget = maxTurns:6, maxToolCalls:4
   valid  = isRecommendationArray → assign ids → slice(0,3)
@@ -210,96 +204,96 @@ RecommendationAgent.propose()
   fallback chain: tryParse ?? synthesize() ?? []
 
 QueryAgent.answer()
-  system = query.md + schema
+  system = query prompt + schema
   tools  = all or intent-filtered
   budget = varies
   valid  = plain text (no JSON validator needed)
 ```
 
-All four share the same `runAgentLoop` with no special-casing inside the loop itself. The loop is "dumb" — it executes tool calls and accumulates messages. The agents are where the domain logic lives.
+All four share the same shared loop with no special-casing inside the loop itself. The loop is "dumb" — it executes tool calls and accumulates messages. The agents are where the domain logic lives.
 
 ---
 
 ### The schema gate — bounding monitoring to runnable categories
 
-`MonitoringAgent.scan` is now `async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]>` (`lib/agents/monitoring.ts` L69). The second argument is the list of anomaly categories the agent should actually check — and it does NOT decide that list itself. The briefing route gates it **upstream of `runAgentLoop`**: before constructing the agent it runs `schemaCapabilities(schema)` then `runnableCategories(capabilities)` (`lib/agents/categories.ts`) and passes the result into `scan`. A category is "runnable" only when the live workspace emits the events (and, for `enriches`, the properties/catalogs) it needs — `runnableCategories` keeps the `full` + `limited` ones and drops the `unavailable` ones.
+The monitoring agent's `scan` signature is `scan(hooks?, categories: AnomalyCategory[] = []): Promise<Anomaly[]>`. The second argument is the list of anomaly categories the agent should actually check — and it does NOT decide that list itself. The briefing route gates it **upstream of the shared loop**: before constructing the agent it runs `schemaCapabilities(schema)` then `runnableCategories(capabilities)` from a categories module and passes the result into `scan`. A category is "runnable" only when the live workspace emits the events (and, for `enriches`, the properties/catalogs) it needs — `runnableCategories` keeps the `full` + `limited` ones and drops the `unavailable` ones.
 
-Inside `scan` (L73–86), the passed `categories` are turned into a per-category checklist string — one bullet per category with its `whyItMatters`, suggested EQL recipe, and threshold gates — which is substituted into the `{categories}` placeholder of the monitoring prompt (L86). An empty array falls back to `'(no checklist provided — scan for any significant recent change)'` (L81). The agent then runs its normal `runAgentLoop` against that prompt. The gate changes WHAT the agent is told to look for; it does not touch the loop mechanics.
+Inside `scan`, the passed `categories` are turned into a per-category checklist string — one bullet per category with its `whyItMatters`, suggested EQL recipe, and threshold gates — which is substituted into the `{categories}` placeholder of the monitoring prompt. An empty array falls back to `'(no checklist provided — scan for any significant recent change)'`. The agent then runs the normal shared loop against that prompt. The gate changes WHAT the agent is told to look for; it does not touch the loop mechanics.
 
 ```
-schema  (bootstrapSchema, in the route)
+schema  (bootstrapped in the route)
   │
-  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }   (categories.ts L116)
+  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }
   │
-  └─ runnableCategories(caps)     → AnomalyCategory[] (full + limited only)   (categories.ts L158)
+  └─ runnableCategories(caps)     → AnomalyCategory[] (full + limited only)
         │
-        └─► MonitoringAgent.scan(hooks, runnable)                             (monitoring.ts L69)
+        └─► MonitoringAgent.scan(hooks, runnable)
                 │
-                ├─ build per-category checklist from `runnable`              (L73–81)
-                ├─ inject into prompt at {categories}                         (L86)
+                ├─ build per-category checklist from `runnable`
+                ├─ inject into prompt at {categories}
                 └─ runAgentLoop(...)   ← UNCHANGED; gate is upstream of the loop
 ```
 
-The consequence: the monitoring agent never spends its `maxToolCalls: 6` EQL budget probing a category this workspace can't support (e.g. no `return` event → the return-spike category is dropped before the loop ever runs). `runAgentLoop` (`lib/agents/base.ts` L48–L176) is identical for all four agents — the gating happens entirely in the route + `scan`'s prompt assembly, never inside the shared loop.
+The consequence: the monitoring agent never spends its `maxToolCalls: 6` EQL budget probing a category this workspace can't support (e.g. no `return` event → the return-spike category is dropped before the loop ever runs). The shared loop is identical for all four agents — the gating happens entirely in the route + the `scan` prompt assembly, never inside the shared loop.
 
 ---
 
 ### The route orchestration — two steps, not one run
 
-`app/api/agent/route.ts` (L112–L268) is the controller. The investigation is no longer one combined diagnostic→recommendation run; it is **two separate requests**, keyed by a `step` query param (`'diagnose' | 'recommend' | null`, parsed at L117–L118). Each request runs exactly one agent and streams its reasoning as NDJSON. The `null` step is the legacy *combined* run, kept only for the dev demo-capture path (it runs both agents and `saveInvestigation`s the snapshot, L254).
+The investigation route handler is the controller. The investigation is no longer one combined diagnostic→recommendation run; it is **two separate requests**, keyed by a `step` query param (`'diagnose' | 'recommend' | null`). Each request runs exactly one agent and streams its reasoning as NDJSON. The `null` step is the legacy *combined* run, kept only for the dev demo-capture path (it runs both agents and persists the snapshot).
 
-The orchestration body (L196–L254, inside the stream):
+The orchestration body (inside the stream):
 
 ```
-send(reasoning_step 'reading the workspace schema…')   ← bootstrap inside stream
-schema = await bootstrapSchema(conn.mcp)               (L201–L202)
+send(reasoning_step 'reading the workspace schema…')   # bootstrap inside stream
+schema = await bootstrapSchema(mcp)
 
-if (q && !insightId)
-  └── QueryAgent.answer()              ← free-form query, single agent
-      send({ type:'done' })
+if q and not insightId:
+    QueryAgent.answer()              # free-form query, single agent
+    send({ type: 'done' })
 
 else  // investigation
-  ├── if (step === 'recommend')        ← STEP 3
-  │     diagnosis = parseDiagnosis(diagnosisParam)   ← handed over from step 2
-  │     if (!diagnosis) throw 'no diagnosis was handed over'   (L228–229)
-  │
-  └── else                             ← STEP 2 (diagnose) or combined
-        DiagnosticAgent.investigate()  ← runs runAgentLoop internally
-        send({ type:'diagnosis', diagnosis })          (L231–239)
+    if step == 'recommend':          # STEP 3
+        diagnosis = parseDiagnosis(diagnosisParam)   # handed over from step 2
+        if not diagnosis: throw 'no diagnosis was handed over'
 
-  if (step !== 'diagnose')             ← STEP 3 or combined
-    RecommendationAgent.propose(inv, diagnosis!)       (L244–248)
-    for each r: send({ type:'recommendation', recommendation:r })
+    else:                            # STEP 2 (diagnose) or combined
+        diagnosis = DiagnosticAgent.investigate()  # runs the shared loop internally
+        send({ type: 'diagnosis', diagnosis })
 
-  send({ type:'done' })
-  if (step == null) saveInvestigation(insightId!, collected)   ← combined run only
+    if step != 'diagnose':           # STEP 3 or combined
+        recs = RecommendationAgent.propose(inv, diagnosis)
+        for r in recs: send({ type: 'recommendation', recommendation: r })
+
+    send({ type: 'done' })
+    if step is null: saveInvestigation(insightId, collected)   # combined run only
 ```
 
-The key structural change: on `step === 'diagnose'` the recommendation agent is **never reached** (the `if (step !== 'diagnose')` guard at L244 skips it) — the decision is not run yet. On `step === 'recommend'` the diagnostic agent is **never reached**; instead the diagnosis arrives as a `&diagnosis=` query param (`parseDiagnosis`, L86–L97, L227) handed over from step 2.
+The key structural change: on `step === 'diagnose'` the recommendation agent is **never reached** (the `if step != 'diagnose'` guard skips it) — the decision is not run yet. On `step === 'recommend'` the diagnostic agent is **never reached**; instead the diagnosis arrives as a `&diagnosis=` query param handed over from step 2.
 
-The handoff lives client-side in `lib/hooks/useInvestigation.ts`. Step 2 (`/investigate/[id]` → `useInvestigation(id, 'diagnose')`) writes the diagnosis to `sessionStorage` under `bi:diag:<id>` when it sees the `done` event (L138–L140). Step 3 (`/investigate/[id]/recommend` → `useInvestigation(id, 'recommend')`) reads it back (L72–L84) and, in live mode, appends it to the request URL as `&diagnosis=` (L162–L164). Each step also stashes its own result under `bi:inv:<step>:<id>` (L130–L136) so re-visits and back-nav hydrate instantly (L50–L60) without re-running the agents.
+The handoff lives client-side in the investigation hook. Step 2 (the diagnose page) writes the diagnosis to `sessionStorage` under `bi:diag:<id>` when it sees the `done` event. Step 3 (the recommend page) reads it back and, in live mode, appends it to the request URL as `&diagnosis=`. Each step also stashes its own result under `bi:inv:<step>:<id>` so re-visits and back-nav hydrate instantly without re-running the agents.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  Two-request investigation + diagnosis handoff                            │
 │                                                                            │
 │  STEP 2  /investigate/[id]                                                │
-│  useInvestigation(id,'diagnose') → GET /api/agent?...&step=diagnose       │
+│  useInvestigation(id,'diagnose') → GET agent?...&step=diagnose            │
 │        └── DiagnosticAgent.investigate()  (recommendation NOT run)        │
 │        on done: stash bi:inv:diagnose:<id>                                │
 │                 + hand off bi:diag:<id> = { diagnosis }   ◀──┐            │
 │                                                              │ sessionStorage│
 │  STEP 3  /investigate/[id]/recommend                         │            │
 │  useInvestigation(id,'recommend') ── reads bi:diag:<id> ─────┘            │
-│        → GET /api/agent?...&step=recommend&diagnosis=<json>  (live mode)  │
+│        → GET agent?...&step=recommend&diagnosis=<json>  (live mode)       │
 │        └── RecommendationAgent.propose(inv, diagnosis)  (diagnostic NOT run)│
 │        on done: stash bi:inv:recommend:<id>                               │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-The route still sequences agents with plain `await`, not a framework or graph — but the sequencing is now split across two HTTP requests with the diagnosis carried between them by the client. The `hooksFor(agent)` factory (L181–L195) wires each agent's `onText`, `onToolCall`, and `onToolResult` callbacks to `send()` calls that push NDJSON events to the client with the agent name attached — so the UI knows whether a `reasoning_step` came from the diagnostic or recommendation agent.
+The route still sequences agents with plain `await`, not a framework or graph — but the sequencing is now split across two HTTP requests with the diagnosis carried between them by the client. A `hooksFor(agent)` factory wires each agent's `onText`, `onToolCall`, and `onToolResult` callbacks to `send()` calls that push NDJSON events to the client with the agent name attached — so the UI knows whether a `reasoning_step` came from the diagnostic or recommendation agent.
 
-In demo (cached) mode there is no live agent at all: the route replays the combined snapshot through `filterByStep(cached, step)` (`route.ts` L66–L84, L129) to show only the requested step's events — see 05-streaming-ndjson.md.
+In demo (cached) mode there is no live agent at all: the route replays the combined snapshot through `filterByStep(cached, step)` to show only the requested step's events — see 05-streaming-ndjson.md.
 
 ---
 
@@ -659,3 +653,4 @@ Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-sp
 Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `scan(hooks?, categories: AnomalyCategory[] = [])` and described the per-category checklist injection; added a "schema gate" sub-section with an ASCII diagram showing schema → capabilities → runnable categories → scan(hooks, runnable), noting the gate is upstream of the unchanged `runAgentLoop`; corrected the `scan` line range (L68–L103 → L69–L120) and the `DiagnosticAgent` `maxToolCalls` ref (L61 → L62); verified `runAgentLoop` (L48–L176) and `DiagnosticAgent.investigate` (L45–L83) against current code.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

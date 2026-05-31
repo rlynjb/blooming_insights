@@ -61,7 +61,7 @@ The gate sits between "we know the schema" and "we spend the budget" — the sam
 
 ### Where it sits in the request
 
-In `app/api/briefing/route.ts` the live path bootstraps the schema, then — before listing tools or constructing the agent — computes the gate and emits its verdict. Only then does the monitoring agent run, scoped to the runnable set.
+In the briefing route handler the live path bootstraps the schema, then — before listing tools or constructing the agent — computes the gate and emits its verdict. Only then does the monitoring agent run, scoped to the runnable set.
 
 ```
  /api/briefing  (live)
@@ -77,7 +77,7 @@ In `app/api/briefing/route.ts` the live path bootstraps the schema, then — bef
    anomalies.map(anomalyToInsight) → insights → stream → done
 ```
 
-The gate is upstream of `runAgentLoop` — it changes *which* categories the monitoring agent is told to check (a prompt-level checklist), not how the shared loop runs. See `06-multi-agent-orchestration.md`.
+The gate is upstream of the shared agent loop — it changes *which* categories the monitoring agent is told to check (a prompt-level checklist), not how the shared loop runs. See `06-multi-agent-orchestration.md`.
 
 ---
 
@@ -100,7 +100,7 @@ Per category, the route emits a reasoning step (the checklist log line) and a `c
      send reasoning_step  "conversion rate drop · monitored"
      send coverage_item   { category:'conversion_drop', coverage:'full' }
                                         │
- client (app/page.tsx) accumulates ────┘
+ client (feed page) accumulates ───────┘
      setCoverage(prev => prev.has(item) ? prev : [...prev, item])
                                         │
  CoverageGrid renders ──────────────────┘
@@ -108,7 +108,7 @@ Per category, the route emits a reasoning step (the checklist log line) and a `c
      not yet + loading? → pending "checking…" skeleton tile
 ```
 
-In demo mode the same sequence replays from the captured snapshot at `REPLAY_DELAY_MS = 140` between events, so the creds-free demo discloses exactly like a live run (see `01-request-flow.md`'s demo hop).
+In demo mode the same sequence replays from the captured snapshot at a fixed delay (around 140 ms) between events, so the creds-free demo discloses exactly like a live run (see `01-request-flow.md`'s demo hop).
 
 ---
 
@@ -326,3 +326,4 @@ Your PM says: "The ghost tiles look broken — just hide categories the workspac
 → 01-request-flow.md · → 05-streaming-ndjson.md · → 06-multi-agent-orchestration.md · → ../02-dsa/07-coverage-gate.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

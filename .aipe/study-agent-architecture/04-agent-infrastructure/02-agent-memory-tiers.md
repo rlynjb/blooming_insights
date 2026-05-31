@@ -74,19 +74,18 @@ The technical thing: **the message history that grows turn by turn inside a sing
 If you're coming from frontend, this is React state inside a single component instance — `useState<Message[]>([...])` with `setMessages([...prev, next])` on every update. It survives the next render (the next `messages.create` call) but not the unmount (the function returning). Lifetime: this render tree.
 
 ```
-working memory — base.ts L79 + L105 + L171
+working memory — pseudocode
 
-  const messages: MessageParam[] = [
-    { role: 'user', content: userPrompt },           // L80
-  ];
+  messages = [
+    { role: 'user', content: user_prompt },
+  ]
 
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const res = await anthropic.messages.create({ ..., messages });
-    messages.push({ role: 'assistant', content: res.content });   // L105
-    // ... run tools ...
-    messages.push({ role: 'user', content: toolResults });        // L171
-  }
-  // function returns → messages goes out of scope → memory is gone
+  for turn in 0..max_turns:
+    res = await model.create({ ..., messages })
+    messages.push({ role: 'assistant', content: res.content })
+    # ... run tools ...
+    messages.push({ role: 'user', content: tool_results })
+  # function returns → messages goes out of scope → memory is gone
 ```
 
 The practical consequence: every turn the model gets the full reasoning trail of *this* run. It remembers it queried `purchase` count two turns ago, so it doesn't re-query. It knows what the diagnostic plan was, so it stays on it. But the *next* run of the same agent starts with `messages = [{role:'user', content: userPrompt}]` — empty otherwise. There's no carry-over.
@@ -102,23 +101,23 @@ If you're coming from frontend, this is the multi-step form pattern: when the us
 ```
 episodic memory — two layers glued at the route boundary
 
-  server side: lib/state/investigations.ts
+  server side: the in-process state map
   ┌────────────────────────────────────────────────────┐
-  │  const mem = new Map<insightId, AgentEvent[]>();   │  ← L11
-  │  saveInvestigation(insightId, collected)            │  ← L30
-  │  getCachedInvestigation(insightId): replay later    │  ← L22
+  │  mem = new Map<insight_id, agent_event[]>()        │
+  │  save_investigation(insight_id, collected)          │
+  │  get_cached_investigation(insight_id): replay later │
   └────────────────────────────────────────────────────┘
 
-  client side: lib/hooks/useInvestigation.ts
+  client side: the investigation hook
   ┌────────────────────────────────────────────────────┐
-  │  stashKey(step,id) = `bi:inv:${step}:${id}`         │  ← L18
-  │  diagHandoffKey(id) = `bi:diag:${id}`               │  ← L19
-  │  on 'done': sessionStorage.setItem(stashKey, ...)   │  ← L133
-  │  step==='diagnose' && cDiag: handoff to step 3      │  ← L138
+  │  stash_key(step, id)    = `bi:inv:${step}:${id}`    │
+  │  diag_handoff_key(id)   = `bi:diag:${id}`           │
+  │  on 'done': session_storage.set(stash_key, ...)     │
+  │  step=='diagnose' && c_diag: handoff to step 3      │
   └────────────────────────────────────────────────────┘
 ```
 
-The practical consequence: the user opens an anomaly, the diagnostic runs (working memory inside `runAgentLoop`), the final diagnosis is sent over NDJSON, the route's `saveInvestigation(insightId, collected)` snapshots it server-side and `useInvestigation` stashes it client-side. When the user clicks "next step" to see the recommendation, the client reads `bi:diag:<id>` from sessionStorage and posts it back to the route as the `diagnosis` param — the recommendation agent now has working memory pre-seeded with the diagnosis it would have re-run otherwise. **Episodic memory turns a cross-step problem into a cross-key lookup.**
+The practical consequence: the user opens an anomaly, the diagnostic runs (working memory inside the shared agent loop), the final diagnosis is sent over NDJSON, the route's save-investigation call snapshots it server-side and the investigation hook stashes it client-side. When the user clicks "next step" to see the recommendation, the client reads `bi:diag:<id>` from session storage and posts it back to the route as the `diagnosis` param — the recommendation agent now has working memory pre-seeded with the diagnosis it would have re-run otherwise. **Episodic memory turns a cross-step problem into a cross-key lookup.**
 
 The condition under which it works: the access pattern has to be "I know exactly which past run I want." The user clicks a specific anomaly's "recommend" button — that's the exact `insightId`. There's no "find me a past run *like* this one"; the access is point-lookup. That's the whole reason the cache can be a `Map` instead of a vector store.
 
@@ -138,7 +137,7 @@ the cross-step handoff in one picture
   └────────────────────┘            └────────────────────┘
 ```
 
-The honest caveat: the server-side `mem` Map lives in the Vercel function instance — it survives within one warm container, but a cold start or a different lambda invocation comes up with an empty map. The dev file (`.investigation-cache.json`) and the committed demo seed cover that gap in development and the seed flow. For real cross-instance persistence you'd want Redis or a row store; right now the cross-instance gap is filled by the client stash, which is more durable than the server cache.
+The honest caveat: the server-side state map lives in the function instance — it survives within one warm container, but a cold start or a different lambda invocation comes up with an empty map. A dev-only file cache and the committed demo seed cover that gap in development and the seed flow. For real cross-instance persistence you'd want Redis or a row store; right now the cross-instance gap is filled by the client stash, which is more durable than the server cache.
 
 ### Move 3 — Long-term memory: NOT built, and that's a real decision
 
@@ -181,7 +180,7 @@ fact → tier routing in this codebase
   the just-produced diagnosis        →  episodic (cache + bi:diag)
   the full investigation trace       →  episodic (cache + bi:inv:<step>)
   the workspace schema               →  working (re-fetched each run)
-  one-off auto-reconnect flag        →  episodic (bi:reconnecting)
+  one-off auto-reconnect flag        →  episodic (a session-storage flag)
   user preferences across runs       →  ✗ no tier
   "anomaly X was dismissed by user"  →  ✗ no tier
   cross-investigation patterns       →  ✗ no tier
@@ -203,28 +202,28 @@ The full picture is below.
 The three tiers, mapped to this codebase
 
   ┌─────────────────── WORKING (in-context) ──────────────────────┐
-  │ lib/agents/base.ts                                            │
-  │   const messages: MessageParam[] = [...]    L79                │
-  │   messages.push({ role: 'assistant', ... }) L105               │
-  │   messages.push({ role: 'user', ... })      L171               │
-  │ lifetime: one runAgentLoop() invocation. dies on return.       │
+  │ the shared agent loop                                          │
+  │   messages = [...]                                              │
+  │   messages.push({ role: 'assistant', ... })                     │
+  │   messages.push({ role: 'user', ... })                          │
+  │ lifetime: one agent-loop invocation. dies on return.            │
   └───────────────────────────────────────────────────────────────┘
                               │
                               │ run ends → final result is captured
                               ▼
   ┌─────────────────── EPISODIC (recent sessions) ────────────────┐
-  │ server: lib/state/investigations.ts                            │
-  │   const mem = new Map<string, AgentEvent[]>()  L11             │
-  │   saveInvestigation(insightId, collected)      L30             │
-  │   getCachedInvestigation(insightId)            L22             │
+  │ server: the in-process state map                               │
+  │   mem = new Map<string, agent_event[]>()                       │
+  │   save_investigation(insight_id, collected)                    │
+  │   get_cached_investigation(insight_id)                         │
   │                                                                │
-  │ client: lib/hooks/useInvestigation.ts                          │
-  │   stashKey(step,id) = `bi:inv:${step}:${id}`   L18             │
-  │   diagHandoffKey(id) = `bi:diag:${id}`         L19             │
-  │   sessionStorage.setItem(stashKey, ...)        L133            │
-  │   diag handoff for step 3                      L138            │
+  │ client: the investigation hook                                 │
+  │   stash_key(step, id) = `bi:inv:${step}:${id}`                 │
+  │   diag_handoff_key(id) = `bi:diag:${id}`                       │
+  │   session_storage.set(stash_key, ...)                          │
+  │   diag handoff for step 3                                       │
   │                                                                │
-  │ access: EXACT KEY by insightId/step. lifetime: warm instance / │
+  │ access: EXACT KEY by insight_id/step. lifetime: warm instance /│
   │         tab session. no relevance retrieval.                   │
   └───────────────────────────────────────────────────────────────┘
                               │
@@ -442,3 +441,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

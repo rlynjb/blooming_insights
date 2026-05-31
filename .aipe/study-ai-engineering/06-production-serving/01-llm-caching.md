@@ -46,7 +46,7 @@
 
 ## How it works
 
-**Mental model.** An LLM request is `(static_prefix + dynamic_suffix) → tokens → response`. There are three places to short-circuit that pipeline, and they nest from coarse to fine. The outermost cache returns the whole *response* (skip everything). The middle cache returns a *tool result* the response needed (skip one network hop). The innermost cache reuses the *tokenized prefix* (skip re-charging the input you already sent). blooming insights owns the outer two and leaves the inner one on the table.
+**Mental model.** An LLM request is `(static_prefix + dynamic_suffix) → tokens → response`. There are three places to short-circuit that pipeline, and they nest from coarse to fine. The outermost cache returns the whole *response* (skip everything). The middle cache returns a *tool result* the response needed (skip one network hop). The innermost cache reuses the *tokenized prefix* (skip re-charging the input you already sent). You own the outer two and leave the inner one on the table.
 
 ```
  request pipeline                          cache layer that short-circuits it
@@ -63,9 +63,9 @@ L0 and L1 are application-level caches the codebase implements as plain `Map`s. 
 
 ---
 
-### L1 — exact-match tool cache (`McpClient.callTool`)
+### L1 — exact-match tool cache (the TTL cache)
 
-This is the cache the codebase leans on hardest. Every MCP tool call passes through `callTool`, which keys a `Map` on the tool name plus a deterministic JSON serialization of every argument.
+This is the cache the codebase leans on hardest. Every MCP tool call passes through the wrapper's `callTool`, which keys a `Map` on the tool name plus a deterministic JSON serialization of every argument.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -77,48 +77,48 @@ This is the cache the codebase leans on hardest. Every MCP tool call passes thro
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The cache key is built at `lib/mcp/client.ts` L102: `` const cacheKey = `${name}:${JSON.stringify(args)}` ``. The TTL defaults to `60_000` ms (L103). The read happens at L105–L110: if an entry exists and `cached.expiresAt > Date.now()`, the call returns `{ result, durationMs: 0, fromCache: true }` without touching the network (L108). The write happens at L143–L144 on success only.
+The cache key is `` `${name}:${JSON.stringify(args)}` ``. The TTL defaults to 60,000 ms. The read returns `{ result, durationMs: 0, fromCache: true }` when an entry exists and its `expiresAt > Date.now()`, without touching the network. The write happens on success only:
 
 ```
 callTool("execute_analytics_eql", { eql })
    │
    ├─ key = "execute_analytics_eql:{...}"
    ├─ cache.get(key)?.expiresAt > now ?
-   │     │ yes → return { result, durationMs: 0, fromCache: true }   ← L108
+   │     │ yes → return { result, durationMs: 0, fromCache: true }
    │     │ no
-   ├─ liveCall (network)                                              ← L113
-   ├─ result.isError ? return WITHOUT caching                        ← L137–L139
-   └─ cache.set(key, { result, expiresAt: now + 60s })               ← L143–L144
+   ├─ liveCall (network)
+   ├─ result.isError ? return WITHOUT caching
+   └─ cache.set(key, { result, expiresAt: now + 60s })
 ```
 
-The critical guard is no-cache-on-error at `lib/mcp/client.ts` L137–L139: an `isError` result is returned without a cache write, so a transient failure never poisons the cache for 60 seconds. This is the same rule React Query applies — queries cache, errors do not.
+The critical guard is no-cache-on-error: an `isError` result is returned without a cache write, so a transient failure never poisons the cache for 60 seconds. This is the same rule React Query applies — queries cache, errors do not.
 
-Within a single investigation, the diagnostic and recommendation agents frequently issue overlapping EQL queries. The 60s TTL means the second agent's identical query returns instantly from L1 instead of re-spending a network round-trip against Bloomreach's ~1 req/s ceiling.
+Within a single investigation, the diagnostic and recommendation agents frequently issue overlapping EQL queries. The 60s TTL means the second agent's identical query returns instantly from L1 instead of re-spending a network round-trip against the source's ~1 req/s ceiling.
 
 ---
 
-### L0 — investigation replay cache (`lib/state/investigations.ts`)
+### L0 — investigation replay cache (the investigation snapshot store)
 
 This is a coarse, whole-response cache: instead of caching one tool result, it caches the *entire NDJSON event stream* a finished investigation produced. Viewing an already-run investigation replays the recorded events rather than re-running three agents.
 
 ```
-getCachedInvestigation(insightId)
+get_cached_investigation(insightId)
    │
-   ├─ mem.has(insightId)        ? return mem.get(insightId)   ← L23  (in-process)
-   ├─ dev file (PERSIST only)   ? return fromFile             ← L24  (.investigation-cache.json)
-   └─ demo seed                 ? return fromDemo ?? null     ← L26  (committed JSON)
+   ├─ mem.has(insightId)        ? return mem.get(insightId)   ← in-process
+   ├─ dev file (PERSIST only)   ? return fromFile             ← .investigation-cache.json
+   └─ demo seed                 ? return fromDemo ?? null     ← committed JSON
 ```
 
-The lookup chain is at `lib/state/investigations.ts` L22–L28: in-memory `Map` first, then a dev-only on-disk file, then a committed demo seed. The write is `saveInvestigation` at L30–L41, called from the route after a live run completes (`app/api/agent/route.ts` L254).
+The lookup chain is three-tier: in-memory `Map` first, then a dev-only on-disk file, then a committed demo seed. The save call is invoked from the route after a live run completes.
 
-The route wires this in at `app/api/agent/route.ts` L127–L141: when an `insightId` is requested and `live !== 1`, it pulls the cached event array and re-emits it through a `ReadableStream`, sleeping `REPLAY_DELAY_MS = 180` (L105) between events so the replay *feels* like a live run.
+The route wires this in: when an `insightId` is requested and `live !== 1`, it pulls the cached event array and re-emits it through a `ReadableStream`, sleeping `REPLAY_DELAY_MS = 180` between events so the replay *feels* like a live run.
 
 ```
 GET /api/agent?insightId=X            GET /api/agent?insightId=X&live=1
    │                                     │
-   ├─ getCachedInvestigation(X)          ├─ skip cache (live=1)
+   ├─ get_cached_investigation(X)        ├─ skip cache (live=1)
    │     │ hit                           └─ run 3 agents, ~15 Claude calls,
-   │     └─ replay NDJSON @ 180ms/event        then saveInvestigation(X)
+   │     └─ replay NDJSON @ 180ms/event        then save_investigation(X)
    │        ZERO Claude calls
 ```
 
@@ -128,7 +128,7 @@ This is a response cache in the strict sense: the unit cached is the final user-
 
 ### L2 — prompt caching (`cache_control`) — ABSENT
 
-This is the layer blooming insights does not implement, and it is the one that maps directly to the dominant cost. Every agent loads a static system prompt from disk (`monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md`) and re-sends it as the `system` field on *every* `anthropic.messages.create` call. A diagnostic run with `maxToolCalls: 6` makes up to 7 such calls, each re-paying full input price for the identical multi-thousand-token prefix.
+This is the layer this system does not implement, and it is the one that maps directly to the dominant cost. Every agent loads a static system prompt from disk and re-sends it as the `system` field on *every* model call. A diagnostic run with `maxToolCalls: 6` makes up to 7 such calls, each re-paying full input price for the identical multi-thousand-token prefix.
 
 Anthropic's prompt caching lets you mark a stable prefix with `cache_control: { type: 'ephemeral' }`. The provider tokenizes that prefix once, stores the KV-cache server-side for ~5 minutes, and on subsequent calls within the window charges a cache *read* rate (~10% of input price) instead of full input.
 
@@ -146,7 +146,7 @@ With cache_control on the static system prefix:
           ...                                                    6× at ~10%
 ```
 
-The semantic cache — "this question is close enough to a cached one, return the stored answer" — is also absent. blooming insights' L1 cache is strictly exact-match: `JSON.stringify(args)` must be byte-identical. A query of "top keywords last week" and "top 10 keywords last week" miss each other entirely. A semantic cache would embed the query and serve a neighbor above a similarity threshold; the codebase has no embeddings anywhere, so this is a deeper gap (see `03-retrieval-and-rag`).
+The semantic cache — "this question is close enough to a cached one, return the stored answer" — is also absent. The L1 cache is strictly exact-match: `JSON.stringify(args)` must be byte-identical. A query of "top keywords last week" and "top 10 keywords last week" miss each other entirely. A semantic cache would embed the query and serve a neighbor above a similarity threshold; the codebase has no embeddings anywhere, so this is a deeper gap (see `03-retrieval-and-rag`).
 
 ---
 
@@ -171,6 +171,8 @@ Cache at the layer where the cost lives. For a network-bound, rate-limited data 
 
 ---
 
+---
+
 ## LLM caching — diagram
 
 This diagram spans all four layers across the UI, Route, Agent, and Provider boundaries. The two solid boxes are built; the two dashed boxes are the gaps.
@@ -183,7 +185,7 @@ This diagram spans all four layers across the UI, Route, Agent, and Provider bou
   │       │                                                             │
   │  ┌────▼─────────────────────────────────────────────┐              │
   │  │  L0  investigation replay cache  (BUILT)          │              │
-  │  │  getCachedInvestigation(X)  L127                  │              │
+  │  │  getCachedInvestigation(X)                        │              │
   │  │   hit → replay NDJSON @ 180ms, 0 Claude calls     │              │
   │  └────┬─────────────────────────────────────────────┘              │
   │       │ miss / live=1                                               │
@@ -207,10 +209,10 @@ This diagram spans all four layers across the UI, Route, Agent, and Provider bou
   │                                                                       │
   │  ┌────────────────────────────────────────────────────┐             │
   │  │  L1  exact-match tool cache  (BUILT)                │             │
-  │  │  key = name:JSON.stringify(args)   L102             │             │
-  │  │  ttl = 60_000   L103                                │             │
-  │  │  hit → durationMs:0, fromCache:true   L108          │             │
-  │  │  no-cache-on-error   L137–L139                      │             │
+  │  │  key = name:JSON.stringify(args)                    │             │
+  │  │  ttl = 60_000                                       │             │
+  │  │  hit → durationMs:0, fromCache:true                 │             │
+  │  │  no-cache-on-error                                  │             │
   │  └────────────────────────────────────────────────────┘             │
   │       │ miss → liveCall → Bloomreach MCP                              │
   └───────────────────────────────────────────────────────────────────────┘
@@ -389,3 +391,4 @@ What is the default TTL of the L1 tool cache, and on which line is it set? (Answ
 Updated: 2026-05-28 — Re-derived drifted refs after the client.ts/route.ts rewrites: cache key L102 / ttl L103 / read L105–L110 / no-cache-on-error L137–L139 / write L143–L144 (callTool L97–L146, field L80); replay branch route.ts L127–L141, REPLAY_DELAY_MS L105, saveInvestigation L254. L2 prompt-cache gap unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

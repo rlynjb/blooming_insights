@@ -76,7 +76,7 @@ reference: "critical"
 score:     output === reference ? 1 : 0   → 1
 ```
 
-In blooming insights the natural fit is classification-shaped output. `classifyIntent` (`lib/agents/intent.ts` L17–L31) returns one of `'monitoring' | 'recommendation' | 'diagnostic'` — a one-word answer (it caps `max_tokens` at 16 to force this). An eval of intent classification is pure exact-match: the model said `diagnostic`, the reference is `diagnostic`, score 1. Severity classification on anomalies (`Severity` = `'critical' | 'warning' | 'info' | 'positive'`, `lib/mcp/types.ts` L3) is the same shape. No tolerance is needed because there is no correct variation in a single enum value.
+In this system the natural fit is classification-shaped output. The intent classifier returns one of `'monitoring' | 'recommendation' | 'diagnostic'` — a one-word answer (it caps `max_tokens` at 16 to force this). An eval of intent classification is pure exact-match: the model said `diagnostic`, the reference is `diagnostic`, score 1. Severity classification on anomalies (`Severity = 'critical' | 'warning' | 'info' | 'positive'`) is the same shape. No tolerance is needed because there is no correct variation in a single enum value.
 
 ### Rung 2 — fuzzy match (tolerance for wording)
 
@@ -93,7 +93,7 @@ recall    = 2/3   (2 of 3 expected were caught)
 F1        = 0.67  (harmonic mean)
 ```
 
-`MonitoringAgent.scan` (`lib/agents/monitoring.ts` L68–L103) returns an *array* of anomalies, sorted by severity and sliced to the top 10. Its quality is not one label — it is a set: did it catch the anomalies that matter (recall) without flagging noise (precision)? F1 is the exact instrument. Exact-match is too strict here (the order or one extra item should not zero the score); a rubric is overkill (the items are structured, not prose).
+The monitoring agent's `scan` returns an *array* of anomalies, sorted by severity and sliced to the top 10. Its quality is not one label — it is a set: did it catch the anomalies that matter (recall) without flagging noise (precision)? F1 is the exact instrument. Exact-match is too strict here (the order or one extra item should not zero the score); a rubric is overkill (the items are structured, not prose).
 
 ### Rung 3 — rubric grading (a checklist for prose)
 
@@ -109,7 +109,7 @@ rubric for a Diagnosis
                                                   score = Σ(passed×weight)/Σweight
 ```
 
-A `Diagnosis` (`lib/mcp/types.ts` L64–L73) has `conclusion`, `evidence[]`, and `hypothesesConsidered[]`. Some criteria are checkable by code (is `hypothesesConsidered.length >= 2`? does `evidence` reference the anomaly's `scope`?); others need a judge. A rubric is the structured middle: more tolerant than exact-match (wording is free), more objective than a single holistic judge score (each criterion is explicit). It is the recommended first method for diagnosis and recommendation prose because it forces you to *define* what good means.
+A `Diagnosis` has `conclusion`, `evidence[]`, and `hypothesesConsidered[]`. Some criteria are checkable by code (is `hypothesesConsidered.length >= 2`? does `evidence` reference the anomaly's `scope`?); others need a judge. A rubric is the structured middle: more tolerant than exact-match (wording is free), more objective than a single holistic judge score (each criterion is explicit). It is the recommended first method for diagnosis and recommendation prose because it forces you to *define* what good means.
 
 ### Rung 4 — LLM-as-judge (a model grades the prose)
 
@@ -125,7 +125,7 @@ output:  {title, rationale, bloomreachFeature:"scenario", steps[...]}
 judge →  4/5 "concrete steps, correct feature, impact vague"
 ```
 
-`RecommendationAgent.propose` (`lib/agents/recommendation.ts` L36–L77) produces `Recommendation` objects whose quality is genuinely subjective — is this action sensible, does the `bloomreachFeature` enum match the problem, are the `steps` concrete? A rubric covers the checkable parts; LLM-as-judge covers the holistic "would an expert endorse this." It is the rung you climb to when a rubric cannot capture the nuance — and you climb it knowing it imports bias you must control.
+The recommendation agent's `propose` produces `Recommendation` objects whose quality is genuinely subjective — is this action sensible, does the `bloomreachFeature` enum match the problem, are the `steps` concrete? A rubric covers the checkable parts; LLM-as-judge covers the holistic "would an expert endorse this." It is the rung you climb to when a rubric cannot capture the nuance — and you climb it knowing it imports bias you must control.
 
 ### Rung 5 — pairwise comparison (which of two is better)
 
@@ -140,7 +140,7 @@ case → diagnostic.md v1 → output A ┐
 v2 wins 64% of cases → v2 is the better prompt
 ```
 
-This is the method for the decisions blooming insights will actually face: did editing `lib/agents/prompts/diagnostic.md` help? Did the next model beat `claude-sonnet-4-6`? Run the golden set through both, judge pairwise, report a win-rate. Pairwise sidesteps the "is 0.82 good?" problem — you do not need a calibrated absolute scale, only a consistent relative one.
+This is the method for the decisions you will actually face: did editing the diagnostic prompt help? Did the next model beat the current one? Run the golden set through both, judge pairwise, report a win-rate. Pairwise sidesteps the "is 0.82 good?" problem — you do not need a calibrated absolute scale, only a consistent relative one.
 
 ### Rung 6 — human evaluation (the gold standard)
 
@@ -154,13 +154,13 @@ calibrates the LLM-judge  → does judge agree with human ≥ X%?
 spot-checks production     → feeds failures to the regression set
 ```
 
-### Matching method to surface in blooming insights
+### Matching method to surface in this system
 
 ```
 surface                          output shape          method
 ───────────────────────────────  ────────────────────  ─────────────────────
-classifyIntent (intent.ts)       one enum word         exact-match
-anomaly severity (types.ts L3)   one enum              exact-match
+classifyIntent                   one enum word         exact-match
+anomaly severity                 one enum              exact-match
 MonitoringAgent.scan (set)       array of anomalies    fuzzy / precision-recall-F1
 DiagnosticAgent.investigate      prose + structure     rubric → LLM-judge
 RecommendationAgent.propose      subjective action     rubric → LLM-judge
@@ -354,3 +354,4 @@ What does `classifyIntent` (`lib/agents/intent.ts` L17–L31) return, and which 
 Updated: 2026-05-28 — Test count 125→157; re-derived `MonitoringAgent.scan` (monitoring.ts L68–L103) and `Diagnosis` (types.ts L64–L73) refs. `classifyIntent` (intent.ts L17–L31), `propose` (recommendation.ts L36–L77), and Severity (types.ts L3) unchanged. Still Case B.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -72,38 +72,38 @@ Three cache scopes, nested by blast radius
 
 The strategy in plain English: **cache where the cost is and the staleness is bounded.** Intra-run is the cheap win — same task, fresh data window (60s here), and the stale hit lives in one run that ends in seconds. Cross-run looks like the same instinct extended (more hits, more savings) but the staleness window grows from "seconds inside one task" to "hours or days across many tasks" — and the value lives in *every* downstream model turn, not in one response.
 
-### Layer 1: intra-run memoization — the cache `McpClient` runs hard
+### Layer 1: intra-run memoization — the cache the MCP client wrapper runs hard
 
-The technical thing: an in-memory `Map` keyed on `${tool_name}:${JSON.stringify(args)}` with a 60-second TTL, sitting in front of every MCP tool call. Same call within 60 seconds = 0 ms hit; otherwise the HTTP round trip runs.
+The technical thing: an in-memory `Map` keyed on `${tool_name}:${serialize(args)}` with a 60-second TTL, sitting in front of every MCP tool call. Same call within 60 seconds = 0 ms hit; otherwise the HTTP round trip runs.
 
-If you're coming from frontend, this is `useMemo` over a deps array. Same args mean the same memoized return; the cache lives for the component's lifetime. The agent version lives for `McpClient`'s lifetime, which in practice is one investigation.
+If you're coming from frontend, this is `useMemo` over a deps array. Same args mean the same memoized return; the cache lives for the component's lifetime. The agent version lives for the MCP client wrapper's lifetime, which in practice is one investigation.
 
 ```
-McpClient.callTool — the intra-run cache lives here
+call_tool — the intra-run cache lives here
 
-  callTool(name, args, opts)
+  call_tool(name, args, opts)
        │
        ▼
-   cacheKey = `${name}:${JSON.stringify(args)}`             L102
+   cache_key = name + ':' + serialize(args)
        │
        ▼
-   cache.get(cacheKey)?.expiresAt > now ?                   L106–L110
+   cache.get(cache_key)?.expires_at > now ?
        │
-       ├─ hit  →  return { result, durationMs: 0,
-       │                    fromCache: true }
+       ├─ hit  →  return { result, duration_ms: 0,
+       │                    from_cache: true }
        │
-       └─ miss → liveCall(name, args)  →  network            L113
+       └─ miss → live_call(name, args)  →  network
                      ▼
-                  if isError: return WITHOUT caching         L137–L139
+                  if is_error: return WITHOUT caching
                   else: cache.set(key, { result,
-                                          expiresAt: now+60s }) L143–L144
+                                          expires_at: now + 60s })
                      ▼
-                  return { result, durationMs, fromCache: false }
+                  return { result, duration_ms, from_cache: false }
 ```
 
-The practical consequence: when the diagnostic agent re-runs the same EQL inside one investigation (which happens when the model verifies a number, or two agents in the chain ask the same workspace-shape query), the second call is free. The 60-second TTL means the cache works *within* a typical investigation (the route's `maxDuration` is 300s, but a single investigation usually finishes in 30–60s) and silently expires across investigations.
+The practical consequence: when the diagnostic agent re-runs the same query inside one investigation (which happens when the model verifies a number, or two agents in the chain ask the same workspace-shape query), the second call is free. The 60-second TTL means the cache works *within* a typical investigation (the per-request ceiling is 300s, but a single investigation usually finishes in 30–60s) and silently expires across investigations.
 
-The condition under which it works (and doesn't): the cache assumes args determine result. That's true for `execute_analytics_eql` on a slow-moving aggregate — the underlying data doesn't shift second-to-second. It's *not* always true; the cache is opted out for the `/debug` "force fresh" path via `skipCache` (L105). The cache also never stores errors (L137–L139) — an `isError: true` result returns to the agent but isn't written, so a 429 doesn't poison the cache for the rest of the run.
+The condition under which it works (and doesn't): the cache assumes args determine result. That's true for analytics tool calls on a slow-moving aggregate — the underlying data doesn't shift second-to-second. It's *not* always true; the cache is opted out for the "force fresh" path via a `skip_cache` flag. The cache also never stores errors — an `is_error: true` result returns to the agent but isn't written, so a 429 doesn't poison the cache for the rest of the run.
 
 ### Layer 2: whole-run replay — the demo cache
 
@@ -117,11 +117,11 @@ The whole-run replay — agents do not run
   GET /api/agent?insightId=...   (no &live=1)
         │
         ▼
-   getCachedInvestigation(insightId) ?                      route.ts L127
+   get_cached_investigation(insight_id) ?
         │
-        ├─ hit  →  filterByStep(...)
+        ├─ hit  →  filter_by_step(...)
         │         stream events from disk with a small delay
-        │         NO MCP calls, NO Claude calls
+        │         NO MCP calls, NO model calls
         │
         └─ miss →  fall through to the live agent path
 ```
@@ -184,10 +184,10 @@ Right now intra-run + whole-run are in; cross-run semantic is out. Naming what s
 ```
        Phase A (now)                    Phase B (with cross-run semantic)
 ┌──────────────────────────────┐   ┌──────────────────────────────────────┐
-│ McpClient cache: 60s TTL,    │   │ McpClient cache: same (intra-run)    │
+│ MCP client cache: 60s TTL,   │   │ MCP client cache: same (intra-run)   │
 │ exact key, intra-run only    │   │ + semantic cache layer above         │ ←
 │   ▼                          │   │   ▼                                  │
-│ Task A: runs full investigat. │   │ Task A: runs full investigation     │
+│ Task A: runs full investigat.│   │ Task A: runs full investigation      │
 │ Task B (2h later, similar q):│   │ Task B (2h later): semantic hit →    │ ←
 │   runs full investigation     │   │   Task A's stale numbers feed model  │
 │   (fresh data, real cost)    │   │   (silent, confident, possibly wrong)│
@@ -217,25 +217,25 @@ blooming insights: cross-turn caching, three scopes labelled by what's in/out
        ▼
   ┌─────────────────────────────────────────────────────────────────┐
   │ L0  Whole-run replay (demo)         BUILT                        │
-  │   route.ts L125–L141                                              │
-  │   key: insightId                                                  │
+  │   the route handler's cache-first branch                          │
+  │   key: insight_id                                                 │
   │   value: captured event stream                                    │
   │   hit  →  no agents run, stream from disk                          │
   └─────────────────────────────────────────────────────────────────┘
                        ▼ miss / live=1
   ┌─────────────────────────────────────────────────────────────────┐
-  │ Agent layer (runAgentLoop ×N)                                    │
+  │ Agent layer (shared agent loop ×N)                                │
   │   each tool_use →                                                 │
   │       ▼                                                            │
   └─────────────────────────────────────────────────────────────────┘
                        ▼
   ┌─────────────────────────────────────────────────────────────────┐
   │ L1  Intra-run cache                  BUILT                        │
-  │   McpClient.callTool, client.ts L97–L146                          │
-  │   key: `${name}:${JSON.stringify(args)}`                          │
-  │   value: { result, expiresAt: now + 60_000 }                      │
+  │   the MCP client wrapper's call_tool                              │
+  │   key: name + ':' + serialize(args)                               │
+  │   value: { result, expires_at: now + 60_000 }                     │
   │   hit  →  return in 0ms; agent's tool-call budget intact          │
-  │   miss →  liveCall → network → cache on success only              │
+  │   miss →  live_call → network → cache on success only             │
   └─────────────────────────────────────────────────────────────────┘
                        ▼ miss
   ┌─────────────────────────────────────────────────────────────────┐
@@ -248,7 +248,7 @@ blooming insights: cross-turn caching, three scopes labelled by what's in/out
   ┌─────────────────────────────────────────────────────────────────┐
   │ L3  Provider prompt-prefix cache     ABSENT                       │
   │     would set cache_control on the static system prompt          │
-  │     covered in `../../study-ai-engineering/06-production-serving/01-llm-caching.md` │
+  │     covered in the ai-engineering LLM-caching note                 │
   └─────────────────────────────────────────────────────────────────┘
                        ▼
                   MCP transport → Bloomreach
@@ -455,3 +455,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

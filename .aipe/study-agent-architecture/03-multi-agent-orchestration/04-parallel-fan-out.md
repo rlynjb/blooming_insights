@@ -120,7 +120,7 @@ The semaphore
 
 The practical consequence: the cap is what prevents fan-out from melting your provider rate limit. Without it, fan-out of 20 workers slams the provider with 20 concurrent requests; you get 429s, retries, and end up *slower* than sequential.
 
-The condition under which this works: the cap has to match the provider's rate limit divided by per-call duration. In blooming insights' case, MCP is ~1 req/s (`connect.ts` L92 — `minIntervalMs: 1100`). Each agent loop makes multiple MCP calls. Even N=2 concurrent agent loops would serialize their MCP calls through the 1.1s spacer — you'd get sequential MCP throughput with the overhead of concurrent agent loops.
+The condition under which this works: the cap has to match the provider's rate limit divided by per-call duration. In blooming insights' case, MCP is ~1 req/s (the MCP client enforces a ~1.1s spacer between calls). Each agent loop makes multiple MCP calls. Even N=2 concurrent agent loops would serialize their MCP calls through the spacer — you'd get sequential MCP throughput with the overhead of concurrent agent loops.
 
 ### Layer 3 — the merge (function call vs agent)
 
@@ -156,9 +156,9 @@ Right now there's no fan-out anywhere. The query agent handles one free-form que
 ┌─────────────────────────────────┐  ┌─────────────────────────────────┐
 │ free-form ?q=…                  │  │ ?q="give me 30-day funnel +      │ ←
 │   ▼                             │  │  conversion + retention +       │
-│ classifyIntent (haiku, ~150ms)  │  │  segments overview"             │
+│ classify_intent (cheap, ~150ms) │  │  segments overview"             │
 │   ▼                             │  │   ▼                              │
-│ QueryAgent.answer(q, intent)    │  │ classifyIntent → MULTI-DOMAIN    │
+│ query agent.answer(q, intent)   │  │ classify_intent → MULTI-DOMAIN   │
 │   ReAct loop (1 stage, 1 budget)│  │   ▼                              │
 │   sequential MCP calls          │  │ fan out 4 sub-agents             │ ←
 │   ▼                             │  │   (one per domain)               │
@@ -167,11 +167,11 @@ Right now there's no fan-out anywhere. The query agent handles one free-form que
 │                                 │  │ merge agent synthesizes one      │ ←
 │                                 │  │  cross-domain overview           │
 └─────────────────────────────────┘  └─────────────────────────────────┘
-   the QueryAgent today is single-domain; the breakpoint is
+   the query agent today is single-domain; the breakpoint is
    when one user request spans multiple independent domains
 ```
 
-*Now:* the query agent processes one question at a time. If the question spans multiple domains (e.g. "compare funnel AND conversion AND retention"), the agent serializes the EQL calls inside its single loop — it makes 4 sequential MCP calls under the 1.1s spacer, totaling ~5 seconds for the data alone.
+*Now:* the query agent processes one question at a time. If the question spans multiple domains (e.g. "compare funnel AND conversion AND retention"), the agent serializes the analytics calls inside its single loop — it makes 4 sequential tool calls under the ~1.1s spacer, totaling ~5 seconds for the data alone.
 
 *If a multi-domain query arrived:* the classifier (or the planner agent) would emit a list of 4 sub-questions; 4 sub-agents would fan out, each running their own ReAct loop for their domain; a merge agent (or a function-call merge with a synthesis prompt) would combine them. The latency win: ~max(t1, t2, t3, t4) ≈ 2 seconds per agent + merge ≈ ~3 seconds total, vs ~5+ sequential. The cost: 4 worker LLM loops + 1 merge LLM call instead of 1 worker loop.
 
@@ -243,9 +243,9 @@ Parallel fan-out — full picture
                          final answer
 
   blooming insights: NOT YET IMPLEMENTED — the pipeline is
-  sequential, the QueryAgent is single-domain, and the ~1 req/s
+  sequential, the query agent is single-domain, and the ~1 req/s
   MCP rate limit means N>1 fan-out would serialize at the MCP
-  layer anyway. See `../06-orchestration-system-design-templates/`
+  layer anyway. See the orchestration system-design templates
   for the refactor.
 ```
 
@@ -495,3 +495,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

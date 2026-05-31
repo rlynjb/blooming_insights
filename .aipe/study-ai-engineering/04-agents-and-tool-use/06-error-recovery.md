@@ -67,18 +67,19 @@ The layers are independent. The agent-level cascade handles "the model did not p
 
 ### Loop protection — the budget IS the cap
 
-The most dangerous agent failure is non-termination: a model that keeps emitting `tool_use` blocks forever. `runAgentLoop` makes this structurally impossible with two bounds. The `for (turn=0; turn<maxTurns; turn++)` loop (`base.ts` L85) is the outer cap (`maxTurns = 8`, L73). The `maxToolCalls` budget is the inner cap: `budgetSpent` is true once `toolCalls.length >= maxToolCalls` (L90), and `forceFinal` is true on the last turn *or* when the budget is spent (L91).
+The most dangerous agent failure is non-termination: a model that keeps emitting `tool_use` blocks forever. The shared agent loop makes this structurally impossible with two bounds. The `for (turn=0; turn<maxTurns; turn++)` loop is the outer cap (`maxTurns = 8`). The `maxToolCalls` budget is the inner cap: `budgetSpent` is true once `toolCalls.length >= maxToolCalls`, and `forceFinal` is true on the last turn *or* when the budget is spent.
 
 ```
-base.ts — the bound   (L85–L101)
+the bound, in the agent loop
 ─────────────────────────────────────────────────────────────
- for (turn=0; turn<maxTurns; turn++)                       L85
-   budgetSpent = toolCalls.length >= maxToolCalls          L90
-   forceFinal  = turn === maxTurns-1 || budgetSpent        L91
-   if (!forceFinal) params.tools = toolSchemas             L101  ← tools WITHHELD on final
+ for turn in 0..maxTurns:
+     budgetSpent = (count(toolCalls) >= maxToolCalls)
+     forceFinal  = (turn == maxTurns - 1) or budgetSpent
+     if not forceFinal:
+         params.tools = toolSchemas             ← tools WITHHELD on final
 ```
 
-On a `forceFinal` turn, `params.tools` is not set (L101). With no tools in the request, the model *cannot* emit a `tool_use` block — it must produce text. This is loop protection by construction: the loop does not "ask nicely" for the model to stop; it removes the model's ability to continue. The per-agent budgets are tuned to the job: diagnostic `maxToolCalls: 6` (`diagnostic.ts` L62), recommendation `4` (`recommendation.ts` L57), monitoring `6` (`monitoring.ts` L84), query `6` (`query.ts` L41). The budget bounds latency (each tool call is ~1.1s under the MCP spacing limit) *and* protects against runaway loops — one mechanism, two guarantees. That is the line: the budget IS the loop protection.
+On a `forceFinal` turn, `params.tools` is not set. With no tools in the request, the model *cannot* emit a `tool_use` block — it must produce text. This is loop protection by construction: the loop does not "ask nicely" for the model to stop; it removes the model's ability to continue. The per-agent budgets are tuned to the job: diagnostic `maxToolCalls: 6`, recommendation `4`, monitoring `6`, query `6`. The budget bounds latency (each tool call is ~1.1s under the MCP spacing limit) *and* protects against runaway loops — one mechanism, two guarantees. That is the line: the budget IS the loop protection.
 
 ```
 diagnostic timeline (maxTurns:8, maxToolCalls:6)
@@ -93,37 +94,38 @@ diagnostic timeline (maxTurns:8, maxToolCalls:6)
 
 ### Recovery tier 1→2 — synthesize() rescues unparseable output
 
-When the forced-final turn produces prose, partial JSON, or a hybrid, `tryParseDiagnosis(finalText)` returns `null` (`diagnostic.ts` L22–L29 — `parseAgentJson` throws, caught, returns `null`). The recovery is a dedicated, tool-less `synthesize()` call (`diagnostic.ts` L87–L126): a fresh `anthropic.messages.create` (L97) with `max_tokens: 2048`, no tool definitions, no loop history — just the gathered `toolCalls` formatted as evidence text and an instruction to emit ONLY the JSON.
+When the forced-final turn produces prose, partial JSON, or a hybrid, the parse-and-validate step returns `null` (the JSON parser throws, the wrapper catches, returns `null`). The recovery is a dedicated, tool-less `synthesize()` call: a fresh model call with `max_tokens: 2048`, no tool definitions, no loop history — just the gathered tool-call results formatted as evidence text and an instruction to emit ONLY the JSON.
 
 ```
-diagnostic.ts — tier 1 → tier 2   (L74–L75, L87–L126)
+tier 1 → tier 2 (in the diagnostic agent)
 ─────────────────────────────────────────────────────────────
- const diag =
-   tryParseDiagnosis(finalText)                    L75  ← tier 1 (loop's JSON)
-   ?? (await this.synthesize(anomaly, toolCalls))  L75  ← tier 2 (clean retry)
-   ?? FALLBACK;                                     L75  ← tier 3 (safe default)
+ diag = try_parse_diagnosis(finalText)             ← tier 1 (loop's JSON)
+        OR (await synthesize(anomaly, toolCalls))  ← tier 2 (clean retry)
+        OR FALLBACK                                 ← tier 3 (safe default)
 
- synthesize: create({ max_tokens: 2048, no tools,  L97
-   system: "Output ONLY a JSON diagnosis", 
-   user: anomaly + evidence-from-toolCalls })      L102–116
-   → tryParseDiagnosis(text)                        L122
-   catch → return null                              L123  ← never throws
+ synthesize: create({
+     max_tokens: 2048, (no tools),
+     system: "Output ONLY a JSON diagnosis",
+     user:   anomaly + evidence-from-toolCalls,
+ })
+   → try_parse_diagnosis(text)
+   catch → return null                              ← never throws
 ```
 
-The reason a *separate* call works where the loop's final turn failed: the loop's message history contains tool_use/tool_result scaffolding and partial reasoning that keeps the model in "exploration mode." `synthesize()` gives it a clean slate — only evidence and a schema — which breaks that mode. `recommendation.ts` L82–L133 has the identical structure (`create` at L96, `max_tokens: 2048`). The whole `synthesize()` body is wrapped in `try/catch` returning `null` (L123), so even if the retry call itself errors, it degrades to the next tier rather than throwing.
+The reason a *separate* call works where the loop's final turn failed: the loop's message history contains tool_use / tool_result scaffolding and partial reasoning that keeps the model in "exploration mode." `synthesize()` gives it a clean slate — only evidence and a schema — which breaks that mode. The recommendation agent has the identical structure. The whole `synthesize()` body is wrapped in `try/catch` returning `null`, so even if the retry call itself errors, it degrades to the next tier rather than throwing.
 
 ---
 
 ### Recovery tier 3 — the safe default
 
-The bottom of every cascade is a value that is valid and never throws. For diagnostic it is `FALLBACK` (`diagnostic.ts` L16–L20): a `Diagnosis` with `conclusion: 'Insufficient data to determine a cause for this change.'` and empty `evidence`/`hypothesesConsidered`. For recommendation it is `[]` (`recommendation.ts` L73 — `if (!idless) return []`). For monitoring it is `[]` on any parse failure.
+The bottom of every cascade is a value that is valid and never throws. For diagnostic it is `FALLBACK`: a `Diagnosis` with `conclusion: 'Insufficient data to determine a cause for this change.'` and empty `evidence`/`hypothesesConsidered`. For recommendation it is `[]`. For monitoring it is `[]` on any parse failure.
 
 ```
 the safe defaults
 ─────────────────────────────────────────────────────────────
- diagnostic:     FALLBACK   { conclusion:'Insufficient data…', evidence:[] }  L16–20
- recommendation: []          (if (!idless) return [])                          L73
- monitoring:     []          (catch → return [])                              L99
+ diagnostic:     FALLBACK   { conclusion:'Insufficient data…', evidence:[] }
+ recommendation: []         (if (!idless) return [])
+ monitoring:     []         (catch → return [])
 ```
 
 These guarantee the route always emits a valid `diagnosis` event and zero-or-more `recommendation` events — the stream never breaks, the UI never hangs on a malformed payload. A `FALLBACK` diagnosis flows into `propose`, which safely returns `[]`; the user sees "Insufficient data" rather than a crash. The safe default is the contract: an agent returns a typed value or a typed empty, never an exception that escapes to the route.
@@ -132,15 +134,18 @@ These guarantee the route always emits a valid `diagnosis` event and zero-or-mor
 
 ### Monitoring's graceful degrade
 
-`MonitoringAgent.scan` (`monitoring.ts` L68–L103) does not use the `synthesize`/`FALLBACK` chain — it degrades directly. After the loop, it tries `parseAgentJson(finalText)` inside a `try/catch`; on a throw it returns `[]` (L96–L100), and if the parsed value fails `isAnomalyArray` it also returns `[]` (L101).
+The monitoring agent's `scan` does not use the `synthesize`/`FALLBACK` chain — it degrades directly. After the loop, it tries `parse_agent_json(finalText)` inside a `try/catch`; on a throw it returns `[]`, and if the parsed value fails the anomaly-array guard it also returns `[]`.
 
 ```
-monitoring.ts — graceful degrade   (L95–L102)
+the monitoring graceful degrade
 ─────────────────────────────────────────────────────────────
- try { parsed = parseAgentJson(finalText) }
- catch { return [] }                              L98–99  ← no anomalies, not a failure
- if (!isAnomalyArray(parsed)) return []           L101
- return [...parsed].sort(...).slice(0, 10)        L102
+ try:
+     parsed = parse_agent_json(finalText)
+ catch:
+     return []                              ← no anomalies, not a failure
+ if not is_anomaly_array(parsed):
+     return []
+ return sorted(parsed, ...).slice(0, 10)
 ```
 
 The framing matters: an unparseable monitoring output is treated as "nothing meaningful to report," not as an error. A briefing with no anomalies is a valid briefing. This is the right degrade for a scan whose normal result on a quiet day is genuinely empty — failing the whole briefing because one scan returned prose would be over-strict.
@@ -149,57 +154,56 @@ The framing matters: an unparseable monitoring output is treated as "nothing mea
 
 ### Transport-level recovery — retry and no-cache-on-error
 
-Underneath the agents, `McpClient.callTool` (`client.ts` L97–L146) recovers transport failures. A rate-limit response (`isRateLimited`, L18–L22: `isError` + matches `/rate limit|too many requests/i`) triggers a bounded retry loop (L122–L132): up to `maxRetries` (3) re-calls, each going back through `liveCall`'s spacing gate. The wait per retry is the *server-stated* window when one is parseable (`parseRetryAfterMs` + `RETRY_BUFFER_MS`), else **exponential backoff** off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`, L125), and every wait is capped at `retryCeilingMs` (L126–129). And any error result is *never cached* (L137–L139): caching a 429 for 60s would make the next minute of calls return the cached failure without retrying. Errors must stay live-retryable.
+Underneath the agents, the MCP client wrapper's `callTool` recovers transport failures. A rate-limit response (an `isRateLimited` predicate: `isError` plus a regex match on `/rate limit|too many requests/i`) triggers a bounded retry loop: up to `maxRetries` (3) re-calls, each going back through the live-call path's spacing gate. The wait per retry is the *server-stated* window when one is parseable (`parseRetryAfterMs` + a small buffer), else **exponential backoff** off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), and every wait is capped at `retryCeilingMs`. And any error result is *never cached*: caching a 429 for 60s would make the next minute of calls return the cached failure without retrying. Errors must stay live-retryable.
 
 ```
-client.ts — transport recovery   (L122–L139)
-─────────────────────────────────────────────────────────────
- while (isRateLimited(result) && retries < maxRetries)       L122
-   hintMs   = parseRetryAfterMs(result)                       L124  ← server-stated window
-   backoffMs = retryDelayMs * 2 ** (retries - 1)              L125  ← exponential
-   waitMs   = min(hintMs ?? backoffMs, retryCeilingMs)        L126  ← capped
-   sleep(waitMs); result = liveCall()                         L130–131
- if (result.isError === true) return { result, ... }          L137–139  ← do NOT cache
- cache.set(key, { result, expiresAt })                        L144
+  while is_rate_limited(result) and retries < maxRetries:
+      hintMs    = parse_retry_after_ms(result)            ← server-stated window
+      backoffMs = retryDelayMs * 2 ** (retries - 1)        ← exponential
+      waitMs    = min(hintMs ?? backoffMs, retryCeilingMs) ← capped
+      await sleep(waitMs)
+      result    = live_call()
+  if result.isError == true:
+      return { result, ... }                                ← do NOT cache
+  cache.set(key, { result, expiresAt })
 ```
 
-The defaults are tuned to Bloomreach's observed ~10s penalty window: `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`, `maxRetries = 3` (`client.ts` L93–L94 / L89; set explicitly in `connect.ts` L91–96 alongside `minIntervalMs: 1100`). There IS exponential backoff now (with the parsed-hint preference); what is still honestly absent is a *circuit breaker* — under a sustained outage every call still pays its full retry budget. The bounded backoff-with-hint retry is the deliberate, sufficient choice for a single-process, ~1 req/s constraint (see the system-design caching/rate-limiting file).
+The defaults are tuned to the alpha backend's observed ~10s penalty window: `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`, `maxRetries = 3` (the same numbers set explicitly at construction alongside `minIntervalMs: 1100`). There IS exponential backoff now (with the parsed-hint preference); what is still honestly absent is a *circuit breaker* — under a sustained outage every call still pays its full retry budget. The bounded backoff-with-hint retry is the deliberate, sufficient choice for a single-process, ~1 req/s constraint (see the system-design caching/rate-limiting file).
 
 ---
 
 ### Route-level recovery — pre-stream setup is wrapped
 
-Before the `ReadableStream` can emit a single event the route must establish a session and connect to MCP — and either can throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production). That setup is wrapped in its own `try/catch` (`route.ts` L156–L165) so the failure returns the *real* message as JSON instead of a bare framework 500.
+Before the `ReadableStream` can emit a single event the route must establish a session and connect to MCP — and either can throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production). That setup is wrapped in its own `try/catch` so the failure returns the *real* message as JSON instead of a bare framework 500.
 
 ```
-route.ts — pre-stream setup guard   (L155–L166)
+the pre-stream setup guard
 ─────────────────────────────────────────────────────────────
- try {
-   sid  = await getOrCreateSessionId()              L157
-   conn = await connectMcp(sid)                      L158
- } catch (e) {
-   return NextResponse.json({ error: `/api/agent setup · ${msg}` }, 500)  L161–164
- }
- if (!conn.ok) return json({ needsAuth, authUrl }, 401)   L166  ← auth, not error
+ try:
+     sid  = await get_or_create_session_id()
+     conn = await connect_mcp(sid)
+ catch e:
+     return json_response({ error: "/api/agent setup · " + msg }, 500)
+ if not conn.ok:
+     return json_response({ needsAuth, authUrl }, 401)    ← auth, not error
 ```
 
-This is distinct from the in-stream `try/catch` (`route.ts` L196/L255–L260) that turns a mid-run throw into an `{ type: 'error', message }` event. Two guards, two phases: setup failures become an HTTP error body (the stream never opened); in-flight failures become a streamed `error` event the client renders inline.
+This is distinct from the in-stream `try/catch` that turns a mid-run throw into an `{ type: 'error', message }` event. Two guards, two phases: setup failures become an HTTP error body (the stream never opened); in-flight failures become a streamed `error` event the client renders inline.
 
 ---
 
 ### Client-level recovery — auto-reconnect on a revoked alpha token
 
-The alpha Bloomreach MCP server revokes tokens after a few minutes and its own 401 instructs the client to re-register. The feed (`app/page.tsx`) does this automatically: when a streamed `error` event's message matches `/invalid_token|unauthor|forbidden|401|session expired|reconnect/i` (L386), it `POST`s `/api/mcp/reset` to clear the revoked token and reloads (L399–L403) — **once**, guarded by a `bi:reconnecting` sessionStorage flag (L389/L395) so a freshly-revoked token cannot loop. On the investigate path, `useInvestigation` handles the related `401 { needsAuth, authUrl }` setup response by redirecting to the auth URL (`useInvestigation.ts` L171–L177); the one-time silent reconnect itself lives only on the feed.
+The alpha MCP server revokes tokens after a few minutes and its own 401 instructs the client to re-register. The feed page does this automatically: when a streamed `error` event's message matches `/invalid_token|unauthor|forbidden|401|session expired|reconnect/i`, it `POST`s `/api/mcp/reset` to clear the revoked token and reloads — **once**, guarded by a `bi:reconnecting` sessionStorage flag so a freshly-revoked token cannot loop. On the investigate path, the investigation hook handles the related `401 { needsAuth, authUrl }` setup response by redirecting to the auth URL; the one-time silent reconnect itself lives only on the feed.
 
 ```
-app/page.tsx — one-time reconnect   (L386–L410)
-─────────────────────────────────────────────────────────────
- if (AUTH_RE.test(msg)):
-   alreadyTried = sessionStorage['bi:reconnecting'] === '1'   L389
-   if (!alreadyTried):
-     sessionStorage['bi:reconnecting'] = '1'                   L395  ← guard
-     fetch('/api/mcp/reset', POST).finally(reload)             L400–402  ← clear + reload
-   else: clear the flag and surface the error                  L405–410
+  if AUTH_RE.test(msg):
+      alreadyTried = (sessionStorage["bi:reconnecting"] == "1")
+      if not alreadyTried:
+          sessionStorage["bi:reconnecting"] = "1"           ← guard
+          fetch("/api/mcp/reset", POST).finally(reload)     ← clear + reload
+      else:
+          clear the flag and surface the error
 ```
 
 ---
@@ -207,6 +211,8 @@ app/page.tsx — one-time reconnect   (L386–L410)
 ### The principle
 
 **Name every failure mode and give each a recovery whose worst case is a valid value, not an exception.** The agent cascade and the transport recovery are the same idea at two layers: try the primary, fall through bounded tiers, and bottom out at something safe. The budget unifies the loop's two needs — terminate, and protect against runaway — into one mechanism. The test of a production agent is not "does it work when the model behaves" but "what does each misbehavior return" — and here the answer is always a typed value the route can stream, never a thrown error that breaks the run.
+
+---
 
 ---
 
@@ -223,20 +229,20 @@ The diagram spans four layers. The Client layer auto-reconnects on a revoked tok
                                 │
 ┌───────────────────────────────▼───────────────────────────────────────┐
 │  ROUTE LAYER   app/api/agent/route.ts                                 │
-│   pre-stream: try { session + connectMcp } catch → real error JSON L156│
+│   pre-stream: try { session + connectMcp } catch → real error JSON     │
 │   in-stream:  emits diagnosis + 0..N recommendation + done            │
-│   in-stream throw → { type:'error', message } event   L255–260        │
+│   in-stream throw → { type:'error', message } event                   │
 │   (guaranteed because agents return typed values, never throw)        │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼───────────────────────────────────────┐
 │  AGENT LAYER   lib/agents/                                            │
 │                                                                       │
-│  BUDGET = loop protection (base.ts L85–101):                         │
+│  BUDGET = loop protection:                         │
 │    for turn<maxTurns; budgetSpent → forceFinal → tools WITHHELD       │
 │    (model cannot emit tool_use → must produce text → loop ends)       │
 │                                                                       │
-│  OUTPUT CASCADE (diagnostic.ts L74–75):                              │
+│  OUTPUT CASCADE:                              │
 │    tryParse(finalText)         ── valid? ──→ return  (tier 1)         │
 │         │ null                                                        │
 │         ▼                                                             │
@@ -245,13 +251,13 @@ The diagram spans four layers. The Client layer auto-reconnects on a revoked tok
 │         ▼                                                             │
 │    FALLBACK / []               ─────────────→ return  (tier 3, safe)  │
 │                                                                       │
-│  monitoring: parse fail → return []  (graceful degrade, L98–99)      │
+│  monitoring: parse fail → return []      │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ mcp.callTool (may fail)
 ┌───────────────────────────────▼───────────────────────────────────────┐
 │  PROVIDER BOUNDARY   lib/mcp/client.ts                                │
-│   isRateLimited? → backoff retry (maxRetries 3, hint||2^n, ≤20s) L122 │
-│   isError? → return WITHOUT caching (no poison)            L137–139   │
+│   isRateLimited? → backoff retry (maxRetries 3, hint||2^n, ≤20s)      │
+│   isError? → return WITHOUT caching (no poison)                       │
 │   (exponential backoff present; NO circuit breaker — honest gap)     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -469,3 +475,4 @@ When `McpClient.callTool` gets an error result, does it write it to the cache, a
 Updated: 2026-05-28 — Corrected the transport claim: retry is now exponential backoff (parsed server-window preferred, capped at `retryCeilingMs = 20_000`), not fixed-delay; added the route's pre-stream setup `try/catch` and the feed's one-time token-revocation auto-reconnect; refreshed all `client.ts`/`diagnostic.ts`/`monitoring.ts` line refs.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

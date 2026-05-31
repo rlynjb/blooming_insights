@@ -45,14 +45,14 @@
 
 ## How it works
 
-**Mental model.** Picture your existing Vitest suite, then change one thing about each test: the assertion. A unit test asserts `result === expected` against a deterministic value with the network mocked out. An eval *case* runs the input through the **real** model and scores the result against a reference answer with a method that tolerates non-determinism (fuzzy match, rubric, LLM-as-judge — see `02-eval-methods.md`). Same input/expected pairing; different assertion and a live model behind it.
+**Mental model.** Picture your existing test suite, then change one thing about each test: the assertion. A unit test asserts `result === expected` against a deterministic value with the network mocked out. An eval *case* runs the input through the **real** model and scores the result against a reference answer with a method that tolerates non-determinism (fuzzy match, rubric, LLM-as-judge — see `02-eval-methods.md`). Same input/expected pairing; different assertion and a live model behind it.
 
 ```
 unit test (what exists)              eval case (what's missing)
 ──────────────────────────────      ──────────────────────────────────
 input: anomaly fixture              input: anomaly fixture
 mcp:   buildFakeMcp (injected)      mcp:   real or recorded MCP results
-model: NOT CALLED (or faked)        model: real anthropic.messages.create
+model: NOT CALLED (or faked)        model: real provider_sdk.messages.create
 assert: toolCalls.length === 6      assert: score(output, reference) ≥ τ
                                             (fuzzy / rubric / judge)
 guards: plumbing, control flow      guards: ANSWER QUALITY
@@ -62,11 +62,11 @@ That single swap — from "did the loop call the tool" to "is the answer good" �
 
 ---
 
-### Why the 169 Vitest tests are not evals
+### Why the 169 unit tests are not evals
 
 The repo has real, well-built tests. They are unit/integration tests with injected fakes, and they are valuable — but they are categorically not evals, and conflating the two is the trap.
 
-`test/agents/diagnostic.test.ts`, `test/agents/recommendation.test.ts`, `test/agents/base.test.ts`, and the rest construct a fake `McpCaller` (the `McpCaller` interface lives at `lib/agents/base.ts` L16–L22) and frequently a fake Anthropic client. They assert that the loop pushed the right messages, that `tryParseDiagnosis ?? synthesize ?? FALLBACK` (`lib/agents/diagnostic.ts` L74–L75) returns the right *shape*, that `maxToolCalls` is respected, that NDJSON encodes/decodes round-trip (`lib/mcp/events.ts` L15–L22). Every one of these is a plumbing assertion.
+The agent tests construct a fake MCP caller (the `McpCaller` interface lives in the shared agent loop module) and frequently a fake provider SDK client. They assert that the loop pushed the right messages, that the `tryParseDiagnosis ?? synthesize ?? FALLBACK` chain returns the right *shape*, that the per-agent `maxToolCalls` budget is respected, that the NDJSON event union encodes/decodes round-trip. Every one of these is a plumbing assertion.
 
 ```
 what the 169 tests assert          what they NEVER assert
@@ -78,7 +78,7 @@ events round-trip                  did the recommendation help?
 budgets are enforced               did quality regress vs. last week?
 ```
 
-`isDiagnosis` (`lib/mcp/validate.ts` L29–L35) checks that `conclusion` is a string and `evidence` is an array — it does not check that the conclusion is *true* or the evidence is *relevant*. A diagnosis of `{ conclusion: "the moon is made of cheese", evidence: ["x"], hypothesesConsidered: [] }` passes `isDiagnosis` and would pass the unit suite. It would fail an eval. That gap is exactly what eval sets fill.
+The diagnosis type guard checks that `conclusion` is a string and `evidence` is an array — it does not check that the conclusion is *true* or the evidence is *relevant*. A diagnosis of `{ conclusion: "the moon is made of cheese", evidence: ["x"], hypothesesConsidered: [] }` passes the guard and would pass the unit suite. It would fail an eval. That gap is exactly what eval sets fill.
 
 ---
 
@@ -107,7 +107,7 @@ The golden set is small and stable — 20–50 cases that cover the important sh
 
 An adversarial set is inputs designed to *break* the system: hostile, malformed, edge-case, or injection inputs where the correct behaviour is to refuse, sanitize, or degrade safely rather than comply. It scores robustness, not helpfulness.
 
-This set is especially apt for blooming insights because of one concrete, present hole: the free-form `?q=` path is unsanitized. In `app/api/agent/route.ts` the query is only `.trim()`'d (L115) and passed straight through as the agent's user prompt (`QueryAgent.answer(q, ...)` at L214, into `lib/agents/query.ts`). There is no instruction-injection filter, no allowlist, no escaping. An adversarial set is how you *prove* the model's behaviour on inputs like:
+This set is especially apt for this system because of one concrete, present hole: the free-form `?q=` path is unsanitized. In the route handler the query is only trimmed and passed straight through as the agent's user prompt to the query agent. There is no instruction-injection filter, no allowlist, no escaping. An adversarial set is how you *prove* the model's behaviour on inputs like:
 
 ```
 adversarial cases for ?q=
@@ -348,3 +348,4 @@ Updated: 2026-05-28 — Test count 125→157 (17 files, `vitest run`); re-derive
 Updated: 2026-05-29 — Test count 157→169 (all live occurrences); diagnostic try-parse chain ref L73–L77→L74–L75 (verified against current `diagnostic.ts`).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -58,23 +58,23 @@ attention reliability across context position
         (strong)          (weak — lost)        (strong)
 ```
 
-The lever you have is *where* each piece lands on this curve. Two clean strategies exist: put critical content at the front (primacy) or at the back (recency). blooming insights consistently uses recency — the last thing the model reads is the thing it most needs to act on.
+The lever you have is *where* each piece lands on this curve. Two clean strategies exist: put critical content at the front (primacy) or at the back (recency). This system consistently uses recency — the last thing the model reads is the thing it most needs to act on.
 
-This is a *thin* surface, and it is worth saying plainly: ordering the conversation is a real but small mitigation. The substantial fix for lost-in-the-middle is retrieval that surfaces only the relevant content plus a reranker that orders it by relevance so nothing important lands in the sag — and blooming insights has neither (see → ../03-retrieval-and-rag/07-reranking.md). What follows is the recency discipline the codebase *does* practice.
+This is a *thin* surface, and it is worth saying plainly: ordering the conversation is a real but small mitigation. The substantial fix for lost-in-the-middle is retrieval that surfaces only the relevant content plus a reranker that orders it by relevance so nothing important lands in the sag — and this system has neither (see → ../03-retrieval-and-rag/07-reranking.md). What follows is the recency discipline you *do* practice.
 
 ---
 
-### Recency lever 1 — the `synthesisInstruction` is appended LAST
+### Recency lever 1 — the synthesis instruction is appended LAST
 
-On the forced-final turn, the instruction that must dominate the model's behavior is concatenated to the *end* of the system prompt. `lib/agents/base.ts` L95–L98:
+On the forced-final turn, the instruction that must dominate the model's behavior is concatenated to the *end* of the system prompt:
 
-```typescript
-system: forceFinal && synthesisInstruction
-  ? `${system}\n\n${synthesisInstruction}`   // instruction appended LAST
-  : system,
+```
+  system_prompt = (forceFinal AND synthesisInstruction)
+                    ? base_system + "\n\n" + synthesisInstruction   # appended LAST
+                    : base_system
 ```
 
-The base system prompt — the persona, the schema summary, the task framing — comes first. The instruction "you have NO more tool calls available, stop and emit ONLY JSON" comes last (its text lives in each agent, e.g. `lib/agents/diagnostic.ts` L63–L67). On the final turn this is the single most important directive, and it sits at the high-attention tail of the system block rather than buried above the schema.
+The base system prompt — the persona, the schema summary, the task framing — comes first. The instruction "you have NO more tool calls available, stop and emit ONLY JSON" comes last (its text lives in each of the per-agent definitions). On the final turn this is the single most important directive, and it sits at the high-attention tail of the system block rather than buried above the schema.
 
 ```
 system prompt on the forced-final turn
@@ -83,7 +83,7 @@ system prompt on the forced-final turn
 │ schema summary (20 events…)       (middle — weak) │
 │ {anomaly} JSON                    (middle — weak) │
 │ ─────────────────────────────────                 │
-│ synthesisInstruction: "stop, emit  (END — strong) │  ← L98 appends here
+│ synthesisInstruction: "stop, emit  (END — strong) │  ← appended here
 │   ONLY JSON in a ```json fence"                    │
 └──────────────────────────────────────────────────┘
    the must-obey directive lands at the strongest position
@@ -93,17 +93,17 @@ Putting the directive last is why the forced-final turn reliably produces JSON: 
 
 ### Recency lever 2 — tool results arrive as the MOST RECENT turn
 
-Inside the loop, every batch of tool results is pushed as a new user turn at the *end* of the message array. `lib/agents/base.ts` L171:
+Inside the loop, every batch of tool results is pushed as a new user turn at the *end* of the message array:
 
-```typescript
-// Feed all tool results back as the next user turn
-messages.push({ role: 'user', content: toolResults });   // L171
+```
+  # Feed all tool results back as the next user turn
+  messages.append({ role: "user", content: toolResults })
 ```
 
 The model always makes its next decision immediately after reading the freshest evidence. The newest tool results are the most recent thing in the conversation, so the content the model should weight most for its *next* action sits at the recency end, not somewhere in the middle of the accumulated transcript.
 
 ```
-messages array  (base.ts: init L79–81, asst L105, tool_results L171)
+messages array growth
 [0] user      initial prompt
 [1] assistant tool_use blocks         turn 0
 [2] user      tool_result …           turn 0 results
@@ -116,7 +116,7 @@ The accumulated middle (turns 1…N-1) is the sag; the latest tool result is at 
 
 ### The dedicated synthesize() call sidesteps the middle entirely
 
-When the loop's final turn still fails to produce JSON, `synthesize()` (`lib/agents/diagnostic.ts` L87–L126) makes a *fresh* single-turn call with no accumulated transcript at all — just the anomaly, the formatted evidence, and the instruction. There is no middle to get lost in: the whole context is short, and the directive ("output ONLY JSON") sits at the end of a compact message (L105–L113). Collapsing the context is the most direct lost-in-the-middle mitigation available without retrieval — if there is no long middle, nothing can be lost in it.
+When the loop's final turn still fails to produce JSON, the dedicated `synthesize()` call makes a *fresh* single-turn call with no accumulated transcript at all — just the anomaly, the formatted evidence, and the instruction. There is no middle to get lost in: the whole context is short, and the directive ("output ONLY JSON") sits at the end of a compact message. Collapsing the context is the most direct lost-in-the-middle mitigation available without retrieval — if there is no long middle, nothing can be lost in it.
 
 ```
 loop context (long)                synthesize() context (short, flat)
@@ -133,8 +133,8 @@ loop context (long)                synthesize() context (short, flat)
 ```
 CURRENT (recency placement only)        FUTURE (retrieval + reranking)
 ────────────────────────────────       ────────────────────────────────
-instruction appended last (L98)         retrieve only relevant evidence
-tool results = most recent turn (L171)  rerank so top hits land at the ends
+instruction appended last               retrieve only relevant evidence
+tool results = most recent turn         rerank so top hits land at the ends
 synthesize() collapses the context      pack reranked results, drop the rest
 no control over what's in the middle    nothing irrelevant is in the context
 ```
@@ -155,15 +155,15 @@ This diagram spans the layers where positional placement is decided. The Service
 ┌──────────────────────────────────────────────────────────────────────┐
 │  SERVICE LAYER — placement decisions (the lever this codebase has)    │
 │                                                                       │
-│  system prompt assembly  base.ts L95–98                               │
+│  system prompt assembly  base.ts                                      │
 │    [ persona │ schema │ anomaly │ synthesisInstruction ]              │
 │                                          ▲ appended LAST (strong)     │
 │                                                                       │
-│  message array growth   base.ts L79/L105/L171                         │
+│  message array growth   (init, asst-turn, tool-results)               │
 │    [ user │ asst │ tool_result │ … │ tool_result ]                   │
 │                                        ▲ most-recent turn (strong)    │
 │                                                                       │
-│  synthesize() escape hatch  diagnostic.ts L82–121                     │
+│  synthesize() escape hatch  diagnostic.ts                             │
 │    short flat context → no middle to lose anything in                 │
 │                                                                       │
 │  ┌─ RETRIEVAL + RERANK LAYER ─ NOT PRESENT ─────────────────┐        │
@@ -176,7 +176,7 @@ This diagram spans the layers where positional placement is decided. The Service
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  PROVIDER BOUNDARY — U-shaped attention over position                │
 │    front (strong) ── middle (weak/sag) ── end (strong)               │
-│    anthropic.messages.create({ system, messages })   base.ts L102    │
+│    anthropic.messages.create({ system, messages })   base.ts         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -342,3 +342,4 @@ On the forced-final turn, where in the system prompt does the must-obey directiv
 Updated: 2026-05-28 — Re-derived the drifted `synthesize()` ranges (diagnostic L87–L126, recommendation L82–L132, compact message L105–L113) and per-agent `synthesisInstruction` text refs (diagnostic L63–L67, monitoring L85–L89); the recency-placement `base.ts` refs (L95–L98, L171) verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

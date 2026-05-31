@@ -52,52 +52,52 @@ Zoom out — where request flow lives        ← we are here (every band)
 
 ### Move 1 — Mental model
 
-The `fetch`-on-mount component is the outer frame. Inside the route every `await` is a layer boundary. Cross a boundary and you hand off to a different subsystem with its own failure modes.
+The fetch-on-mount component is the outer frame. Inside the route every `await` is a layer boundary. Cross a boundary and you hand off to a different subsystem with its own failure modes.
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │  Browser                                            │
-│  useEffect → fetch('/api/briefing')                 │
+│  useEffect → fetch(briefing endpoint)               │
 │              ↓  HTTP GET                            │
 ├─────────────────────────────────────────────────────┤
-│  Next.js Route Handler  (app/api/briefing/route.ts) │
+│  Route handler                                      │
 │  ┌─────────────┐  ┌───────────┐  ┌───────────────┐ │
 │  │ session/    │→ │ MCP conn  │→ │ agent run     │ │
 │  │ auth gate   │  │ bootstrap │  │ anomaly→JSON  │ │
 │  └─────────────┘  └───────────┘  └───────────────┘ │
-│              ↓  NextResponse.json(...)              │
+│              ↓  NDJSON stream                       │
 ├─────────────────────────────────────────────────────┤
-│  External MCP server  (Bloomreach, ~1 req/s)        │
+│  External MCP server  (~1 req/s)                    │
 └─────────────────────────────────────────────────────┘
 ```
 
-The route is the controller. `bootstrapSchema` + `connectMcp` are the service layer. `MonitoringAgent.scan` is the processing layer. `anomalyToInsight` + `putInsights` + `listInsights` are the repository layer. The diagram above is the recap — walk each hop below.
+The route handler is the controller. The schema bootstrap and MCP connect call are the service layer. The monitoring agent is the processing layer. The anomaly-to-insight mapper plus the in-process state map are the repository layer. The diagram above is the recap — walk each hop below.
 
 ### Move 2 — Layered walkthrough
 
 **Hop 1 — The page fetch**
 
-A `useEffect` keyed on `[mode, ready]` (`app/page.tsx` L248–455) fires once the persisted demo/live mode resolves — the same pattern as any data-fetching component. The runtime demo/live toggle picks the URL: `isDemo` (from `localStorage` `bi:mode`, resolved in the L119–129 effect) appends `?demo=cached`, live uses no suffix (L252). It builds the URL (L263) and calls `fetch(url)`. State starts at `'loading'` (L88). The concrete consequence: the browser holds an open HTTP connection until the route resolves — up to 300 seconds (`maxDuration = 300`, `route.ts` L17).
+An effect keyed on the resolved demo/live mode fires once persisted state has been read — the same pattern as any data-fetching component. The runtime demo/live toggle picks the URL: demo mode appends a query flag, live mode uses no suffix. State starts at `loading`. The concrete consequence: the browser holds an open HTTP connection until the route resolves — up to the function's hard ceiling (5 minutes on the platform tier this app targets).
 
 ```
-useEffect fires (mode resolved)
+effect fires (mode resolved)
   │
-  ├─ isDemo? → url = '/api/briefing?demo=cached'   (localStorage bi:mode)
+  ├─ demo mode? → url = briefing_endpoint + "?demo=cached"
   │
-  └─ else    → url = '/api/briefing'
+  └─ else       → url = briefing_endpoint
        │
        └─ fetch(url) ──────────────────► route handler
 ```
 
 **Hop 2 — Demo short-circuit (paced NDJSON replay)**
 
-The route checks `?demo=cached` before any network call (L76, L84). If the flag is set and `lib/state/demo-insights.json` exists, it reads the file synchronously, then *replays the snapshot as a paced NDJSON stream* — it does NOT return a single JSON blob. The replay (L97–149) mirrors the live event order exactly: `workspace` → the coverage checklist + `coverage_item` tiles → the recorded EQL `tool_call_*` trace → `insight` cards → `done`, each event spaced by `REPLAY_DELAY_MS = 140` (L23). No session, no MCP, no agent. The consequence: a public demo works with zero credentials AND reveals progressively — the feed animates identically to a live run.
+The route handler checks the demo flag before any network call. If the flag is set and the recorded snapshot file exists, it reads the file synchronously, then *replays the snapshot as a paced NDJSON stream* — it does NOT return a single JSON blob. The replay mirrors the live event order exactly: a workspace event → the coverage checklist + per-tile coverage events → the recorded tool-call trace → insight cards → a terminal `done` event, each event spaced by a fixed delay (around 140 ms). No session, no MCP, no agent. The consequence: a public demo works with zero credentials AND reveals progressively — the feed animates identically to a live run.
 
 ```
-GET /api/briefing?demo=cached
+GET briefing?demo=cached
   │
-  ├─ demo=cached AND file exists? (L84)
-  │     └─ readFileSync(DEMO_FILE) → ReadableStream (NDJSON, 140ms/event):
+  ├─ demo=cached AND snapshot file exists?
+  │     └─ read snapshot → ReadableStream (NDJSON, ~140 ms/event):
   │          {workspace}
   │          {step "matching…checklist"} → per category: {step}+{coverage_item}
   │          recorded trace: {tool_call_start}{tool_call_end}…
@@ -109,82 +109,82 @@ GET /api/briefing?demo=cached
 
 **Hop 3 — Session resolution**
 
-`getOrCreateSessionId()` (`lib/mcp/session.ts` L16–24) reads the `bi_session` cookie from the Next.js cookie jar. If absent it writes a new `crypto.randomUUID()` with options from `sessionCookieOpts()` (L10–14): `httpOnly: true, sameSite: 'none', secure: true` in prod, `sameSite: 'lax'` in dev. The return value is a string — this is the key that gates all per-session MCP state. The concrete consequence: every browser that has never visited the app starts an OAuth flow on the first request.
+The session helper reads the session cookie from the framework's cookie jar. If absent it writes a new UUID with cookie options tuned to the environment: `httpOnly: true, sameSite: none, secure: true` in prod (so the cookie survives the cross-site OAuth round trip), `sameSite: lax` in dev. The return value is a string — this is the key that gates all per-session MCP state. The concrete consequence: every browser that has never visited the app starts an OAuth flow on the first request.
 
 ```
-cookies().get('bi_session')
+cookies.get(session_cookie_name)
   │
   ├─ exists → return id
-  └─ absent → crypto.randomUUID() → set cookie → return id
+  └─ absent → new_uuid() → set cookie → return id
 ```
 
 **Hop 4 — MCP connection and OAuth gate**
 
-`connectMcp(sid)` (`lib/mcp/connect.ts` L59–64) is now `async` and wraps `connectMcpInner` (L66–107) in `withAuthCookies` — in prod that seeds the encrypted-cookie auth store from the request and flushes it once (see 02-oauth-boundary.md); in dev/test it is a passthrough. `connectMcpInner` derives `redirectUri()` (async, host-based, L31–52) for the provider, builds a `BloomreachAuthProvider` keyed to the session id, attaches it to a `StreamableHTTPClientTransport`, and calls `client.connect(transport)`. If the session has valid tokens, `client.connect` succeeds and the function returns `{ok: true, mcp: McpClient}`. If not, the SDK fires the OAuth `redirectToAuthorization` callback, the auth provider captures the URL, and the function returns `{ok: false, authUrl}`. The route runs `getOrCreateSessionId` + `connectMcp` inside a try/catch (`route.ts` L161–171) so a setup throw — a missing `AUTH_SECRET` breaking cookie encryption in prod — returns the real error message instead of a bare 500; it then checks `conn.ok` (L172–174) and returns a 401 with `{needsAuth: true, authUrl}`. The page (`app/page.tsx` L272–277) checks `res.status === 401 && body.needsAuth` and redirects the browser to `body.authUrl`.
+The connect helper is async and wraps its inner connect path in an auth-cookie context — in prod that seeds the encrypted-cookie auth store from the request and flushes it once (see 02-oauth-boundary.md); in dev/test it is a passthrough. The inner path derives a host-based redirect URI for the provider, builds an OAuth provider keyed to the session id, attaches it to the SDK's HTTP transport, and calls `connect`. If the session has valid tokens, connect succeeds and the function returns `{ok: true, mcp}`. If not, the SDK fires the `redirectToAuthorization` callback, the auth provider captures the URL, and the function returns `{ok: false, authUrl}`. The route runs session resolution plus connect inside a try/catch so a setup throw — a missing cookie-encryption secret breaking the auth store in prod — returns the real error message instead of a bare 500; it then checks the `ok` flag and returns a 401 with `{needsAuth: true, authUrl}`. The page checks for `status === 401 && body.needsAuth` and redirects the browser to `authUrl`.
 
 ```
 connectMcp(sid)
   │
-  ├─ tokens valid → {ok: true, mcp: McpClient}  → hop 5
+  ├─ tokens valid → {ok: true, mcp}  → hop 5
   └─ no tokens   → {ok: false, authUrl}
-        └─ route: NextResponse.json({needsAuth, authUrl}, {status:401})
+        └─ route: NDJSON not started → JSON {needsAuth, authUrl}, status 401
               └─ page: window.location.href = authUrl
 ```
 
 **Hop 5 — Schema bootstrap**
 
-`bootstrapSchema(conn.mcp)` (`lib/mcp/schema.ts` L170–192) checks an in-process module-level cache (`cached`, L131) first. On a cache miss it calls four sequential MCP tools — `get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview` — spaced by the 1100 ms rate-limit interval baked into `McpClient`. The result is a `WorkspaceSchema` object stored in `cached`. The concrete consequence: the first request after a cold function start pays the 4+ second schema cost; subsequent requests within the same function lifetime (Vercel's warm function window) skip it.
+The schema bootstrap helper checks an in-process module-level cache first. On a cache miss it calls four sequential MCP tools — `get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview` — spaced by the ~1100 ms rate-limit interval baked into the MCP client wrapper. The result is a `WorkspaceSchema` object stored in the module-level cache. The concrete consequence: the first request after a cold function start pays the 4+ second schema cost; subsequent requests within the same function lifetime (the platform's warm function window) skip it.
 
 ```
 bootstrapSchema(mcp)
   │
-  ├─ cached !== null → return cached  (fast path)
+  ├─ cached_schema != null → return cached  (fast path)
   └─ cold start
         ├─ resolveProject: list_cloud_organizations → list_projects
-        ├─ get_event_schema        (1100ms gap)
-        ├─ get_customer_property_schema  (1100ms gap)
-        ├─ list_catalogs           (1100ms gap)
-        ├─ get_project_overview    (1100ms gap)
-        └─ parseWorkspaceSchema → cached = result → return
+        ├─ get_event_schema              (~1100 ms gap)
+        ├─ get_customer_property_schema  (~1100 ms gap)
+        ├─ list_catalogs                 (~1100 ms gap)
+        ├─ get_project_overview          (~1100 ms gap)
+        └─ parse → cached_schema = result → return
 ```
 
 **Hop 5.5 — Coverage gate**
 
-Between schema bootstrap and the agent run the route gates the fixed 10-category anomaly checklist against the live schema (`route.ts` L199–212). It runs three pure functions from `lib/agents/categories.ts`: `schemaCapabilities(schema)` (L116–127) flattens the schema into a `Set` of event names plus `event.property` and `catalog:<name>` strings; `coverageReport(capabilities)` (L144–155) classifies every category as `full`/`limited`/`unavailable`; `runnableCategories(capabilities)` (L158–160) keeps only the `full` + `limited` ones. The route then narrates the gate as a per-category checklist — it emits a step (`'matching the workspace schema to the 10-category anomaly checklist…'`, L207), then per category a reasoning `step` line plus a `coverage_item` event (L209–212) so the UI grid fills tile-by-tile. Finally `agent.scan({...hooks}, runnable)` (L223–240) is gated to only the runnable categories. The concrete consequence: the agent never spends its 6-call EQL budget probing a category this workspace's events can't support (no `return` event → no return-spike category), and the user watches the coverage grid resolve before the agent starts.
+Between schema bootstrap and the agent run the route gates the fixed 10-category anomaly checklist against the live schema. Three pure functions in the category module do the work: a capabilities pass flattens the schema into a `Set` of event names plus `event.property` and `catalog:<name>` strings; a report pass classifies every category as `full`/`limited`/`unavailable`; a runnable pass keeps only the `full` + `limited` ones. The route then narrates the gate as a per-category checklist — it emits a step line `"matching the workspace schema to the 10-category anomaly checklist…"`, then per category a reasoning step line plus a `coverage_item` event so the UI grid fills tile-by-tile. Finally the agent's scan is gated to only the runnable categories. The concrete consequence: the agent never spends its 6-call EQL budget probing a category this workspace's events can't support (no `return` event → no return-spike category), and the user watches the coverage grid resolve before the agent starts.
 
 ```
 schema (from hop 5)
   │
-  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }   (categories.ts L116)
+  ├─ schemaCapabilities(schema)   → Set{ event, event.prop, catalog:name }
   │
-  ├─ coverageReport(capabilities) → 10 × {category, coverage: full|limited|unavailable}  (L144)
-  │     └─ step "matching…checklist…" + per category: step + {coverage_item}  (route.ts L207–212)
+  ├─ coverageReport(capabilities) → 10 × {category, coverage: full|limited|unavailable}
+  │     └─ step "matching…checklist…" + per category: step + {coverage_item}
   │
-  └─ runnableCategories(capabilities) → AnomalyCategory[] (full + limited only)  (L158)
+  └─ runnableCategories(capabilities) → AnomalyCategory[] (full + limited only)
         │
         └─► agent.scan(hooks, runnable)   ← agent gated to runnable categories (hop 6)
 ```
 
 **Hop 6 — Agent run (gated to runnable categories)**
 
-`new MonitoringAgent(anthropic, mcp, schema, allTools).scan(hooks, runnable)` (`lib/agents/monitoring.ts` L69–120) runs an agentic loop. The signature is now `scan(hooks?, categories: AnomalyCategory[] = [])` (L69) — the second argument is the `runnable` list produced by hop 5.5's coverage gate, so the agent only checks categories the live schema can support. `scan` builds a per-category checklist string from `categories` and injects it into the system prompt (L73–86) alongside the token-bounded schema summary, sends it plus a user prompt to Claude, receives tool-call requests, executes them against the live MCP server (up to 6 calls — `maxToolCalls` L101 — and 8 turns), parses the final assistant message as a JSON anomaly array, sorts by severity, and returns at most 10 `Anomaly` objects. Instead of a `trace` array, `scan` takes a `MonitorHooks` object (`onToolCall`/`onToolResult`/`onText`); the route's hooks (L223–240) emit NDJSON `BriefingEvent`s into the stream — `describeToolCall(tc)` (L62–67) for the live status line and `trunc(tc.result)` (L70–73) for the gathered trace. The concrete consequence: this is where most of the 300-second budget is spent.
+The monitoring agent runs an agentic loop with two arguments — an optional hooks object and the runnable category list from the coverage gate. The agent only checks categories the live schema can support. Internally it builds a per-category checklist string from those categories and injects it into the system prompt alongside a token-bounded schema summary, sends prompt-plus-user-message to the LLM provider, receives tool-call requests, executes them against the live MCP server (up to 6 calls and 8 turns), parses the final assistant message as a JSON anomaly array, sorts by severity, and returns at most 10 anomalies. Instead of a trace array, the agent takes a hooks object (`onToolCall`/`onToolResult`/`onText`); the route's hooks emit NDJSON events into the stream — a brief tool-call description for the live status line and a truncated tool result for the gathered trace. The concrete consequence: this is where most of the 5-minute budget is spent.
 
 ```
 MonitoringAgent.scan(hooks, runnable)
   │
-  ├─ build per-category checklist from `runnable` → inject into prompt
+  ├─ build per-category checklist from runnable → inject into prompt
   ├─ build system prompt (PROMPT + schemaSummary + checklist)
-  ├─ runAgentLoop (up to 8 turns, 6 tool calls)
-  │     ├─ Claude → tool_use request
-  │     ├─ mcp.callTool(name, args) → result → hooks → BriefingEvent
-  │     └─ Claude → text (final answer)
-  ├─ parseAgentJson(finalText) → Anomaly[]
+  ├─ agent loop (up to 8 turns, 6 tool calls)
+  │     ├─ LLM → tool_use request
+  │     ├─ call tool → result → hooks → NDJSON event
+  │     └─ LLM → text (final answer)
+  ├─ parse JSON → Anomaly[]
   └─ sort by severity → slice(0, 10) → return
 ```
 
 **Hop 7 — Mapping and response**
 
-`anomalies.map(anomalyToInsight)` (`lib/state/insights.ts` L8–27) converts each `Anomaly` to an `Insight` with a UUID, a formatted `headline`, and a `summary`. It now also sets `impact` (the agent's one-sentence business impact, L23), `history` (the weekly sparkline series, L24), and spreads `...deriveInsightFields(a)` (L25) for the business-owner fields derived from the evidence. `putInsights(insights, anomalies)` clears and rewrites the maps in-process (L29–41). `listInsights()` reads back all stored insights (L51–53). The route streams the insights as NDJSON `insight` events (L130) followed by a `done` event, not a single JSON body. The page collects them and on `done` sets `setInsights(collected)` and `setStatus('loaded')` (L370–377), and the `.map((insight) => <InsightCard key={insight.id}>)` finally runs (L682).
+The mapper converts each `Anomaly` to an `Insight` with a UUID, a formatted `headline`, and a `summary`. It also sets `impact` (the agent's one-sentence business impact), `history` (the weekly sparkline series), and spreads in the derived business-owner fields built from the evidence (see 06-enrichment-derivation.md). A write helper clears and rewrites the in-process state maps. A read helper reads back all stored insights. The route streams them as NDJSON `insight` events followed by a `done` event, not a single JSON body. The page collects them and on `done` sets `insights = collected` and `status = "loaded"`, and the card list finally renders.
 
 ```
 anomalies.map(anomalyToInsight)
@@ -195,34 +195,34 @@ listInsights()
   │
 send({insight}) per insight → send({done})   ← NDJSON stream
   │
-page: collect → on done: setInsights(collected) → setStatus('loaded') → render cards
+page: collect → on done: setInsights(collected) → setStatus("loaded") → render cards
 ```
 
 ### Move 2.5 — Live briefing vs cached demo
 
-The demo/live choice is a **runtime toggle**, not a build flag: `app/page.tsx` reads `localStorage` `bi:mode` (L119–129), and live mode fetches `/api/briefing` while demo mode appends `?demo=cached` (L252). `switchMode` (L131–140) persists the choice and re-runs the effect.
+The demo/live choice is a **runtime toggle**, not a build flag: the page reads a persisted `mode` from local storage, and live mode hits the bare endpoint while demo mode appends `?demo=cached`. A mode-switch handler persists the choice and re-runs the fetch effect.
 
-| Step | Live briefing (no `?demo=cached`) | Cached demo (`?demo=cached`) |
-|------|-----------------------------------|------------------------------|
+| Step | Live briefing (no demo flag) | Cached demo (`?demo=cached`) |
+|------|------------------------------|------------------------------|
 | Auth | Session cookie + OAuth flow (prod: encrypted-cookie store) | None |
-| Data source | MCP server (network) | `lib/state/demo-insights.json` (disk) |
-| Agent run | Yes — up to 300 s | No — replays a captured snapshot |
-| Response shape | NDJSON stream: `workspace` → `coverage_item` tiles → `tool_call_*` → `insight` → `done` | Same NDJSON event order, replayed at `REPLAY_DELAY_MS = 140`/event (`route.ts` L23, L97–149) |
+| Data source | MCP server (network) | A committed snapshot file (disk) |
+| Agent run | Yes — up to 5 min | No — replays a captured snapshot |
+| Response shape | NDJSON stream: `workspace` → `coverage_item` tiles → `tool_call_*` → `insight` → `done` | Same NDJSON event order, replayed at ~140 ms / event |
 | Failure modes | 401 (pre-stream), 500 (setup throw), `error` event mid-stream, empty | Only file parse error (falls through to live) |
 
 Both paths now emit the SAME NDJSON event sequence — demo just replays a recorded snapshot at a fixed pace instead of computing it live.
 
 ```
          live                          cached demo
-fetch('/api/briefing')         fetch('/api/briefing?demo=cached')
+fetch(briefing)                fetch(briefing?demo=cached)
          │                                  │
-    session check                    file exists? (L84)
+    session check                    snapshot file exists?
          │                             yes │  no
     MCP connect ◄────────────────────────  │  └── falls through to live
          │                                 │
-    bootstrapSchema               readFileSync + JSON.parse
+    bootstrapSchema               read snapshot + parse JSON
          │                                 │
-    coverage gate                 ReadableStream replay (140ms/event):
+    coverage gate                 ReadableStream replay (~140 ms/event):
     agent.scan                      {workspace}→{coverage_item}…
          │                          →recorded {tool_call_*}…→{insight}…→{done}
     anomalyToInsight
@@ -232,7 +232,7 @@ fetch('/api/briefing')         fetch('/api/briefing?demo=cached')
 
 ### Move 3 — The generalizing principle
 
-Every layer-crossing in this pipeline is an await on I/O that can fail independently. The pattern is: authenticate → fetch context → process → transform → respond. The same shape appears in any backend that fronts an external service: the route is the controller, the session/connect layer is the auth middleware, schema bootstrap is the data-access layer, the agent is the service layer, and `anomalyToInsight` is the mapper. Knowing which layer a failure comes from determines the fix.
+Every layer-crossing in this pipeline is an `await` on I/O that can fail independently. The pattern is: authenticate → fetch context → process → transform → respond. The same shape appears in any backend that fronts an external service: the route handler is the controller, the session/connect layer is the auth middleware, schema bootstrap is the data-access layer, the agent is the service layer, and the anomaly-to-insight mapper is the data mapper. Knowing which layer a failure comes from determines the fix.
 
 The primary diagram below makes all layers and boundaries explicit.
 
@@ -581,3 +581,4 @@ Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now s
 Updated: 2026-05-29 — added Hop 5.5 coverage gate (`schemaCapabilities`/`coverageReport`/`runnableCategories`, `categories.ts`) with ASCII diagram + folded it into the primary diagram, pseudocode, and Summary; documented the demo path as a paced NDJSON replay (`REPLAY_DELAY_MS = 140`) instead of a plain-JSON blob; updated `MonitoringAgent.scan(hooks, runnable)` to its gated 2-arg signature; re-derived all `route.ts` (now L75–265) and `monitoring.ts` (now L61–121) line refs against the grown files.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

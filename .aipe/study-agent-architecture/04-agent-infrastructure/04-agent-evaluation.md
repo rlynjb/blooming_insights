@@ -61,53 +61,53 @@ the unit of evaluation expands
                           └──────────────────────────────┘
 ```
 
-The strategy in plain English: **the trajectory is data you can inspect, freeze, diff, and grade.** Three things have to be true for trajectory eval to be possible: (1) the trajectory is recorded structurally (not just logged as prose), (2) there's a way to compare a new trajectory against an expected shape, and (3) the comparison is cheap enough to run on every PR. blooming insights has (1) — every reasoning step, tool call, result, error, and final output is in `AgentEvent` records (`lib/mcp/events.ts`) and replayable from the cache. It has a partial version of (2) — the unit tests assert *loop-shape* invariants (forced-final paths, parse fallbacks, budget enforcement). It does not have (3) — no automated trajectory-eval harness that runs a frozen anomaly through the loop and scores the new trajectory against a golden one.
+The strategy in plain English: **the trajectory is data you can inspect, freeze, diff, and grade.** Three things have to be true for trajectory eval to be possible: (1) the trajectory is recorded structurally (not just logged as prose), (2) there's a way to compare a new trajectory against an expected shape, and (3) the comparison is cheap enough to run on every PR. blooming insights has (1) — every reasoning step, tool call, result, error, and final output is in a tagged-union event record and replayable from the cache. It has a partial version of (2) — the unit tests assert *loop-shape* invariants (forced-final paths, parse fallbacks, budget enforcement). It does not have (3) — no automated trajectory-eval harness that runs a frozen anomaly through the loop and scores the new trajectory against a golden one.
 
 ### Move 1 — The trajectory exists as a typed record
 
-The technical thing: **`AgentEvent` is a tagged-union type covering every step the agent takes** — reasoning_step, tool_call_start, tool_call_end, diagnosis, recommendation, done, error. The route streams these to the client as NDJSON, and the route also collects them server-side into `collected: AgentEvent[]` and stashes them via `saveInvestigation` (`lib/state/investigations.ts`).
+The technical thing: **an `AgentEvent` tagged-union type covers every step the agent takes** — reasoning_step, tool_call_start, tool_call_end, diagnosis, recommendation, done, error. The route streams these to the client as NDJSON, and the route also collects them server-side into a `collected: AgentEvent[]` buffer and stashes them via the save-investigation function.
 
 If you're coming from frontend, this is a structured log instead of `console.log` — same idea as Redux action history, where every state transition is a typed action you can replay and inspect, instead of opaque state mutations.
 
 ```
-the trajectory IS the inspectable artefact — lib/mcp/events.ts
+the trajectory IS the inspectable artefact
 
   AgentEvent union (one variant per step kind):
     { type: 'reasoning_step', step: { agent, kind, content } }
-    { type: 'tool_call_start', toolName, agent }
-    { type: 'tool_call_end', toolName, agent, durationMs, result, error }
+    { type: 'tool_call_start', tool_name, agent }
+    { type: 'tool_call_end', tool_name, agent, duration_ms, result, error }
     { type: 'diagnosis', diagnosis }
     { type: 'recommendation', recommendation }
     { type: 'done' }
     { type: 'error', message }
 
   A whole investigation = AgentEvent[].
-  Saved by route.ts L254: saveInvestigation(insightId, collected)
-  Replayed by route.ts L128: getCachedInvestigation(insightId)
+  Saved by the route handler: save_investigation(insight_id, collected)
+  Replayed by the route handler: get_cached_investigation(insight_id)
   Inspectable at: /debug · /api/agent?insightId=<id> (replays the array)
 ```
 
-The practical consequence: every run produces a trajectory you can open and read. The trajectory tells you exactly which tool was called, with which args (visible at tool_call_start), how long it took (durationMs at tool_call_end), whether it errored, and what the final structured output was. The cached investigation in `lib/state/demo-investigations.json` is a frozen example trajectory you can diff a new run against by eye.
+The practical consequence: every run produces a trajectory you can open and read. The trajectory tells you exactly which tool was called, with which args (visible at tool_call_start), how long it took (duration_ms at tool_call_end), whether it errored, and what the final structured output was. A committed demo-investigations seed file is a frozen example trajectory you can diff a new run against by eye.
 
-The condition under which it works: the trajectory has to be complete and faithful — every step the loop takes has to emit an event. The current shape covers all of `runAgentLoop`'s observable steps because every call to `onToolCall` / `onToolResult` / `onText` is wired through `hooksFor(agent)` (`route.ts` L181–L195) into a `send()` call that pushes into `collected` while streaming to the client. There's no in-loop decision that goes unrecorded.
+The condition under which it works: the trajectory has to be complete and faithful — every step the loop takes has to emit an event. The current shape covers all of the shared loop's observable steps because every call to its on-text / on-tool-call / on-tool-result hooks is wired through a per-agent hooks helper into a `send()` call that pushes into the collected buffer while streaming to the client. There's no in-loop decision that goes unrecorded.
 
 ### Move 2 — Unit tests grade the LOOP, not the trajectory quality
 
-The technical thing: **~169 vitest tests use the injected `Anthropic` and `McpCaller` seams in `base.ts` to drive the loop with fake responses, then assert the loop's reactive behaviour** — parse-failure fallback, the forced-final tool-less path, the budget cap, the schema gate, validators returning safe defaults.
+The technical thing: **~169 vitest tests use the injected model client and MCP-caller seams in the shared agent loop to drive the loop with fake responses**, then assert the loop's reactive behaviour — parse-failure fallback, the forced-final tool-less path, the budget cap, the schema gate, validators returning safe defaults.
 
 If you're coming from frontend, this is component-testing posture: render with a mock data layer, click through, assert the right callbacks fired. You're testing *that the component reacts correctly to inputs*, not that the data layer's content is correct.
 
 ```
-the test seams — base.ts L13–L22 (interface for fakes)
+the test seams — a small interface for fakes
 
-  export interface McpCaller {
-    callTool(name, args, opts?): Promise<{result, durationMs, fromCache}>;
+  interface McpCaller {
+    call_tool(name, args, opts?): Promise<{result, duration_ms, from_cache}>
   }
 
-  Test injects a fake McpCaller + a fake Anthropic with scripted responses.
+  Test injects a fake MCP caller + a fake model client with scripted responses.
   Then asserts:
-    ✓ when budget spent → tools removed on next turn (forceFinal)
-    ✓ when fake returns empty JSON → parseAgentJson throws → caller
+    ✓ when budget spent → tools removed on next turn (force_final)
+    ✓ when fake returns empty JSON → parser throws → caller
       returns safe default (e.g. [] for anomalies)
     ✓ when fake errors → tc.error set, is_error block pushed, loop
       continues
@@ -115,7 +115,7 @@ the test seams — base.ts L13–L22 (interface for fakes)
     ✓ ...
 ```
 
-What these tests do well: they pin down the *invariants* of the loop. The forced-final turn always strips tools (`base.ts` L101). A budget overrun always triggers the synthesis instruction. A parse failure always returns the type's safe default rather than throwing through the route. Those invariants are the load-bearing safety properties — if any of them broke, the system would silently misbehave. The 169 tests are how you sleep at night knowing they hold.
+What these tests do well: they pin down the *invariants* of the loop. The forced-final turn always strips tools. A budget overrun always triggers the synthesis instruction. A parse failure always returns the type's safe default rather than throwing through the route. Those invariants are the load-bearing safety properties — if any of them broke, the system would silently misbehave. The 169 tests are how you sleep at night knowing they hold.
 
 What these tests don't do: grade whether the trajectory itself was *good*. They assert "given fake response X, the loop did Y" — they don't assert "given anomaly X, the model's chosen tools and order were optimal." That's the gap a trajectory-eval harness would fill.
 
@@ -136,7 +136,7 @@ trajectory-eval harness (NOT in this codebase yet)
   └──────────────────────┬────────────────────────────────────┘
                          ▼
   ┌─ run the agent ───────────────────────────────────────────┐
-  │  runAgentLoop on each input → trajectory                  │
+  │  shared agent loop on each input → trajectory             │
   │  may use cached MCP responses for determinism             │
   └──────────────────────┬────────────────────────────────────┘
                          ▼
@@ -198,23 +198,23 @@ The full picture is below.
 What's built (✓) vs what's not yet (✗)
 
   ┌──────────── LOOP-SHAPE TESTS (✓ built) ──────────────────────┐
-  │ ~169 vitest tests with injected Anthropic + McpCaller fakes  │
+  │ ~169 vitest tests with injected model + MCP-caller fakes      │
   │ assert invariants:                                            │
-  │   forced-final turn strips tools           (base.ts L101)    │
-  │   budget cap triggers synthesisInstruction (base.ts L98)     │
-  │   parse failures → safe defaults           (validate.ts)     │
-  │   schema gate excludes unrunnable cats     (categories.ts)   │
+  │   forced-final turn strips tools                              │
+  │   budget cap triggers synthesis instruction                   │
+  │   parse failures → safe defaults                              │
+  │   schema gate excludes unrunnable categories                  │
   └──────────────────────────────────────────────────────────────┘
                             ▲
                             │ test the LOOP, not the trajectory quality
                             │
   ┌──────────── INSPECTABLE TRAJECTORY (✓ built) ────────────────┐
   │ AgentEvent[] streamed as NDJSON + cached server-side          │
-  │   tool_call_start { toolName, agent }                          │
-  │   tool_call_end { toolName, durationMs, result, error }        │
+  │   tool_call_start { tool_name, agent }                         │
+  │   tool_call_end { tool_name, duration_ms, result, error }      │
   │   reasoning_step { kind, content }                             │
   │   diagnosis / recommendation / done / error                    │
-  │ stored: lib/state/investigations.ts (Map + dev cache)         │
+  │ stored: in-process state map + dev cache                       │
   │ viewable: /debug, /api/agent?insightId=<id>                    │
   └──────────────────────────────────────────────────────────────┘
                             ▲
@@ -443,3 +443,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

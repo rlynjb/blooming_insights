@@ -41,7 +41,7 @@
 
 ## How it works
 
-**Mental model.** Meta-prompting puts a model in the loop at *authoring* time, not runtime. There is a meta-prompt (instructions to the model about how to write a good agent prompt), an input (the goal plus context like the workspace schema), a drafting call (the model emits a candidate prompt), and — the non-negotiable step — a human review that turns the draft into a committed artifact. The output of the whole process is a `.md` file in `lib/agents/prompts/`, identical in kind to the hand-written ones (→ 03-prompts-as-code.md); only its origin differs.
+**Mental model.** Meta-prompting puts a model in the loop at *authoring* time, not runtime. There is a meta-prompt (instructions to the model about how to write a good agent prompt), an input (the goal plus context like the workspace schema), a drafting call (the model emits a candidate prompt), and — the non-negotiable step — a human review that turns the draft into a committed artifact. The output of the whole process is a versioned `.md` prompt file in the per-agent prompts directory, identical in kind to the hand-written ones (→ 03-prompts-as-code.md); only its origin differs.
 
 ```
 META-PROMPTING (authoring-time, NOT runtime)
@@ -56,17 +56,17 @@ META-PROMPTING (authoring-time, NOT runtime)
     EQL reminders / Output schema / {schema}."
         │
         ▼
- DRAFT prompt  (candidate .md text)
+ DRAFT prompt  (candidate markdown text)
         │
         ▼
  ⚠ HUMAN REVIEW  ← delete fluff, tighten rules, verify
    the placeholders, kill hedging
         │
         ▼
- commit  lib/agents/prompts/<new>.md   (a spec, git-reviewed)
+ commit  prompts dir / <new>.md   (a spec, git-reviewed)
 ```
 
-The runtime path is untouched. The four agents still `readFileSync` a static `.md` file (`diagnostic.ts` L13, etc.); meta-prompting just changes how that file got written the first time. This is the distinction that matters: nothing generates a prompt *per request* — that would be slow, non-deterministic, and unreviewable.
+The runtime path is untouched. The four agents still load a static markdown file at import; meta-prompting just changes how that file got written the first time. This is the distinction that matters: nothing generates a prompt *per request* — that would be slow, non-deterministic, and unreviewable.
 
 ---
 
@@ -86,7 +86,7 @@ THE META-PROMPT must encode the house anatomy
  ## Workspace schema  {schema}   ← the injected placeholder
 ```
 
-Without this, the model drafts a generic "you are a helpful analytics assistant" prompt that ignores the conventions the rest of the system depends on — the `{schema}`/`{project_id}` placeholders the loader replaces (`diagnostic.ts` L45–48), the tool-call budget the loop enforces (`base.ts` L90), the JSON shape the validators check (`validate.ts`). The meta-prompt's job is to transfer that house style into the draft.
+Without this, the model drafts a generic "you are a helpful analytics assistant" prompt that ignores the conventions the rest of the system depends on — the `{schema}`/`{project_id}` placeholders the loader replaces in each agent, the tool-call budget the shared agent loop enforces, the JSON shape the validators check. The meta-prompt's job is to transfer that house style into the draft.
 
 ---
 
@@ -98,8 +98,8 @@ This is the honest cost accounting the brief demands.
 SAVES TIME                          DOESN'T SAVE TIME
 ─────────────────────────           ─────────────────────────
 initial draft of a NEW complex      a small tweak to an existing
- prompt (85-line diagnostic.md       prompt ("change the budget
- from a goal + schema)               from 6 to 4 calls")
+ prompt (an 85-line diagnostic       prompt ("change the budget
+ spec from a goal + schema)          from 6 to 4 calls")
 ─────────────────────────           ─────────────────────────
 getting the anatomy + the           a high-iteration prompt you're
  EQL examples + the JSON schema      editing daily against evals —
@@ -108,13 +108,13 @@ getting the anatomy + the           a high-iteration prompt you're
 the 0→70% leap                      the 95→100% polish
 ```
 
-The asymmetry is the whole decision. Drafting `diagnostic.md` from scratch is a job meta-prompting accelerates — you describe the goal, hand over the schema, get a structured draft, and edit. Changing `monitoring.md` L11's "at most 6 tool calls" to 4 is a one-line edit; round-tripping it through a model is pure overhead. And a prompt you are iterating on hourly against an eval set (→ 05-eval-driven-iteration.md) is worse handled by regenerating each time — you lose the precise, incremental control that the iteration depends on.
+The asymmetry is the whole decision. Drafting a fresh diagnostic prompt from scratch is a job meta-prompting accelerates — you describe the goal, hand over the schema, get a structured draft, and edit. Changing the monitoring prompt's "at most 6 tool calls" to 4 is a one-line edit; round-tripping it through a model is pure overhead. And a prompt you are iterating on hourly against an eval set (→ 05-eval-driven-iteration.md) is worse handled by regenerating each time — you lose the precise, incremental control that the iteration depends on.
 
 ---
 
 ### The failure mode — prompts that read like LLM output
 
-A hand-written prompt in this repo reads like an engineering spec: terse, imperative, every line load-bearing. "Pass `project_id: {project_id}` to **every** tool call — no exceptions" (`diagnostic.md` L9). "Never report a change derived from an empty or zero window" (`monitoring.md` L31). There is no fluff; you can tell exactly what each line is for.
+A hand-written prompt in this repo reads like an engineering spec: terse, imperative, every line load-bearing. "Pass `project_id: {project_id}` to **every** tool call — no exceptions" (a Hard rule in the diagnostic prompt). "Never report a change derived from an empty or zero window" (the empty-window block in the monitoring prompt). There is no fluff; you can tell exactly what each line is for.
 
 A generated prompt, committed unreviewed, reads like the model's default register: hedged, padded, courteous.
 
@@ -129,7 +129,7 @@ SPEC (hand-written, this repo)         LLM-DEFAULT (unreviewed draft)
                                         an id field if appropriate"
 ```
 
-The right column is the failure. It hedges where the spec commands ("try to" / "where possible" / "may want to"), it pads, and — fatally for a prompt — the model reads hedged instructions as optional. The whole reason `monitoring.md`'s empty-window rule works is that it is an absolute "Never," not a "be careful to consider." A generated draft drifts toward the polite register, and the review step's main job is to drag it back to spec voice: delete the hedges, make every rule imperative, cut anything that is not load-bearing.
+The right column is the failure. It hedges where the spec commands ("try to" / "where possible" / "may want to"), it pads, and — fatally for a prompt — the model reads hedged instructions as optional. The whole reason the monitoring prompt's empty-window rule works is that it is an absolute "Never," not a "be careful to consider." A generated draft drifts toward the polite register, and the review step's main job is to drag it back to spec voice: delete the hedges, make every rule imperative, cut anything that is not load-bearing.
 
 ---
 
@@ -141,33 +141,33 @@ Meta-prompting is authoring-time scaffolding: a model drafts a prompt from a goa
 
 ## Meta-prompting — diagram
 
-This diagram spans the authoring pipeline and shows where it joins the existing runtime. The Authoring layer is where the model drafts and the human reviews; the artifact it produces is a `.md` file that drops into the *same* `lib/agents/prompts/` directory the hand-written prompts live in; the Runtime layer (`readFileSync` → `runAgentLoop`) is unchanged and never sees the meta-prompt.
+This diagram spans the authoring pipeline and shows where it joins the existing runtime. The Authoring layer is where the model drafts and the human reviews; the artifact it produces is a markdown file that drops into the *same* prompts directory the hand-written prompts live in; the Runtime layer (sync read at import → shared agent loop) is unchanged and never sees the meta-prompt.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  AUTHORING LAYER   (dev-time helper — NOT built)                      │
 │                                                                       │
-│  human GOAL + {schema} shape                                         │
-│        │                                                             │
-│        ▼                                                             │
-│  META-PROMPT (encodes house anatomy: Role/Hard rules/EQL/Output)    │
-│        │  drafting call                                              │
-│        ▼                                                             │
-│  DRAFT .md text                                                      │
-│        │                                                             │
-│        ▼  ⚠ HUMAN REVIEW (kill hedging, tighten to spec voice)      │
-│  reviewed prompt                                                     │
+│  human GOAL + {schema} shape                                          │
+│        │                                                              │
+│        ▼                                                              │
+│  META-PROMPT (encodes house anatomy: Role/Hard rules/EQL/Output)      │
+│        │  drafting call                                               │
+│        ▼                                                              │
+│  DRAFT markdown text                                                  │
+│        │                                                              │
+│        ▼  ⚠ HUMAN REVIEW (kill hedging, tighten to spec voice)        │
+│  reviewed prompt                                                      │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │ commit
 ┌───────────────────────────▼───────────────────────────────────────────┐
-│  lib/agents/prompts/<new>.md   ← same dir as the hand-written four    │
-│  (indistinguishable in kind from diagnostic.md / monitoring.md)       │
+│  prompts dir / <new>.md   ← same dir as the hand-written four         │
+│  (indistinguishable in kind from the existing prompt files)           │
 └───────────────────────────┬───────────────────────────────────────────┘
-                            │ readFileSync  (diagnostic.ts L13, etc.)
+                            │ sync read at module import
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  RUNTIME LAYER  (unchanged — never sees the meta-prompt)              │
-│   PROMPT.replace('{schema}',…).replace('{project_id}',…)             │
-│   → runAgentLoop(system = PROMPT, …)   base.ts L48                   │
+│   PROMPT.replace("{schema}", …).replace("{project_id}", …)            │
+│   → run_agent_loop(system = PROMPT, …)                                │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -324,3 +324,4 @@ Updated: 2026-05-29 — Added a note distinguishing the new `{categories}` injec
 Updated: 2026-05-29 — Resynced the stale `diagnostic.md` "customers matching" ban ref L33→L35 (pre-existing drift) across all three citations.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

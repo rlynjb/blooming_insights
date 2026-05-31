@@ -148,28 +148,28 @@ The condition under which the cap-of-one collapse is honest: there has to actual
 
 ### What blooming insights has — serial spacing, not fan-out backpressure
 
-The technical thing: `McpClient.liveCall` (`lib/mcp/client.ts` L148–L163) enforces a fixed minimum interval between outbound calls. The interval is set to 1100 ms via `minIntervalMs: 1100` in `lib/mcp/connect.ts` L92, satisfying Bloomreach's ~1 req/s per-user limit. There's no semaphore, no queue, no upward signal — just one timestamp (`lastCallAt`, L81) and a sleep when needed.
+The technical thing: the MCP client wrapper's live-call path enforces a fixed minimum interval between outbound calls. The interval is set to 1100 ms via a constructor option, satisfying Bloomreach's ~1 req/s per-user limit. There's no semaphore, no queue, no upward signal — just one timestamp (`last_call_at`) and a sleep when needed.
 
 If you're coming from frontend, this is `debounce` for a backend caller: track the last send time, wait until enough has passed, send. It assumes one caller, serial calls, no concurrency.
 
 ```
-McpClient.liveCall — serial spacing, not backpressure
+live_call — serial spacing, not backpressure (pseudocode)
 
-  liveCall(name, args):                           lib/mcp/client.ts L148–L163
-    elapsed = Date.now() - lastCallAt             L149
-    if elapsed < minIntervalMs:                   L150
-      await sleep(minIntervalMs - elapsed)        L151
-    result = transport.callTool(name, args)       L154
-    lastCallAt = Date.now()                       L155
+  live_call(name, args):
+    elapsed = now() - last_call_at
+    if elapsed < min_interval_ms:
+      await sleep(min_interval_ms - elapsed)
+    result = transport.call_tool(name, args)
+    last_call_at = now()
     return result
 
   No semaphore. No queue. No upward signal.
   One caller, sequential calls, 1100 ms gap.
 ```
 
-The practical consequence: a single user's investigation chain — diagnostic → recommendation, each one a `runAgentLoop` running 4–6 EQL tool calls — never exceeds ~1 call/sec to Bloomreach. The agents are sequential at the topology layer (route.ts picks the next agent) and the tool calls within an agent are serial inside `runAgentLoop`. There's no point where K parallel calls happen, so K-bounded concurrency control isn't needed.
+The practical consequence: a single user's investigation chain — diagnostic → recommendation, each one a shared-loop run executing 4–6 tool calls — never exceeds ~1 call/sec to Bloomreach. The agents are sequential at the topology layer (the route picks the next agent) and the tool calls within an agent are serial inside the shared loop. There's no point where K parallel calls happen, so K-bounded concurrency control isn't needed.
 
-The condition under which this is enough: the topology stays sequential and the deployment target stays one user-investigation at a time. The instant two users investigate in parallel against the same MCP transport (or one user runs two investigations concurrently from two tabs), serial spacing is no longer sufficient — `lastCallAt` is a per-instance field, and two `McpClient` instances each sending one call per second is *two* calls per second from Bloomreach's perspective.
+The condition under which this is enough: the topology stays sequential and the deployment target stays one user-investigation at a time. The instant two users investigate in parallel against the same MCP transport (or one user runs two investigations concurrently from two tabs), serial spacing is no longer sufficient — `last_call_at` is a per-instance field, and two MCP-client instances each sending one call per second is *two* calls per second from Bloomreach's perspective.
 
 ### Why "1.1s inter-call spacing is rate-limit compliance, not backpressure"
 
@@ -200,15 +200,14 @@ Right now the topology is sequential and serial spacing is enough. Naming what w
 ```
        Phase A (now — sequential, serial spacing)
 ┌────────────────────────────────────────────────────────────┐
-│ route.ts picks agents in order: monitoring → diagnostic → │
+│ the route picks agents in order: monitoring → diagnostic → │
 │   recommendation                                            │
 │   │                                                          │
 │   ▼  one chain, one call at a time                          │
-│ runAgentLoop ─► tool_use ─► McpClient.callTool              │
+│ shared agent loop ─► tool_use ─► mcp_client.call_tool       │
 │                                ▼                             │
 │   ┌──────────────────────────────────────┐                  │
-│   │ liveCall: 1100 ms spacing            │                  │
-│   │   (client.ts L148–L163)              │                  │
+│   │ live_call: 1100 ms spacing           │                  │
 │   └──────────────────────────────────────┘                  │
 │   No semaphore, no queue, no upward signal — not needed     │
 └────────────────────────────────────────────────────────────┘
@@ -281,25 +280,25 @@ The canonical fan-out backpressure shape — and where this codebase sits
 
   WHAT THIS CODEBASE HAS INSTEAD (sequential topology):
 
-       Sequential agent chain (route.ts)
+       Sequential agent chain (the route handler)
             │
             ▼
        ┌───────────────────────────────────────┐
-       │ runAgentLoop (one agent at a time)    │
+       │ shared agent loop (one agent at a time)│
        │   tool_use blocks, one per turn       │
        └────────────┬──────────────────────────┘
                     ▼
        ┌───────────────────────────────────────┐
-       │ McpClient.callTool                    │
-       │   intra-run cache, then liveCall      │
+       │ mcp_client.call_tool                  │
+       │   intra-run cache, then live_call     │
        └────────────┬──────────────────────────┘
                     ▼
        ┌───────────────────────────────────────┐
-       │ McpClient.liveCall  (client.ts L148)  │
-       │   elapsed = now − lastCallAt          │
+       │ live_call                             │
+       │   elapsed = now − last_call_at        │
        │   if elapsed < 1100 ms: sleep diff    │
-       │   transport.callTool(...)             │
-       │   lastCallAt = now                    │
+       │   transport.call_tool(...)            │
+       │   last_call_at = now                  │
        └────────────┬──────────────────────────┘
                     ▼
        Bloomreach: at most ~1 req/s/user (serial)
@@ -509,3 +508,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

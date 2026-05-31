@@ -69,14 +69,14 @@ If you're coming from frontend, this is the difference between writing `if (step
 ```
 Plan call output (the shape, not the impl)
 
-  POST /messages { model: "expensive", system: PLANNER_PROMPT,
-                   user: TASK }
+  call model { model: "expensive", system: PLANNER_PROMPT,
+               user: TASK }
   →  { plan: [
-        { id: 1, tool: "execute_analytics_eql", args: {…},
+        { id: 1, tool: "analytics_query", args: {…},
           rationale: "establish baseline volume" },
-        { id: 2, tool: "execute_analytics_eql", args: {…},
+        { id: 2, tool: "analytics_query", args: {…},
           depends_on: 1, rationale: "compare to prior window" },
-        { id: 3, tool: "get_event_segmentation", args: {…},
+        { id: 3, tool: "segmentation_query", args: {…},
           depends_on: [1, 2], rationale: "locate the change" }
      ] }
 ```
@@ -130,17 +130,17 @@ The practical consequence: every re-plan is another expensive planner call. The 
 
 ### Move 2.4 — Where blooming insights actually sits (Case B with nuance)
 
-Honest read: this codebase does *not* run a plan phase. There is no separate planner call. All four agents go straight into ReAct via `runAgentLoop` (`lib/agents/base.ts` L48–L176). Pre-execution, the only thing that happens is intent classification on `?q=` (a 16-token Haiku call in `lib/agents/intent.ts` L17–L31 that picks an agent — that's *routing*, not planning).
+Honest read: this codebase does *not* run a plan phase. There is no separate planner call. All four agents go straight into ReAct via the shared agent loop. Pre-execution, the only thing that happens is intent classification on the `?q=` free-form path (a tiny cheap-model call that picks an agent — that's *routing*, not planning).
 
-But there's a *degenerate* plan-in-prompt to name: the monitoring agent's system prompt at `lib/agents/prompts/monitoring.md` L39–L47 contains a literal section called **"## Suggested query plan (~5 calls, global)"** listing the five EQL queries the agent should run, in order. That's a plan — written by the engineer, baked into the prompt, the same for every run. The model then executes it inside a normal ReAct loop bounded by `maxToolCalls: 6`.
+But there's a *degenerate* plan-in-prompt to name: the monitoring agent's system prompt contains a literal section called **"## Suggested query plan (~5 calls, global)"** listing the five queries the agent should run, in order. That's a plan — written by the engineer, baked into the prompt, the same for every run. The model then executes it inside a normal ReAct loop bounded by its tool-call budget.
 
 ```
-Plan-and-execute proper          What monitoring.md actually does
+Plan-and-execute proper          What the monitoring prompt does
 ─────────────────────            ─────────────────────────────────
 runtime plan call                static plan in the prompt
-plan is task-specific             plan is identical across all runs
+plan is task-specific            plan is identical across all runs
 re-plan on failure               no re-plan — the loop just adapts
-2 model calls (plan + execute)   1 model call (loop only)
+2 model calls (plan + execute)   1 model call per turn (loop only)
 ```
 
 So the right way to characterize it: blooming insights replaced the *plan phase* with a *plan section in the system prompt*. That's a deliberate choice — the steps for monitoring really are knowable up front (you always check purchase volume first, then revenue, then conversion, then traffic), so a runtime planner would re-derive a list that's already known. The cost saved is one expensive planner call per scan; the cost paid is that the plan is static and can't adapt per workspace.
@@ -158,8 +158,8 @@ The trade visualised
   │ execute loop │                          │
   └──────────────┘                          ▼
                                   ┌──────────────────┐
-                                  │ runAgentLoop     │ ◄── one model
-                                  │ executes the plan│
+                                  │ shared loop      │ ◄── one model
+                                  │ executes the plan│      call per turn
                                   └──────────────────┘
 ```
 
@@ -176,16 +176,17 @@ The three positions you can take
 
   POSITION A: pure ReAct (what diagnostic + recommendation + query do)
   ┌──────────────────────────────────────────────────────────────┐
-  │  user prompt ──► runAgentLoop (model decides every turn)      │
+  │  user prompt ──► shared loop (model decides every turn)       │
   │                  per-turn cost grows with depth               │
   └──────────────────────────────────────────────────────────────┘
 
   POSITION B: plan in the prompt (what monitoring does)
   ┌──────────────────────────────────────────────────────────────┐
-  │  user prompt ──► runAgentLoop                                 │
+  │  user prompt ──► shared loop                                  │
   │                  │ system prompt CONTAINS the plan            │
-  │                  │ (monitoring.md L39–L47, 5-step list)       │
+  │                  │ (5-step "suggested query plan" section)    │
   │                  │ model walks it (mostly) — one model call    │
+  │                  │ per turn                                    │
   └──────────────────────────────────────────────────────────────┘
 
   POSITION C: plan-and-execute proper (NOT in this codebase)
@@ -408,3 +409,4 @@ Open and verify. ✓ File + section name + the "one model call per turn" answer 
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

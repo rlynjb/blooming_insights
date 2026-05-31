@@ -41,10 +41,10 @@
 
 ## How it works
 
-**Mental model.** ReAct is a `while` loop where each iteration has three phases, and blooming insights attaches a callback to each phase that emits an event. Think of the loop as a state machine that cycles `THINK → ACT → OBSERVE → THINK …`, where `runAgentLoop`'s hooks (`onText`, `onToolCall`, `onToolResult`) are the taps that turn each transition into an NDJSON line the client renders.
+**Mental model.** ReAct is a `while` loop where each iteration has three phases, and this system attaches a callback to each phase that emits an event. Think of the loop as a state machine that cycles `THINK → ACT → OBSERVE → THINK …`, where the shared agent loop's hooks (`onText`, `onToolCall`, `onToolResult`) are the taps that turn each transition into an NDJSON line the client renders.
 
 ```
-ReAct cycle (one turn of runAgentLoop)
+ReAct cycle (one turn of the shared agent loop)
 ─────────────────────────────────────────────────────────────
    ┌────────── THOUGHT ──────────┐
    │ model emits text reasoning  │  onText → reasoning_step (thought)
@@ -56,12 +56,12 @@ ReAct cycle (one turn of runAgentLoop)
                   ▼
    ┌──────── OBSERVATION ────────┐
    │ code runs tool, gets result │  onToolResult → tool_call_end
-   │ result pushed as user turn  │  (base.ts L171 — feeds next THOUGHT)
+   │ result pushed as user turn  │  (feeds next THOUGHT)
    └──────────────┬──────────────┘
                   ▼  loop back to THOUGHT (model reads the observation)
 ```
 
-The Observation is fed back as the next user message (`base.ts` L171), so the model's *next* Thought is conditioned on what it just saw. That feedback edge — observation becomes the input to the next reasoning step — is the entire point of ReAct: the model updates its belief state after every action instead of planning everything up front.
+The Observation is fed back as the next user message, so the model's *next* Thought is conditioned on what it just saw. That feedback edge — observation becomes the input to the next reasoning step — is the entire point of ReAct: the model updates its belief state after every action instead of planning everything up front.
 
 ---
 
@@ -70,7 +70,7 @@ The Observation is fed back as the next user message (`base.ts` L171), so the mo
 ReAct has an irreducible kernel: six pieces that *are* the loop. Strip anything else and you still have a working agent; strip any of these and you don't.
 
 ```
-runAgentLoop({ anthropic, mcp, system, userPrompt, toolSchemas, maxToolCalls }):
+runAgentLoop({ provider_sdk, mcp, system, userPrompt, toolSchemas, maxToolCalls }):
   messages = [{ role:'user', content: userPrompt }]
   for turn in maxTurns:                                              ─┐
     budgetSpent = toolCalls.length >= maxToolCalls                    │
@@ -78,7 +78,7 @@ runAgentLoop({ anthropic, mcp, system, userPrompt, toolSchemas, maxToolCalls }):
     params = { model, system: forceFinal ? system+synth : system,     │  KERNEL
                messages, max_tokens }                                 │
     if not forceFinal: params.tools = toolSchemas    ← strip on final │  (the
-    res = await anthropic.messages.create(params)                     │   loop,
+    res = await provider_sdk.messages.create(params)                  │   loop,
                                                                        │   minus
     messages.push({ role:'assistant', content: res.content })          │   nothing)
     toolUses = res.content.filter(b => b.type == 'tool_use')           │
@@ -149,7 +149,7 @@ The dual termination is the subtle one: ReAct needs BOTH the "model said done" p
 The kernel above is the minimum. Everything around it is hardening — useful, but layered on. Saying which is which is part of the pattern.
 
 ```
-SKELETON (in base.ts — required)               HARDENING (some present, some not)
+SKELETON (the agent loop — required)           HARDENING (some present, some not)
 ────────────────────────────────────           ──────────────────────────────────
 for-turn loop with maxTurns                    ┌ onText / onToolCall / onToolResult
 params.tools toggle (on/off for final)         │   hooks (PRESENT — used for the
@@ -157,13 +157,13 @@ tool_use detection + execution                 │   NDJSON trace, ai-eng 05-str
 tool_result push back as user turn             ├ NDJSON streaming of every phase
 no-tool exit                                   │   (PRESENT — the trace is a product)
 maxToolCalls budget + forced-final             ├ per-agent tool SUBSETS via
-                                               │   filterToolSchemas (PRESENT —
+                                               │   the tool-schema filter (PRESENT —
                                                │   ai-eng 04-tool-routing)
                                                ├ synthesisInstruction injected on
                                                │   forced-final (PRESENT — pushes
                                                │   the model to emit structured JSON)
                                                ├ tool_result truncation (PRESENT —
-                                               │   16k cap, base.ts L29/L171)
+                                               │   16k cap on each result)
                                                ├ structured-output validator on
                                                │   finalText (PRESENT — synthesize()
                                                │   retry, see structured-outputs.md)
@@ -172,13 +172,13 @@ maxToolCalls budget + forced-final             ├ per-agent tool SUBSETS via
                                                    bare loop, no super-structure)
 ```
 
-`runAgentLoop` ships the six-piece kernel plus six pieces of hardening that turn the loop from a working agent into a *production* agent: streaming makes the trace a product surface, tool subsets make the wrong-tool failure structurally absent (→ `04-tool-routing.md`), and the synthesis injection makes the forced-final turn produce structured output instead of generic text. None of those is required for the loop to *work* — they're required for it to ship.
+The shared agent loop ships the six-piece kernel plus six pieces of hardening that turn the loop from a working agent into a *production* agent: streaming makes the trace a product surface, tool subsets make the wrong-tool failure structurally absent (→ `04-tool-routing.md`), and the synthesis injection makes the forced-final turn produce structured output instead of generic text. None of those is required for the loop to *work* — they're required for it to ship.
 
 ---
 
 ### The principle
 
-**Make the reasoning loop emit its phases as it runs.** ReAct's value is not just that the model reasons before acting — it is that reasoning, acting, and observing are *distinct, interleaved steps* you can tap. The moment you give each step a name and an event, the agent stops being a black box: you can stream it to a user, log it for evals, and debug it by reading the trace. A final-answer-only agent throws away the most valuable artifact it produces — the path it took. blooming insights keeps the path and makes it the product.
+**Make the reasoning loop emit its phases as it runs.** ReAct's value is not just that the model reasons before acting — it is that reasoning, acting, and observing are *distinct, interleaved steps* you can tap. The moment you give each step a name and an event, the agent stops being a black box: you can stream it to a user, log it for evals, and debug it by reading the trace. A final-answer-only agent throws away the most valuable artifact it produces — the path it took. You keep the path and make it the product.
 
 ---
 
@@ -195,11 +195,11 @@ The diagram spans three layers. The Model layer produces Thoughts and Actions. T
 ┌───────────▼──────────────────────────────▼─────────────────────┼──────┐
 │  LOOP LAYER   lib/agents/base.ts                                │      │
 │                                                                 │      │
-│  THOUGHT:  onText(text)            L108–113                     │      │
-│  ACTION:   onToolCall(tc)          L138  (before the call)      │      │
-│  OBSERVE:  result = mcp.callTool() L144                         │      │
-│            onToolResult(tc)        L159                          │      │
-│            messages.push(user: toolResults)  L171 ──────────────┘      │
+│  THOUGHT:  onText(text)                                         │      │
+│  ACTION:   onToolCall(tc)  (before the call)      │      │
+│  OBSERVE:  result = mcp.callTool()                              │      │
+│            onToolResult(tc)                                      │      │
+│            messages.push(user: toolResults) ──────────────┘      │
 │            (observation re-enters context → conditions next THOUGHT)   │
 └───────────┬──────────────────────────────┬────────────────────────────┘
             │ onText                        │ onToolCall / onToolResult    
@@ -397,3 +397,4 @@ Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -56,9 +56,9 @@ The first three are dials you can turn before the call; the fourth is a gauge yo
 
 ---
 
-### Lever 1 — call-count budgets (`maxToolCalls`)
+### Lever 1 — call-count budgets
 
-Each agent caps total tool calls, which caps the number of agent-turn model calls (each tool round-trip is a model call). The budgets (`lib/agents/monitoring.ts` L74, `lib/agents/diagnostic.ts` L61, `lib/agents/recommendation.ts` L57, `lib/agents/query.ts` L41):
+Each agent caps total tool calls, which caps the number of agent-turn model calls (each tool round-trip is a model call). The budgets:
 
 ```
 agent           maxToolCalls   why
@@ -69,7 +69,7 @@ recommendation      4          fewer queries needed to propose actions
 query               6          free-form, broad tool access
 ```
 
-`budgetSpent` flips `forceFinal` once `toolCalls.length >= maxToolCalls` (`lib/agents/base.ts` L90–L91), forcing the model to stop querying and emit its answer. Without this, the loop runs until `maxTurns` (8) or the route's `maxDuration = 300` (`app/api/agent/route.ts` L20) — burning tokens on every wasted turn. The budget is the primary defense against a runaway bill.
+A `budgetSpent` check flips `forceFinal` once the count of tool calls hits the agent's budget, forcing the model to stop querying and emit its answer. Without this, the loop runs until `maxTurns` (8) or the route's `maxDuration` of 300s — burning tokens on every wasted turn. The budget is the primary defense against a runaway bill.
 
 ```
 turn 0  2 calls
@@ -82,7 +82,7 @@ turn 2  6 calls → budgetSpent → forceFinal → emit JSON, STOP
 
 ### Lever 2 — input truncation
 
-Output tokens cost ~5×, but *input* tokens accumulate fast in a multi-turn loop because every prior tool result rides along in `messages` on every subsequent call. Truncation caps that growth: `truncate` slices each tool result to `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29, L31–L34), and `schemaSummary` caps the static schema prefix (`lib/agents/monitoring.ts` L15–L48). See → 02-tokenization.md for the full character-budget story.
+Output tokens cost ~5×, but *input* tokens accumulate fast in a multi-turn loop because every prior tool result rides along in `messages` on every subsequent call. Truncation caps that growth: the agent loop slices each tool result to a 16,000-character ceiling, and the monitoring agent caps the static schema prefix via list-count caps. See → 02-tokenization.md for the full character-budget story.
 
 ```
 without truncation:           with truncation:
@@ -94,32 +94,32 @@ input grows ~60KB/turn        input grows ~16KB/turn  ← ~3.75× cheaper input
 
 ---
 
-### Lever 3 — model tiering (haiku classifier vs sonnet agents)
+### Lever 3 — model tiering (cheap classifier vs dear agents)
 
-The cheapest routing decision: do not pay the expensive model to do a trivial job. Intent classification — mapping a query to one of three labels — uses haiku (`CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`, `lib/agents/intent.ts` L14), while the actual analysis uses sonnet (`AGENT_MODEL = 'claude-sonnet-4-6'`, `lib/agents/base.ts` L9):
+The cheapest routing decision: do not pay the expensive model to do a trivial job. Intent classification — mapping a query to one of three labels — uses a cheap-tier model (the haiku-class classifier), while the actual analysis uses a more capable model (the sonnet-class agent):
 
 ```
-classify intent   → haiku   (cheap, fast)   intent.ts L14, max_tokens 16
-analyze / diagnose → sonnet  (capable, dearer) base.ts L9, max_tokens 4096
+classify intent   → cheap tier   (fast)             max_tokens 16
+analyze / diagnose → dear tier    (capable, costly)  max_tokens 4096
 ```
 
-A haiku call capped at `max_tokens: 16` (→ 03-sampling-parameters.md) costs a tiny fraction of a sonnet agent turn. Putting the cheap model on the routing decision and the expensive model on the reasoning is textbook cost-aware tiering.
+A classifier call capped at `max_tokens: 16` (→ 03-sampling-parameters.md) costs a tiny fraction of an agent turn. Putting the cheap model on the routing decision and the expensive model on the reasoning is textbook cost-aware tiering.
 
 ---
 
 ### Where the big line item is, and the meter that would show it
 
-The single most expensive call in an investigation is the **synthesis pass** when it runs. `synthesize()` (`lib/agents/diagnostic.ts` L87–L126, `lib/agents/recommendation.ts` L82–L132) is a *full sonnet call* with `max_tokens: 2048` of output, and it formats up to six tool results as evidence text in its input — large input, large output, on the dear model. It only fires when the loop's final turn fails to produce valid JSON (→ 04-structured-outputs.md), so its cost is conditional: zero on the happy path, ~2× the agent's tokens on the unlucky path.
+The single most expensive call in an investigation is the **synthesis pass** when it runs. The `synthesize()` call is a *full dear-tier call* with `max_tokens: 2048` of output, and it formats up to six tool results as evidence text in its input — large input, large output, on the dear model. It only fires when the loop's final turn fails to produce valid JSON (→ 04-structured-outputs.md), so its cost is conditional: zero on the happy path, ~2× the agent's tokens on the unlucky path.
 
 ```
-investigation token cost (sonnet)
+investigation token cost (dear tier)
   diagnostic loop   : up to 6 turns × growing input + 4096 output
   synthesis (maybe) : large evidence input + 2048 output   ← the spike
   recommendation    : up to 4 turns × input + 4096 output
   + synthesis (maybe): another spike
 ```
 
-The meter to see this is `res.usage` — the SDK returns `input_tokens` and `output_tokens` on every `create` response. **Nothing in the codebase reads it.** There is no `ai_call_log`, no per-run token total, no cost dashboard. The spend is *bounded* (the three levers guarantee a worst case) but *unmeasured* (no one knows the typical case, or which call dominates it).
+The meter to see this is the response's `usage` field — the provider SDK returns `input_tokens` and `output_tokens` on every response. **Nothing in the codebase reads it.** There is no per-call log, no per-run token total, no cost dashboard. The spend is *bounded* (the three levers guarantee a worst case) but *unmeasured* (no one knows the typical case, or which call dominates it).
 
 ---
 
@@ -128,10 +128,10 @@ The meter to see this is `res.usage` — the SDK returns `input_tokens` and `out
 ```
 CURRENT (bounded, blind)              FUTURE (bounded, metered)
 ────────────────────────────────     ────────────────────────────────
-maxToolCalls caps worst case          + res.usage logged per call
+maxToolCalls caps worst case          + usage logged per call
 truncation caps input growth          + per-agent token totals
-haiku tiering on classification       + cost = tokens × price table
-NO record of actual spend             + ai_call_log row per run
+cheap-tier classification             + cost = tokens × price table
+NO record of actual spend             + per-run cost log row
 "which call is expensive?" = guess    "which call is expensive?" = query
 ```
 
@@ -141,7 +141,7 @@ The bounds make a runaway bill *impossible*; the missing meter makes the *typica
 
 ### The principle
 
-Cost engineering is two disciplines: bound the worst case before the call (budgets, truncation, tiering) and measure the typical case after the call (`res.usage` logging). blooming insights does the first thoroughly — a runaway loop cannot happen — and skips the second entirely, so it has guarantees without observability. That is a fine posture for a bounded demo and a liability the moment you need to tune cost against real traffic, because the meter is the prerequisite for every targeted optimization.
+Cost engineering is two disciplines: bound the worst case before the call (budgets, truncation, tiering) and measure the typical case after the call (usage logging). This system does the first thoroughly — a runaway loop cannot happen — and skips the second entirely, so it has guarantees without observability. That is a fine posture for a bounded demo and a liability the moment you need to tune cost against real traffic, because the meter is the prerequisite for every targeted optimization.
 
 ---
 
@@ -153,17 +153,17 @@ This diagram spans the call path and marks where each cost lever acts and where 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  SERVICE LAYER (cost levers — all on the bounding side)              │
 │                                                                       │
-│  classifyIntent → HAIKU  intent.ts L14   ← tier: cheap model         │
+│  classifyIntent → HAIKU  intent.ts   ← tier: cheap model         │
 │       │                                                              │
 │  runAgentLoop (SONNET base.ts L9)                                    │
 │   maxToolCalls budget  monitoring 6 / diag 6 / rec 4 / query 6       │
-│       │  budgetSpent → forceFinal  base.ts L90–91   ← fewer calls    │
-│   truncate tool result → 16_000 chars  base.ts L31–34  ← smaller in  │
-│   schemaSummary caps   monitoring.ts L15–48            ← smaller in  │
+│       │  budgetSpent → forceFinal  base.ts   ← fewer calls    │
+│   truncate tool result → 16_000 chars  base.ts  ← smaller in  │
+│   schemaSummary caps   monitoring.ts            ← smaller in  │
 │       │                                                              │
-│   synthesize() (conditional)  diagnostic L87–126, 2048 out  ← spike  │
+│   synthesize() (conditional)  diagnostic out  ← spike  │
 └───────────────────────────┬───────────────────────────────────────────┘
-                            │  create(params)  base.ts L102
+                            │  create(params)  base.ts
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  PROVIDER LAYER (Anthropic — where the bill is set)                 │
 │                                                                       │
@@ -336,3 +336,4 @@ Which model classifies intent, and why is it the cheap choice rather than the ag
 Updated: 2026-05-28 — `maxDuration` 60→300 (route.ts L20); re-derived the `synthesize()` line ranges (diagnostic L87–L126, recommendation L82–L132) and the `saveInvestigation` location (now `lib/state/investigations.ts` L30, called at route.ts L254).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

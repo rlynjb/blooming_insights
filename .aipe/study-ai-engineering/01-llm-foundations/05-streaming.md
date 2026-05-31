@@ -58,20 +58,20 @@ NDJSON is the framing because it is trivial to produce (`+ '\n'`), trivial to sp
 
 ---
 
-### The event vocabulary (`AgentEvent`)
+### The event vocabulary
 
-Every increment is one variant of a discriminated union, `AgentEvent` (`lib/mcp/events.ts` L4–L12):
+Every increment is one variant of a discriminated union:
 
-```typescript
-export type AgentEvent =
-  | { type: 'reasoning_step'; step: ReasoningStep }
-  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
-  | { type: 'tool_call_end'; toolName: string; agent: AgentName; durationMs: number; result?: unknown; error?: string }
-  | { type: 'insight'; insight: Insight }
-  | { type: 'diagnosis'; diagnosis: Diagnosis }
-  | { type: 'recommendation'; recommendation: Recommendation }
-  | { type: 'done' }
-  | { type: 'error'; message: string };
+```
+  AgentEvent =
+    | { type: "reasoning_step",   step }
+    | { type: "tool_call_start",  toolName, agent }
+    | { type: "tool_call_end",    toolName, agent, durationMs, result?, error? }
+    | { type: "insight",          insight }
+    | { type: "diagnosis",        diagnosis }
+    | { type: "recommendation",   recommendation }
+    | { type: "done" }
+    | { type: "error",            message }
 ```
 
 The `type` field is the discriminant; the client's `switch (e.type)` renders each variant differently. `done` and `error` are the terminal events. This is the same pattern as a Redux action union or a WebSocket message protocol — a closed set of typed messages, each self-describing.
@@ -90,51 +90,48 @@ error           → show the error state
 
 ### Encode / decode: one line per event
 
-The framing is two one-line functions (`lib/mcp/events.ts` L15–L22):
+The framing is two one-line functions:
 
-```typescript
-export function encodeEvent(e: AgentEvent): string {
-  return JSON.stringify(e) + '\n';     // NDJSON: JSON + newline
-}
-export function decodeEvent(line: string): AgentEvent {
-  return JSON.parse(line) as AgentEvent;
-}
+```
+  function encode_event(e):
+      return JSON.stringify(e) + "\n"      # NDJSON: JSON + newline
+
+  function decode_event(line):
+      return JSON.parse(line)
 ```
 
-`encodeEvent` is the entire wire format. The `+ '\n'` is the frame delimiter; everything else is standard JSON.
+`encode_event` is the entire wire format. The `+ "\n"` is the frame delimiter; everything else is standard JSON.
 
 ---
 
-### The server: a `ReadableStream` that enqueues NDJSON
+### The server: a ReadableStream that enqueues NDJSON
 
-`app/api/agent/route.ts` builds a `ReadableStream<Uint8Array>` whose `start(controller)` runs the agents and enqueues each event (L169–L265). Crucially, the **schema bootstrap now happens *inside* the stream**, not before it, so the client sees a progress event immediately instead of waiting silently while the route connects and reads the schema:
+The route handler builds a `ReadableStream<Uint8Array>` whose `start(controller)` runs the agents and enqueues each event. Crucially, the **schema bootstrap now happens *inside* the stream**, not before it, so the client sees a progress event immediately instead of waiting silently while the route connects and reads the schema:
 
-```typescript
-const encoder = new TextEncoder();
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const collected: AgentEvent[] = [];
-    const send = (e: AgentEvent) => {
-      collected.push(e);
-      controller.enqueue(encoder.encode(encodeEvent(e)));   // L172–175
-    };
-    try {
-      stepFor(leadAgent, 'thought', 'reading the workspace schema…');  // L201
-      const schema = await bootstrapSchema(conn.mcp);                  // L202 — INSIDE the stream
-      // ... run agents (by `step`), calling send() per increment ...
-      send({ type: 'done' });                                          // L251
-      if (step == null) saveInvestigation(insightId!, collected);      // L254 — combined run only
-    } catch (e) {
-      send({ type: 'error', message: `/api/agent · ${e instanceof Error ? e.message : String(e)}` });  // L257
-    } finally {
-      controller.close();                                              // L262
-    }
-  },
-});
-return new Response(stream, { headers: NDJSON_HEADERS });              // L267 (defined L107–110)
+```
+  encoder = new TextEncoder()
+  stream  = new ReadableStream({
+    async start(controller):
+      collected = []
+      function send(e):
+          collected.push(e)
+          controller.enqueue(encoder.encode(encode_event(e)))
+      try:
+          stepFor(leadAgent, "thought", "reading the workspace schema…")
+          schema = await bootstrap_schema(conn.mcp)            # INSIDE the stream
+          ... run agents (by `step`), calling send() per increment ...
+          send({ type: "done" })
+          if step is null:
+              save_investigation(insightId, collected)         # combined run only
+      catch e:
+          send({ type: "error", message: "/api/agent · " + str(e) })
+      finally:
+          controller.close()
+  })
+  return new Response(stream, { headers: NDJSON_HEADERS })
 ```
 
-`send` is the single choke-point: it records the event (for caching the full trace) *and* enqueues its NDJSON bytes. The agent hooks (`hooksFor`, L181–L195) wire each agent's `onText` / `onToolCall` / `onToolResult` to `send` calls, so the model's reasoning streams out the moment the loop surfaces it. The entire body is wrapped in `try/catch/finally` (L196–L263) so any error inside the run becomes an `error` event and the stream still closes cleanly. (Pre-stream setup — `connectMcp` — is *also* wrapped in its own try/catch at L155–L165 so a setup throw returns the real error message, not a bare 500.)
+`send` is the single choke-point: it records the event (for caching the full trace) *and* enqueues its NDJSON bytes. The agent hooks wire each agent's `onText` / `onToolCall` / `onToolResult` to `send` calls, so the model's reasoning streams out the moment the loop surfaces it. The entire body is wrapped in `try/catch/finally` so any error inside the run becomes an `error` event and the stream still closes cleanly. (Pre-stream setup — connecting to MCP — is *also* wrapped in its own try/catch so a setup throw returns the real error message, not a bare 500.)
 
 ```
 agent loop hook fires
@@ -145,35 +142,35 @@ agent loop hook fires
         ▼  send() → encode → enqueue → over the wire immediately
 ```
 
-Note `result: trunc(tc.result)` (L192) — the UI-stream truncation budget (`TRUNC = 4000`, → 02-tokenization.md) keeps each event's payload small on the wire. The `/api/briefing` route mirrors this exact shape: it bootstraps the schema inside its own `ReadableStream.start` (`app/api/briefing/route.ts` L88–L141) after wrapping `connectMcp` in a pre-stream try/catch (L62–L72).
+Note `result: trunc(tc.result)` — the UI-stream truncation budget (`TRUNC = 4000`, → 02-tokenization.md) keeps each event's payload small on the wire. The briefing route mirrors this exact shape: it bootstraps the schema inside its own `ReadableStream.start` after wrapping the MCP connect in a pre-stream try/catch.
 
 ---
 
-### The client: `getReader()` + `TextDecoder` + line buffer (in the `useInvestigation` hook)
+### The client: getReader() + TextDecoder + line buffer (in the investigation hook)
 
-The investigation consumer now lives in a hook, `lib/hooks/useInvestigation.ts` — the investigate page (`app/investigate/[id]/page.tsx`) just calls `useInvestigation(id, 'diagnose')` and renders the returned state. The hook consumes the stream with the raw Streams API — no library (`lib/hooks/useInvestigation.ts` L184–L201):
+The investigation consumer lives in a hook — the investigate page just calls the hook and renders the returned state. The hook consumes the stream with the raw Streams API — no library:
 
-```typescript
-const reader = res.body.getReader();
-const dec = new TextDecoder();
-let buf = '';
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += dec.decode(value, { stream: true });   // accumulate bytes → text
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';                        // keep the trailing partial line
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try { handle(JSON.parse(line) as AgentEvent); }
-    catch { /* ignore malformed line */ }
-  }
-}
+```
+  reader = res.body.getReader()
+  dec    = new TextDecoder()
+  buf    = ""
+  loop forever:
+      { done, value } = await reader.read()
+      if done: break
+      buf += dec.decode(value, { stream: true })   # accumulate bytes → text
+      lines = buf.split("\n")
+      buf   = lines.pop() ?? ""                    # keep the trailing partial line
+      for line in lines:
+          if line.trim() is empty: continue
+          try:
+              handle(JSON.parse(line))
+          catch:
+              # ignore malformed line
 ```
 
-The critical detail is `buf = lines.pop()` — a chunk boundary can land mid-line, so the last (possibly incomplete) segment is held back until the next chunk completes it. `dec.decode(value, { stream: true })` similarly handles multi-byte UTF-8 characters split across chunks. After the loop, a trailing buffered line is flushed (L202–L208). `handle` (L97–L151) is the `switch (e.type)` that updates React state per variant.
+The critical detail is `buf = lines.pop()` — a chunk boundary can land mid-line, so the last (possibly incomplete) segment is held back until the next chunk completes it. `dec.decode(value, { stream: true })` similarly handles multi-byte UTF-8 characters split across chunks. After the loop, a trailing buffered line is flushed. `handle` is the `switch (e.type)` that updates React state per variant.
 
-The hook runs the reader **exactly once per mount** even under React StrictMode (dev mount → cleanup → re-mount): a `startedRef` guard (L43, L47–L48) blocks the second run, and the effect deliberately does *not* abort the fetch on cleanup — cancelling on the first StrictMode cleanup would kill the only stream and leave the log empty (comment L31–L36). Because each `GET /api/agent?step=…` is one expensive run, "run once" is the same non-idempotency concern that rules out `EventSource` below — here enforced at the hook level. The feed page has its *own* separate reader loop for the briefing stream (`app/page.tsx`: `getReader()` at L323, read loop at L439–L457, consuming `/api/briefing` — see "Briefing route — a second streaming surface" above).
+The hook runs the reader **exactly once per mount** even under React StrictMode (dev mount → cleanup → re-mount): a started-once ref guard blocks the second run, and the effect deliberately does *not* abort the fetch on cleanup — cancelling on the first StrictMode cleanup would kill the only stream and leave the log empty. Because each request *starts* an expensive run, "run once" is the same non-idempotency concern that rules out `EventSource` below — here enforced at the hook level. The feed page has its *own* separate reader loop for the briefing stream — see "Briefing route — a second streaming surface" below.
 
 ```
 chunk 1: '{"type":"reasoning_step"...}\n{"type":"tool_'
@@ -188,52 +185,51 @@ chunk 2: 'call_start"...}\n'
 
 ### Briefing route — a second streaming surface
 
-The investigation stream is not the only NDJSON surface. The morning briefing (`app/api/briefing/route.ts`) is a *second* `ReadableStream` that the feed page consumes with the same `getReader()` + line-buffer loop. It reuses the agent route's NDJSON shape but differs in three deliberate ways worth studying side by side.
+The investigation stream is not the only NDJSON surface. The morning briefing is a *second* `ReadableStream` that the feed page consumes with the same `getReader()` + line-buffer loop. It reuses the agent route's NDJSON shape but differs in three deliberate ways worth studying side by side.
 
-**1. A local superset event type — the shared union is left untouched.** The briefing needs two event variants the investigation does not — a `workspace` header (project name + totals) and coverage events for the anomaly grid. Rather than widen the shared `AgentEvent` union in `lib/mcp/events.ts` (which the agent route and the investigation view depend on), the briefing defines a *local* `BriefingEvent` superset (`app/api/briefing/route.ts` L54–L58):
-
-```typescript
-type BriefingEvent =
-  | AgentEvent                                            // reuse the live-activity variants
-  | { type: 'workspace'; workspace: BriefingWorkspace }
-  | { type: 'coverage_item'; item: CoverageItem }         // one category's tile
-  | { type: 'coverage'; coverage: CoverageReport };       // bulk form (plain-JSON fallback)
-```
-
-`BriefingEvent` *includes* `AgentEvent` (so `reasoning_step` / `tool_call_*` / `insight` / `done` / `error` still stream exactly as before) and adds the briefing-only variants on top. The shared `AgentEvent` contract is unchanged — the comment at L49–L53 states this explicitly — so the investigation consumer never has to handle variants it will never receive. The feed page mirrors the same local type for its reader (`app/page.tsx` L28–L32).
-
-**2. Demo-mode paced replay — a slower delay than the agent route.** When `?demo=cached` is set and a snapshot file exists, the briefing replays the captured snapshot as a *paced* NDJSON stream instead of running the live agent: each `emit()` enqueues one event then `await`s `REPLAY_DELAY_MS = 140` (`app/api/briefing/route.ts` L23, L99–L102). This is the same replay idea as the agent route's cache branch, but with a *different* tempo — the agent route replays at `REPLAY_DELAY_MS = 180` (`app/api/agent/route.ts` L105). The briefing reveals slightly faster (140ms vs 180ms) because it is narrating a longer monitoring sweep into the feed, and the snapshot replay deliberately mirrors the *live* event order (workspace → coverage checklist → trace → insights) so the demo and the real run look identical to the consumer.
-
-**3. Per-category `coverage_item` events fill the grid tile-by-tile.** The most distinctive part: the live briefing does *not* send the coverage report as one bulk event. After gating the 10-category checklist against the schema, it emits one `coverage_item` per category, each paired with a status line, so the coverage grid resolves one tile at a time in step with the checklist log (`app/api/briefing/route.ts` L209–L212):
-
-```typescript
-coverage.forEach((item, i) => {
-  step(coverageLines[i]);                 // a 'reasoning_step' status line
-  send({ type: 'coverage_item', item }); // one tile of the grid
-});
-```
-
-The feed's `handle` accumulates each tile into the grid state (`app/page.tsx` L333–L338: `setCoverage(prev => [...prev, evt.item])`), so the grid *fills progressively* rather than appearing all at once. The bulk `coverage` variant exists only for the plain-JSON fallback path (when the response is not NDJSON). This is the same "the trace is the product" principle applied to coverage: the user watches the schema-gate decision resolve category by category.
+**1. A local superset event type — the shared union is left untouched.** The briefing needs two event variants the investigation does not — a `workspace` header (project name + totals) and coverage events for the anomaly grid. Rather than widen the shared `AgentEvent` union (which the agent route and the investigation view depend on), the briefing defines a *local* `BriefingEvent` superset:
 
 ```
-LIVE BRIEFING (app/api/briefing/route.ts)              FEED (app/page.tsx)
+  BriefingEvent =
+    | AgentEvent                                            # reuse the live-activity variants
+    | { type: "workspace",       workspace }
+    | { type: "coverage_item",   item }                     # one category's tile
+    | { type: "coverage",        coverage }                 # bulk form (plain-JSON fallback)
+```
+
+`BriefingEvent` *includes* `AgentEvent` (so `reasoning_step` / `tool_call_*` / `insight` / `done` / `error` still stream exactly as before) and adds the briefing-only variants on top. The shared `AgentEvent` contract is unchanged — the comment alongside states this explicitly — so the investigation consumer never has to handle variants it will never receive. The feed page mirrors the same local type for its reader.
+
+**2. Demo-mode paced replay — a slower delay than the agent route.** When `?demo=cached` is set and a snapshot file exists, the briefing replays the captured snapshot as a *paced* NDJSON stream instead of running the live agent: each emit enqueues one event then awaits a `REPLAY_DELAY_MS` of 140. This is the same replay idea as the agent route's cache branch, but with a *different* tempo — the agent route replays at 180ms. The briefing reveals slightly faster (140ms vs 180ms) because it is narrating a longer monitoring sweep into the feed, and the snapshot replay deliberately mirrors the *live* event order (workspace → coverage checklist → trace → insights) so the demo and the real run look identical to the consumer.
+
+**3. Per-category `coverage_item` events fill the grid tile-by-tile.** The most distinctive part: the live briefing does *not* send the coverage report as one bulk event. After gating the 10-category checklist against the schema, it emits one `coverage_item` per category, each paired with a status line, so the coverage grid resolves one tile at a time in step with the checklist log:
+
+```
+  for each (item, i) in coverage:
+      step(coverageLines[i])                  # a 'reasoning_step' status line
+      send({ type: "coverage_item", item })   # one tile of the grid
+```
+
+The feed's `handle` accumulates each tile into the grid state (`setCoverage(prev => [...prev, evt.item])`), so the grid *fills progressively* rather than appearing all at once. The bulk `coverage` variant exists only for the plain-JSON fallback path (when the response is not NDJSON). This is the same "the trace is the product" principle applied to coverage: the user watches the schema-gate decision resolve category by category.
+
+```
+LIVE BRIEFING                                         FEED
 ──────────────────────────────────────────            ──────────────────────────────
-send({type:'workspace', ...})                  ══▶     setWorkspace(...)                L330–331
-for each category:                                      reader.read() loop               L439–457
+send({type:'workspace', ...})                  ══▶     setWorkspace(...)
+for each category:                                      reader.read() loop
   step(coverageLines[i])  ─ reasoning_step ──▶          → setStepStatus / trace log
-  send({type:'coverage_item', item})  L211    ══▶       setCoverage(p => [...p, item])   L333–338
+  send({type:'coverage_item', item})          ══▶       setCoverage(p => [...p, item])
                                                           → grid fills ONE TILE at a time
 ...trace + insight events (AgentEvent shape)   ══▶       same switch as investigation
-send({type:'done'})                            ══▶       setInsights(collected)           L390–399
+send({type:'done'})                            ══▶       setInsights(collected)
 ```
 
 Demo mode replays this exact sequence from the snapshot, paced at 140ms/event, so the only difference the consumer sees is the source — live agent vs recorded file — not the shape or the order.
 
 ---
 
-### Why NDJSON over `ReadableStream`, not `EventSource`
+### Why NDJSON over a ReadableStream, not EventSource
 
-`EventSource` (the Server-Sent Events client) is the obvious browser primitive for server-push, and the codebase deliberately does **not** use it. The decisive reason: **`EventSource` auto-reconnects, and a reconnect would re-fire the agent run.**
+`EventSource` (the Server-Sent Events client) is the obvious browser primitive for server-push, and the system deliberately does **not** use it. The decisive reason: **`EventSource` auto-reconnects, and a reconnect would re-fire the agent run.**
 
 ```
 EventSource:                          fetch + getReader (this codebase):
@@ -244,15 +240,15 @@ EventSource:                          fetch + getReader (this codebase):
   → second investigation, double cost   → one run, ever
 ```
 
-Each `GET /api/agent` *starts an investigation* in `start(controller)` — it runs Claude and MCP tool calls that cost tokens and hit a rate-limited provider. `EventSource`'s built-in reconnect would silently launch a *second* run on any network blip, doubling cost and producing a confusing double-trace. `fetch` + `getReader()` has no reconnect: a dropped connection simply ends the read loop, and the client keeps whatever it received. The route also returns plain `Cache-Control: no-cache, no-transform` NDJSON, not the `text/event-stream` format `EventSource` requires.
+Each `GET` on the agent route *starts an investigation* inside `start(controller)` — it runs the model and tool calls that cost tokens and hit a rate-limited provider. `EventSource`'s built-in reconnect would silently launch a *second* run on any network blip, doubling cost and producing a confusing double-trace. `fetch` + `getReader()` has no reconnect: a dropped connection simply ends the read loop, and the client keeps whatever it received. The route also returns plain `Cache-Control: no-cache, no-transform` NDJSON, not the `text/event-stream` format `EventSource` requires.
 
-There is also a divergence worth naming against the curriculum: streaming is listed as *learn-only*, but blooming insights treats it as a **first-class product surface** — the reasoning trace is the UI, so streaming is implemented fully, not skipped.
+There is also a divergence worth naming against the curriculum: streaming is listed as *learn-only*, but this system treats it as a **first-class product surface** — the reasoning trace is the UI, so streaming is implemented fully, not skipped.
 
 ---
 
 ### The principle
 
-Stream when the increments have value, and pick the transport by what reconnect does to your work. NDJSON over a `fetch` `ReadableStream` is the right transport when each `GET` *triggers* expensive, non-idempotent work, because it has no silent reconnect to re-fire that work. `EventSource` is right for cheap, idempotent, resumable feeds. blooming insights chose the former precisely because starting the stream *is* starting the investigation.
+Stream when the increments have value, and pick the transport by what reconnect does to your work. NDJSON over a `fetch` `ReadableStream` is the right transport when each `GET` *triggers* expensive, non-idempotent work, because it has no silent reconnect to re-fire that work. `EventSource` is right for cheap, idempotent, resumable feeds. You chose the former precisely because starting the stream *is* starting the investigation.
 
 ---
 
@@ -262,33 +258,33 @@ This diagram spans Service (the route's stream) and UI (the browser consumer). T
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER   app/api/agent/route.ts   (maxDuration = 300, L20)   │
+│  SERVICE LAYER   app/api/agent/route.ts   │
 │                                                                       │
 │  new ReadableStream({ async start(controller) {                      │
 │    try {                                                             │
-│      send(e) = controller.enqueue(encoder.encode(encodeEvent(e)))    │ L172–175
-│      stepFor(lead,'thought','reading the workspace schema…')         │ L201
-│      schema = await bootstrapSchema(conn.mcp)  ← INSIDE the stream   │ L202
-│      agent hooks → send(reasoning_step / tool_call_start / _end)     │ L181–195
-│      send({type:'diagnosis'}) ... send({type:'recommendation'})      │ L239,248
-│      send({type:'done'}); if(step==null) saveInvestigation(...)      │ L251,254
-│    } catch(e) { send({type:'error', message}) }                      │ L255–260
-│    finally { controller.close() }                                    │ L261–262
+│      send(e) = controller.enqueue(encoder.encode(encodeEvent(e)))    │
+│      stepFor(lead,'thought','reading the workspace schema…')         │
+│      schema = await bootstrapSchema(conn.mcp)  ← INSIDE the stream   │
+│      agent hooks → send(reasoning_step / tool_call_start / _end)     │
+│      send({type:'diagnosis'}) ... send({type:'recommendation'})      │
+│      send({type:'done'}); if(step==null) saveInvestigation(...)      │
+│    } catch(e) { send({type:'error', message}) }                      │
+│    finally { controller.close() }                                    │
 │  }})                                                                 │
-│  Response: NDJSON_HEADERS (application/x-ndjson, no-cache)           │ L107–110, L267
+│  Response: NDJSON_HEADERS (application/x-ndjson, no-cache)           │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  "{...}\n{...}\n{...}\n"   (NDJSON, chunked)
                             │  NO EventSource — no auto-reconnect
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  UI LAYER   lib/hooks/useInvestigation.ts   (page just calls it)     │
 │                                                                       │
-│  startedRef guard → run reader ONCE per mount (StrictMode-safe)      │ L43,47–48
-│  fetch(`/api/agent?insightId=${id}&step=${step}`)                    │ L170
-│  reader = res.body.getReader(); dec = new TextDecoder()              │ L184–185
-│  loop: buf += dec.decode(value,{stream:true})                        │ L190
-│        lines = buf.split('\n'); buf = lines.pop()  ← keep partial     │ L191–192
-│        for line: handle(JSON.parse(line))                            │ L193–200
-│           switch(e.type): reasoning_step|tool_call_*|diagnosis|...    │ L97–151
+│  startedRef guard → run reader ONCE per mount (StrictMode-safe)      │
+│  fetch(`/api/agent?insightId=${id}&step=${step}`)                    │
+│  reader = res.body.getReader(); dec = new TextDecoder()              │
+│  loop: buf += dec.decode(value,{stream:true})                        │
+│        lines = buf.split('\n'); buf = lines.pop()  ← keep partial     │
+│        for line: handle(JSON.parse(line))                            │
+│           switch(e.type): reasoning_step|tool_call_*|diagnosis|...    │
 │              → setItems / setDiagnosis / setRecommendations           │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -451,3 +447,4 @@ Updated: 2026-05-28 — `maxDuration` 60→300; documented schema bootstrap move
 Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (local `BriefingEvent` superset L54–L58 that does NOT widen the shared `AgentEvent`; demo paced replay `REPLAY_DELAY_MS = 140` vs the agent route's 180; per-category `coverage_item` streaming L209–L212 that fills the grid tile-by-tile); refreshed drifted refs — briefing `maxDuration` L16→L17, and the feed's briefing reader from the stale `app/page.tsx` L311–L312 to the live reader (`getReader()` L323, loop L439–L457, `BriefingEvent` L28–L32).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

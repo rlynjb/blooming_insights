@@ -62,11 +62,11 @@ Each function takes a value the agent produced (an `Anomaly`, a `Diagnosis`, an 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The boundary is sharp: agents emit evidence; `derive.ts` emits display fields; components render them. Adding a display field never touches the agent.
+The boundary is sharp: agents emit evidence; the derivation module emits display fields; components render them. Adding a display field never touches the agent.
 
 ### (a) find-first numeric pair — linear scan
 
-`findCurrentPrior` (`lib/insights/derive.ts` L12–L20) scans an anomaly's `evidence` array for the first element whose `result` carries both a numeric `current` and a numeric `prior`. It returns on the first match; if none, `null`.
+A `findCurrentPrior` helper scans an anomaly's `evidence` array for the first element whose `result` carries both a numeric `current` and a numeric `prior`. It returns on the first match; if none, `null`.
 
 ```
   evidence: [ e0, e1, e2, … ]
@@ -80,21 +80,20 @@ The boundary is sharp: agents emit evidence; `derive.ts` emits display fields; c
 
 It is `Array.prototype.find` written as a `for` loop so the type narrowing (`typeof r.current === 'number'`) is visible. O(n) over evidence entries; n is the number of tool results on one anomaly — single digits.
 
-`deriveInsightFields` (L27–L39) uses that pair: if a pair exists, the metric name matches `REVENUE_RE` (`/revenue|sales|gmv|total_price|spend/i`), and the change direction is `'down'`, it emits `revenueImpact = { lostUsd: round(current - prior), expectedUsd: round(prior), currency: 'USD' }`. Otherwise it emits an empty object. The UI renders the tile only when the field is present — derivation returns *only what it can compute*.
+The `deriveInsightFields` projection uses that pair: if a pair exists, the metric name matches a revenue-name regex (`/revenue|sales|gmv|total_price|spend/i`), and the change direction is `'down'`, it emits `revenueImpact = { lostUsd: round(current - prior), expectedUsd: round(prior), currency: 'USD' }`. Otherwise it emits an empty object. The UI renders the tile only when the field is present — derivation returns *only what it can compute*.
 
 ### (b) the funnel leak point — min-by-key reduce (`argmin`)
 
-In `components/feed/InsightCard.tsx` the funnel object `{ view, cart, checkout, purchase }` (each a signed % change vs prior) is first projected into an array of `{ k, v }` pairs (L156–L158), then reduced to the single pair with the smallest `v`:
+In the insight-card component the funnel object `{ view, cart, checkout, purchase }` (each a signed % change vs prior) is first projected into an array of `{ k, v }` pairs, then reduced to the single pair with the smallest `v`:
 
-```ts
-// components/feed/InsightCard.tsx  L155–L161
-const funnel = insight.funnel;
-const funnelStages = funnel
-  ? (['view', 'cart', 'checkout', 'purchase'] as const).map((k) => ({ k, v: funnel[k] }))
-  : [];
-const leakKey = funnelStages.length
-  ? funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k
-  : null;
+```
+funnel = insight.funnel
+funnelStages = funnel
+    ? ['view','cart','checkout','purchase'].map(k => ({ k, v: funnel[k] }))
+    : []
+leakKey = funnelStages.length
+    ? funnelStages.reduce((a, b) => b.v < a.v ? b : a).k
+    : null
 ```
 
 `reduce((a, b) => b.v < a.v ? b : a)` with no seed: the accumulator `a` starts as element 0, and each step keeps whichever of `a`/`b` has the smaller `v`. The result is the `{k, v}` with the minimum `v`; `.k` extracts its stage name. This is the classic `argmin` — find the *key* of the minimum, not the minimum value. The empty-array guard (`funnelStages.length ?`) matters because seedless `reduce` on `[]` throws.
@@ -111,7 +110,7 @@ const leakKey = funnelStages.length
 
 ### (c) confidence bucketing — count then threshold
 
-`diagnosisConfidence` (`lib/insights/derive.ts` L54–L62) returns `'high' | 'medium' | 'low'`. It prefers the agent's own `confidence` if set; otherwise it counts supported and tested hypotheses and applies thresholds.
+A `diagnosisConfidence` helper returns `'high' | 'medium' | 'low'`. It prefers the agent's own `confidence` if set; otherwise it counts supported and tested hypotheses and applies thresholds.
 
 ```
   if d.confidence set → return it (agent's own call wins)
@@ -124,18 +123,18 @@ const leakKey = funnelStages.length
   else                                   → 'low'     (no cause supported)
 ```
 
-`hypothesesTested` (L42–L48) is itself two `filter`/`length` counts: `tested` = hypotheses with non-empty `reasoning`, `total` = all hypotheses. "Tested" means the agent actually reasoned about it; an untested hypothesis is one the agent ran out of budget (tool calls / rate limit) to investigate.
+`hypothesesTested` is itself two `filter`/`length` counts: `tested` = hypotheses with non-empty `reasoning`, `total` = all hypotheses. "Tested" means the agent actually reasoned about it; an untested hypothesis is one the agent ran out of budget (tool calls / rate limit) to investigate.
 
 ### (d) impact shape normalization — union narrowing
 
-`EstimatedImpact` is `string | { range: string; rangeUsd?; assumption: string }` — a legacy string or a rich object. `impactRange` (L4–L6) and `impactAssumption` (L7–L9) collapse the union to a stable display shape so callers never branch on the type:
+`EstimatedImpact` is `string | { range: string; rangeUsd?; assumption: string }` — a legacy string or a rich object. `impactRange` and `impactAssumption` collapse the union to a stable display shape so callers never branch on the type:
 
 ```
   impactRange(e):       typeof e === 'string' ? e : e.range
   impactAssumption(e):  typeof e === 'string' ? null : (e.assumption?.trim() || null)
 ```
 
-A bare string has no assumption → `null`. A rich object's assumption is trimmed and, if empty after trimming, also `null`. Callers (`RecommendationCard`, the markdown export) call `impactRange`/`impactAssumption` and render uniformly regardless of which arm of the union they got.
+A bare string has no assumption → `null`. A rich object's assumption is trimmed and, if empty after trimming, also `null`. Callers (the recommendation card, the markdown export) call `impactRange`/`impactAssumption` and render uniformly regardless of which arm of the union they got.
 
 **Move 3 — the principle.** Anything that is a pure function of data you already have is a *derivation*, not a *fetch*. Compute it at the presentation boundary with a scan, a fold, or a `typeof`. The agent's job is to gather evidence; the derivation layer's job is to project that evidence into whatever the UI needs — at zero I/O cost and full determinism.
 
@@ -445,3 +444,4 @@ A reviewer says: "Move `diagnosisConfidence` into the agent prompt — let the m
 Updated: 2026-05-29 — funnel-leak reduce refreshed to current lines (block L155–L161, `funnelStages` map L156–L158, `leakKey` argmin L159–L161); verified `anomalyToInsight` copies `category` at `lib/state/insights.ts` L25 and `derive.ts` refs unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

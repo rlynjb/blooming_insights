@@ -177,23 +177,23 @@ The condition under which it works: the model has to understand the synthetic ob
 
 ### What blooming insights has — bounded exponential-backoff retry, no breaker
 
-The technical thing: `McpClient.callTool` (`lib/mcp/client.ts` L122–L132) retries rate-limited calls up to 3 times with exponential backoff. The wait is computed two ways and the smaller-of-(chosen, ceiling) wins: a parsed `Retry-After` hint from the error text + 500 ms buffer, else `retryDelayMs × 2^(retries-1)` off a 10s base, every wait capped at `retryCeilingMs = 20_000`. Configuration lives in `lib/mcp/connect.ts` L92–L95: `retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`.
+The technical thing: the MCP client wrapper's tool-call path retries rate-limited calls up to 3 times with exponential backoff. The wait is computed two ways and the smaller-of-(chosen, ceiling) wins: a parsed `Retry-After` hint from the error text + 500 ms buffer, else `retry_delay_ms × 2^(retries-1)` off a 10s base, every wait capped at `retry_ceiling_ms = 20_000`. Configuration: `retry_delay_ms: 10_000`, `retry_ceiling_ms: 20_000`, `max_retries: 3`.
 
 If you're coming from frontend, this is `fetch` retry with `Retry-After` honoring — done correctly. It's the right thing for transient blips: one bad call clears on retry, the budget allows for it, the wait honors the server's stated penalty window.
 
 ```
-McpClient.callTool — retry shape (no breaker)
+call_tool — retry shape (no breaker), pseudocode
 
-  result = liveCall(name, args)                  client.ts L113
+  result = live_call(name, args)
   retries = 0
-  while isRateLimited(result) && retries < 3:    L122
-    retries++                                    L123
-    hintMs   = parseRetryAfterMs(result)         L124
-    backoffMs = retryDelayMs × 2^(retries-1)     L125  (base 10s)
-    waitMs   = min(hintMs+500 ?? backoffMs,
-                   retryCeilingMs=20s)            L126–129
-    await sleep(waitMs)                          L130
-    result = liveCall(name, args)                L131
+  while is_rate_limited(result) and retries < 3:
+    retries += 1
+    hint_ms    = parse_retry_after_ms(result)
+    backoff_ms = retry_delay_ms × 2^(retries-1)    # base 10s
+    wait_ms    = min(hint_ms + 500 if hint_ms else backoff_ms,
+                     retry_ceiling_ms)              # 20s ceiling
+    await sleep(wait_ms)
+    result = live_call(name, args)
 
   After 3 retries: return the error result to the agent.
   No breaker state. No fail-fast. No agent observation
@@ -214,7 +214,8 @@ Three layers of failure handling — and what each covers
   layer                       failure it handles            in this codebase
   ──────────────              ──────────────────────────    ─────────────────
   retry (bounded)             transient blip                BUILT
-                              (rate-limit window, jitter)   client.ts L122–L132
+                              (rate-limit window, jitter)   (the MCP client
+                                                             wrapper's retry)
   circuit breaker             sustained outage              ABSENT
                               (provider down for minutes)
   + agent observation         agent retrying a dead tool    ABSENT
@@ -234,14 +235,14 @@ Right now there's bounded retry, no breaker, no observation. Naming where they w
 ┌────────────────────────────────────────────────────────────┐
 │ agent emits tool_use                                       │
 │   ▼                                                         │
-│ McpClient.callTool                                          │
-│   ├─ cache check (L106–L110)                               │
-│   ├─ liveCall (L113)                                       │
+│ mcp_client.call_tool                                        │
+│   ├─ cache check                                           │
+│   ├─ live_call                                             │
 │   │   on rate-limit error: retry up to 3 times             │
-│   │   (L122–L132, waits 10–20s each)                       │
+│   │   (waits 10–20s each)                                  │
 │   └─ return result (success or final error)                │
 │   ▼                                                         │
-│ loop feeds tool_result back to agent (base.ts L161–L171)   │
+│ loop feeds tool_result back to agent                        │
 │   error or success → agent reads, decides next call         │
 │   (no signal "this tool is dead, switch")                   │
 └────────────────────────────────────────────────────────────┘
@@ -250,26 +251,26 @@ Right now there's bounded retry, no breaker, no observation. Naming where they w
 ┌────────────────────────────────────────────────────────────┐
 │ agent emits tool_use                                       │
 │   ▼                                                         │
-│ McpClient.callTool                                          │
+│ mcp_client.call_tool                                        │
 │   ├─ breaker.state(name) ?                                  │ ← NEW
 │   │   ├─ OPEN  → return synthetic "tool unavailable"        │ ← NEW
 │   │   │          observation (no upstream call)             │
 │   │   ├─ HALF-OPEN → allow one probe                        │ ← NEW
 │   │   └─ CLOSED → existing flow                              │
 │   ├─ cache check                                            │
-│   ├─ liveCall                                                │
-│   │   on failure: breaker.recordFailure(name)               │ ← NEW
-│   │   on success: breaker.recordSuccess(name)               │ ← NEW
+│   ├─ live_call                                              │
+│   │   on failure: breaker.record_failure(name)              │ ← NEW
+│   │   on success: breaker.record_success(name)              │ ← NEW
 │   │   retry as before                                       │
 │   └─ return result                                          │
 │   ▼                                                         │
 │ loop feeds tool_result back to agent (UNCHANGED shape)      │
 │   if synthetic "unavailable" → model picks different tool   │
 └────────────────────────────────────────────────────────────┘
-   the breaker state has to be per-instance lived per           │
-   investigation (matches the cache lifecycle), or shared       │
-   across investigations if outage detection should span         │
-   them (more useful, more ops to maintain)                      │
+   the breaker state has to be per-instance lived per
+   investigation (matches the cache lifecycle), or shared
+   across investigations if outage detection should span
+   them (more useful, more ops to maintain)
 ```
 
 *Phase A (now):* retry handles transient blips well; sustained outages burn the budget. Acceptable when Bloomreach availability is high and outages are short (the retry covers most of them).
@@ -316,9 +317,9 @@ The canonical per-tool circuit breaker — with the agent-observation extension
                                        (or abstains honestly)
 
   WHAT THIS CODEBASE HAS:
-   bounded exponential-backoff retry (client.ts L122–L132)
+   bounded exponential-backoff retry (the MCP client wrapper)
    ─ honors Retry-After hint from error text
-   ─ retryDelayMs=10_000, retryCeilingMs=20_000, maxRetries=3
+   ─ retry_delay_ms=10_000, retry_ceiling_ms=20_000, max_retries=3
    ─ no breaker state, no fail-fast
    ─ no agent observation saying "switch tools"
 
@@ -543,3 +544,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

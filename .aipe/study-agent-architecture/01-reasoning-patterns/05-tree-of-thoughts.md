@@ -100,7 +100,7 @@ Beam search over thoughts — pseudocode
 
 The practical consequence: at each depth, you pay K * |beam| generation calls plus K * |beam| scorer calls. Even a tiny beam width of 2 with K=3 and D=4 fires 2 * 3 * 4 = 24 generations and 24 scorings — ~50 LLM calls for one task. That's before any tool calls inside the explored branches.
 
-The condition under which it works (and where it doesn't): the scorer's judgments have to *track which branch will lead to a good final answer*. If the scorer can't tell — because the difference between branches is subtle, or because the scorer shares the producer's blind spots (see `04-reflexion-self-critique.md`) — you're paying a multiplier on cost to commit to randomness.
+The condition under which it works (and where it doesn't): the scorer's judgments have to *track which branch will lead to a good final answer*. If the scorer can't tell — because the difference between branches is subtle, or because the scorer shares the producer's blind spots (see the reflexion / self-critique note) — you're paying a multiplier on cost to commit to randomness.
 
 ### Move 2.3 — When this earns its cost
 
@@ -130,15 +130,13 @@ The honest version, with numbers from this codebase:
 ```
 Constraints (from this codebase):
   MCP rate limit:          ~1 req/s spacing
-  Per-investigation ceiling: 300s (Vercel Pro max — app/api/agent/route.ts L20)
-  Current investigation:    ~100–115s (route.ts L18–L19 comment)
-  Per-agent maxToolCalls:   6 (monitoring/diagnostic/query) or 4 (recommendation)
-                            base.ts L60, monitoring.ts L101,
-                            diagnostic.ts L62, recommendation.ts L57
+  Per-investigation ceiling: 300s (Vercel Pro max — the route handler)
+  Current investigation:    ~100–115s
+  Per-agent tool budget:    6 (monitoring/diagnostic/query) or 4 (recommendation)
 
 ReAct cost (baseline):
   1 trajectory × 6 tool calls × ~1s/call = ~6s of MCP serialization
-  + Sonnet generation per turn ≈ ~100s total/agent (most is MCP wait)
+  + per-turn model generation ≈ ~100s total/agent (most is MCP wait)
 
 ToT with b=3, d=3 (modest):
   27 partial trajectories × 6 tool calls × ~1s/call = 162s of MCP work
@@ -149,7 +147,7 @@ ToT with b=3, d=3 (modest):
 ToT with b=2, d=2 (minimal):
   4 partial trajectories × 6 tool calls × ~1s/call = 24s of MCP work
   + 4 scorer calls
-  + 4x the Sonnet token cost
+  + 4x the per-turn token cost
   TOTAL: still 2-3x ReAct's cost for an investigation type whose
           answer surface is smooth (so branching doesn't help)
 ```
@@ -399,3 +397,4 @@ Open and verify. ✓ The "no" answer, the rate-limit / ceiling numbers, and the 
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

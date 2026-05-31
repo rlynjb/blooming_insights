@@ -56,48 +56,50 @@ context window = one fixed-size array (≈200k tokens for the model used)
    if input fills the array → output has no room → truncated/empty answer
 ```
 
-blooming insights never measures this array in tokens (see → ../01-llm-foundations/02-tokenization.md — it bounds by characters as a coarse proxy). What matters here is the *shape*: the window is shared, the answer competes with the inputs, and the system has to actively defend the answer's room.
+This system never measures this array in tokens (see → ../01-llm-foundations/02-tokenization.md — it bounds by characters as a coarse proxy). What matters here is the *shape*: the window is shared, the answer competes with the inputs, and the system has to actively defend the answer's room.
 
 ---
 
-### Inflow budget 1 — tool results (`truncate` / `MAX_TOOL_RESULT_CHARS`)
+### Inflow budget 1 — tool results (the tool-result cap)
 
-The biggest single consumer of window space is a raw EQL tool result. `lib/agents/base.ts` L29 and L31–L34 cap it before it re-enters the conversation:
-
-```typescript
-const MAX_TOOL_RESULT_CHARS = 16_000;
-
-function truncate(s: string): string {
-  if (s.length <= MAX_TOOL_RESULT_CHARS) return s;
-  return s.slice(0, MAX_TOOL_RESULT_CHARS) + '\n…[truncated]';
-}
-```
-
-Every tool result is `JSON.stringify`'d and passed through `truncate` (`lib/agents/base.ts` L150) before being pushed back as a `tool_result` block (L161–L171). A 60,000-char EQL response becomes 16,000 chars plus a marker. Across the diagnostic agent's six-call budget, this caps the *cumulative* tool-result contribution to ~96,000 characters — the load-bearing defense against the transcript outgrowing the window.
+The biggest single consumer of window space is a raw query tool result. The shared agent loop caps it before it re-enters the conversation:
 
 ```
-EQL result: 60,000 chars
-      │  truncate()   base.ts L31–34
+  MAX_TOOL_RESULT_CHARS = 16_000
+
+  function truncate(s):
+      if length(s) <= MAX_TOOL_RESULT_CHARS:
+          return s
+      return slice(s, 0, MAX_TOOL_RESULT_CHARS) + "\n…[truncated]"
+```
+
+Every tool result is JSON-serialized and passed through `truncate` before being pushed back as a tool-result block. A 60,000-char query response becomes 16,000 chars plus a marker. Across the diagnostic agent's six-call budget, this caps the *cumulative* tool-result contribution to ~96,000 characters — the load-bearing defense against the transcript outgrowing the window.
+
+```
+query result: 60,000 chars
+      │  truncate()   (the agent-loop cap)
       ▼
 16,000 chars + "\n…[truncated]"
-      │  fed back   base.ts L150 (stringify+truncate) → L161–171 (tool_result)
+      │  fed back (stringify + truncate) → tool_result block
       ▼
 each of 6 calls ≤ 16,000 chars → transcript stays bounded
 ```
 
-### Inflow budget 2 — the UI stream (`route TRUNC = 4000`)
+### Inflow budget 2 — the UI stream (the route stream cap)
 
-A *separate, smaller* budget governs what is streamed to the browser — this one does not protect the window, it protects the wire. `app/api/agent/route.ts` L99–L103:
+A *separate, smaller* budget governs what is streamed to the browser — this one does not protect the window, it protects the wire. The route handler runs a different cap:
 
-```typescript
-const TRUNC = 4000;
-const trunc = (v: unknown): unknown => {
-  const s = JSON.stringify(v);
-  return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
-};
+```
+  TRUNC = 4000
+
+  function trunc(v):
+      s = JSON.serialize(v)
+      if s and length(s) > TRUNC:
+          return slice(s, 0, TRUNC) + "…"
+      return v
 ```
 
-`trunc` is applied to `tc.result` before it goes into a `tool_call_end` NDJSON event (route.ts L192). It is unrelated to the model's window. Two budgets, two purposes: `16_000` defends the model's context array; `4000` defends the NDJSON payload size to the UI.
+The route applies `trunc` to each tool-call result before it goes into a `tool_call_end` streaming event. It is unrelated to the model's window. Two budgets, two purposes: 16,000 defends the model's context array; 4,000 defends the streaming payload size to the UI.
 
 ```
 tool result ──┬── truncate(16_000) ──▶ tool_result block ──▶ model window
@@ -105,31 +107,32 @@ tool result ──┬── truncate(16_000) ──▶ tool_result block ──�
    same source, two different ceilings, two different reasons
 ```
 
-### Inflow budget 3 — the schema prefix (`schemaSummary` caps)
+### Inflow budget 3 — the schema prefix (schema-summary caps)
 
-The system prompt's static prefix is the workspace schema, which is ~112KB raw. `lib/agents/monitoring.ts` L15–L48 builds a compact summary instead of inlining the whole thing, with three hard caps:
+The system prompt's static prefix is the workspace schema, which is ~112KB raw. The monitoring agent builds a compact summary instead of inlining the whole thing, with three hard caps:
 
 ```
-schemaSummary caps   (monitoring.ts L21, L22, L33)
-  MAX_EVENTS          = 20   ← top 20 events only          (L21)
-  MAX_PROPS_PER_EVENT = 10   ← 10 properties per event     (L22)
-  MAX_CPROPS          = 30   ← 30 customer properties       (L33)
+schemaSummary caps
+  MAX_EVENTS          = 20   ← top 20 events only
+  MAX_PROPS_PER_EVENT = 10   ← 10 properties per event
+  MAX_CPROPS          = 30   ← 30 customer properties
 ```
 
-The comment on L14 is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This prefix is shared by every agent (diagnostic and recommendation both call `schemaSummary` via the import at their L6), so capping it once shrinks the fixed cost of *every* agent turn. Inlining the full 112KB schema would consume the window before a single tool result arrived.
+The comment alongside is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This prefix is shared by every agent (diagnostic and recommendation both reuse the same summary helper), so capping it once shrinks the fixed cost of *every* agent turn. Inlining the full 112KB schema would consume the window before a single tool result arrived.
 
 ### Reserving room for the answer — the forced tool-less final turn
 
-Bounding inflow is half the problem. The other half: the loop keeps *adding* turns, and each added turn shrinks the room left for the answer. `lib/agents/base.ts` L85–L101 stops that growth deliberately. `budgetSpent` (L90) is `true` once `toolCalls.length >= maxToolCalls`; `forceFinal` (L91) is `true` on that turn or the last allowed turn; and L101 withholds the tool schemas on a `forceFinal` turn:
+Bounding inflow is half the problem. The other half: the loop keeps *adding* turns, and each added turn shrinks the room left for the answer. The agent loop stops that growth deliberately. A `budgetSpent` check is true once tool calls reach the agent's budget; a `forceFinal` flag is true on that turn or the last allowed turn; and the loop withholds the tool schemas on a `forceFinal` turn:
 
-```typescript
-const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-const forceFinal = turn === maxTurns - 1 || budgetSpent;          // L91
-// …
-if (!forceFinal) params.tools = toolSchemas;                       // L101
+```
+  budgetSpent = (maxToolCalls is set) and (count(toolCalls) >= maxToolCalls)
+  forceFinal  = (turn == maxTurns - 1) or budgetSpent
+  ...
+  if not forceFinal:
+      params.tools = toolSchemas
 ```
 
-With no tool schemas in the request, the model *cannot* emit a `tool_use` block, so it cannot trigger another `tool_result` to be appended (L161–L171). The transcript stops growing. The model is now forced to spend its remaining `max_tokens` writing the answer rather than asking for more data — exactly the room the inflow budgets reserved.
+With no tool schemas in the request, the model *cannot* emit a `tool_use` block, so it cannot trigger another `tool_result` to be appended. The transcript stops growing. The model is now forced to spend its remaining `max_tokens` writing the answer rather than asking for more data — exactly the room the inflow budgets reserved.
 
 ```
 turn  toolCalls  forceFinal  tools sent?  transcript
@@ -144,7 +147,7 @@ turn  toolCalls  forceFinal  tools sent?  transcript
 
 ### The principle
 
-A finite shared buffer demands two disciplines, not one: bound every inflow at the door, and stop filling it before the consumer needs room. blooming insights bounds inflow with character caps (`16_000` tool results, `30/20/10` schema, separately `4000` for the UI) and reserves the answer's room by withholding tools on the final turn so the transcript cannot grow past the point where the model still has space to respond. The window is shared; the answer is what you are protecting.
+A finite shared buffer demands two disciplines, not one: bound every inflow at the door, and stop filling it before the consumer needs room. You bound inflow with character caps (16,000 tool results, 30/20/10 schema, separately 4,000 for the UI) and reserve the answer's room by withholding tools on the final turn so the transcript cannot grow past the point where the model still has space to respond. The window is shared; the answer is what you are protecting.
 
 ---
 
@@ -157,26 +160,26 @@ This diagram spans the layers a request crosses and where each budget is applied
 │  SERVICE LAYER — inflow bounded in CHARACTERS                         │
 │                                                                       │
 │  schema (112KB)                                                       │
-│     │ schemaSummary  monitoring.ts L15–48 (20 events/10 props/30)    │
+│     │ schemaSummary  monitoring.ts (20 events/10 props/30)    │
 │     ▼                                                                 │
 │  compact schema string ──┐                                           │
 │                          │ system prefix (shared by all agents)      │
 │  EQL tool result (60KB)  │                                           │
-│     │ truncate  base.ts L31–34 (16_000)                              │
+│     │ truncate  base.ts (16_000)                              │
 │     ▼                    │                                           │
 │  16,000-char result ─────┤                                           │
 │                          ▼                                           │
 │        messages[]  (system + turns + tool_results — grows per turn)  │
 │                          │                                           │
-│  forced-final turn  base.ts L85–101                                  │
-│     forceFinal? → omit tools (L101) → transcript STOPS growing       │
+│  forced-final turn  base.ts                                          │
+│     forceFinal? → omit tools → transcript STOPS growing       │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  the bounded array crosses to the model;
                             │  max_tokens reserves the OUTPUT slots
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  PROVIDER BOUNDARY — the fixed-size context window                   │
 │                                                                       │
-│  anthropic.messages.create({ system, messages, max_tokens })  L102   │
+│  anthropic.messages.create({ system, messages, max_tokens })         │
 │     input slots = bounded transcript │ output slots = max_tokens     │
 └────────────────────────────────────────────────────────────────────────┘
 
@@ -339,3 +342,4 @@ Which line withholds the tool schemas so the model cannot grow the transcript on
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); the character-budget/forced-final-turn mechanics and `base.ts`/`monitoring.ts` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

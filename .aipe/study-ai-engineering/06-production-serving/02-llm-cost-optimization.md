@@ -42,7 +42,7 @@
 
 ## How it works
 
-**Mental model.** A request's cost is `input_tokens × in_price + output_tokens × out_price`, summed over every model call in the request. Three families of lever exist: **route** (send the request to a cheaper model when the task is easy), **shrink** (reduce the tokens — cap exploration, truncate context, cache the prefix), and **see** (measure per-request cost so you optimize the right line). blooming insights pulls the route lever once at the edge, pulls most shrink levers, and pulls no see lever at all.
+**Mental model.** A request's cost is `input_tokens × in_price + output_tokens × out_price`, summed over every model call in the request. Three families of lever exist: **route** (send the request to a cheaper model when the task is easy), **shrink** (reduce the tokens — cap exploration, truncate context, cache the prefix), and **see** (measure per-request cost so you optimize the right line). You pull the route lever once at the edge, pull most shrink levers, and pull no see lever at all.
 
 ```
  cost = Σ over calls ( in_tokens·in$ + out_tokens·out$ )
@@ -56,30 +56,30 @@ The trap is that `out$` is several times `in$`, and the agents' `synthesize()` c
 
 ---
 
-### Route — model selection at the edge (`classifyIntent`)
+### Route — model selection at the edge (the intent classifier)
 
-The one place blooming insights routes by cost is intent classification. A free-form `?q=` query first goes to a haiku model to decide which agent surface should answer it — a one-word output.
+The one place this system routes by cost is intent classification. A free-form `?q=` query first goes to a cheap-tier model to decide which agent surface should answer it — a one-word output.
 
 ```
  ?q="why did conversion drop?"
         │
-        ├─ classifyIntent  →  haiku  (max_tokens: 16)   ← cheap, one word
-        │                     "diagnostic"
+        ├─ classify_intent  →  cheap tier  (max_tokens: 16)   ← cheap, one word
+        │                       "diagnostic"
         ▼
-   QueryAgent.answer       →  sonnet (full agent loop)  ← expensive, the work
+   QueryAgent.answer        →  dear tier (full agent loop)    ← expensive, the work
 ```
 
-`CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` at `lib/agents/intent.ts` L14. The call at L17–L31 sets `max_tokens: 16` (L20) and a system prompt that forces exactly one word. Routing a classification to haiku instead of sonnet is the textbook cheap-model-for-an-easy-task move: the task has one bit of decision content, so it does not need the strong model's reasoning.
+The classifier model is a cheap-tier model and the call sets `max_tokens: 16` plus a system prompt that forces exactly one word. Routing a classification to the cheap tier instead of the dear tier is the textbook cheap-model-for-an-easy-task move: the task has one bit of decision content, so it does not need the strong model's reasoning.
 
 ```
   task: "pick one of three labels"
    ┌──────────────────────────────┐
-   │ haiku   max_tokens 16  cheap  │  ← chosen
-   │ sonnet  full reasoning  costly │  ← overkill for a label
+   │ cheap tier  max_tokens 16   chosen
+   │ dear tier   full reasoning  overkill for a label
    └──────────────────────────────┘
 ```
 
-That is the *only* model-routing decision. Inside every agent, the model is `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9), used uniformly for the loop turns *and* the dedicated synthesis calls.
+That is the *only* model-routing decision. Inside every agent, the model is a shared `AGENT_MODEL` constant (the dear-tier model), used uniformly for the loop turns *and* the dedicated synthesis calls.
 
 ---
 
@@ -88,15 +88,15 @@ That is the *only* model-routing decision. Inside every agent, the model is `AGE
 Each agent caps the total number of tool calls it may make. Once the cap is hit, the loop forces a tool-less final turn (see `../04-agents-and-tool-use`), bounding both token spend and latency.
 
 ```
-agent              maxToolCalls   where
-─────────────      ────────────   ──────────────────────────
-MonitoringAgent         6         lib/agents/monitoring.ts L84
-DiagnosticAgent         6         lib/agents/diagnostic.ts L62
-RecommendationAgent     4         lib/agents/recommendation.ts L57
-QueryAgent              6         lib/agents/query.ts L41
+agent                maxToolCalls
+─────────────        ────────────
+MonitoringAgent           6
+DiagnosticAgent           6
+RecommendationAgent       4
+QueryAgent                6
 ```
 
-`budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls` at `lib/agents/base.ts` L90; `forceFinal` at L91 flips on when the budget is spent. Without this cap an agent could explore until the `maxDuration = 300` route limit (`app/api/agent/route.ts` L20) killed it — burning tokens the whole way with nothing to show.
+A `budgetSpent` check is true once `toolCalls.length >= maxToolCalls`; the `forceFinal` flag flips on when the budget is spent. Without this cap an agent could explore until the route's `maxDuration = 300` limit killed it — burning tokens the whole way with nothing to show.
 
 ```
 turn  toolCalls  budgetSpent  → tokens spent grow linearly per turn
@@ -113,37 +113,37 @@ turn  toolCalls  budgetSpent  → tokens spent grow linearly per turn
 Two truncation points keep token counts from ballooning as tool results accumulate in the message history.
 
 ```
- MCP result ──► truncate(16_000) ──► fed back as tool_result   lib/agents/base.ts L29,L31
- tool result ──► trunc(4000) ──────► sent to UI as NDJSON       app/api/agent/route.ts L99
+ MCP result ──► truncate(16_000) ──► fed back as tool_result   (the agent-loop cap)
+ tool result ──► trunc(4000) ──────► sent to UI as NDJSON       (the route stream cap)
 ```
 
-`MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) caps what re-enters the model's context — critical because the full message history is re-sent on every turn (L99), so an un-truncated 50k result would be re-charged 5+ times. The route's `TRUNC = 4000` (`app/api/agent/route.ts` L99) is a separate, smaller cap for what streams to the browser. `schemaSummary` (`lib/agents/monitoring.ts`) further caps the schema injected into prompts (20 events / 10 props / 30 customer-props).
+The 16,000-character cap on each tool result is critical because the full message history is re-sent on every turn, so an un-truncated 50k result would be re-charged 5+ times. The route's 4,000-character cap is a separate, smaller cap for what streams to the browser. The schema-summary helper further caps the schema injected into prompts (20 events / 10 props / 30 customer-props).
 
 ---
 
 ### Shrink — caching (cross-reference)
 
-The 60s exact-match tool cache (`lib/mcp/client.ts` L97–L146) removes repeat network round-trips and the tokens of re-feeding an identical result. The investigation replay cache (`lib/state/investigations.ts`) removes entire runs. Both are covered in `01-llm-caching.md`. The cost lever they do *not* pull — prompt caching of the static prefix — is the unbuilt shrink lever below.
+The 60s exact-match tool cache removes repeat network round-trips and the tokens of re-feeding an identical result. The investigation replay cache removes entire runs. Both are covered in `01-llm-caching.md`. The cost lever they do *not* pull — prompt caching of the static prefix — is the unbuilt shrink lever below.
 
 ---
 
 ### Shrink — gate before spend (the coverage gate)
 
-There is a fourth shrink lever that costs nothing per request: refuse to spend on work the data cannot support. Before the monitoring agent runs, the briefing route computes `runnable = runnableCategories(schemaCapabilities(schema))` (`app/api/briefing/route.ts` L202–L204) — a pure in-memory schema check (`lib/agents/categories.ts`) — and passes only those categories into `agent.scan({…}, runnable)` (L223/L240). The agent's prompt checklist (`lib/agents/monitoring.ts` L73–L86) therefore lists only categories this workspace's events can support, so the agent never burns one of its ~1 req/s MCP calls querying a category the schema cannot answer.
+There is a fourth shrink lever that costs nothing per request: refuse to spend on work the data cannot support. Before the monitoring agent runs, the briefing route computes `runnable = runnableCategories(schemaCapabilities(schema))` — a pure in-memory schema check — and passes only those categories into `agent.scan({…}, runnable)`. The agent's prompt checklist therefore lists only categories this workspace's events can support, so the agent never burns one of its ~1 req/s MCP calls querying a category the schema cannot answer.
 
 ```
  gate-before-spend (free) ── then the agent spends (metered)
  ─────────────────────────────────────────────────────────────
- schemaCapabilities(schema)        ← in-memory Set build, $0
+ schema_capabilities(schema)       ← in-memory Set build, $0
         │
- runnableCategories(...)           ← filter 10 → runnable, $0   categories.ts
+ runnable_categories(...)          ← filter 10 → runnable, $0
         │ runnable
  agent.scan({…}, runnable)         ← only runnable categories enter the prompt
         │
  runAgentLoop (≤6 MCP calls)       ← spends the ~1 req/s budget here, gated set only
 ```
 
-The lever is "do not pay the metered cost (MCP budget, tokens, latency) for work a cheap free check already proved impossible." It is the same discipline as the haiku classifier — decide cheaply before committing the expensive resource — applied to *which categories* rather than *which model*. See `../04-agents-and-tool-use/07-capability-gating.md` for the full treatment of the gate.
+The lever is "do not pay the metered cost (MCP budget, tokens, latency) for work a cheap free check already proved impossible." It is the same discipline as the intent classifier — decide cheaply before committing the expensive resource — applied to *which categories* rather than *which model*. See `../04-agents-and-tool-use/07-capability-gating.md` for the full treatment of the gate.
 
 ---
 
@@ -158,7 +158,7 @@ Input tokens are many but cheap; output tokens are few but several times more ex
  synthesize()         output-heavy (JSON)  HIGH per token  ← line item
 ```
 
-`DiagnosticAgent.synthesize` (`lib/agents/diagnostic.ts` L87–L126) is a dedicated `anthropic.messages.create` with `max_tokens: 2048` (L99) on sonnet, emitting a full diagnosis JSON. `RecommendationAgent.synthesize` mirrors it at `max_tokens: 2048` (`lib/agents/recommendation.ts` L98). These output-heavy sonnet calls are the dominant cost per investigation — and the codebase has no telemetry pointing at them.
+The diagnostic agent's `synthesize` call is a dedicated model call with `max_tokens: 2048` on the dear tier, emitting a full diagnosis JSON. The recommendation agent's `synthesize` mirrors it at `max_tokens: 2048`. These output-heavy dear-tier calls are the dominant cost per investigation — and the codebase has no telemetry pointing at them.
 
 ---
 
@@ -174,7 +174,7 @@ shrink      maxToolCalls, truncate,        prompt caching (cache_control)
 see         —                              cost dashboard / per-run meter
 ```
 
-Three gaps: (1) **no in-agent cascade** — every agent runs sonnet from the first turn; a cheap-first pass (try haiku, escalate to sonnet only when the cheap output fails validation) is not attempted. (2) **no prompt caching** — the static prefix re-costs at full input price every turn (see `01-llm-caching.md`). (3) **no cost visibility** — `res.usage` (returned on every Anthropic response) is read by nobody, so the output-heavy `synthesize()` line item is invisible.
+Three gaps: (1) **no in-agent cascade** — every agent runs the dear tier from the first turn; a cheap-first pass (try the cheap tier, escalate to the dear tier only when the cheap output fails validation) is not attempted. (2) **no prompt caching** — the static prefix re-costs at full input price every turn (see `01-llm-caching.md`). (3) **no cost visibility** — `res.usage` (returned on every provider response) is read by nobody, so the output-heavy `synthesize()` line item is invisible.
 
 ---
 
@@ -196,7 +196,7 @@ This diagram spans the Route, Agent, and Provider layers and marks each cost lev
   │       │                                                             │
   │  ┌────▼──────────────────────────────────────┐                     │
   │  │  ROUTE  classifyIntent → haiku  (BUILT)    │                     │
-  │  │  intent.ts L14,L20 — max_tokens 16, 1 word │                     │
+  │  │  intent.ts — max_tokens 16, 1 word │                     │
   │  └────┬──────────────────────────────────────┘                     │
   │       │                                                             │
   │  ╎ SEE  per-request cost meter from res.usage  (ABSENT) ╎          │
@@ -206,23 +206,23 @@ This diagram spans the Route, Agent, and Provider layers and marks each cost lev
   │  AGENT LAYER   lib/agents/  — all sonnet (AGENT_MODEL base.ts L9)     │
   │                                                                       │
   │  ┌────────────────────────────────────────────────────┐             │
-  │  │  SHRINK  maxToolCalls 6/6/4/6  (BUILT)  base.ts L90  │             │
-  │  │  SHRINK  truncate 16k         (BUILT)  base.ts L29   │             │
+  │  │  SHRINK  maxToolCalls 6/6/4/6  (BUILT)  base.ts      │             │
+  │  │  SHRINK  truncate 16k         (BUILT)  base.ts       │             │
   │  └────────────────────────────────────────────────────┘             │
   │       │                                                               │
-  │  ╎ SHRINK  prompt cache (cache_control)  (ABSENT)  base.ts L98 ╎     │
+  │  ╎ SHRINK  prompt cache (cache_control)  (ABSENT)  base.ts ╎     │
   │  ╎ ROUTE   cheap-first-then-escalate     (ABSENT)              ╎     │
   │       │                                                               │
   │  ┌────▼───────────────────────────────────────────────┐            │
   │  │  synthesize()  sonnet, max_tokens 2048, JSON out     │            │
   │  │  OUTPUT-HEAVY → dominant line item                   │            │
-  │  │  diagnostic.ts L87–L126 / recommendation.ts L82–L132 │            │
+  │  │  diagnostic.ts / recommendation.ts          │            │
   │  └─────────────────────────────────────────────────────┘            │
   └───────┼──────────────────────────────────────────────────────────────┘
           │  mcp.callTool
   ┌───────▼──────────────────────────────────────────────────────────────┐
   │  PROVIDER / MCP LAYER                                                 │
-  │  SHRINK  60s tool cache (BUILT)  lib/mcp/client.ts L35–L65            │
+  │  SHRINK  60s tool cache (BUILT)  lib/mcp/client.ts                    │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -404,3 +404,4 @@ Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived drifted 
 Updated: 2026-05-29 — Added a "gate before spend" shrink lever: `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204) gates the monitoring agent's category checklist before it spends any of the ~1 req/s MCP budget (monitoring.ts L73–86 / scan call L223/240). Verified maxDuration L20 already cites 300. Cross-ref ../04-agents-and-tool-use/07-capability-gating.md.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -43,19 +43,19 @@
 ```
 finalText: "Here's the diagnosis:\n```json\n{...}\n```\nHope this helps!"
       │
-  (1) EXTRACT     parseAgentJson  validate.ts L3–13
+  (1) EXTRACT     the JSON parser
       │  fenced → bare JSON.parse → first-bracket-to-last-bracket scan
       ▼
   parsed: unknown
       │
-  (2) VALIDATE    isDiagnosis  validate.ts L29–35
+  (2) VALIDATE    the type guard
       │  every required field present & correct type?
       ▼
   typed Diagnosis ✓        ─── or ───▶ null
                                          │
-  (3) REPAIR      synthesize()  diagnostic.ts L87–126  (clean-context retry)
+  (3) REPAIR      synthesize()  (clean-context retry)
                                          │
-                                         ▼  ?? FALLBACK
+                                         ▼  OR FALLBACK
                                    always a valid Diagnosis
 ```
 
@@ -63,22 +63,25 @@ The model's job is to *try* to emit JSON; the contract's job is to *guarantee* a
 
 ---
 
-### Stage 1 — extract: `parseAgentJson`
+### Stage 1 — extract: the JSON parser
 
-`parseAgentJson` (`lib/mcp/validate.ts` L3–L13) handles the three ways the model presents JSON, in order of likelihood:
+The JSON parser handles the three ways the model presents JSON, in order of likelihood:
 
-```typescript
-export function parseAgentJson(text: string): unknown {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);   // (a) fenced
-  const candidate = (fence ? fence[1] : text).trim();
-  try { return JSON.parse(candidate); } catch { /* fall through */ }  // (b) bare
-  const start = candidate.search(/[[{]/);                       // (c) substring
-  const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-  if (start >= 0 && end > start) {
-    return JSON.parse(candidate.slice(start, end + 1));
-  }
-  throw new Error('no parseable json in agent output');
-}
+```
+  function parse_agent_json(text):
+      fence = match(text, regex(```` ``` ````json + body + ```` ``` ````))
+      candidate = trim(fence.body if fence else text)
+
+      try:                                     # (a) bare attempt on the candidate
+          return JSON.parse(candidate)
+      except: pass
+
+      start = index_of_first(candidate, "[" or "{")    # (c) substring scan
+      end   = last_index_of(candidate, "]" or "}")
+      if start >= 0 and end > start:
+          return JSON.parse(slice(candidate, start, end + 1))
+
+      throw "no parseable json in agent output"
 ```
 
 ```
@@ -94,42 +97,41 @@ Each strategy is a fallback for the previous. The synthesis instruction *asks* f
 
 ### Stage 2 — validate: the type guards
 
-Three `v is T` predicates in `lib/mcp/validate.ts` prove the parsed object matches the expected shape, field by field. `isDiagnosis` (L29–L35):
+Three `v is T` predicates prove the parsed object matches the expected shape, field by field. The diagnosis guard:
 
-```typescript
-export function isDiagnosis(v: unknown): v is Diagnosis {
-  if (!v || typeof v !== 'object') return false;
-  const d = v as any;
-  return typeof d.conclusion === 'string'
-    && Array.isArray(d.evidence)
-    && Array.isArray(d.hypothesesConsidered);
-}
+```
+  function is_diagnosis(v) -> v is Diagnosis:
+      if not v or type_of(v) != "object":
+          return false
+      return type_of(v.conclusion)             == "string"
+         AND is_array(v.evidence)
+         AND is_array(v.hypothesesConsidered)
 ```
 
-`isAnomalyArray` (L17–L27) is stricter — it walks every element and checks nested fields (`change.value` is a number, `change.direction` is `'up'|'down'`, `severity` is in the `SEVERITIES` set). `isRecommendationArray` (L42–L57) validates the *id-less* shape, because the agent emits recommendations without an `id` and the code assigns it after validation (`lib/agents/recommendation.ts` L76):
+The anomaly-array guard is stricter — it walks every element and checks nested fields (the change value is a number, the change direction is `'up'|'down'`, the severity is in the allowed set). The recommendation-array guard validates the *id-less* shape, because the agent emits recommendations without an `id` and the code assigns it after validation:
 
 ```
 agent emits:   { title, rationale, bloomreachFeature, steps, ... }   ← no id
-isRecommendationArray validates THIS shape  (validate.ts L42)
-code assigns:  { id: crypto.randomUUID(), ...r }   (recommendation.ts L76)
+guard validates THIS shape
+code assigns:  { id: random_uuid(), ...r }
 ```
 
-This is a deliberate split: the validator checks what the *model* controls; the system owns identity. Letting the model invent `id`s would risk collisions and non-UUID strings.
+This is a deliberate split: the validator checks what the *model* controls; the system owns identity. Letting the model invent ids would risk collisions and non-UUID strings.
 
 ```
-isAnomalyArray       ── every item: metric, scope[], change{value,direction,baseline}, severity∈SET
-isDiagnosis          ── conclusion:string, evidence:[], hypothesesConsidered:[]
-isRecommendationArray ── every item: title, rationale, bloomreachFeature∈SET, steps[], estimatedImpact, confidence∈SET
-                         (id intentionally NOT validated — assigned post-hoc)
+anomaly-array guard       ── every item: metric, scope[], change{value,direction,baseline}, severity∈SET
+diagnosis guard           ── conclusion:string, evidence:[], hypothesesConsidered:[]
+recommendation-array guard── every item: title, rationale, bloomreachFeature∈SET, steps[], estimatedImpact, confidence∈SET
+                             (id intentionally NOT validated — assigned post-hoc)
 ```
 
-`isRecommendationArray` was deliberately *loosened* as the output contract grew. `estimatedImpact` is now a union — a legacy `string` OR a `{ range, rangeUsd?, assumption }` object (`EstimatedImpact`, `lib/mcp/types.ts` L77–L79) — and the guard accepts either shape via an `impactOk` check (`lib/mcp/validate.ts` L46–L48): `typeof x.estimatedImpact === 'string'` OR an object whose `range` is a string. The richer enrichment fields the agent may emit (`effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric` — `types.ts` L94–L99) are all *optional*, so the guard does not check them; only the load-bearing fields (`title`, `rationale`, `bloomreachFeature`, `steps`, `estimatedImpact`, `confidence`) are validated. Accepting both impact shapes is what lets a legacy snapshot and a fresh dollar-range recommendation pass the *same* guard.
+The recommendation guard was deliberately *loosened* as the output contract grew. `estimatedImpact` is now a union — a legacy `string` OR a `{ range, rangeUsd?, assumption }` object — and the guard accepts either shape via an `impactOk` check: `type_of(x.estimatedImpact) == "string"` OR an object whose `range` is a string. The richer enrichment fields the agent may emit (`effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`) are all *optional*, so the guard does not check them; only the load-bearing fields (`title`, `rationale`, `bloomreachFeature`, `steps`, `estimatedImpact`, `confidence`) are validated. Accepting both impact shapes is what lets a legacy snapshot and a fresh dollar-range recommendation pass the *same* guard.
 
 ```
-estimatedImpact accepted by isRecommendationArray:
+estimatedImpact accepted:
   "string"                                   ← legacy snapshots
   { range, rangeUsd?: {low,high}, assumption } ← current agent output
-  validate.ts L46–48: impactOk = string OR object-with-string-`range`
+  impactOk = string OR object-with-string-`range`
 ```
 
 ---
@@ -138,48 +140,53 @@ estimatedImpact accepted by isRecommendationArray:
 
 The contract has two repair mechanisms before the final fallback.
 
-**The synthesis instruction** (the in-loop nudge) is appended to the system prompt on the forced-final turn (`lib/agents/base.ts` L96–L98). For the diagnostic agent it reads (`lib/agents/diagnostic.ts` L63–L67): "You have NO more tool calls available... Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape." This tells the model exactly what to emit and prohibits further exploration — so the loop's final turn usually produces fence-wrapped JSON that clears stages 1 and 2 directly.
+**The synthesis instruction** (the in-loop nudge) is appended to the system prompt on the forced-final turn. For the diagnostic agent it reads, in spirit: "You have NO more tool calls available... Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape." This tells the model exactly what to emit and prohibits further exploration — so the loop's final turn usually produces fence-wrapped JSON that clears stages 1 and 2 directly.
 
-**The dedicated `synthesize()` call** is the clean-context retry when the nudge fails. `DiagnosticAgent.synthesize` (`lib/agents/diagnostic.ts` L87–L126) is a *separate* `anthropic.messages.create` (L97) — no tools, no loop history. It formats the gathered `toolCalls` as evidence text and asks for only the JSON:
-
-```typescript
-const res = await this.anthropic.messages.create({
-  model: AGENT_MODEL,
-  max_tokens: 2048,
-  system: 'You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data.',
-  messages: [{ role: 'user', content: `Anomaly...\n\nQueries run...\n${evidence}\n\n...output ... {"conclusion": string, "evidence": string[], "hypothesesConsidered": [...]}` }],
-});
-return tryParseDiagnosis(text);
-```
-
-Why a fresh call instead of one more loop turn: the loop's message history is full of `tool_use`/`tool_result` pairs and partial reasoning — the model has momentum toward "I should query more." A clean single-turn call with no tools and no history breaks that momentum; it sees only evidence + schema + "output JSON" and reliably complies. The recommendation agent has the identical structure (`lib/agents/recommendation.ts` L82–L132, call at L96).
-
-The whole contract assembles in the fallback chain (`lib/agents/diagnostic.ts` L74–L75):
+**The dedicated `synthesize()` call** is the clean-context retry when the nudge fails. It is a *separate* model call — no tools, no loop history. It formats the gathered tool calls as evidence text and asks for only the JSON:
 
 ```
-tryParseDiagnosis(finalText)             ← stages 1+2 on the loop's output
-  ?? (await this.synthesize(...))         ← stages 1+2 on a clean-context retry
-  ?? FALLBACK                             ← model-independent floor
+  response = provider_sdk.messages.create({
+    model:       AGENT_MODEL,
+    max_tokens:  2048,
+    system:      "You are concluding a completed investigation. "
+                 "Output ONLY a JSON diagnosis. Never ask for more data.",
+    messages:    [{ role: "user", content:
+      "Anomaly...\n\nQueries run...\n" + evidence +
+      "\n\n...output ... {\"conclusion\": string, \"evidence\": string[], "
+      "\"hypothesesConsidered\": [...]}"
+    }],
+  })
+  return try_parse_diagnosis(response.text)
+```
+
+Why a fresh call instead of one more loop turn: the loop's message history is full of tool-use / tool-result pairs and partial reasoning — the model has momentum toward "I should query more." A clean single-turn call with no tools and no history breaks that momentum; it sees only evidence + schema + "output JSON" and reliably complies. The recommendation agent has the identical structure.
+
+The whole contract assembles in the fallback chain:
+
+```
+try_parse_diagnosis(finalText)            ← stages 1+2 on the loop's output
+  OR (await synthesize(...))               ← stages 1+2 on a clean-context retry
+  OR FALLBACK                              ← model-independent floor
 ```
 
 ---
 
 ### Why extract-from-prose instead of native JSON mode
 
-This is the key design decision worth defending. The codebase *does* use Anthropic's native tool-use (the `tools` parameter) for **data retrieval** — every MCP call is a structured tool invocation with a JSON-schema'd input. But the **final structured artifact** (the `Diagnosis`, the `Recommendation[]`) is *parsed from the model's text*, not produced by a native JSON/structured-output mode.
+This is the key design decision worth defending. The system *does* use the provider's native tool-use (the `tools` parameter) for **data retrieval** — every tool call is a structured invocation with a JSON-schema'd input. But the **final structured artifact** (the `Diagnosis`, the `Recommendation[]`) is *parsed from the model's text*, not produced by a native JSON / structured-output mode.
 
 ```
-DATA retrieval        → native tool-use (Anthropic tools param)  ← structured IN
-FINAL artifact        → prose → parseAgentJson → type guard       ← structured OUT (parsed)
+DATA retrieval        → native tool-use (provider tools param)   ← structured IN
+FINAL artifact        → prose → parse + type guard                ← structured OUT (parsed)
 ```
 
-The reason is the same provider-agnosticism that drives the testability seam (→ 08-provider-abstraction.md): prose-extraction works against *any* text model, and the `synthesisInstruction` + `parseAgentJson` + guard pipeline is fully under the codebase's control and fully unit-testable with injected fakes. A native JSON mode would couple the *final-artifact* contract to one provider's feature surface. The trade is real — native modes guarantee validity at the token level — but the team chose portability and testability for the output contract while still using native tool-use for input.
+The reason is the same provider-agnosticism that drives the testability seam (→ 08-provider-abstraction.md): prose-extraction works against *any* text model, and the synthesis-instruction + JSON parser + guard pipeline is fully under the codebase's control and fully unit-testable with injected fakes. A native JSON mode would couple the *final-artifact* contract to one provider's feature surface. The trade is real — native modes guarantee validity at the token level — but the team chose portability and testability for the output contract while still using native tool-use for input.
 
 ---
 
 ### The principle
 
-A structured-output contract is three jobs, not one: extract the JSON from prose, validate its shape against a type guard, and repair via a clean-context retry before falling back. Asking the model for JSON is the *request*; the contract is the *guarantee*. blooming insights guarantees a typed output for the final artifact in application code (portable, testable) while using native tool-use only for the structured *input* side — a deliberate split between where it trusts the provider and where it trusts its own parser.
+A structured-output contract is three jobs, not one: extract the JSON from prose, validate its shape against a type guard, and repair via a clean-context retry before falling back. Asking the model for JSON is the *request*; the contract is the *guarantee*. You guarantee a typed output for the final artifact in application code (portable, testable) while using native tool-use only for the structured *input* side — a deliberate split between where you trust the provider and where you trust your own parser.
 
 ---
 
@@ -191,7 +198,7 @@ This diagram spans the full contract. The Provider layer emits prose-with-JSON; 
 ┌──────────────────────────────────────────────────────────────────────┐
 │  PROVIDER LAYER (Anthropic)                                           │
 │                                                                       │
-│  forced-final turn: system + synthesisInstruction  base.ts L96–98    │
+│  forced-final turn: system + synthesisInstruction  base.ts           │
 │  "Respond with ONLY a JSON object in a ```json fence"                │
 │           │                                                          │
 │           ▼                                                          │
@@ -205,18 +212,18 @@ This diagram spans the full contract. The Provider layer emits prose-with-JSON; 
 │       fenced → bare → first-bracket-to-last-bracket → throw          │
 │           │ unknown                                                  │
 │  (2) VALIDATE isDiagnosis / isAnomalyArray / isRecommendationArray   │
-│       validate.ts L17–57   (id NOT validated; impact union accepted) │
+│       validate.ts   (id NOT validated; impact union accepted) │
 │           │ valid              │ null / threw                        │
 │           ▼                    ▼                                     │
-│      typed value         (3) REPAIR  synthesize()  diagnostic L87–126│
+│      typed value         (3) REPAIR  synthesize()  diagnostic        │
 │                              fresh call, NO tools, NO history        │
 │                              evidence text → ONLY JSON                │
 │                                   │ valid        │ null              │
 │                                   ▼              ▼                   │
 │                              typed value      FALLBACK / []          │
-│                                                diagnostic.ts L16–20  │
+│                                                diagnostic.ts         │
 │                                                                       │
-│  chain: tryParse(finalText) ?? synthesize() ?? FALLBACK  (L74–75)    │
+│  chain: tryParse(finalText) ?? synthesize() ?? FALLBACK    │
 └────────────────────────────────────────────────────────────────────────┘
 
   (separate) DATA retrieval uses native tool-use (tools param) — structured IN.
@@ -384,3 +391,4 @@ Updated: 2026-05-28 — Refreshed the output contract for grown types (Insight/D
 Updated: 2026-05-29 — Synthesis-instruction append ref drifted to L96–L98 (was L95–L98); corrected the three remaining occurrences (the In-this-codebase line already read L96–L98).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

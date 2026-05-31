@@ -119,7 +119,7 @@ The infinite handoff
         ...
    until: hop_count >= MAX_HOPS  → forced stop, no answer
 
-  cross-ref: ./09-coordination-failure-modes.md
+  cross-ref: the coordination-failure-modes note
 ```
 
 The practical consequence: every swarm framework has a handoff counter / max-hops constraint. OpenAI Swarm has a `max_turns` config; LangGraph has graph-level recursion limits; CrewAI tracks `delegation_count`. Without a cap, a swarm can burn the full per-run token budget on routing.
@@ -149,7 +149,7 @@ Three context-passing shapes
   preserves nuance      cheap             enforced contract
 ```
 
-The practical consequence: full-history is what most swarm frameworks default to (OpenAI Swarm passes the whole `messages` array); summaries are what production teams move to once token costs become real; typed messages are what blooming insights' Diagnosis pattern already uses for its sequential pipeline (cross-ref `./03-sequential-pipeline.md`) — and would be the right shape for any handoff this codebase ever introduced.
+The practical consequence: full-history is what most swarm frameworks default to (OpenAI Swarm passes the whole `messages` array); summaries are what production teams move to once token costs become real; typed messages are what blooming insights' Diagnosis pattern already uses for its sequential pipeline (cross-ref the sequential-pipeline note) — and would be the right shape for any handoff this codebase ever introduced.
 
 The condition under which this works: the handoff protocol matches the agents' actual coupling. Loosely-coupled peers (different domains, different prompts) need typed messages because there's no shared context to inherit. Tightly-coupled peers (same domain, different sub-specialties) can ride on summary or full history.
 
@@ -158,23 +158,23 @@ The condition under which this works: the handoff protocol matches the agents' a
 ```
         Now (centralized route)              If peer routing earned itself
 ┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│ app/api/agent/route.ts L199–L249    │  │ route picks the FIRST agent          │
-│   route picks ONE agent for the run │  │   then each agent has a transfer_to_X│ ←
-│   that agent runs to completion     │  │   tool in its subset                 │
-│   no agent calls another agent      │  │ DiagnosticAgent may transfer_to(     │
-│   ▼                                 │  │   RecommendationAgent) once done     │
-│ DiagnosticAgent → returns Diagnosis │  │ RecommendationAgent may transfer_to( │ ←
-│ (route hands it to recommendation)  │  │   DiagnosticAgent) on insufficient   │
+│ the route handler                   │  │ route picks the FIRST agent          │
+│   route picks ONE agent for the run │  │   then each agent has a               │
+│   that agent runs to completion     │  │   transfer_to_X tool in its subset   │ ←
+│   no agent calls another agent      │  │ diagnostic agent may transfer_to(    │
+│   ▼                                 │  │   recommendation agent) once done    │
+│ diagnostic agent → returns Diagnosis│  │ recommendation agent may transfer_to(│ ←
+│ (route hands it to recommendation)  │  │   diagnostic agent) on insufficient  │
 │                                     │  │   diagnosis (back-edge)              │
-│ control: centralized, in route.ts   │  │ control: distributed across agents   │
+│ control: centralized, in the route  │  │ control: distributed across agents   │
 └─────────────────────────────────────┘  └─────────────────────────────────────┘
    the WORKERS are unchanged; only WHO decides "next agent"
    moves from route code to model emit
 ```
 
-*Now:* there's no peer handoff. The route picks one agent (`QueryAgent`, `DiagnosticAgent`, or `RecommendationAgent`) based on the request shape, that agent runs to completion, the route may follow up with the next agent in the pipeline (only `DiagnosticAgent` → `RecommendationAgent`, deterministically). No agent can transfer control.
+*Now:* there's no peer handoff. The route picks one agent (query, diagnostic, or recommendation) based on the request shape, that agent runs to completion, the route may follow up with the next agent in the pipeline (only diagnostic → recommendation, deterministically). No agent can transfer control.
 
-*If peer routing earned itself:* each agent's tool subset would include `transfer_to_<peer>` tools. The `DiagnosticAgent` could decide mid-investigation that it needs deeper context only a hypothetical `DeepDiveAgent` has, and hand off. The `RecommendationAgent` could hand back to diagnostic on "this diagnosis is too thin to recommend on." A *handoff counter* would cap total transfers (`MAX_HOPS = 4` say); each agent's prompt would have clear stay-vs-handoff rules.
+*If peer routing earned itself:* each agent's tool subset would include `transfer_to_<peer>` tools. The diagnostic agent could decide mid-investigation that it needs deeper context only a hypothetical deep-dive agent has, and hand off. The recommendation agent could hand back to diagnostic on "this diagnosis is too thin to recommend on." A *handoff counter* would cap total transfers (`MAX_HOPS = 4` say); each agent's prompt would have clear stay-vs-handoff rules.
 
 The takeaway: **handoff distributes control to where the most context lives.** The agent running this turn has the freshest view of what's needed next. The cost: a new failure mode (infinite handoff), a new debug shape (which hop went wrong?), and harder traceability (the trajectory is fragmented across agents).
 
@@ -246,9 +246,8 @@ Swarm / handoff — full picture
                           gets to ship the response)
 
   blooming insights: NOT IMPLEMENTED. Control is centralized
-  in app/api/agent/route.ts; no agent transfers to a peer.
-  See `../06-orchestration-system-design-templates/` for the
-  refactor.
+  in the route handler; no agent transfers to a peer.
+  See the orchestration system-design templates for the refactor.
 ```
 
 ---
@@ -502,3 +501,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

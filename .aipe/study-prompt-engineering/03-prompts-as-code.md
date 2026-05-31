@@ -47,8 +47,8 @@
 ```
 AUTHORING HALF  (have it)              OBSERVABILITY HALF  (don't)
 ─────────────────────────────         ─────────────────────────────
-file:    monitoring.md                 pair:  prompt@sha + model id
-load:    readFileSync (mon.ts L13)     log:   which prompt → which output
+file:    a versioned markdown file     pair:  prompt@sha + model id
+load:    sync read at import           log:   which prompt → which output
 version: git history                   trace: bisect a regression to a line
 review:  PR diff                       alert: failure rate per prompt version
 ```
@@ -62,42 +62,44 @@ The left column is what makes a prompt a maintainable artifact. The right column
 Each agent reads its prompt off disk at module load — once, synchronously, as the module is imported:
 
 ```
-monitoring.ts   L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/monitoring.md'),'utf8');
-diagnostic.ts   L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/diagnostic.md'),'utf8');
-recommendation.ts L14 const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/recommendation.md'),'utf8');
-query.ts        L13  const PROMPT = readFileSync(join(process.cwd(),'lib/agents/prompts/query.md'),'utf8');
+  PROMPT = read_file_sync(prompts_dir + "/monitoring.md")
+  PROMPT = read_file_sync(prompts_dir + "/diagnostic.md")
+  PROMPT = read_file_sync(prompts_dir + "/recommendation.md")
+  PROMPT = read_file_sync(prompts_dir + "/query.md")
 ```
 
-The `.md` files are not strings hidden in a `.ts` literal and they are not rows in a database — they are first-class files under `lib/agents/prompts/`. That placement is the whole move: a prompt under `lib/` is reviewed, diffed, and shipped exactly like the `.ts` next to it. A teammate changing `monitoring.md`'s "90-day window" method shows up in the PR as a content diff a reviewer reads line by line.
+The markdown files are not strings hidden in a code literal and they are not rows in a database — they are first-class files in the prompts directory. That placement is the whole move: a prompt under the source tree is reviewed, diffed, and shipped exactly like the code next to it. A teammate changing the monitoring prompt's "90-day window" method shows up in the PR as a content diff a reviewer reads line by line.
 
 ```
 edit prompt → git diff → PR review → merge → ships with the build
-   (same lifecycle as lib/mcp/validate.ts)
+   (same lifecycle as any other source file)
 ```
 
-Because `readFileSync` runs at import, the prompt is also baked into the running process — there is no live-edit path, no dashboard override, no way for the deployed prompt to differ from the committed one. That immutability-at-runtime is a feature: the prompt that ran is exactly the prompt in the commit.
+Because the read runs at import, the prompt is also baked into the running process — there is no live-edit path, no dashboard override, no way for the deployed prompt to differ from the committed one. That immutability-at-runtime is a feature: the prompt that ran is exactly the prompt in the commit.
 
-### The `.md` choice: prose that reviews like prose
+### The markdown choice: prose that reviews like prose
 
-The prompts are Markdown, not TypeScript template literals, and that matters for review. A reviewer reading `diagnostic.md`'s "Investigation approach" (L18–24) reads it as prose — the way the model reads it — not as an escaped string with `\n`s. The instruction *is* the artifact; Markdown keeps it legible as one. The headings (`## Role`, `## Hard rules`) double as a structure a reviewer can scan (→ 01-anatomy.md).
+The prompts are Markdown, not code template literals, and that matters for review. A reviewer reading the diagnostic prompt's "Investigation approach" section reads it as prose — the way the model reads it — not as an escaped string with `\n`s. The instruction *is* the artifact; Markdown keeps it legible as one. The headings (`## Role`, `## Hard rules`) double as a structure a reviewer can scan (→ 01-anatomy.md).
 
 ### Runtime interpolation is part of the same pattern: `{categories}`
 
-The versioned-`.md`-plus-runtime-interpolation pattern is not only for static values like `{schema}` and `{project_id}`. `monitoring.md` has a `## Your category checklist` section (L7) whose body is a single `{categories}` slot (L11), and that slot is filled with a string the code *builds at call time*:
+The versioned-markdown-plus-runtime-interpolation pattern is not only for static values like `{schema}` and `{project_id}`. The monitoring prompt has a `## Your category checklist` section whose body is a single `{categories}` slot, and that slot is filled with a string the code *builds at call time*:
 
 ```
-monitoring.ts L69–86
-  async scan(hooks?, categories: AnomalyCategory[] = []) {     // ← new param, L69
-    const checklist = categories.length
-      ? categories.map(c => `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} …`).join('\n')
-      : '(no checklist provided — scan for any significant recent change)';
-    const system = PROMPT
-      .replace('{schema}', schemaSummary(this.schema))
-      .replace(/\{project_id\}/g, this.schema.projectId)
-      .replace('{categories}', checklist);                     // ← same .replace pattern, L86
+  scan(hooks?, categories = []):
+    if categories is non-empty:
+        checklist = join_lines(categories.map(c =>
+            "- `" + c.id + "` (" + c.label + ") — " + c.why_it_matters + " …"))
+    else:
+        checklist = "(no checklist provided — scan for any significant recent change)"
+
+    system = PROMPT
+      .replace("{schema}",     schema_summary(schema))
+      .replace(/{project_id}/g, schema.project_id)
+      .replace("{categories}", checklist)        # ← same replace pattern
 ```
 
-This is the *same* discipline as `{schema}`/`{project_id}`: the constant lives in the version-controlled `.md`, and a runtime value is stamped into a named slot with `.replace` right before the call. The only thing that differs is provenance — `{schema}` is a workspace summary and `{project_id}` is one id, while `{categories}` is a checklist *assembled in code* (`monitoring.ts` L70–86) from the `AnomalyCategory[]` argument that `scan` now takes (L69). The prompt file stays the diffable, reviewable artifact; the per-call payload is the runnable-category list the route gates and passes in. For the prompts-as-code lens, the takeaway is that "what's in the file" and "what's injected" is still a clean two-way split even when the injected value is computed — the slot is committed, the content is built per call. (The gate that decides which categories get passed is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
+This is the *same* discipline as `{schema}`/`{project_id}`: the constant lives in the version-controlled markdown, and a runtime value is stamped into a named slot with a string replace right before the call. The only thing that differs is provenance — `{schema}` is a workspace summary and `{project_id}` is one id, while `{categories}` is a checklist *assembled in code* from the anomaly-category list the scan method now takes. The prompt file stays the diffable, reviewable artifact; the per-call payload is the runnable-category list the route gates and passes in. For the prompts-as-code lens, the takeaway is that "what's in the file" and "what's injected" is still a clean two-way split even when the injected value is computed — the slot is committed, the content is built per call. (The gate that decides which categories get passed is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
 
 ---
 
@@ -108,27 +110,27 @@ The honest part. Here is what is *not* wired, and why it bites.
 **Gap 1 — model ID is separate from the prompt.** The model the prompt runs on is a constant in code, in a different file from the prompt:
 
 ```
-base.ts   L9   export const AGENT_MODEL = 'claude-sonnet-4-6';     ← the 3 agents + query
-intent.ts L14  const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'; ← the classifier
+agent model      = "claude-sonnet-4-6"          ← the 3 agents + query
+classifier model = "claude-haiku-4-5-20251001"  ← the classifier
 ```
 
-Nothing ties `monitoring.md@<sha>` to `claude-sonnet-4-6`. They version independently. You can change the prompt without touching the model, and change the model (`base.ts` L9) without touching any prompt — and there is no record that pins which prompt version was validated against which model version. A prompt is tuned for the behavior of a *specific* model; decoupling them in the source means the pairing exists only in someone's memory.
+Nothing ties the monitoring prompt's content hash to the agent model string. They version independently. You can change the prompt without touching the model, and change the model without touching any prompt — and there is no record that pins which prompt version was validated against which model version. A prompt is tuned for the behavior of a *specific* model; decoupling them in the source means the pairing exists only in someone's memory.
 
 ```
-prompt version:  monitoring.md@abc123   ─┐
-                                          ├─ NOT paired, NOT co-logged
-model version:   claude-sonnet-4-6  (base.ts L9) ─┘
+prompt version:  monitoring prompt @ abc123     ─┐
+                                                  ├─ NOT paired, NOT co-logged
+model version:   the agent model constant       ─┘
 ```
 
-**Gap 2 — no prompt-version → output observability.** The route streams the trace (`route.ts` L169–256, the `ReadableStream` body) and `saveInvestigation` persists the events (`route.ts` L254), but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which `monitoring.md` was live then, on which model?" without correlating git history to a deploy timestamp by hand.
+**Gap 2 — no prompt-version → output observability.** The route handler streams the trace and persists the events on stream close, but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which monitoring prompt was live then, on which model?" without correlating git history to a deploy timestamp by hand.
 
 ```
-saved (route.ts L254):  reasoning_step · diagnosis · recommendation · done
-NOT saved:              prompt sha · model id · prompt version tag
+saved:      reasoning_step · diagnosis · recommendation · done
+NOT saved:  prompt sha · model id · prompt version tag
 → can't bisect a regression to a prompt line or a model bump
 ```
 
-**Why this is the "worked-on-Sonnet-breaks-on-the-next-Sonnet" risk, precisely.** Change `base.ts` L9 to a newer model. The prompts are unchanged, so the diff looks safe — one line, a model string. But the prompts were tuned against the *old* model's behavior: its default formatting, its tendency to fence JSON, its adherence to "do not re-run variations" (`monitoring.md` L11). The new model may format differently, and now the diagnostic agent's parse-failure rate climbs. Because the prompt version and model version aren't paired or co-logged, the regression presents as "diagnoses got worse" with no signal pointing at the model bump. The fix that would make it traceable — log `{promptSha, model}` with every output — is exactly the missing half.
+**Why this is the "worked-on-Sonnet-breaks-on-the-next-Sonnet" risk, precisely.** Change the agent-model constant to a newer model. The prompts are unchanged, so the diff looks safe — one line, a model string. But the prompts were tuned against the *old* model's behavior: its default formatting, its tendency to fence JSON, its adherence to the monitoring prompt's "do not re-run variations" rule. The new model may format differently, and now the diagnostic agent's parse-failure rate climbs. Because the prompt version and model version aren't paired or co-logged, the regression presents as "diagnoses got worse" with no signal pointing at the model bump. The fix that would make it traceable — log `{promptSha, model}` with every output — is exactly the missing half.
 
 ---
 
@@ -146,26 +148,25 @@ This diagram spans the authoring half (solid) and the observability half (dashed
 ┌──────────────────────────────────────────────────────────────────────┐
 │  AUTHORING HALF — IMPLEMENTED                                         │
 │                                                                       │
-│  lib/agents/prompts/*.md  ──readFileSync──▶  PROMPT const            │
-│   monitoring.md (mon.ts L13) · diagnostic.md (diag.ts L13)           │
-│   recommendation.md (rec.ts L14) · query.md (query.ts L13)          │
+│  prompts directory (*.md)  ──sync read──▶  PROMPT const               │
+│   monitoring · diagnostic · recommendation · query prompts            │
 │                                                                       │
-│   git history ── PR diff ── review ── ships in the build             │
-│   (runtime-immutable: import-time read, no live edit)               │
+│   git history ── PR diff ── review ── ships in the build              │
+│   (runtime-immutable: import-time read, no live edit)                 │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │  runs on
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │  MODEL IDs — SEPARATE, UNPAIRED                                       │
-│   base.ts L9   AGENT_MODEL    = 'claude-sonnet-4-6'                  │
-│   intent.ts L14 CLASSIFIER    = 'claude-haiku-4-5-20251001'          │
+│   agent model      = "claude-sonnet-4-6"                              │
+│   classifier model = "claude-haiku-4-5-20251001"                      │
 └───────────────────────────┬───────────────────────────────────────────┘
                             ┊  (no pairing, no co-logging)
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
    OBSERVABILITY HALF — NOT IMPLEMENTED
-   saveInvestigation (route.ts L254) persists OUTPUTS only:
+   investigation save persists OUTPUTS only:
      reasoning_step · diagnosis · recommendation · done
    MISSING: prompt sha · model id · version tag per output
-   → a model bump (base.ts L9) is a 1-line diff that can silently regress
+   → a model bump is a 1-line diff that can silently regress
 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 
@@ -337,3 +338,4 @@ Where does the model ID that runs the three agents live, and is it stored anywhe
 Updated: 2026-05-29 — Documented the `{categories}` runtime checklist injection as a prompts-as-code interpolation pattern (`monitoring.ts` L69–86: `scan` now takes a `categories` param at L69, builds a checklist, and `.replace('{categories}', checklist)` at L86 — same versioned-`.md`-plus-runtime-interpolation as `{schema}`/`{project_id}`). Also corrected stale code refs: `monitoring.ts` L12→L13 and `saveInvestigation` `route.ts` L162→L254 (with the stream body L169–256 and `collected` declared L171).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

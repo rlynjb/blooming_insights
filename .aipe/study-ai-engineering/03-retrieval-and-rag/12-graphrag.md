@@ -67,10 +67,10 @@ The body walks the graph shape, the traversal, and the hybrid that combines it w
 
 ### The schema is already a graph
 
-`bootstrapSchema` produces a `WorkspaceSchema` whose shape is nodes and edges, even though it is stored as nested arrays:
+The schema bootstrap produces a `WorkspaceSchema` whose shape is nodes and edges, even though it is stored as nested arrays:
 
 ```
-  WorkspaceSchema as a graph (lib/mcp/schema.ts)
+  WorkspaceSchema as a graph
   ──────────────────────────────────────────────────────
   (project)
      ├──has──▶ (event: purchase) ──has──▶ (property: amount)
@@ -80,11 +80,11 @@ The body walks the graph shape, the traversal, and the hybrid that combines it w
      └──has──▶ (customer property: lifetime_value)
 ```
 
-`bootstrapSchema` (L170–L192) *walks* this: it calls `get_event_schema` (events + their properties), `get_customer_property_schema`, `list_catalogs`, and `get_project_overview`, then `parseWorkspaceSchema` (L73–L124) assembles the edges — each event mapped to its property list (L91–L99). That assembly *is* building a graph from a traversal of the source. The structure is there; it is just not yet *queried* as a graph.
+The bootstrap *walks* this: it calls `get_event_schema` (events + their properties), `get_customer_property_schema`, `list_catalogs`, and `get_project_overview`, then a parser assembles the edges — each event mapped to its property list. That assembly *is* building a graph from a traversal of the source. The structure is there; it is just not yet *queried* as a graph.
 
 ### Insights form a second graph: shared metric and scope
 
-The `Insight` type (`lib/mcp/types.ts` L7–L17) carries `metric: string` and `scope: string[]`. Those are edges waiting to be drawn: two insights about `conversion_rate` share a *metric* edge; two insights scoped to `["mobile", "checkout"]` share a *scope* edge. A "related insights" graph connects insights through these shared attributes.
+The `Insight` type carries `metric: string` and `scope: string[]`. Those are edges waiting to be drawn: two insights about `conversion_rate` share a *metric* edge; two insights scoped to `["mobile", "checkout"]` share a *scope* edge. A "related insights" graph connects insights through these shared attributes.
 
 ```
   insight A: metric=conversion_rate, scope=[mobile, checkout]
@@ -129,7 +129,7 @@ The production GraphRAG pattern combines both retrievers (`06`): use vector simi
 
 ### The principle
 
-When the answer lives in *relationships* — shared attributes, cause-and-effect chains, entity links — retrieve by traversing edges, not only by comparing vectors, because similarity is blind to connection. Model the entities as a graph (nodes + adjacency), use vector similarity to find an entry point, and traverse edges to gather what is connected. blooming insights' schema is already graph-shaped and `bootstrapSchema` already traverses it; GraphRAG would query that structure as a graph instead of flattening it.
+When the answer lives in *relationships* — shared attributes, cause-and-effect chains, entity links — retrieve by traversing edges, not only by comparing vectors, because similarity is blind to connection. Model the entities as a graph (nodes + adjacency), use vector similarity to find an entry point, and traverse edges to gather what is connected. This system's schema is already graph-shaped and the bootstrap already traverses it; GraphRAG would query that structure as a graph instead of flattening it.
 
 ---
 
@@ -156,7 +156,7 @@ This diagram spans the Service layer (the hybrid retriever) and the State layer 
 │  STATE LAYER  (lib/state/, built like bootstrapSchema walks)        │
 │   nodes:  insights, metrics, scopes, events, properties             │
 │   edges:  shared-metric, shared-scope, event-has-property,          │
-│           event-references-catalog (schema.ts L91–L99 already maps   │
+│           event-references-catalog (schema.ts already maps   │
 │           events→properties — the graph is half-built)              │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -313,3 +313,4 @@ What graph-shaped data does blooming insights already build and walk, and what e
 Updated: 2026-05-28 — corrected one stale ref: `bootstrapSchema` moved to `lib/mcp/schema.ts` L170–L192 (was L152–L176). Case-B rationale (graph-shaped schema, no graph query yet) unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

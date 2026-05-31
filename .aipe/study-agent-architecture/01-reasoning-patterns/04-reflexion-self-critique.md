@@ -121,33 +121,33 @@ The condition under which it works (when it does): when the failure mode you wan
 
 Honest read: this codebase does not run a critic step. There is no separate model call that grades the producer's output. What there *is*, in the diagnostic and recommendation agents, is a different pattern that looks similar at a glance — a **forced synthesis recovery**.
 
-When `runAgentLoop` returns a `finalText`, the agent class tries to parse it (`tryParseDiagnosis` in `diagnostic.ts` L22–L29, `tryParseRecommendations` in `recommendation.ts` L19–L26). If the parse fails, the agent runs a *second* tool-less LLM call — `synthesize()` — that hands the model its own already-gathered tool results and demands the structured output. That second call is the *same model* using the *same evidence* the loop already collected. It's not a critic; it's a recovery prompt that says "stop investigating, produce the JSON now."
+When the shared agent loop returns a final text answer, the agent class tries to parse it. If the parse fails, the agent runs a *second* tool-less LLM call — a "synthesize" pass — that hands the model its own already-gathered tool results and demands the structured output. That second call is the *same model* using the *same evidence* the loop already collected. It's not a critic; it's a recovery prompt that says "stop investigating, produce the JSON now."
 
 ```
 What this repo has vs what a critic loop would look like
 
   This repo (forced synthesis recovery)        Critic loop (NOT here)
   ┌──────────────────────────────────┐         ┌────────────────────────┐
-  │ runAgentLoop produces finalText   │        │ ReAct produces draft   │
+  │ shared loop produces finalText    │        │ ReAct produces draft   │
   └──────────────┬───────────────────┘         └────────┬───────────────┘
                  ▼                                       ▼
-          tryParseDiagnosis(text)                ┌────────────────┐
-                 │                               │ critic LLM call │
-       ┌─────────┴─────────┐                     │ verdict + issues│
-       ▼ parse ok           ▼ parse fails        └────────┬────────┘
-   return diag         synthesize(): another             │
-                       LLM call WITHOUT tools,        ┌────┴────┐
-                       same model, same evidence      ▼ ok      ▼ rej
-                                                   return     retry generator
-                                                              with feedback
+          parse the text                          ┌────────────────┐
+                 │                                │ critic LLM call │
+       ┌─────────┴─────────┐                      │ verdict + issues│
+       ▼ parse ok           ▼ parse fails         └────────┬────────┘
+   return diag         synthesize: another                │
+                       LLM call WITHOUT tools,         ┌──┴──────┐
+                       same model, same evidence       ▼ ok      ▼ rej
+                                                    return     retry generator
+                                                               with feedback
 
   The difference: forced synthesis isn't judging the producer.
   It's the producer giving up its tools and being forced to commit.
 ```
 
-The diagnostic agent's `synthesize()` lives at `lib/agents/diagnostic.ts` L87–L126. It's invoked from L75 only when the loop's `finalText` didn't parse as a Diagnosis. The system prompt is *not* "evaluate the answer" — it's "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data." (L101). The user message hands the model the anomaly plus a stringified summary of every tool call the loop already ran. The model is being told *what to produce*, not asked *whether the prior produced thing was correct*.
+The diagnostic agent's recovery pass is invoked only when the loop's final text didn't parse as a Diagnosis. The system prompt is *not* "evaluate the answer" — it's "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data." The user message hands the model the anomaly plus a stringified summary of every tool call the loop already ran. The model is being told *what to produce*, not asked *whether the prior produced thing was correct*.
 
-The recommendation agent has the parallel structure at `lib/agents/recommendation.ts` L82–L132 — same recovery shape.
+The recommendation agent has the parallel structure — same recovery shape.
 
 The principle: **forced synthesis and self-critique solve different problems.** Forced synthesis solves "the loop exhausted its budget without emitting parseable JSON." Self-critique solves "the loop emitted parseable JSON but the JSON is wrong." This repo accepts the second problem (a parseable-but-wrong diagnosis ships as-is) and only handles the first. That's a deliberate choice: the substantive correctness is checked downstream by the user reading the conclusion, not by a critic that shares the producer's blind spots.
 
@@ -162,15 +162,15 @@ The three positions you can take
 
   POSITION A: no recovery (pure ReAct, return whatever the loop returned)
   ┌─────────────────────────────────────────────────────────────┐
-  │ runAgentLoop → finalText                                     │
+  │ shared loop → finalText                                      │
   │   parse → ok? return : FALLBACK                              │
   │   no second pass, no judgment                                │
   └─────────────────────────────────────────────────────────────┘
 
   POSITION B: forced synthesis recovery (THIS REPO, diagnostic + recommendation)
   ┌─────────────────────────────────────────────────────────────┐
-  │ runAgentLoop → finalText                                     │
-  │   parse → ok? return : synthesize() ← same model,            │
+  │ shared loop → finalText                                      │
+  │   parse → ok? return : synthesize ← same model,              │
   │                       no tools, "commit now"                 │
   │   → parse synthesis → ok? return : FALLBACK                  │
   │   ONE recovery pass, no judgment of correctness              │
@@ -178,7 +178,7 @@ The three positions you can take
 
   POSITION C: reflexion / self-critique (NOT IN THIS REPO)
   ┌─────────────────────────────────────────────────────────────┐
-  │ runAgentLoop → draft                                         │
+  │ shared loop → draft                                          │
   │   critic LLM call → { approved, issues }                     │
   │   approved? return : retry generator with feedback           │
   │   capped at N rounds                                         │
@@ -186,7 +186,7 @@ The three positions you can take
   └─────────────────────────────────────────────────────────────┘
 
   This repo sits at B for diagnostic and recommendation;
-  at A for monitoring and query (no synthesize() retry).
+  at A for monitoring and query (no synthesize retry).
 ```
 
 ---
@@ -401,3 +401,4 @@ Open and verify. ✓ File + function + the recovery-vs-critic distinction matter
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

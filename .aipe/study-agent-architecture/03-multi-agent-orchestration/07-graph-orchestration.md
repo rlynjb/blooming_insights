@@ -85,10 +85,10 @@ If you're coming from frontend, a node is a `step` component in a multi-step for
 A node, conceptually
 
   function diagnose_node(state):
-    diagnosis = DiagnosticAgent.investigate(state.anomaly)
+    diagnosis = diagnostic_agent.investigate(state.anomaly)
     return { ...state, diagnosis: diagnosis }
 
-  // in a real LangGraph definition:
+  // in a real graph definition:
   graph.add_node("diagnose", diagnose_node)
 ```
 
@@ -110,7 +110,7 @@ Conditional edges
                                   │
                                   └─► recommend_if_high_conf
 
-  // in LangGraph:
+  // in a graph engine:
   graph.add_conditional_edge(
     "diagnose",
     lambda state: "review" if state.diagnosis.confidence == "low" else "recommend",
@@ -172,38 +172,38 @@ A human-in-the-loop node
                     if rejected → diagnose (loop)
 ```
 
-The practical consequence: human-in-the-loop becomes a first-class concept, not a hack. The codebase's current "user clicks 'see recommendations'" gate is already conceptually a human node — but it's not implemented in a graph engine; the route file just splits the work into two requests and uses sessionStorage to bridge them.
+The practical consequence: human-in-the-loop becomes a first-class concept, not a hack. The codebase's current "user clicks 'see recommendations'" gate is already conceptually a human node — but it's not implemented in a graph engine; the route file just splits the work into two requests and uses session storage to bridge them.
 
-The condition under which this works: the UI has to support pause/resume — which means the UI has to know which checkpoint to resume from when the user responds. Frameworks like LangGraph handle this with a thread_id; the UI passes the thread_id when resuming.
+The condition under which this works: the UI has to support pause/resume — which means the UI has to know which checkpoint to resume from when the user responds. Graph frameworks handle this with a thread id; the UI passes the thread id when resuming.
 
 ### Phase A vs Phase B — imperative route vs graph runtime
 
 ```
         Now (imperative route)                If quality/debuggability forced it
 ┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│ app/api/agent/route.ts L199–L249    │  │ Graph definition (declarative)       │
+│ the route handler                   │  │ Graph definition (declarative)       │
 │   if-ladder + sequential function   │  │   nodes: monitor, diagnose, review,  │
 │   calls                             │  │           recommend, final           │
 │   no checkpointing                  │  │   edges: with conditions             │
 │   no graph runtime                  │  │   state schema (typed)               │ ←
 │                                     │  │                                      │
-│ UI ProcessStepper:                  │  │ Graph engine (e.g. LangGraph)         │
+│ UI step-stepper:                    │  │ Graph engine (e.g. LangGraph)         │
 │   client-side state machine for      │  │   reads node, runs agent, persists  │
 │   which step is rendered             │  │   state, picks edge, repeats         │
 │   does NOT carry agent context       │  │                                      │
-│   cannot resume server-side runs    │  │ UI ProcessStepper:                   │
+│   cannot resume server-side runs    │  │ UI step-stepper:                     │
 │                                     │  │   subscribes to graph events,        │
 │                                     │  │   pauses on human nodes, resumes     │
-│                                     │  │   via thread_id                      │ ←
+│                                     │  │   via thread id                      │ ←
 └─────────────────────────────────────┘  └─────────────────────────────────────┘
    moving from left to right: agents unchanged, route replaced
    by graph definition + engine, UI gains a checkpoint-aware
    resume hook
 ```
 
-*Now:* the orchestration is imperative TypeScript in `app/api/agent/route.ts`. The ProcessStepper component is a UI state machine for *rendering* the step UI — it tracks which view is active (`diagnose`, `recommend`, `complete`) but it doesn't own agent state. Agent state is collected in the SSE stream and accumulated client-side in `useInvestigation`. The "step 2 → step 3" gate works because the client persists the typed `Diagnosis` to `sessionStorage`; the route's step 3 request reads it back. This is pause/resume *manually implemented* via the cross-request handoff — it's not graph orchestration.
+*Now:* the orchestration is imperative TypeScript in the route handler. The step-stepper UI component is a UI state machine for *rendering* the step UI — it tracks which view is active (diagnose, recommend, complete) but it doesn't own agent state. Agent state is collected in the SSE stream and accumulated client-side in an investigation hook. The "step 2 → step 3" gate works because the client persists the typed Diagnosis to session storage; the route's step 3 request reads it back. This is pause/resume *manually implemented* via the cross-request handoff — it's not graph orchestration.
 
-*If a graph runtime were adopted:* the route file would shrink dramatically. Each agent would be wrapped in a node function. Edges would express the transitions. The graph engine would own state persistence — `sessionStorage` would become a thread_id passed to the engine. Human-in-the-loop pauses would be first-class. Debugging would shift from "read route.ts and replay one trajectory" to "open the graph viewer and see which node failed at which state."
+*If a graph runtime were adopted:* the route file would shrink dramatically. Each agent would be wrapped in a node function. Edges would express the transitions. The graph engine would own state persistence — session storage would become a thread id passed to the engine. Human-in-the-loop pauses would be first-class. Debugging would shift from "read the route file and replay one trajectory" to "open the graph viewer and see which node failed at which state."
 
 The takeaway: **graphs trade imperative simplicity for inspectable orchestration.** Worth it when the orchestration grows complex enough that imperative is opaque, or when checkpointing/human-in-the-loop becomes a hard requirement.
 
@@ -221,10 +221,10 @@ Graph orchestration — full picture
   ┌─ GRAPH DEFINITION (declarative — the data) ──────────────────┐
   │                                                              │
   │   nodes:                                                      │
-  │     • monitor      (MonitoringAgent)                          │
-  │     • diagnose     (DiagnosticAgent)                          │
+  │     • monitor      (monitoring agent)                         │
+  │     • diagnose     (diagnostic agent)                         │
   │     • review_diag  (HUMAN — waits for "approve" / "redo")    │
-  │     • recommend    (RecommendationAgent)                      │
+  │     • recommend    (recommendation agent)                     │
   │     • final        (emit + persist)                           │
   │                                                              │
   │   edges:                                                      │
@@ -256,7 +256,7 @@ Graph orchestration — full picture
                               │
                               ▼
   ┌─ CHECKPOINT STORE ───────────────────────────────────────────┐
-  │   thread_id → list of (node, state) snapshots                 │
+  │   thread id → list of (node, state) snapshots                 │
   │   in-memory / Redis / SQLite / whatever                      │
   │                                                              │
   │   used for: resume after failure, resume after human         │
@@ -267,14 +267,14 @@ Graph orchestration — full picture
   ┌─ UI (the resume hook) ───────────────────────────────────────┐
   │   subscribes to engine events                                 │
   │   on human node: prompts user, sends user response back       │
-  │                  with thread_id                              │
+  │                  with thread id                              │
   │   on completion: renders final state                          │
   └──────────────────────────────────────────────────────────────┘
 
   blooming insights TODAY: NOT IMPLEMENTED. Orchestration is
-  imperative TypeScript in app/api/agent/route.ts L199–L249.
-  The ProcessStepper UI component is a UI state machine, NOT
-  an agent-orchestration graph runtime.
+  imperative TypeScript in the route handler. The step-stepper
+  UI component is a UI state machine, NOT an agent-orchestration
+  graph runtime.
 ```
 
 ---
@@ -542,3 +542,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -57,8 +57,8 @@ The sequential pipeline in this codebase
        │                      │                       │
        └──────────────────────┴───────────────────────┘
               CODE owns the order
-              (app/api/agent/route.ts L224–L249)
-              + (cross-request handoff via sessionStorage)
+              (the route handler's if-ladder)
+              + (cross-request handoff via session storage)
 ```
 
 The strategy in plain English: **fix the order where you know it, isolate the work where you don't.** The order is fixed because the data flow is sequential (each stage's input is the previous stage's output). The work inside each stage is isolated because each stage has its own prompt, its own tool subset, and its own iteration budget.
@@ -81,12 +81,12 @@ stage_(N+1)(input, TypedMessage)   ←  consumes the typed value as input
 
 Four load-bearing pieces:
 
-1. **Typed inter-stage message** — a concrete schema (here: `Diagnosis` with `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers` / `confidence` / `timeSeries`, `lib/mcp/types.ts`). Stage N+1 takes it as a typed argument; the type system enforces that "stage N's output is a valid stage N+1 input."
-2. **A handoff carrier** — *something* that moves the typed value from stage N to stage N+1. Two carriers ship in this repo: a function argument when stages run in the same request, a `sessionStorage`-write-plus-URL-param-read when they don't. Same message, two carriers.
-3. **A gate that picks who runs next** — `app/api/agent/route.ts` reads `?step=diagnose|recommend` and picks the lead agent. Code, not an LLM. The Combined Run path makes this gate automatic ("after diagnose, recommend"); the Split Steps path makes it user-driven (the user clicks "see recommendations").
-4. **Per-stage tool subset + budget** — each stage gets only the tools it needs (`lib/mcp/tools.ts`) and a budget calibrated to its job (monitoring 6, diagnostic 6, recommendation 4, query 6). The budget IS the per-stage isolation.
+1. **Typed inter-stage message** — a concrete schema (here: a Diagnosis with `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers` / `confidence` / `timeSeries`). Stage N+1 takes it as a typed argument; the type system enforces that "stage N's output is a valid stage N+1 input."
+2. **A handoff carrier** — *something* that moves the typed value from stage N to stage N+1. Two carriers ship in this repo: a function argument when stages run in the same request, a session-storage-write-plus-URL-param-read when they don't. Same message, two carriers.
+3. **A gate that picks who runs next** — the route handler reads a step query param (diagnose | recommend) and picks the lead agent. Code, not an LLM. The Combined Run path makes this gate automatic ("after diagnose, recommend"); the Split Steps path makes it user-driven (the user clicks "see recommendations").
+4. **Per-stage tool subset + budget** — each stage gets only the tools it needs and a budget calibrated to its job (monitoring 6, diagnostic 6, recommendation 4, query 6). The budget IS the per-stage isolation.
 
-The wire-level mechanics — what the `Diagnosis` object looks like, how `sessionStorage['bi:diag:<id>']` is keyed, what `parseDiagnosis` validates, how the route's `if (step === 'diagnose')` ladder dispatches — are below. The kernel is what makes this a pipeline; everything else is hardening.
+The wire-level mechanics — what the diagnosis object looks like, how its session-storage handoff key is shaped, what the inbound parse function validates, how the route's if-ladder dispatches — are below. The kernel is what makes this a pipeline; everything else is hardening.
 
 ---
 
@@ -144,20 +144,20 @@ The kernel is the minimum that makes this a pipeline. Everything around it is ha
 SKELETON (required to be a pipeline)        HARDENING (some chosen, some not)
 ─────────────────────────────────────       ──────────────────────────────────
 Diagnosis / Anomaly typed schemas           ┌ Carrier #1: function argument
-  (lib/mcp/types.ts)                        │   in-process (PRESENT — Combined
-diagnostic.ts: investigate() →              │   Run mode for capture + demo)
-  Promise<Diagnosis>                        ├ Carrier #2: sessionStorage +
-recommendation.ts: propose(anomaly,         │   URL param across requests
+  (the inter-stage contract)                │   in-process (PRESENT — Combined
+diagnostic stage: investigate() →           │   Run mode for capture + demo)
+  Promise<Diagnosis>                        ├ Carrier #2: session storage +
+recommendation stage: propose(anomaly,      │   URL param across requests
   diagnosis, …) consuming the typed Dx      │   (PRESENT — Split Steps mode,
 route picks the next agent from ?step       │   the production UX)
-per-stage maxToolCalls + tool subsets       ├ saveInvestigation +
-                                            │   filterByStep replay so the
+per-stage tool-call budget + tool subsets   ├ save-investigation +
+                                            │   filter-by-step replay so the
                                             │   captured event log replays
                                             │   in either mode (PRESENT —
                                             │   the demo path)
                                             ├ streaming each stage's
                                             │   intermediate output (the
-                                            │   `diagnosis` event) so the
+                                            │   "diagnosis" event) so the
                                             │   UI renders before the next
                                             │   stage runs (PRESENT)
                                             ├ user gate vs automatic gate
@@ -171,14 +171,16 @@ per-stage maxToolCalls + tool subsets       ├ saveInvestigation +
                                             │   the next stage from model
                                             │   judgment instead of route
                                             │   code (ABSENT — deliberate;
-                                            │   see `02-supervisor-worker.md`)
+                                            │   see the supervisor-worker
+                                            │   note)
                                             └ parallel fan-out across peer
                                                 stages (ABSENT — stages are
                                                 inherently sequential here;
-                                                see `04-parallel-fan-out.md`)
+                                                see the parallel-fan-out
+                                                note)
 ```
 
-The takeaway is **the pipeline is one shape with two carriers.** In-process: a function call (`const dx = await diagAgent.investigate(...); await recAgent.propose(inv, dx, ...)`). Across requests: a `sessionStorage` write plus a URL-param read. The *typed message* — `Diagnosis` — is the invariant. The carrier is hardening that varies by mode.
+The takeaway is **the pipeline is one shape with two carriers.** In-process: a function call (`dx = await diag.investigate(...); await rec.propose(inv, dx, ...)`). Across requests: a session-storage write plus a URL-param read. The *typed message* — Diagnosis — is the invariant. The carrier is hardening that varies by mode.
 
 This is what people mean by "agents as pipeline stages": agents that ship typed messages between themselves the way functions ship typed return values, with code owning the order.
 
@@ -193,16 +195,16 @@ The full picture is below.
 Sequential pipeline — the full picture in this codebase
 
   ┌─ CODE LAYER (order owner) ────────────────────────────────────────────┐
-  │  app/api/agent/route.ts L224–L249                                     │
+  │  the route handler's if-ladder                                        │
   │                                                                       │
-  │  if step === 'recommend':                                             │
-  │     diagnosis = parseDiagnosis(URL ?diagnosis=…)   ◄── handoff in     │
+  │  if step == 'recommend':                                              │
+  │     diagnosis = parse_diagnosis(URL ?diagnosis=…)  ◄── handoff in     │
   │  else:                                                                │
-  │     diagnosis = await diagAgent.investigate(inv, hooksFor('diag'))   │
+  │     diagnosis = await diag_agent.investigate(inv, hooks)              │
   │     send('diagnosis', diagnosis)                   ──► handoff out    │
   │                                                                       │
-  │  if step !== 'diagnose':                                              │
-  │     recs = await recAgent.propose(inv, diagnosis!, hooksFor('rec'))   │
+  │  if step != 'diagnose':                                               │
+  │     recs = await rec_agent.propose(inv, diagnosis, hooks)             │
   │     send('recommendation', …)                                         │
   └───────────────────────┬───────────────────────────────────────────────┘
                           │
@@ -212,12 +214,11 @@ Sequential pipeline — the full picture in this codebase
   │  ┌─ Diagnostic stage ──┐         ┌─ Recommendation stage ──┐         │
   │  │ prompt: investigate │         │ prompt: propose actions  │         │
   │  │ tools: 6 analytics  │         │ tools: 4 feature-spec    │         │
-  │  │ budget: maxTC=6     │         │ budget: maxTC=4          │         │
+  │  │ budget: 6 calls     │         │ budget: 4 calls          │         │
   │  │ output: Diagnosis   ├────────►│ input:  Diagnosis        │         │
   │  └─────────────────────┘         └──────────────────────────┘         │
   │       │                                  │                            │
-  │       └──────► runAgentLoop ◄────────────┘                            │
-  │              (lib/agents/base.ts L48–L176)                            │
+  │       └──────► shared agent loop ◄───────┘                            │
   │              same loop primitive, different prompts/tools/budgets     │
   └────────────────────────────┬──────────────────────────────────────────┘
                                │
@@ -231,7 +232,7 @@ Sequential pipeline — the full picture in this codebase
   │    confidence?: 'high'|'medium'|'low';                                │
   │    timeSeries?: { day; value }[];                                     │
   │  }                                                                    │
-  │  defined in lib/mcp/types.ts L95–L104                                 │
+  │  (the typed contract between diagnostic and recommendation stages)    │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -465,3 +466,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

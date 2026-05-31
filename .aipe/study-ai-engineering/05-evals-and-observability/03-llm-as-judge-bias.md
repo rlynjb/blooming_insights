@@ -74,7 +74,7 @@ present (A=v2, B=v1) → judge picks A   ← SAME position, winner flipped
                                           content didn't decide; order did
 ```
 
-**Fix — randomize and/or average both orders.** Present each pair in a random order per case, or run the comparison twice (A,B then B,A) and count a win only when the judge is consistent across both orders; ties (the judge flips) are discarded or scored 0.5. For blooming insights' prompt A/B (comparing two versions of `lib/agents/prompts/diagnostic.md`), this is the difference between a real win-rate and a coin flip dressed as data.
+**Fix — randomize and/or average both orders.** Present each pair in a random order per case, or run the comparison twice (A,B then B,A) and count a win only when the judge is consistent across both orders; ties (the judge flips) are discarded or scored 0.5. For a prompt A/B (comparing two versions of the diagnostic prompt), this is the difference between a real win-rate and a coin flip dressed as data.
 
 ```
 debiased pairwise
@@ -96,29 +96,29 @@ diagnosis B: 5 sentences, same content + filler  → judge 4/5
                           ↑ longer ≠ better, but the judge rewards it
 ```
 
-**Fix — cap or control for length.** Cap the answer length the judge sees (truncate or instruct the agent to a length budget), or include length-neutrality in the judge instructions ("do not reward length; penalize padding"), or normalize the score by length post-hoc. In blooming insights, a `Diagnosis` (`lib/mcp/types.ts` L64–L73) has bounded structure — `conclusion`, `evidence[]`, `hypothesesConsidered[]` — so the cleanest control is a rubric that scores *per criterion* (did it name a specific cause? cite scoped evidence?) rather than a holistic "how good is this," which is where verbosity bias enters.
+**Fix — cap or control for length.** Cap the answer length the judge sees (truncate or instruct the agent to a length budget), or include length-neutrality in the judge instructions ("do not reward length; penalize padding"), or normalize the score by length post-hoc. In this system, a `Diagnosis` has bounded structure — `conclusion`, `evidence[]`, `hypothesesConsidered[]` — so the cleanest control is a rubric that scores *per criterion* (did it name a specific cause? cite scoped evidence?) rather than a holistic "how good is this," which is where verbosity bias enters.
 
 ### Self-preference bias — the judge favors its own family
 
-A model rates outputs from its own family higher than outputs from other families, independent of quality — it recognizes its own style and rewards it. This is the most dangerous bias in blooming insights specifically, because the agents run on `claude-sonnet-4-6` (`AGENT_MODEL`, `lib/agents/base.ts` L9). **Judging `claude-sonnet-4-6` output with a `claude-sonnet-4-6` judge is textbook self-preference — the eval flatters exactly the system it is supposed to scrutinize.**
+A model rates outputs from its own family higher than outputs from other families, independent of quality — it recognizes its own style and rewards it. This is the most dangerous bias in this system specifically, because the agents run on a single shared `AGENT_MODEL` (a sonnet-class Claude model). **Judging that model's output with a judge of the same family is textbook self-preference — the eval flatters exactly the system it is supposed to scrutinize.**
 
 ```
-self-preference in blooming insights
+self-preference in this system
 ─────────────────────────────────────────────────────────────
-agent output:  claude-sonnet-4-6  (AGENT_MODEL, base.ts L9)
-judge:         claude-sonnet-4-6  ← SAME family
+agent output:  AGENT_MODEL (sonnet-class)
+judge:         AGENT_MODEL (sonnet-class)  ← SAME family
 result:        judge over-rates its own family's phrasing
                eval reports "quality is high" because the judge
                likes its own style, not because the answer is good
 ```
 
-**Fix — use a cross-family judge.** Score `claude-sonnet-4-6` agent output with a judge from a *different* family (a GPT-class or Gemini-class model, or at minimum a different Claude tier evaluated for the same effect). The judge's stylistic preferences then no longer align with the system under test, so a high score means the answer is genuinely good, not that the judge recognized itself.
+**Fix — use a cross-family judge.** Score the agent's output with a judge from a *different* family (a GPT-class or Gemini-class model, or at minimum a different Claude tier evaluated for the same effect). The judge's stylistic preferences then no longer align with the system under test, so a high score means the answer is genuinely good, not that the judge recognized itself.
 
 ```
 debiased judge selection
 ─────────────────────────────────────────────────────────────
-agent: claude-sonnet-4-6  ──judged by──▶  different-family model
-                                           (no self-recognition)
+agent: AGENT_MODEL (sonnet-class)  ──judged by──▶  different-family model
+                                                    (no self-recognition)
 high score now means "good answer", not "judge likes its own voice"
 ```
 
@@ -149,19 +149,19 @@ This diagram spans the Eval-harness layer (which controls the protocol around th
 ┌──────────────────────────────────────────────────────────────────────┐
 │  EVAL HARNESS  (evals/scorers/judge.ts — NEW)                       │
 │                                                                       │
-│   agent output (claude-sonnet-4-6) + reference/rubric                  │
+│   agent output (AGENT_MODEL, sonnet-class) + reference/rubric          │
 │        │                                                              │
 │   ┌────▼─────────────────────────────────────────────────────┐       │
 │   │  DEBIAS PROTOCOL (applied before the judge call)          │       │
 │   │   position:  randomize order / run both (A,B)+(B,A)       │       │
 │   │   verbosity: cap length / per-criterion rubric            │       │
-│   │   family:    select a CROSS-FAMILY judge (not sonnet)     │       │
+│   │   family:    select a CROSS-FAMILY judge (not same family)│       │
 │   └────┬──────────────────────────────────────────────────────┘       │
 │        │ judge prompt (order-randomized, length-controlled)            │
 └────────┼──────────────────────────────────────────────────────────────┘
          │  PROVIDER BOUNDARY
 ┌────────▼──────────────────────────────────────────────────────────────┐
-│   JUDGE model — DIFFERENT family from claude-sonnet-4-6               │
+│   JUDGE model — DIFFERENT family from AGENT_MODEL                     │
 │   returns score / winner                                              │
 └────────┬──────────────────────────────────────────────────────────────┘
          │ aggregate
@@ -321,3 +321,4 @@ What model do the diagnostic and recommendation agents run on, and why does that
 Updated: 2026-05-28 — Re-derived `Diagnosis` ref (types.ts L64–L73). `AGENT_MODEL` (base.ts L9) and `CLASSIFIER_MODEL` (intent.ts L14) verified unchanged — the sonnet-judges-sonnet self-preference trap still holds. Still Case B (no judge wired).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

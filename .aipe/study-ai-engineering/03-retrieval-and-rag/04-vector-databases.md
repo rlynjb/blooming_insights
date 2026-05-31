@@ -42,7 +42,7 @@
 
 ## How it works
 
-**Mental model.** A vector database is two things bolted together: a place to *store* float arrays (like the `Map` or the JSON files in `lib/state/`) and an *index* that answers nearest-neighbor queries without scanning everything. At small scale the storage is a `Map` and the "index" is `Array.prototype.sort` over computed cosines. At large scale the storage is on disk and the index is an approximate graph.
+**Mental model.** A vector database is two things bolted together: a place to *store* float arrays (like a `Map` or a JSON file in the state layer) and an *index* that answers nearest-neighbor queries without scanning everything. At small scale the storage is a `Map` and the "index" is sorting computed cosines. At large scale the storage is on disk and the index is an approximate graph.
 
 ```
   scale          storage              nearest-neighbor method
@@ -56,12 +56,12 @@ The body walks from the tier blooming insights already lives in up to the tier t
 
 ---
 
-### Tier 0: the in-memory `Map` (where blooming insights already is)
+### Tier 0: the in-memory `Map` (where this system already lives)
 
-For tens to low-thousands of vectors, store them in a `Map<id, Float32Array>` and answer a query by computing cosine against every entry and sorting. This is exact (it checks all of them) and needs zero new infrastructure. blooming insights already runs this pattern for non-vector data: `McpClient`'s cache `Map` (`lib/mcp/client.ts` L18) and the schema's module-level cache (`lib/mcp/schema.ts` L130).
+For tens to low-thousands of vectors, store them in a `Map<id, Float32Array>` and answer a query by computing cosine against every entry and sorting. This is exact (it checks all of them) and needs zero new infrastructure. This codebase already runs this pattern for non-vector data: the MCP client wrapper's TTL cache and the schema cache are both in-memory `Map`-backed stores.
 
 ```
-  vectors: Map<id, Float32Array>          (lives in the process, like McpClient.cache)
+  vectors: Map<id, Float32Array>          (lives in the process, same shape as the TTL cache)
   query q:
     for each [id, v] in vectors:          ← brute-force scan
         score[id] = cosine(q, v)
@@ -72,10 +72,10 @@ The cost is O(N·d) per query — N vectors times d dimensions. At N=80, d=1536 
 
 ### Tier 1: persistence (JSON file / SQLite)
 
-The `Map` dies on process restart and on a serverless cold start (the exact limitation called out for `McpClient`'s cache). To survive restarts you persist the vectors — a JSON file (like `lib/state/demo-investigations.json`) or SQLite with a vector extension (`sqlite-vss`, `sqlite-vec`). Storage survives; the query is still a brute-force scan loaded into memory.
+The `Map` dies on process restart and on a serverless cold start (the exact limitation called out for the TTL cache). To survive restarts you persist the vectors — a JSON file (like the dev-mode investigation snapshot file) or SQLite with a vector extension (`sqlite-vss`, `sqlite-vec`). Storage survives; the query is still a brute-force scan loaded into memory.
 
 ```
-  STATE LAYER (like lib/state/investigations.ts file-cache pattern)
+  STATE LAYER (same dev-file persistence pattern the in-process state map already uses)
   vectors.json ──load──▶ Map ──scan──▶ top-k
        │ survives restart
 ```
@@ -116,7 +116,7 @@ This is the right tier only when scale and operational needs justify it — mill
 
 ### The principle
 
-Nearest-neighbor is a `for` loop until the `for` loop is too slow, and the entire vector-database industry exists to replace that loop with an approximate index once it is. The corollary is the one engineers most often miss: at small scale you do not need a vector database, you need the `Map` you already have — the same judgment `McpClient` made by caching in memory instead of standing up Redis.
+Nearest-neighbor is a `for` loop until the `for` loop is too slow, and the entire vector-database industry exists to replace that loop with an approximate index once it is. The corollary is the one engineers most often miss: at small scale you do not need a vector database, you need the `Map` you already have — the same judgment the MCP client wrapper made by caching in memory instead of standing up Redis.
 
 ---
 
@@ -134,7 +134,7 @@ This diagram spans the Service layer (the query) and the State layer (where vect
 │  STATE LAYER  (lib/state/, lib/mcp/)                                │
 │                                                                      │
 │  TIER 0  Map<id, vec>          ← blooming insights ALREADY here     │
-│          (McpClient.cache L18, schema cache L130)                   │
+│                   │
 │          brute-force scan, exact, zero infra                       │
 │                                                                      │
 │  TIER 1  JSON / SQLite         ← survives restart                  │
@@ -293,3 +293,4 @@ What storage tier does blooming insights already run that a small vector index w
 → 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

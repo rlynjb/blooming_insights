@@ -105,7 +105,7 @@ Supervisor's three jobs
 
 The practical consequence: when a multi-agent system goes wrong, the failure is in one of those three steps. Decomposition failure (supervisor decomposed the request into the wrong sub-jobs). Delegation failure (picked the wrong worker, or sent the wrong context). Synthesis failure (merged contradictory worker outputs into a confident-sounding wrong answer). The diagnostic question every bug starts with: which of the three?
 
-The condition under which this works: the supervisor's three jobs need to actually be the right framing for the problem. They are when the workers are *single-purpose specialists* and the problem genuinely decomposes. They aren't when the workers are *peers* that hand control to each other directly (that's swarm — see `./06-swarm-handoff.md`).
+The condition under which this works: the supervisor's three jobs need to actually be the right framing for the problem. They are when the workers are *single-purpose specialists* and the problem genuinely decomposes. They aren't when the workers are *peers* that hand control to each other directly (that's swarm — covered in the swarm-handoff note).
 
 ### Layer 2 — tools-style supervisor (control stays with the supervisor)
 
@@ -165,7 +165,7 @@ Handoff-style: control transfers to the worker
   ShippingAgent loop runs … etc.
 ```
 
-The practical consequence: the trajectory is *fragmented* across multiple agent runs. Debugging is "find the right loop's trajectory, then the next one, then the next." Each agent's context window is fresh and small (a win), but the *narrative* of what happened is now distributed across loops. Failure modes from `./06-swarm-handoff.md` (infinite handoff) start to apply.
+The practical consequence: the trajectory is *fragmented* across multiple agent runs. Debugging is "find the right loop's trajectory, then the next one, then the next." Each agent's context window is fresh and small (a win), but the *narrative* of what happened is now distributed across loops. Failure modes from the swarm-handoff note (infinite handoff) start to apply.
 
 The condition under which this works: each worker is large enough (or specialized enough) that running it as a sub-tool inside the supervisor's window would explode context, AND the order of workers genuinely depends on what one worker emits.
 
@@ -176,24 +176,25 @@ Right now in blooming insights, the supervisor role exists — it's played by co
 ```
         Now (route as code supervisor)        If quality forced it (LLM supervisor)
 ┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│ app/api/agent/route.ts L199–L249    │  │ a new SupervisorAgent class         │ ←
-│   if q && !insightId  → QueryAgent  │  │   runAgentLoop with worker-as-tool  │
-│   else step === 'recommend'         │  │   schemas for diagnostic /          │
-│     → RecommendationAgent           │  │   recommendation / query            │
+│ route handler's if-ladder           │  │ a new supervisor agent class        │ ←
+│   if q AND no insightId             │  │   shared agent loop with            │
+│     → query agent                   │  │   worker-as-tool schemas for        │
+│   else step == 'recommend'          │  │   diagnostic / recommendation /     │
+│     → recommendation agent          │  │   query                             │
 │   else                              │  │                                     │
-│     → DiagnosticAgent               │  │ supervisor decides ORDER at runtime │
-│       then RecommendationAgent      │  │ (skip, loop, re-order)              │
+│     → diagnostic agent              │  │ supervisor decides ORDER at runtime │
+│       then recommendation agent     │  │ (skip, loop, re-order)              │
 │   ▼                                 │  │   ▼                                 │
 │ workers are unchanged               │  │ workers are unchanged                │ ←
-│ (DiagnosticAgent.investigate, etc.) │  │ (same agent classes, same loops)    │
+│ (diagnostic.investigate, etc.)      │  │ (same agent classes, same loops)    │
 └─────────────────────────────────────┘  └─────────────────────────────────────┘
    the WORKERS don't change in either phase — only the
    supervisor's implementation moves from code to model
 ```
 
-*Now:* the supervisor is `route.ts`'s `GET` handler. It decomposes the request via query-string fields (`insightId`, `q`, `step`), picks the worker by `if`-ladder, hands the typed `Diagnosis` from one worker to the next via a function call, and "synthesizes" by streaming workers' outputs to the client in order. The decomposition is hard-coded because the user *journey* is the decomposition: there are exactly three product flows.
+*Now:* the supervisor is the route handler's `GET` body. It decomposes the request via query-string fields (an insightId, a free-form q, a step), picks the worker by if-ladder, hands the typed diagnosis from one worker to the next via a function call, and "synthesizes" by streaming workers' outputs to the client in order. The decomposition is hard-coded because the user *journey* is the decomposition: there are exactly three product flows.
 
-*If quality forced it:* the day the user journey isn't expressible as 3 product flows — e.g. when "anomaly type" branches into 20 specialist worker agents and the route file becomes a switchboard — a supervisor agent earns its overhead. The workers (`DiagnosticAgent`, `RecommendationAgent`, etc.) don't change at all; only the *outer* implementation of decompose-delegate-merge moves from code to a model.
+*If quality forced it:* the day the user journey isn't expressible as 3 product flows — e.g. when "anomaly type" branches into 20 specialist worker agents and the route file becomes a switchboard — a supervisor agent earns its overhead. The workers (diagnostic, recommendation, etc.) don't change at all; only the *outer* implementation of decompose-delegate-merge moves from code to a model.
 
 The takeaway: **a "hard-coded supervisor" is still a supervisor.** It plays the supervisor role; it just doesn't reason. Naming this out loud is what keeps the architecture honest — the codebase is supervisor-worker shaped, with the supervisor implemented as `if`s.
 
@@ -234,15 +235,15 @@ Supervisor-worker — the two flavors
 
   ┌─ FLAVOR 3 (this codebase): CODE SUPERVISOR ──────────────────┐
   │                                                              │
-  │   app/api/agent/route.ts (no LLM in the supervisor role)     │
+  │   route handler (no LLM in the supervisor role)              │
   │   ┌────────────────────────────────────────────────────┐     │
-  │   │ if q && !insightId   → QueryAgent                  │     │
-  │   │ else step==='recommend' → RecommendationAgent      │     │
-  │   │ else                  → DiagnosticAgent +          │     │
-  │   │                          RecommendationAgent       │     │
+  │   │ if q AND no insightId    → query agent             │     │
+  │   │ else step == 'recommend' → recommendation agent    │     │
+  │   │ else                     → diagnostic agent +      │     │
+  │   │                            recommendation agent    │     │
   │   └─────────────────┬──────────────────────────────────┘     │
   │                     ▼                                        │
-  │   workers (DiagnosticAgent, RecommendationAgent, …)          │
+  │   workers (diagnostic, recommendation, …)                    │
   │   are ReAct loops — but the supervisor is code               │
   │                                                              │
   │   trajectory: ONE per worker; the route streams them         │
@@ -484,3 +485,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

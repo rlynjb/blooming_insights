@@ -119,7 +119,7 @@ The condition under which this works: the debaters have to disagree productively
 
 ### Layer 3 — the same-model-family blind-spot problem (the failure mode)
 
-The technical thing: *self-preference bias* — when an LLM judges its own output or output from its own family, it tends to rate it higher than it should. Documented across the LLM-as-judge literature; cross-reference `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`.
+The technical thing: *self-preference bias* — when an LLM judges its own output or output from its own family, it tends to rate it higher than it should. Documented across the LLM-as-judge literature; cross-reference the ai-engineering LLM-as-judge-bias note.
 
 If you're coming from frontend, this is asking the developer of a component to code-review their own PR. They'll miss the bugs they put in because their assumptions match. The mitigation: get a reviewer from a different team / training set.
 
@@ -149,16 +149,16 @@ The condition under which a critic adds real value: the critic is doing somethin
 ```
         Now (forced re-pass, not a critic)     If quality forced it (real critic)
 ┌────────────────────────────────────────┐  ┌────────────────────────────────────────┐
-│ runAgentLoop (base.ts L48–L176)        │  │ producer: DiagnosticAgent (Sonnet)     │
-│   budgetSpent = toolCalls >= maxToolCalls │ │   investigate() → Diagnosis            │
-│   forceFinal = ... || budgetSpent      │  │   ▼                                    │
-│   ▼                                    │  │ critic: a NEW DiagnosticReviewAgent     │ ←
+│ the shared agent loop                  │  │ producer: diagnostic agent             │
+│   budget_spent = tool_calls >= cap     │  │   investigate() → Diagnosis            │
+│   force_final  = … OR budget_spent     │  │   ▼                                    │
+│   ▼                                    │  │ critic: a NEW diagnostic-review agent   │ ←
 │ on forced-final turn:                  │  │   different model family (e.g. GPT-4    │
-│   - strip tools from request           │  │   or Haiku acting on a strict review     │
-│   - append synthesisInstruction to     │  │   prompt)                               │
+│   - strip tools from request           │  │   or a cheap-model on a strict review    │
+│   - append synthesis instruction to    │  │   prompt)                               │
 │     system prompt                      │  │   review(diagnosis) → { ok, reason }   │
 │   - same model emits final answer      │  │   ▼                                    │
-│ same Sonnet · same trajectory ·        │  │ if ok: ship to recommendation           │
+│ same model · same trajectory ·         │  │ if ok: ship to recommendation           │
 │ same blind spots                       │  │ else:  loop back to producer with reason│
 └────────────────────────────────────────┘  └────────────────────────────────────────┘
    "forced re-pass" ≠ critic. The producer is reviewing
@@ -167,7 +167,7 @@ The condition under which a critic adds real value: the critic is doing somethin
 
 *Now:* the forced-synthesis turn is the producer reading its own trajectory and being told "stop calling tools and emit your final answer." It doesn't *check* the answer; it *finishes* it. There's no second-opinion architecture in the codebase.
 
-*If quality forced it:* the day the diagnostic agent ships confident wrong diagnoses at a rate the user notices, a critic earns its overhead. The critic would have to be a different model family (the LLM-as-judge bias makes Sonnet-critiquing-Sonnet a rubber stamp) and would have to check against the `Diagnosis` schema (a structural check the producer can already partially do) AND against a quality rubric (e.g. "does the conclusion follow from the evidence? are the hypotheses considered exhaustive?").
+*If quality forced it:* the day the diagnostic agent ships confident wrong diagnoses at a rate the user notices, a critic earns its overhead. The critic would have to be a different model family (the LLM-as-judge bias makes same-family critiquing a rubber stamp) and would have to check against the Diagnosis schema (a structural check the producer can already partially do) AND against a quality rubric (e.g. "does the conclusion follow from the evidence? are the hypotheses considered exhaustive?").
 
 The takeaway: **the absence of a critic is a deliberate choice, not an oversight.** The codebase doesn't have the failure mode (confident wrong diagnoses at a rate users complain about) that justifies the cost of adding one — and adding a same-family critic would be paying the cost without getting the value.
 
@@ -226,13 +226,13 @@ Debate vs verifier-critic — full picture
 
   ┌─ BLOOMING INSIGHTS (today) ──────────────────────────────────┐
   │                                                              │
-  │   runAgentLoop (base.ts L48–L176)                            │
-  │     budgetSpent = toolCalls >= maxToolCalls                  │
-  │     forceFinal = lastTurn || budgetSpent                     │
+  │   the shared agent loop                                      │
+  │     budget_spent = tool_calls >= cap                         │
+  │     force_final  = last_turn OR budget_spent                 │
   │     ▼                                                        │
   │   on forced-final turn:                                      │
   │     - strip tools                                            │
-  │     - append synthesisInstruction                            │
+  │     - append synthesis instruction                           │
   │     - same model, same trajectory → final answer             │
   │                                                              │
   │   THIS IS NOT A CRITIC. It's a forced re-pass.               │
@@ -483,3 +483,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

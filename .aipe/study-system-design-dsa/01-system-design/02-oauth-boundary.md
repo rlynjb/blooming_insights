@@ -79,23 +79,20 @@ PKCE (Proof Key for Code Exchange, RFC 7636) is the mechanism that replaces a `c
 
 The IdP verifies `hash(code_verifier) === code_challenge`. No secret leaves the client.
 
-Dynamic Client Registration (RFC 7591) lets the app POST its own metadata to the IdP's registration endpoint and receive a `client_id` on the fly. The `clientMetadata` getter in `BloomreachAuthProvider` (L172–L181) declares exactly this:
+Dynamic Client Registration (RFC 7591) lets the app POST its own metadata to the IdP's registration endpoint and receive a `client_id` on the fly. The provider exposes a `clientMetadata` getter that returns exactly this shape:
 
-```typescript
-// lib/mcp/auth.ts L172–L181
-get clientMetadata(): OAuthClientMetadata {
-  return {
-    client_name: 'blooming insights',
-    redirect_uris: [this.redirectUri],
-    grant_types: ['authorization_code', 'refresh_token'],
-    response_types: ['code'],
-    scope: 'openid profile email',
-    token_endpoint_auth_method: 'none',   // ← public client, no secret
-  };
+```
+clientMetadata = {
+  client_name:                "<app name>",
+  redirect_uris:              [redirect_uri],
+  grant_types:                ["authorization_code", "refresh_token"],
+  response_types:             ["code"],
+  scope:                      "openid profile email",
+  token_endpoint_auth_method: "none",          # ← public client, no secret
 }
 ```
 
-`token_endpoint_auth_method: 'none'` is the DCR declaration that this is a public client. The IdP accepts the code exchange without a `client_secret`.
+`token_endpoint_auth_method: "none"` is the DCR declaration that this is a public client. The IdP accepts the code exchange without a `client_secret`.
 
 ```
 Browser / Server-side app
@@ -123,9 +120,9 @@ Browser / Server-side app
 
 ### Sub-section B — The provider as a persistence seam
 
-`BloomreachAuthProvider` is keyed by `sessionId`. Every SDK callback that carries data the app must remember calls `patchState(sessionId, ...)` — a partial-update write into the `SessionAuthState` shape.
+The auth provider is keyed by `sessionId`. Every SDK callback that carries data the app must remember calls a `patchState(sessionId, …)` helper — a partial-update write into the per-session auth state.
 
-The `SessionAuthState` shape:
+The per-session state shape:
 
 | Field               | Type                          | Set by                        | Read by                        |
 |---------------------|-------------------------------|-------------------------------|-------------------------------|
@@ -134,14 +131,14 @@ The `SessionAuthState` shape:
 | `codeVerifier`      | `string`                      | `saveCodeVerifier()`          | `codeVerifier()`              |
 | `state`             | `string`                      | `state()` (generates + saves) | `consumeState()` (one-time)   |
 
-The full interface at `lib/mcp/auth.ts L12–L17`:
+The full per-session shape:
 
-```typescript
-interface SessionAuthState {
-  clientInformation?: OAuthClientInformationMixed;
-  tokens?: OAuthTokens;
-  codeVerifier?: string;
-  state?: string;
+```
+SessionAuthState = {
+  clientInformation?:  OAuthClientInformationMixed,
+  tokens?:             OAuthTokens,
+  codeVerifier?:       string,
+  state?:              string,
 }
 ```
 
@@ -168,28 +165,25 @@ sessionId = "uuid-a1b2c3"
 
 ### Sub-section C — Capture-don't-open: `redirectToAuthorization`
 
-When `client.connect(transport)` runs and no token exists, the SDK calls `redirectToAuthorization(url)` on the provider, then throws `UnauthorizedError`. In a browser OAuth client this method would call `window.location.assign(url)`. In a server context there is no browser to navigate. The provider captures the URL instead:
+When the SDK's `connect(transport)` runs and no token exists, the SDK calls `redirectToAuthorization(url)` on the provider, then throws `UnauthorizedError`. In a browser OAuth client this method would call `window.location.assign(url)`. In a server context there is no browser to navigate. The provider captures the URL instead:
 
-```typescript
-// lib/mcp/auth.ts L205–L207
-redirectToAuthorization(url: URL): void {
-  this.lastAuthorizeUrl = url;
-}
+```
+provider.redirectToAuthorization(url):
+    self.lastAuthorizeUrl = url       # stash, don't navigate
 ```
 
-Back in `connectMcpInner`, the `catch` block reads that captured URL and returns it as `{ ok: false, authUrl }`:
+Back in the inner connect path, the `catch` block reads that captured URL and returns it as `{ ok: false, authUrl }`:
 
-```typescript
-// lib/mcp/connect.ts L98–L106
-} catch (err) {
-  if (provider.lastAuthorizeUrl) {
-    return { ok: false, authUrl: provider.lastAuthorizeUrl.toString() };
-  }
-  throw err;
-}
+```
+try:
+    client.connect(transport)         # SDK drives DCR + PKCE
+catch UnauthorizedError:
+    if provider.lastAuthorizeUrl:
+        return { ok: false, authUrl: str(provider.lastAuthorizeUrl) }
+    raise
 ```
 
-The route that called `connectMcp` receives `{ ok: false, authUrl }` and sends the URL back to the browser. The browser does the redirect. The server never opens a tab.
+The route that called the connect helper receives `{ ok: false, authUrl }` and sends the URL back to the browser. The browser does the redirect. The server never opens a tab.
 
 ```
 Route handler
@@ -218,14 +212,14 @@ Browser  ──▶  window.location = authUrl  ──▶  Bloomreach IdP login p
 
 ### Sub-section D — The callback exchange: `finishAuth`
 
-After the user logs in, the IdP redirects to `/api/mcp/callback?code=XYZ`. The route:
+After the user logs in, the IdP redirects to the callback route with a `?code=XYZ` query parameter. The callback route:
 
-1. Reads the `bi_session` cookie to recover `sessionId` (`readSessionId()`, L19 of callback route).
-2. Calls `completeAuth(sid, code)` (L29).
+1. Reads the session cookie to recover `sessionId`.
+2. Calls the auth-completion helper with that session id and the code.
 
-`completeAuth` (`connect.ts` L114–L122) wraps its work in `withAuthCookies`, reconstructs a `BloomreachAuthProvider` for the *same* `sessionId` (L116) and calls `transport.finishAuth(code)` (L120). The SDK's `finishAuth` calls back into the provider:
+The completion helper wraps its work in the auth-cookie context, reconstructs an auth provider for the *same* `sessionId`, and calls `transport.finishAuth(code)`. The SDK's `finishAuth` calls back into the provider:
 
-- `provider.codeVerifier()` — reads the verifier saved during `connectMcp` from the store.
+- `provider.codeVerifier()` — reads the verifier saved during the connect phase from the store.
 - `provider.clientInformation()` — reads the DCR `client_id` from the store.
 
 It builds the token exchange POST and calls `provider.saveTokens(tokens)` when the IdP responds. The session is now authenticated.
@@ -258,43 +252,41 @@ It builds the token exchange POST and calls `provider.saveTokens(tokens)` when t
 
 ### Sub-section E — Why dev persists to a file
 
-Next.js's dev server hot-reloads route modules when source files change and compiles routes on demand. When a module is re-evaluated, its module-level state resets. `memStore` is declared at module level:
+The framework's dev server hot-reloads route modules when source files change and compiles routes on demand. When a module is re-evaluated, its module-level state resets. The in-memory fallback store is a module-level `Map`:
 
-```typescript
-// lib/mcp/auth.ts L36
-const memStore = new Map<string, SessionAuthState>();
+```
+memStore: Map<sessionId, SessionAuthState>   # module-level, resets on reload
 ```
 
-In test, if the module re-evaluates between the `connectMcp` call (which writes `codeVerifier` and `clientInformation`) and the `finishAuth` call (which reads them), the `Map` is empty. `codeVerifier()` throws `"no PKCE code_verifier stored for this session"`. The flow is dead. Dev avoids this by writing to disk instead.
+In test, if the module re-evaluates between the connect call (which writes `codeVerifier` and `clientInformation`) and the `finishAuth` call (which reads them), the `Map` is empty. `codeVerifier()` throws `"no PKCE code_verifier stored for this session"`. The flow is dead. Dev avoids this by writing to disk instead.
 
-The file-backed store survives module re-evaluation because it writes to `.auth-cache.json` on disk:
+The file-backed store survives module re-evaluation because it writes to a gitignored JSON cache file on disk:
 
-```typescript
-// lib/mcp/auth.ts L34–L35
-const PERSIST = process.env.NODE_ENV === 'development';
-const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
+```
+PERSIST     = env.NODE_ENV == "development"
+CACHE_FILE  = cwd() + "/.auth-cache.json"   # gitignored
 ```
 
-`readAll()` always reads from disk in dev; `writeAll()` always writes to disk in dev. The file is gitignored. The state survives hot-reloads.
+The `readAll`/`writeAll` helpers hit disk in dev. The state survives hot-reloads.
 
 ---
 
 ### Sub-section F — Why prod persists to an encrypted cookie
 
-Vercel runs the `connect` request and the `callback` request on different ephemeral instances, so a module-level `Map` is empty by the time the callback reads it — and a disk file is read-only on Vercel. The only state both requests can see is the browser. So in production the auth store is an **AES-256-GCM encrypted httpOnly cookie** named `bi_auth`, keyed by the `bi_session` cookie, holding the same `Store` shape the dev file holds (the per-session `clientInformation` + `codeVerifier` + `tokens`).
+A serverless platform runs the connect request and the callback request on different ephemeral instances, so a module-level `Map` is empty by the time the callback reads it — and a disk file is read-only at runtime. The only state both requests can see is the browser. So in production the auth store is an **AES-256-GCM encrypted httpOnly cookie** named `bi_auth`, keyed by the session cookie, holding the same per-session shape the dev file holds (`clientInformation` + `codeVerifier` + `tokens`).
 
-`readAll`/`writeAll` (L113–L142) pick the backend by `NODE_ENV`: the ALS-scoped cookie store in prod, the file in dev, an in-memory `Map` in test. The crypto is three functions: `aesKey()` (L51–L60) derives a 32-byte AES-256 key from `AUTH_SECRET` via SHA-256; `encryptStore`/`decryptStore` (L62–L79) GCM-encrypt/decrypt the JSON `Store` to/from a base64url token. A tampered, rotated-secret, or corrupt cookie decrypts to `{}` (treated as no auth).
+The `readAll`/`writeAll` helpers pick the backend by `NODE_ENV`: the request-scoped cookie store in prod, the file in dev, an in-memory `Map` in test. The crypto is three primitives: a key-derivation function turns the cookie-encryption secret into a 32-byte AES-256 key via SHA-256; an encode/decode pair GCM-encrypts/decrypts the JSON store to/from a base64url token. A tampered, rotated-secret, or corrupt cookie decrypts to `{}` (treated as no auth).
 
-The problem the cookie creates is Next's request-vs-response cookie split: a `cookies().get()` *after* a `cookies().set()` in the same request still returns the OLD value, so the provider's many synchronous read/write calls cannot touch the cookie directly. `withAuthCookies(fn)` (L86–L104) solves this with an `AsyncLocalStorage`-scoped `requestStore`: it decrypts the `bi_auth` cookie into an in-memory `Store` ONCE at the start, runs `fn` (which reads/writes that store via the ALS context), and flushes it back to the cookie ONCE at the end — only if `dirty`. Each request gets its own ALS context, so concurrent requests on one instance never share state. `connectMcp` and `completeAuth` both wrap their work in `withAuthCookies` (`connect.ts` L63, L115).
+The problem the cookie creates is the framework's request-vs-response cookie split: a `cookies.get()` *after* a `cookies.set()` in the same request still returns the OLD value, so the provider's many synchronous read/write calls cannot touch the cookie directly. An auth-cookie context (`withAuthCookies(fn)`) solves this with an async-local-storage-scoped request store: it decrypts the cookie into an in-memory store ONCE at the start, runs `fn` (which reads/writes that store via the ALS context), and flushes it back to the cookie ONCE at the end — only if the store was mutated. Each request gets its own ALS context, so concurrent requests on one instance never share state. The connect and the auth-completion helpers both wrap their work in this context.
 
 ```
 PROD request (connect or callback)
    │
    │  withAuthCookies(fn):
-   │    decrypt bi_auth cookie ──▶ Store  ──┐  ONCE, at start
+   │    decrypt bi_auth cookie ──▶ store  ──┐  ONCE, at start
    │                                        ▼
    │    requestStore.run(ctx, fn) ──▶  ┌──────────────────────────┐
-   │                                   │ ALS-scoped Store (ctx)   │
+   │                                   │ ALS-scoped store (ctx)   │
    │      provider.saveCodeVerifier ──▶│  readAll()/writeAll() hit│
    │      provider.codeVerifier()   ◀──│  ctx, set ctx.dirty=true │
    │      provider.saveTokens()     ──▶│                          │
@@ -305,13 +297,13 @@ PROD request (connect or callback)
    ▼
 ```
 
-`_authCookieCrypto` (L244–L247) is a test seam exposing `encrypt`/`decrypt` so the cookie crypto can be exercised without a request context. `deleteAuthCookie` (L107–L111) clears `bi_auth` for the reset route.
+A test seam (`_authCookieCrypto`) exposes the encrypt/decrypt pair so the cookie crypto can be exercised without a request context. A `deleteAuthCookie` helper clears the cookie for the reset route.
 
-The failure mode is explicit: `aesKey()` throws if `AUTH_SECRET` is unset. Because `connectMcp` runs inside `withAuthCookies`, that throw surfaces from the live route — and `/api/briefing` now wraps its setup in a try/catch that returns the real message instead of a bare 500 (see 01-request-flow.md).
+The failure mode is explicit: the key-derivation step throws if the cookie-encryption secret is unset. Because the connect helper runs inside the auth-cookie context, that throw surfaces from the live route — and the briefing route now wraps its setup in a try/catch that returns the real message instead of a bare 500 (see 01-request-flow.md).
 
-The `redirect_uri` is host-based: `redirectUri()` in `connect.ts` (L31–L52) is async and, in prod, derives the callback origin from `x-forwarded-host` (falling back to `host`), so a preview deployment and the production alias both register their own redirect URI via DCR and the callback returns to the same origin that set the `bi_session` cookie. Locally it uses `APP_ORIGIN`.
+The `redirect_uri` is host-based: a `redirectUri()` helper is async and, in prod, derives the callback origin from the request's forwarded host (falling back to the bare host), so a preview deployment and the production alias both register their own redirect URI via DCR and the callback returns to the same origin that set the session cookie. Locally it uses an `APP_ORIGIN` env var.
 
-The `bi_session` and `bi_auth` cookies are both `SameSite=None; Secure` in prod so they survive the cross-site OAuth round trip (the IdP redirect back to `/api/mcp/callback`), and `Lax` in dev — set by `sessionCookieOpts()` in `session.ts` (L10–L14) and inline in `withAuthCookies` (L92–L101).
+The session and auth cookies are both `SameSite=None; Secure` in prod so they survive the cross-site OAuth round trip (the IdP redirect back to the callback route), and `Lax` in dev — set by the session helper's cookie-options factory and inline in the auth-cookie context.
 
 ---
 
@@ -340,7 +332,7 @@ Phase A — dev (single Node process)              Phase B — prod/serverless
                                                  thing both requests can see.
 ```
 
-The `NODE_ENV` checks select the backend. In production `readAll`/`writeAll` (L113–L142) hit the ALS-scoped cookie store seeded by `withAuthCookies`; in dev `PERSIST` is `true` and the file is used; in test the in-memory `memStore` is used. The encrypted cookie — not a KV/Redis store — is what makes the connect→callback bridge work across ephemeral instances, because the browser is the only state both requests share.
+The `NODE_ENV` checks select the backend. In production the read/write helpers hit the ALS-scoped cookie store seeded by the auth-cookie context; in dev the persist flag is `true` and the file is used; in test the in-memory `memStore` Map is used. The encrypted cookie — not a KV/Redis store — is what makes the connect→callback bridge work across ephemeral instances, because the browser is the only state both requests share.
 
 ---
 
@@ -646,3 +638,4 @@ Answer points: `localStorage` is accessible to any JavaScript on the page — an
 Updated: 2026-05-28 — documented the PRODUCTION auth store: AES-256-GCM encrypted httpOnly `bi_auth` cookie keyed by `bi_session`, seeded/flushed once per request by `withAuthCookies` via an `AsyncLocalStorage` `requestStore` (`aesKey`/`encryptStore`/`decryptStore`/`readAll`/`writeAll`/`_authCookieCrypto`); added a Move-2 sub-section + ASCII diagram, reflected it in the primary diagram/Summary; noted host-based async `redirectUri()`, `SameSite=None; Secure` prod cookies, and the `AUTH_SECRET`-missing 500 failure mode; refreshed all line refs.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

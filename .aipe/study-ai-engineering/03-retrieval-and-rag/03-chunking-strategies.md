@@ -57,13 +57,13 @@
        └── tune size + overlap to the question granularity ──┘
 ```
 
-The body walks the strategies from crudest (what `schemaSummary` does) to context-aware.
+The body walks the strategies from crudest (what the schema summary does) to context-aware.
 
 ---
 
 ### Fixed-size chunking (the crude baseline)
 
-Split every N characters (or tokens), optionally with a fixed overlap. This is what `truncate` (`lib/agents/base.ts` L31–L34) does in degenerate form — it keeps the first 16k characters and drops the rest, a single chunk with everything after the boundary discarded.
+Split every N characters (or tokens), optionally with a fixed overlap. The agent loop's `truncate` is this in degenerate form — it keeps the first 16k characters and drops the rest, a single chunk with everything after the boundary discarded.
 
 ```
   document: [================================================]
@@ -76,9 +76,9 @@ Split every N characters (or tokens), optionally with a fixed overlap. This is w
 
 Overlap exists because a fixed boundary cuts blindly — it can sever a sentence whose first half is the question's keyword and second half is the answer. Overlap re-includes the boundary region in both neighbors so the answer survives in at least one whole chunk. Fixed-size is fast and simple; it ignores meaning entirely.
 
-### Truncate-by-rank (what `schemaSummary` actually does)
+### Truncate-by-rank (what the schema summary actually does)
 
-`schemaSummary` is a chunking variant: it keeps the *most important* slice rather than the *first* slice. Events are pre-sorted by `eventCount` descending (`lib/mcp/schema.ts` L99), then `.slice(0, MAX_EVENTS)` keeps the top 20, with each event's properties capped at 10 and customer properties at 30.
+The schema-summary helper is a chunking variant: it keeps the *most important* slice rather than the *first* slice. Events are pre-sorted by event count descending, then sliced to keep the top 20, with each event's properties capped at 10 and customer properties at 30.
 
 ```
   schema.events (sorted by eventCount desc)
@@ -134,7 +134,7 @@ This diagram spans the Service layer (where a document is split) and the State l
 ┌──────────────────────────────────────────────────────────────────────┐
 │  SERVICE LAYER  (would live next to lib/mcp/schema.ts)              │
 │                                                                      │
-│   CURRENT: schemaSummary (monitoring.ts L15–L48)                    │
+│   CURRENT: schemaSummary                    │
 │     full schema ──▶ sort by eventCount ──▶ slice(0,20) ──▶ text     │
 │                       (rank-truncation: one cut, drop the tail)     │
 │                                                                      │
@@ -299,3 +299,4 @@ What chunking strategy does blooming insights use today, where, and what does it
 → 01-embeddings.md · → 04-vector-databases.md · → 10-incremental-indexing.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

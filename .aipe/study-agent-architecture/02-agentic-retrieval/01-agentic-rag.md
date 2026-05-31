@@ -119,11 +119,11 @@ The retriever slot — anything that grounds a query goes here
 
 If you're coming from frontend, this is the same shape as "the data layer is an interface" — your component doesn't care if `useUser()` reads localStorage, a cookie, or a `/api/me` fetch, as long as it returns a user. The agent loop doesn't care what `execute_analytics_eql` is under the hood, as long as it returns rows the model can reason on.
 
-The practical consequence: the agentic loop shape generalizes across retriever types. You can drop a vector index in beside a live API and the model can route between them (covered in `03-retrieval-routing.md`). The loop's structure — reason, retrieve, observe, repeat — doesn't change.
+The practical consequence: the agentic loop shape generalizes across retriever types. You can drop a vector index in beside a live API and the model can route between them (covered in the retrieval-routing note). The loop's structure — reason, retrieve, observe, repeat — doesn't change.
 
 ### The "no embedding-RAG" case — why this codebase skipped the vector index
 
-The technical thing: blooming insights does agentic retrieval without ever building an embedding index. The retriever is `execute_analytics_eql` against Bloomreach — a live tool call, not a nearest-neighbor lookup over chunked documents.
+The technical thing: blooming insights does agentic retrieval without ever building an embedding index. The retriever is a live analytics tool call against Bloomreach — not a nearest-neighbor lookup over chunked documents.
 
 If you're coming from frontend, this is the difference between caching `/api/users` in localStorage at build time (snapshot, ages immediately) and just calling `/api/users` fresh every time (slower per call, always current). The codebase chose the second: no snapshot, no chunker, no vector store. The retriever is the live source.
 
@@ -139,16 +139,16 @@ Three things make the live retriever the right choice here
 
 The practical consequence: the agentic loop here is pure — every observation is fresh data, not a snapshot. The cost is per-call latency (an HTTP round trip to Bloomreach, ~1.1s spaced + execution time) instead of the millisecond reads of a local vector index. The codebase pays that cost on purpose because the alternative (a stale embedding of "42,000 purchases") would silently poison every downstream turn.
 
-The condition under which this stays right: the data has to be a queryable API returning exact results. The day a feature needs to *search free-text narratives* (e.g. "find past investigations similar to this one"), the live-tool retriever is the wrong shape and an embedding index earns its place. The cross-reference file (`../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`) walks that threshold rule end-to-end.
+The condition under which this stays right: the data has to be a queryable API returning exact results. The day a feature needs to *search free-text narratives* (e.g. "find past investigations similar to this one"), the live-tool retriever is the wrong shape and an embedding index earns its place. The ai-engineering RAG note walks that threshold rule end-to-end.
 
 ### The loop is a budget, not a freeway
 
-The technical thing: the agentic-RAG loop has caps. `runAgentLoop` enforces `maxTurns` (default 8) and `maxToolCalls` (6 for monitoring/diagnostic/query, 4 for recommendation), and once the budget is spent the loop strips the tools from the next request, forcing the model to answer (`base.ts` L90–L101).
+The technical thing: the agentic-RAG loop has caps. The shared agent loop enforces a per-loop turn ceiling (default 8) and a per-loop tool-call budget (6 for monitoring/diagnostic/query, 4 for recommendation), and once the budget is spent the loop strips the tools from the next request, forcing the model to answer.
 
 If you're coming from frontend, this is `useEffect` with a dependency array and an abort controller — a loop with an off-switch. Without it, you've shipped an infinite render loop the model drives.
 
 ```
-runAgentLoop — the loop has two off-switches
+shared agent loop — the loop has two off-switches
 
   turn N:
     if (budget spent OR last allowed turn):
@@ -159,7 +159,7 @@ runAgentLoop — the loop has two off-switches
     run each tool, append result as next user turn
 ```
 
-The practical consequence: an agentic investigation never spends more than ~6 EQL calls. If the diagnostic agent can't reach a conclusion in 6 queries it's forced to synthesize from what it has — including "I couldn't establish a populated window" if that's the honest answer. The cost is occasional truncation; the win is a bounded latency budget the route's `maxDuration = 300` can sit on top of.
+The practical consequence: an agentic investigation never spends more than ~6 tool calls. If the diagnostic agent can't reach a conclusion in 6 queries it's forced to synthesize from what it has — including "I couldn't establish a populated window" if that's the honest answer. The cost is occasional truncation; the win is a bounded latency budget the route handler's per-investigation ceiling (300s) can sit on top of.
 
 The principle: an agentic loop without a cap is a runaway. The cap is what makes the adaptability cost-controlled instead of unbounded.
 
@@ -177,7 +177,7 @@ blooming insights: agentic retrieval over a live API
        ▼
   ┌─────────────────────────────────────────────────────────────────┐
   │                       AGENT LAYER                                │
-  │                  (runAgentLoop, base.ts L85)                     │
+  │                  (the shared agent loop)                         │
   │                                                                  │
   │   turn 0  ┌───────────────────┐                                  │
   │           │ model reasons      │                                 │
@@ -185,9 +185,9 @@ blooming insights: agentic retrieval over a live API
   │           └────────┬───────────┘                                 │
   │                    ▼ tool_use                                    │
   │           ┌───────────────────────────────────────┐              │
-  │           │ execute_analytics_eql(eql=...)        │              │
+  │           │ analytics tool call                   │              │
   │           └────────┬──────────────────────────────┘              │
-  │                    ▼  observation fed back (base.ts L171)        │
+  │                    ▼  observation fed back                       │
   │   turn 1  ┌───────────────────┐                                  │
   │           │ model: "purchases  │  ◄── result of turn 0 in        │
   │           │ down 18%; compare  │      context window             │
@@ -195,27 +195,27 @@ blooming insights: agentic retrieval over a live API
   │           └────────┬───────────┘                                 │
   │                    ▼ tool_use                                    │
   │           ┌───────────────────────────────────────┐              │
-  │           │ execute_analytics_eql(eql=...)        │              │
+  │           │ analytics tool call                   │              │
   │           └────────┬──────────────────────────────┘              │
   │                    ▼                                              │
   │   turn 2  ┌───────────────────┐                                  │
-  │           │ model: no tool_use │ ──► natural stop (base.ts L121) │
+  │           │ model: no tool_use │ ──► natural stop                │
   │           │ → emits JSON       │                                 │
   │           └───────────────────┘                                  │
   │                                                                  │
-  │   BUDGET: maxTurns=8, maxToolCalls=6 → forced final (L90)        │
+  │   BUDGET: turn cap + tool-call budget → forced final             │
   └─────────────────────────┬───────────────────────────────────────┘
                             │
                             ▼
   ┌─────────────────────────────────────────────────────────────────┐
   │                       RETRIEVER LAYER                            │
-  │   McpClient.callTool → execute_analytics_eql → Bloomreach        │
+  │   MCP client wrapper → analytics tool → Bloomreach               │
   │   (live API; no vector index, no chunks, no embeddings)          │
   └─────────────────────────────────────────────────────────────────┘
 
   The loop length is variable — the model writes it. The retriever
-  is a live API call. The cap is a budget the route's 300s window
-  sits on.
+  is a live API call. The cap is a budget the route's per-investigation
+  window sits on.
 ```
 
 ---
@@ -397,3 +397,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

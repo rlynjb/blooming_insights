@@ -136,7 +136,7 @@ The four parts compose: spacing PREVENTS most 429s; detection RECOGNIZES the one
 The kernel is the minimum. The codebase ships some hardening on top and omits the rest, and naming which is which is part of the pattern.
 
 ```
-SKELETON (in McpClient — required)             HARDENING
+SKELETON (in the provider wrapper — required)  HARDENING
 ────────────────────────────────────           ────────────────────────────────
 elapsed < minIntervalMs spacing gate           ┌ jitter on retry sleeps   (absent)
 lastCallAt single-state clock                  ├ per-tool circuit breaker (absent)
@@ -148,7 +148,7 @@ no-cache-on-error guard (cross-cuts            │   capacity hint         (abse
                                                   via parseRetryAfterMs)
 ```
 
-The codebase has exactly one piece of optional hardening — `parseRetryAfterMs` (`lib/mcp/client.ts` L31–L38), which prefers a window parsed from the Bloomreach error text when present and falls back to exponential backoff otherwise. It deliberately omits jitter (single user, no thundering-herd risk at this scale), a per-tool breaker (one upstream, no tool-isolation needed), and a token bucket (the simple counter holds at one user under a 1 req/s limit). The breakpoints that flip any of those choices live in Tradeoffs.
+The codebase has exactly one piece of optional hardening — a `parseRetryAfterMs` helper, which prefers a window parsed from the upstream error text when present and falls back to exponential backoff otherwise. It deliberately omits jitter (single user, no thundering-herd risk at this scale), a per-tool breaker (one upstream, no tool-isolation needed), and a token bucket (the simple counter holds at one user under a 1 req/s limit). The breakpoints that flip any of those choices live in Tradeoffs.
 
 ---
 
@@ -497,3 +497,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers; retry
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

@@ -161,14 +161,14 @@ If you're coming from frontend, this is literal function composition: `const dx 
 ```
 In-process function-arg handoff
 
-  // app/api/agent/route.ts L237–L247
-  const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
-  diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+  // in the route handler
+  diag_agent  = new diagnostic_agent(...)
+  diagnosis   = await diag_agent.investigate(inv, hooks)
   // ▲ diagnosis is a Diagnosis object, typed by the return signature
-  send({ type: 'diagnosis', diagnosis });
+  send({ type: 'diagnosis', diagnosis })
 
-  const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
-  const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+  rec_agent       = new recommendation_agent(...)
+  recommendations = await rec_agent.propose(inv, diagnosis, hooks)
   //                                              ▲
   //                                              │ the message
 ```
@@ -189,10 +189,10 @@ Cross-request handoff
   Step 2 (diagnose request) — client:
    ─────────────────────────────────────────
     receives Diagnosis from SSE stream
-    in useInvestigation 'done' handler (L138):
-      sessionStorage.setItem(
+    in the investigation hook's 'done' handler:
+      session_storage.set(
         'bi:diag:<id>',
-        JSON.stringify({ diagnosis: cDiag })
+        serialize({ diagnosis: c_diag })
       )
 
   User clicks "see recommendations"
@@ -200,30 +200,30 @@ Cross-request handoff
        ▼
   Step 3 (recommend request) — client:
    ─────────────────────────────────────────
-    reads 'bi:diag:<id>' from sessionStorage
+    reads 'bi:diag:<id>' from session storage
     constructs ?diagnosis=<encoded JSON> URL param
     sends GET /api/agent?insightId=...&step=recommend&diagnosis=...
 
   Step 3 — server:
    ─────────────────────────────────────────
-    route.ts L86–L97:
-      const diagnosisParam = req.searchParams.get('diagnosis');
-      const diagnosis = parseDiagnosis(diagnosisParam);
-      if (!diagnosis) throw 'no diagnosis was handed over'
+    in the route handler:
+      diagnosis_param = req.searchParams.get('diagnosis')
+      diagnosis       = parse_diagnosis(diagnosis_param)
+      if not diagnosis: throw 'no diagnosis was handed over'
 
-    parseDiagnosis validates the shape:
+    parse_diagnosis validates the shape:
       - conclusion: string
       - evidence: array
       - hypothesesConsidered: array
 ```
 
-The practical consequence: the *carrier* changes (function arg → sessionStorage + URL param), but the *message* is the same typed `Diagnosis`. The validation function `parseDiagnosis()` enforces the schema at the trust boundary — if the client sent a malformed object, the route rejects it before resuming the pipeline.
+The practical consequence: the *carrier* changes (function arg → session storage + URL param), but the *message* is the same typed Diagnosis. The validation function enforces the schema at the trust boundary — if the client sent a malformed object, the route rejects it before resuming the pipeline.
 
 The condition under which it works: the message has to fit in a URL query param (a `Diagnosis` does, comfortably — usually under 4KB). For larger messages, you'd POST them or use a server-side session store.
 
 ### Layer 5 — per-agent tool subsets are part of context scoping
 
-The technical thing: each agent's tool subset (`lib/mcp/tools.ts`) is *part of its scoped context*. The recommendation agent can't even attempt to call analytics tools — they're not in its toolbox. Tools are scoped the same way messages are.
+The technical thing: each agent's tool subset is *part of its scoped context*. The recommendation agent can't even attempt to call analytics tools — they're not in its toolbox. Tools are scoped the same way messages are.
 
 If you're coming from frontend, this is component scoping for which side effects can fire: a child component with no `onSubmit` prop literally can't submit the form. The capability isn't there.
 
@@ -322,16 +322,16 @@ Shared state vs message passing — full picture
 
   Carriers for the message in this codebase:
   ┌──────────────────────────────────────────┐
-  │ in-process:   function arg               │  → route.ts L247
+  │ in-process:   function arg               │
   │   diagnosis: Diagnosis                   │
   ├──────────────────────────────────────────┤
   │ cross-request:                            │
-  │   write:  sessionStorage.setItem(         │  → useInvestigation L138
-  │            'bi:diag:<id>', JSON.stringify(│
+  │   write:  session_storage.set(            │
+  │            'bi:diag:<id>', serialize(     │
   │            { diagnosis }))                │
-  │   read:   parseDiagnosis(URL ?diagnosis=) │  → route.ts L86–L97
+  │   read:   parse_diagnosis(URL ?diagnosis=)│
   └──────────────────────────────────────────┘
-  Schema (the contract): interface Diagnosis     → lib/mcp/types.ts L95–L104
+  Schema (the contract): interface Diagnosis     (the typed inter-agent message)
 ```
 
 ---
@@ -611,3 +611,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

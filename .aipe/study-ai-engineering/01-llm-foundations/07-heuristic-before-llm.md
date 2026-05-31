@@ -40,21 +40,21 @@
 
 ## How it works
 
-**Mental model.** Two functions, same return type, ordered cheapest-first. `parseIntent(raw): Intent` is a pure string function — no network, no model, no async. `classifyIntent(anthropic, query): Promise<Intent>` is the LLM. The system reaches for the model *only* when the cheap function cannot decide, and even `classifyIntent` runs its model output back through `parseIntent` to normalize it. The cheap path is both the pre-filter and the post-parser.
+**Mental model.** Two functions, same return type, ordered cheapest-first. The intent parser is a pure string function — no network, no model, no async. The intent classifier is the LLM. The system reaches for the model *only* when the cheap function cannot decide, and even the classifier runs its model output back through the parser to normalize it. The cheap path is both the pre-filter and the post-parser.
 
 ```
 question: "what intent is this query?"
       │
   ┌───▼──────────────────────────┐
-  │ parseIntent (pure, free)      │  substring match
+  │ intent parser (pure, free)    │  substring match
   │ includes("monitoring")? ...   │
   └───┬───────────────────────────┘
       │ decisive?  ── yes ──▶ return Intent   (no model call)
       │ no / ambiguous
       ▼
   ┌──────────────────────────────┐
-  │ classifyIntent (haiku, paid)  │  LLM round-trip
-  │ → text → parseIntent(text)    │  ← cheap path normalizes the output
+  │ intent classifier (paid)      │  LLM round-trip
+  │ → text → intent parser(text)  │  ← cheap path normalizes the output
   └───┬───────────────────────────┘
       ▼
    Intent
@@ -64,63 +64,62 @@ The free path is tried first and reused to interpret the paid path's answer. The
 
 ---
 
-### The heuristic: `parseIntent`
+### The heuristic: the intent parser
 
-`parseIntent` (`lib/agents/intent.ts` L6–L12) is a pure function: lowercase the input and substring-match against the three intent keywords, defaulting to `'diagnostic'`:
-
-```typescript
-export function parseIntent(raw: string): Intent {
-  const t = raw.trim().toLowerCase();
-  if (t.includes('monitoring')) return 'monitoring';
-  if (t.includes('recommendation')) return 'recommendation';
-  if (t.includes('diagnostic')) return 'diagnostic';
-  return 'diagnostic';
-}
-```
-
-Zero cost, zero latency, fully deterministic. It serves two roles: a fast classifier for inputs that literally contain an intent word, and — critically — the *parser for the LLM's output*. When the haiku model replies "monitoring", `parseIntent("monitoring")` turns that string into the typed `Intent`. The cheap function is the boundary parser for the expensive function (the same parse-the-output discipline as → 01-what-an-llm-is.md and → 04-structured-outputs.md).
+The intent parser is a pure function: lowercase the input and substring-match against the three intent keywords, defaulting to `'diagnostic'`:
 
 ```
-parseIntent("show me monitoring")  → 'monitoring'   (heuristic hit, no model)
-parseIntent("why did sales drop?") → 'diagnostic'   (default — no keyword)
-parseIntent(<haiku output "monitoring">) → 'monitoring'  (normalize LLM text)
+  function parse_intent(raw) -> Intent:
+      t = lower(trim(raw))
+      if t contains "monitoring":     return 'monitoring'
+      if t contains "recommendation": return 'recommendation'
+      if t contains "diagnostic":     return 'diagnostic'
+      return 'diagnostic'    # default bias
+```
+
+Zero cost, zero latency, fully deterministic. It serves two roles: a fast classifier for inputs that literally contain an intent word, and — critically — the *parser for the LLM's output*. When the cheap-tier model replies "monitoring", the intent parser turns that string into the typed `Intent`. The cheap function is the boundary parser for the expensive function (the same parse-the-output discipline as → 01-what-an-llm-is.md and → 04-structured-outputs.md).
+
+```
+parse_intent("show me monitoring")  → 'monitoring'   (heuristic hit, no model)
+parse_intent("why did sales drop?") → 'diagnostic'   (default — no keyword)
+parse_intent(<cheap-tier output "monitoring">) → 'monitoring'  (normalize LLM text)
 ```
 
 ---
 
-### The LLM fallback: `classifyIntent`
+### The LLM fallback: the intent classifier
 
-`classifyIntent` (`lib/agents/intent.ts` L17–L31) is the paid path for genuinely free-form queries that contain no literal intent keyword. It calls haiku with `max_tokens: 16` and a one-word system prompt, then feeds the result through `parseIntent`:
+The intent classifier is the paid path for genuinely free-form queries that contain no literal intent keyword. It calls the cheap-tier model with `max_tokens: 16` and a one-word system prompt, then feeds the result through the intent parser:
 
-```typescript
-export async function classifyIntent(anthropic: Anthropic, query: string): Promise<Intent> {
-  const res = await anthropic.messages.create({
-    model: CLASSIFIER_MODEL,           // haiku — cheap
-    max_tokens: 16,                     // one word
-    system: 'Classify the user query as exactly one word: monitoring ... diagnostic ... recommendation ...',
-    messages: [{ role: 'user', content: query }],
-  });
-  const text = res.content.filter(...text...).join('');
-  return parseIntent(text);             // ← cheap path normalizes the answer
-}
+```
+  async function classify_intent(provider_sdk, query) -> Intent:
+      response = await provider_sdk.messages.create({
+        model:       CLASSIFIER_MODEL,    # cheap tier
+        max_tokens:  16,                   # one word
+        system:      "Classify the user query as exactly one word: "
+                     "monitoring ... diagnostic ... recommendation ...",
+        messages:    [{ role: "user", content: query }],
+      })
+      text = join(filter(response.content, type == "text"))
+      return parse_intent(text)            # cheap path normalizes the answer
 ```
 
-This is the LLM doing what the substring heuristic cannot: understanding that "why did sales drop?" is *diagnostic* intent even though it contains none of the keywords. The model is on the cheap haiku tier (→ 06-token-economics.md) and capped to one word — the least expensive way to get a model's judgment.
+This is the LLM doing what the substring heuristic cannot: understanding that "why did sales drop?" is *diagnostic* intent even though it contains none of the keywords. The model is on the cheap tier (→ 06-token-economics.md) and capped to one word — the least expensive way to get a model's judgment.
 
 ---
 
 ### The route's own heuristic branch
 
-Before any classification at all, the route runs a free structural check: which flow to enter, based purely on *which query parameters are present* (`app/api/agent/route.ts` L210 for the query branch, L121–L123 for the neither→400 guard):
+Before any classification at all, the route runs a free structural check: which flow to enter, based purely on *which query parameters are present*:
 
 ```
 GET /api/agent
-  q present, no insightId  → query flow:  classifyIntent → QueryAgent.answer
-  insightId present        → investigation flow: DiagnosticAgent → RecommendationAgent
-  neither                  → 400  (route.ts L121–123)
+  q present, no insightId  → query flow:  classify_intent → query agent
+  insightId present        → investigation flow: diagnostic agent → recommendation agent
+  neither                  → 400
 ```
 
-The `q && !insightId` test (L210) is a heuristic — presence of a parameter — that decides the entire downstream path with zero model involvement. The expensive `classifyIntent` call (L211) runs *only inside* the query branch, only after the free structural check has already routed the request. Two layers of fast-path: structural routing (free) then keyword routing (free) then, last, the model.
+The `q && !insightId` test is a heuristic — presence of a parameter — that decides the entire downstream path with zero model involvement. The expensive intent-classifier call runs *only inside* the query branch, only after the free structural check has already routed the request. Two layers of fast-path: structural routing (free) then keyword routing (free) then, last, the model.
 
 ```
 ┌─ route: parameter-presence heuristic (free) ─┐
@@ -128,8 +127,8 @@ The `q && !insightId` test (L210) is a heuristic — presence of a parameter —
 └──────────────┬───────────────────────────────┘
                │ query flow only
         ┌──────▼─────────────────────────┐
-        │ parseIntent-style keyword (free)│  (implicit in classifyIntent's parse)
-        │      → classifyIntent (haiku)   │  ← paid, last resort
+        │ parse_intent keyword (free)     │
+        │      → classify_intent (paid)   │  ← paid, last resort
         └─────────────────────────────────┘
 ```
 
@@ -137,7 +136,7 @@ The `q && !insightId` test (L210) is a heuristic — presence of a parameter —
 
 ### The principle
 
-Order your routing checks cheapest-first and reserve the model for what only a model can do. A substring match and a parameter-presence test cost nothing and resolve the unambiguous cases; the LLM is the fallback for genuine ambiguity. blooming insights layers three checks — parameter presence, keyword substring, haiku classification — so the paid path runs only when the two free paths cannot decide, and even then the free parser normalizes the paid path's output.
+Order your routing checks cheapest-first and reserve the model for what only a model can do. A substring match and a parameter-presence test cost nothing and resolve the unambiguous cases; the LLM is the fallback for genuine ambiguity. You layer three checks — parameter presence, keyword substring, cheap-tier classification — so the paid path runs only when the two free paths cannot decide, and even then the free parser normalizes the paid path's output.
 
 ---
 
@@ -151,7 +150,7 @@ This diagram spans the route (structural heuristic) and the intent layer (keywor
 │                                                                       │
 │  app/api/agent/route.ts                                              │
 │    heuristic: parameter presence  (FREE)                            │
-│      q && !insightId ? query flow : investigation flow   L210 / L221  │
+│      q && !insightId ? query flow : investigation flow /       │
 │              │ query flow                                            │
 │              ▼                                                       │
 │  lib/agents/intent.ts                                                │
@@ -164,7 +163,7 @@ This diagram spans the route (structural heuristic) and the intent layer (keywor
 ┌──────────────▼────────────────────────────────────────────────────────┐
 │  PROVIDER LAYER — paid path (last resort)                           │
 │                                                                       │
-│  classifyIntent → haiku, max_tokens 16       intent.ts L17–31        │
+│  classifyIntent → haiku, max_tokens 16       intent.ts               │
 │    res.content text ──▶ parseIntent(text)  ← FREE parser normalizes  │
 │              │                                                       │
 │              ▼                                                       │
@@ -327,3 +326,4 @@ What does `parseIntent` return for an input with no intent keyword, and where is
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` structural-heuristic refs (query branch now L210, `classifyIntent` L211, neither→400 at L121–L123, investigation flow L221); `intent.ts` `parseIntent`/`classifyIntent` refs verified unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
