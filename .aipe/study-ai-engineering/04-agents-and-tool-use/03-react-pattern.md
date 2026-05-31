@@ -61,94 +61,114 @@ The Observation is fed back as the next user message (`base.ts` L171), so the mo
 
 ---
 
-### Thought — the model reasons in text (onText)
+### Isolate the kernel
 
-When the model emits text blocks (not tool calls), that text *is* its reasoning. `runAgentLoop` extracts those text blocks and hands them to the `onText` hook (`base.ts` L108–L113).
-
-```
-base.ts — text extraction   (L108–L113)
-─────────────────────────────────────────────────────────────
- textBlocks = res.content.filter(b => b.type === 'text')   L108
- if (textBlocks.length > 0 && onText)                      L111
-   onText(textBlocks.map(b => b.text).join(''))            L112
-```
-
-The route wires `onText` to emit a `reasoning_step` of kind `'thought'` (`route.ts` L182–L184):
+ReAct has an irreducible kernel: six pieces that *are* the loop. Strip anything else and you still have a working agent; strip any of these and you don't.
 
 ```
-route.ts — hooksFor(agent).onText   (L182–L184)
-─────────────────────────────────────────────────────────────
- onText: (t) => { if (t.trim()) stepFor(agent, 'thought', t) }
- stepFor → send({ type:'reasoning_step', step:{ id, agent, kind:'thought', content:t } })  L176–180
+runAgentLoop({ anthropic, mcp, system, userPrompt, toolSchemas, maxToolCalls }):
+  messages = [{ role:'user', content: userPrompt }]
+  for turn in maxTurns:                                              ─┐
+    budgetSpent = toolCalls.length >= maxToolCalls                    │
+    forceFinal  = (turn == last) || budgetSpent                       │
+    params = { model, system: forceFinal ? system+synth : system,     │  KERNEL
+               messages, max_tokens }                                 │
+    if not forceFinal: params.tools = toolSchemas    ← strip on final │  (the
+    res = await anthropic.messages.create(params)                     │   loop,
+                                                                       │   minus
+    messages.push({ role:'assistant', content: res.content })          │   nothing)
+    toolUses = res.content.filter(b => b.type == 'tool_use')           │
+    if toolUses.length == 0: return { finalText }    ← NO-TOOL EXIT   │
+                                                                       │
+    for tu of toolUses:                                                │
+      result = await mcp.callTool(tu.name, tu.input)                   │
+      toolCalls.push({ ...tu, result })                                │
+                                                                       │
+    messages.push({ role:'user',                       ← TOOL_RESULT  │
+                    content: toolResults_for_each_tu })  fed back     ─┘
 ```
 
-So every chunk of the model's textual reasoning becomes a `reasoning_step` event on the wire. The client's `useInvestigation` hook's `handle` (`useInvestigation.ts` L99–L111) appends it to the trace as a visible thought bubble. The Thought is not hidden chain-of-thought you discard — it is rendered.
+Six load-bearing pieces: (1) the `for turn` loop, (2) the model call with `params.tools` set, (3) the `tool_use` detection, (4) the `mcp.callTool` execution, (5) the `tool_result` push back as a user turn, and (6) the dual termination — no-tool exit OR budget-triggered forced-final-without-tools. The `onText`/`onToolCall`/`onToolResult` hooks, the NDJSON streaming, and the per-agent tool subsets are all *hardening* layered on the kernel.
 
 ---
 
-### Action — the model emits a tool call (onToolCall)
+### Name each part by what breaks when removed
 
-When the model decides to act, it emits a `tool_use` block. `runAgentLoop` fires `onToolCall` *before* executing the tool (`base.ts` L138), so the UI can show "running `get_funnel`…" while the call is in flight.
-
-```
-base.ts — action hook   (L129–L138)
-─────────────────────────────────────────────────────────────
- for tu of toolUses:                                       L129
-   tc = { id, agent, toolName: tu.name, args: tu.input }   L130
-   onToolCall?.(tc)   ← fired BEFORE the call               L138
-```
-
-The route maps this to a `tool_call_start` event (`route.ts` L185, `events.ts` L6):
+Each kernel piece is here because something specific breaks if you drop it.
 
 ```
-events.ts — Action event   (L6)
-─────────────────────────────────────────────────────────────
- | { type:'tool_call_start'; toolName: string; agent: AgentName }
+Removed                            What breaks
+────────────────────────────       ─────────────────────────────────────
+the for-turn loop                  You don't have an agent. You have a
+                                   single LLM completion. The model can
+                                   request a tool, but nothing runs it
+                                   and nothing comes back.
+
+params.tools assignment            The model can't request a tool. Every
+                                   turn is text-only. The "Action" phase
+                                   is gone; the loop never advances.
+
+tool_use detection                 The model emits a tool_use block, you
+                                   ignore it, you push assistant text only.
+                                   The loop returns whatever was in the
+                                   first text block — never the answer.
+
+mcp.callTool execution             Detection works but nothing happens.
+                                   You push an empty tool_result back, the
+                                   model sees no observation, hallucinates
+                                   one, and reasons on imaginary data.
+
+messages.push(tool_results)        The result is computed and discarded.
+                                   Next turn, the model has no memory of
+                                   what it asked for. It re-asks. Infinite
+                                   loop of the same tool call.
+
+no-tool exit                       The model decides it's done and emits
+                                   only text — you keep looping anyway,
+                                   pushing empty tool_results, until
+                                   maxTurns. Wasted turns; the answer is
+                                   trapped in turn 1.
+
+budget cap + forced-final          The model keeps requesting tools every
+(strip tools when budgetSpent)     turn. maxToolCalls is hit; you keep
+                                   passing tools; it never synthesizes.
+                                   Forced-final removes the tool menu so
+                                   the next turn HAS to be a final answer.
 ```
 
-The hook's `handle` pushes a tool row with `status: 'running'` (`useInvestigation.ts` L112–L117). The Action is the second visible phase: the user sees not just that the agent is thinking, but *what* it chose to do.
+The dual termination is the subtle one: ReAct needs BOTH the "model said done" path and the "I forced it to be done" path. Drop the first and a model that already finished keeps spinning; drop the second and a model that never wants to finish runs the budget into the ceiling.
 
 ---
 
-### Observation — code runs the tool, result feeds back (onToolResult)
+### Separate skeleton from optional hardening
 
-After the tool returns, `runAgentLoop` fires `onToolResult` (`base.ts` L159) and pushes the result back into the conversation as a user turn (`base.ts` L171). The route maps `onToolResult` to a `tool_call_end` event carrying `durationMs`, a truncated `result`, and any `error` (`route.ts` L186–L194, `events.ts` L7).
-
-```
-base.ts — observation     (L144–L171)
-─────────────────────────────────────────────────────────────
- { result, durationMs } = await mcp.callTool(tu.name, tu.input)  L144
- tc.result = result; tc.durationMs = durationMs                  L148
- onToolResult?.(tc)                                              L159  → tool_call_end
- ...
- messages.push({ role:'user', content: toolResults })            L171  ← OBSERVATION fed back
-```
+The kernel above is the minimum. Everything around it is hardening — useful, but layered on. Saying which is which is part of the pattern.
 
 ```
-events.ts — Observation event   (L7)
-─────────────────────────────────────────────────────────────
- | { type:'tool_call_end'; toolName; agent; durationMs; result?; error? }
+SKELETON (in base.ts — required)               HARDENING (some present, some not)
+────────────────────────────────────           ──────────────────────────────────
+for-turn loop with maxTurns                    ┌ onText / onToolCall / onToolResult
+params.tools toggle (on/off for final)         │   hooks (PRESENT — used for the
+tool_use detection + execution                 │   NDJSON trace, ai-eng 05-streaming)
+tool_result push back as user turn             ├ NDJSON streaming of every phase
+no-tool exit                                   │   (PRESENT — the trace is a product)
+maxToolCalls budget + forced-final             ├ per-agent tool SUBSETS via
+                                               │   filterToolSchemas (PRESENT —
+                                               │   ai-eng 04-tool-routing)
+                                               ├ synthesisInstruction injected on
+                                               │   forced-final (PRESENT — pushes
+                                               │   the model to emit structured JSON)
+                                               ├ tool_result truncation (PRESENT —
+                                               │   16k cap, base.ts L29/L171)
+                                               ├ structured-output validator on
+                                               │   finalText (PRESENT — synthesize()
+                                               │   retry, see structured-outputs.md)
+                                               └ planning / reflection / debate
+                                                   (absent — every agent runs the
+                                                   bare loop, no super-structure)
 ```
 
-Two roles in one phase. The `tool_call_end` event is the Observation made *visible* (the hook flips the matching running tool row to `status: 'done'` with its duration via `replaceRunningTool`, `useInvestigation.ts` L86–L95 / L118–L121). The `messages.push` at L171 is the Observation made *available to the model* — the result re-enters the context so the next Thought is informed by it. The same data serves the UI and the next reasoning turn; that dual role is what makes the trace both a debugging surface and a functional part of the loop.
-
----
-
-### The trace as a product surface
-
-The events are NDJSON (`encodeEvent` = `JSON.stringify(e) + '\n'`, `events.ts` L15). The route enqueues them into a `ReadableStream` (`route.ts` L169–L265); the client reads them inside `useInvestigation` with `res.body.getReader()` + `TextDecoder`, splits on `\n`, and `JSON.parse`s each line (`useInvestigation.ts` L184–L201). There is no `EventSource` — it is a raw streamed reader over `fetch`, started once per mount behind a `startedRef` guard so React StrictMode's double-mount does not double-fetch. Because the Thought/Action/Observation events arrive *as they happen*, the investigation page is a live trace: the analyst watches the agent reason, query, and observe, step by step. When a diagnosis is wrong, the analyst scrolls the trace and sees which Observation the reasoning misread — debugging by reading, not by re-running.
-
-```
-NDJSON stream over fetch (no EventSource)
-─────────────────────────────────────────────────────────────
- route start():  enqueue(encodeEvent(reasoning_step))  ─┐
-                 enqueue(encodeEvent(tool_call_start))   │  one JSON
-                 enqueue(encodeEvent(tool_call_end))     │  per line,
-                 enqueue(encodeEvent(diagnosis))         │  '\n'-delimited
-                 enqueue(encodeEvent(done))             ─┘
- page reader:    buf += decode(value); lines = buf.split('\n')
-                 for line: handleEvent(JSON.parse(line))   ← renders each phase
-```
+`runAgentLoop` ships the six-piece kernel plus six pieces of hardening that turn the loop from a working agent into a *production* agent: streaming makes the trace a product surface, tool subsets make the wrong-tool failure structurally absent (→ `04-tool-routing.md`), and the synthesis injection makes the forced-final turn produce structured output instead of generic text. None of those is required for the loop to *work* — they're required for it to ship.
 
 ---
 
@@ -427,3 +447,4 @@ Which line in `lib/agents/base.ts` turns an Observation into input for the model
 
 ---
 Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page.tsx` to `lib/hooks/useInvestigation.ts` (StrictMode-safe `startedRef` reader, shared by both step pages) and refreshed all `route.ts` hook/stream and `ReasoningStep` line refs.
+Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.

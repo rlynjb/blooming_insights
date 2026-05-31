@@ -48,53 +48,87 @@ Every live call passes through a spacing gate that delays it until the minimum i
 
 The retry loop re-enters the spacing gate, so every retry also waits the minimum interval.
 
-### The spacing gate (`liveCall`)
+### Isolate the kernel
 
-`liveCall` (`lib/mcp/client.ts` L148–L163) is the only place the transport is called. It reads `elapsed = Date.now() - this.lastCallAt`. If `elapsed < minIntervalMs`, it sleeps the difference. Then it calls the transport and sets `lastCallAt = Date.now()`.
-
-Three calls arriving faster than 1100 ms apart are forced into a single-file queue:
+Spacing + bounded retry has an irreducible kernel: four parts that *are* the pattern. Strip anything else and you still have a working flow-controlled caller; strip any of these and you don't.
 
 ```
-  time ────────────────────────────────────────────────────────────▶
-
-  call A arrives at T=0
-       │
-       ▼
-  ┌────┤ liveCall A
-  │    │ lastCallAt = 0  → elapsed = ∞  → no wait
-  │    │ transport.callTool()
-  │    │ lastCallAt = T₀ (≈ T=5 ms, network round trip)
-  └────┘
-       │◀────────────── minIntervalMs = 1100 ms ──────────────────▶│
-  call B arrives at T=300 ms                                        │
-       │                                                             │
-       ▼                                                             │
-  ┌────┤ liveCall B                                                  │
-  │    │ elapsed = 300 - 0 = 300 ms                                  │
-  │    │ 300 < 1100 → await 800 ms ────────────────────────────────▶│
-  │    │ transport.callTool()                                        │
-  │    │ lastCallAt = T₁ (≈ T=1105 ms)                              │
-  └────┘
+callTool(name, args):
+  // SPACING
+  elapsed = Date.now() - lastCallAt                  ─┐
+  if elapsed < minIntervalMs:                         │
+    await sleep(minIntervalMs - elapsed)              │  KERNEL
+  result = transport.call(name, args)                 │
+  lastCallAt = Date.now()                             │
+                                                       │
+  // BOUNDED RETRY                                    │
+  while isRateLimited(result) and retries++ < max:    │
+    await sleep(parsedHint ?? backoff, capped at ceil)│
+    result = transport.call(...)                      │
+  return result                                      ─┘
 ```
 
-### `lastCallAt` as the only state
+Four load-bearing pieces: the inter-call spacing gate, the `lastCallAt` clock, the rate-limit detector, and the bounded retry with a backoff cap. No jitter, no per-tool circuit-breaker, no token bucket — those are *hardening*.
 
-`lastCallAt` is a single `number` field initialized to `0` (`lib/mcp/client.ts` L81). When `lastCallAt = 0`, `Date.now() - 0` is large, so the first call never waits. After that, every call updates `lastCallAt` to the moment the transport returned — NOT the moment the call started — which means the gap is measured from the end of the previous network round trip, not from when it was scheduled.
+---
 
-### The retry loop
+### Name each part by what breaks when removed
 
-After `liveCall` returns, `callTool` calls `isRateLimited(result)` (`lib/mcp/client.ts` L122). If true and `retries < maxRetries`, it increments `retries`, sleeps, then calls `liveCall` again. The sleep prefers a window parsed out of the Bloomreach error text (`parseRetryAfterMs`, L31–L38) and otherwise uses exponential backoff off `retryDelayMs` (`retryDelayMs * 2 ** (retries - 1)`), with every wait capped at `retryCeilingMs` (`lib/mcp/client.ts` L122–L132). Defaults: `maxRetries = 3`, `retryDelayMs = 10_000` ms, `retryCeilingMs = 20_000` ms (`lib/mcp/client.ts` L88–L94).
+Each kernel piece is here because something specific breaks if you drop it.
 
-The loop counter is `retries`, not "attempts". A `maxRetries = 3` allows the original call plus up to 3 retries — 4 transport calls total.
+```
+Removed                                What breaks
+─────────────────────────────         ─────────────────────────────────────
+elapsed < minIntervalMs wait          The first three calls fire in <300 ms,
+                                      the server 429s every subsequent one,
+                                      and the retry loop kicks in for ALL of
+                                      them. The whole budget is spent on
+                                      retries that wouldn't have been needed.
 
-### Detection (`isRateLimited`)
+lastCallAt update                     The clock never moves. elapsed stays
+                                      huge. The gate becomes a no-op and the
+                                      first failure mode returns.
 
-`isRateLimited` (`lib/mcp/client.ts` L18–L22) inspects the RESULT object, not a thrown exception. The transport does not throw on 429; it returns a structured result. The check requires two conditions:
+isRateLimited detection               A real 429 (returned, not thrown) flows
+                                      back to the caller as a "successful"
+                                      result — no retry, no error logged.
+                                      The caller silently processes garbage.
 
-1. `result.isError === true`
-2. `JSON.stringify(result.content ?? result)` matches `/rate limit|too many requests/i`
+maxRetries cap                        A permanently-down endpoint loops the
+                                      retry forever, burning the 300s function
+                                      budget on a tool that isn't coming back.
+                                      One dead tool = the whole request dies.
 
-Only when both conditions hold is a retry triggered.
+retryCeilingMs cap on backoff         Exponential growth means retry 3 sleeps
+                                      40 s, retry 4 sleeps 80 s, etc. — past
+                                      the function timeout, the response is
+                                      gone before the retry returns.
+```
+
+The four parts compose: spacing PREVENTS most 429s; detection RECOGNIZES the ones it can't prevent; bounded retry HANDLES them; the ceiling KEEPS the handling inside the function budget. Drop any one and the chain breaks at a different place.
+
+---
+
+### Separate skeleton from optional hardening
+
+The kernel is the minimum. The codebase ships some hardening on top and omits the rest, and naming which is which is part of the pattern.
+
+```
+SKELETON (in McpClient — required)             HARDENING
+────────────────────────────────────           ────────────────────────────────
+elapsed < minIntervalMs spacing gate           ┌ jitter on retry sleeps   (absent)
+lastCallAt single-state clock                  ├ per-tool circuit breaker (absent)
+isError + regex 429 detection                  ├ token-bucket limiter     (absent)
+bounded retry counter (maxRetries)             ├ adaptive backoff that
+backoff cap (retryCeilingMs)                   │   reads the server's
+no-cache-on-error guard (cross-cuts            │   capacity hint         (absent)
+  with the TTL-cache file — same write site)   └ parsed Retry-After hint  (PRESENT,
+                                                  via parseRetryAfterMs)
+```
+
+The codebase has exactly one piece of optional hardening — `parseRetryAfterMs` (`lib/mcp/client.ts` L31–L38), which prefers a window parsed from the Bloomreach error text when present and falls back to exponential backoff otherwise. It deliberately omits jitter (single user, no thundering-herd risk at this scale), a per-tool breaker (one upstream, no tool-isolation needed), and a token bucket (the simple counter holds at one user under a 1 req/s limit). The breakpoints that flip any of those choices live in Tradeoffs.
+
+---
 
 ### Step-by-step execution trace
 
@@ -492,3 +526,4 @@ Under what conditions does the parsed-hint path beat the raw backoff? Is jitter 
 
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now prefers a parsed retry-after window / exponential backoff capped at `retryCeilingMs` (defaults `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
+Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.

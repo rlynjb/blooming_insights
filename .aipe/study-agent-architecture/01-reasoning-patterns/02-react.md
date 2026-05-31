@@ -62,83 +62,100 @@ The baseline loop — model writes the chain at runtime
 
 The strategy in plain English: **interleave reason and act in one loop, no planner up front, no critic on the back.** The model's "reasoning" is the text it writes around its tool call; the act is the tool call; the observation is the tool result you pass back. There's no separate plan phase deciding the route, and no critic re-reading the answer. One actor, one budget, one stopping condition.
 
-### Move 2.1 — The shape of one turn
+### Isolate the kernel
 
-The technical thing: a single Messages-API turn that returns a mix of `text` and `tool_use` content blocks. The agent runtime treats `tool_use` blocks as side-effects to execute and `text` blocks as the streamed "thinking."
-
-If you're coming from frontend, think of one turn as one request/response pair in a long-poll: the request carries the full conversation so far plus the tool schemas, and the response is either "here's a tool call, run it for me" or "here's the final text." There is no streaming reasoning hidden inside one turn — every external action is its own visible turn.
+ReAct as a *placement* — the bottom of the reasoning-pattern ladder — has an irreducible kernel: four pieces that make it ReAct rather than a single LLM call.
 
 ```
-One turn — what enters and leaves
-
-  IN:   messages so far + tools schema + system prompt
-        ▼
-  ┌──────────────────────────────────────┐
-  │  model.messages.create               │
-  └──────────────────────────────────────┘
-        ▼
-  OUT:  content blocks
-        ├─ text: "let me check purchase volume first"
-        └─ tool_use: { name: "execute_analytics_eql",
-                       input: { eql: "select count …" } }
+for turn in maxTurns:                                ─┐
+  forceFinal = (turn == last) or (toolCalls >= budget)│
+  res = model.call({                                  │
+    tools: forceFinal ? OMITTED : schemas,            │  KERNEL
+    system: forceFinal ? system+synth : system,       │
+    messages,                                          │
+  })                                                   │
+  if no tool_use blocks → return finalText  ← exit    │
+  for each tool_use: execute, push result back        │
+  messages.push({ role:'user', content: results })   ─┘
 ```
 
-The practical consequence: the model's emitted `tool_use` block IS the agent's choice of next action. Your runtime doesn't parse free text to figure out what to call — the SDK gives you a typed block. (`lib/agents/base.ts` L116–L124: filter `tool_use` blocks; zero blocks = "I'm done.")
+Four load-bearing pieces: (1) the **bounded turn loop**, (2) the **`tool_use` → execute → `tool_result` back** observation cycle, (3) the **`maxToolCalls` budget**, and (4) the **forced-final escape hatch** (strip `tools` so the model must write text). The wire-level mechanics — what a turn looks like in the Messages API, the difference between `text` and `tool_use` blocks, how `messages.push` accumulates — are covered in `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`. This file's kernel is about *placement*: what makes this an agent loop and not its predecessor or its replacement.
 
-The condition under which it works: the model is told what tools exist via the `tools` parameter and they have to actually be supplied. Strip the tools from the request and the model literally cannot emit a `tool_use` block — that's the escape hatch the forced-final turn uses.
+---
 
-### Move 2.2 — The loop body
+### Name each part by what breaks when removed
 
-The technical thing: a bounded `for` loop that re-calls the model until either (a) it returns zero `tool_use` blocks, or (b) the turn budget is exhausted, or (c) the per-loop tool-call budget is exhausted.
-
-If you're coming from frontend, this is `for (let i = 0; i < n; i++) await tick()` where each `tick` reads the previous tick's output and decides whether to keep ticking. The model owns the "should I tick again" decision via the presence/absence of a tool call.
+Each kernel piece is here because something specific breaks if you drop it, and each "what breaks" maps to where on the ladder ReAct would lose its place.
 
 ```
-runAgentLoop body — base.ts L85–L172
+Removed                            What breaks (placement consequence)
+────────────────────────────       ─────────────────────────────────────
+the for-turn loop                  You have an LLM call, not an agent.
+                                   No act → observe → reason cycle. ReAct
+                                   collapses back into the row above it
+                                   on the ladder: a single completion.
 
-  for (turn = 0; turn < maxTurns; turn++):
-    forceFinal = (turn == maxTurns-1) OR (toolCalls >= maxToolCalls)   ← L90–L91
-    res = anthropic.messages.create({
-      tools: forceFinal ? OMITTED : toolSchemas,                       ← L101
-      system: forceFinal ? system + synthesisInstruction : system,
-      messages,
-    })
-    messages.push({ role: 'assistant', content: res.content })          ← L105
-    if no tool_use blocks → return {finalText, toolCalls}               ← L121
-    for each tool_use:
-      result = await mcp.callTool(name, args)                            ← L144
-      append tool_result to next user turn                                ← L161
-    messages.push({ role: 'user', content: tool_results })                ← L171
+tool_use → tool_result feedback    The "Re" in ReAct is gone — the model
+                                   can't condition the next turn on what
+                                   the last action returned. You'd be
+                                   running plan-and-execute without the
+                                   plan: blind execution.
+
+maxToolCalls budget                The loop has no upper bound. Cost and
+                                   latency become unpredictable. This is
+                                   the specific property the multi-agent
+                                   escalation gate (→ `../03-multi-agent-
+                                   orchestration/01-when-not-to-go-multi-
+                                   agent.md`) tests against — without it,
+                                   "ReAct hit its ceiling" is unmeasurable.
+
+forced-final escape hatch          Budget hits but the model still has
+                                   tools. It keeps calling them. The loop
+                                   either runs to maxTurns or returns
+                                   incomplete. No clean terminal — the
+                                   loop is no longer bounded in *output*,
+                                   only in *iteration*. The structured
+                                   answer never arrives.
 ```
 
-The practical consequence: the model decides each next call by looking at the *whole history* — every prior tool call and result is in `messages`. That's why a ReAct loop can adapt: turn 4's choice is informed by turns 1–3's observations. (It's also why the loop scales token cost with depth — the context grows on every turn.)
+The placement consequence of each removal: drop the loop and you're below ReAct on the ladder; drop the budget or the escape and you can't honestly say "ReAct hit its ceiling" because the ceiling is undefined.
 
-The condition under which it works (and the safety rail): the `for` loop is bounded. `maxTurns` defaults to 8 (`lib/agents/base.ts` L73). The per-agent `maxToolCalls` is the tighter bound that actually fires: 6 for monitoring/diagnostic/query, 4 for recommendation (`lib/agents/monitoring.ts` L101, `diagnostic.ts` L62, `recommendation.ts` L57, `query.ts` L41). Without these, a misbehaving model could loop until the API or rate limit cut it off.
+---
 
-### Move 2.3 — The forced final turn (the escape hatch)
+### Separate skeleton from optional hardening
 
-The technical thing: when the budget is spent, the next call is made *without* the `tools` parameter, plus a `synthesisInstruction` appended to the system prompt. With no tools available, the model cannot emit a `tool_use` block — it has to write a final answer. This is the difference between "ReAct that might hang" and "ReAct with a guaranteed terminal."
-
-If you're coming from frontend, this is the `AbortController` of the loop: not a kill, but a "you must produce output now" signal. The model's only legal move is text.
+The kernel is the minimum that makes a ReAct agent. Everything else is hardening that turns one ReAct agent into a *production* ReAct agent. In this codebase, the four agents share the kernel and vary only at the hardening layer.
 
 ```
-Forced-final mechanics — base.ts L90–L101
-
-  Normal turn:                       Forced-final turn:
-  ┌───────────────────────┐          ┌───────────────────────────┐
-  │ params = {            │          │ params = {                 │
-  │   system,             │          │   system: system + "\n\n"  │
-  │   messages,           │          │           + synthesisInstr,│
-  │   tools: toolSchemas, │          │   messages,                │
-  │ }                     │          │   (NO tools)               │
-  └───────────────────────┘          │ }                          │
-   model: may call tool             └───────────────────────────┘
-   or write text                     model: must write text
+SKELETON (in runAgentLoop — required)         HARDENING (placement-relevant)
+────────────────────────────────────          ──────────────────────────────────
+bounded turn loop (maxTurns = 8)              ┌ per-agent tool SUBSETS via
+tool_use → execute → tool_result back         │   filterToolSchemas (→ this
+maxToolCalls budget per agent                 │   folder's 06-routing.md)
+forced-final: tools omitted on last turn      ├ streamed trace as a product
+synthesisInstruction appended on the          │   surface (→ ai-eng 05-streaming;
+  forced-final turn                           │   the trace makes the loop
+                                              │   inspectable to the user)
+                                              ├ output validators on finalText
+                                              │   (parseAgentJson + type guards)
+                                              ├ a tool-less synthesize() retry
+                                              │   on parse failure (diagnostic +
+                                              │   recommendation)
+                                              ├ a deterministic supervisor
+                                              │   composing multiple ReAct
+                                              │   nodes (→ 03/03-sequential-
+                                              │   pipeline.md — the actual
+                                              │   topology this codebase uses)
+                                              └ self-critique, planning,
+                                                  branch exploration
+                                                  (absent — every escalation
+                                                  on the ladder is hardening
+                                                  layered on this kernel)
 ```
 
-The practical consequence: the loop has a hard ceiling. Each agent's `synthesisInstruction` literally tells the model "you have NO more tool calls" and points at the required output shape (a JSON object for diagnostic, a JSON array for recommendation, prose for query). The trace shows this as a final turn with no tool calls — that's the forced one.
+All four agents in this codebase share the kernel — that's why one `runAgentLoop` function powers them (`lib/agents/base.ts` L48–L176). The variations are at the hardening layer: which tool subset (`lib/mcp/tools.ts`), which synthesisInstruction, which validator. The agents themselves are the same loop. And the next escalation on the ladder — plan-and-execute, reflexion, etc. — is *another layer of hardening* on the same kernel, not a different kernel.
 
-The condition under which it works: only when a `synthesisInstruction` is provided. Without one, the forced-final turn just removes tools but doesn't change the prompt, and the model often produces an apology ("I would need to query more data…") instead of an answer. That's why every agent in this repo supplies one.
+---
 
 ### Move 2.4 — Why this is the baseline
 
@@ -475,3 +492,4 @@ Open and verify. ✓ File + function + the two budgets matter; line numbers drif
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.

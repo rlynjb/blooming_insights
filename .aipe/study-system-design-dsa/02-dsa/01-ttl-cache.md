@@ -69,71 +69,71 @@ The diagram captures the full decision tree. Every path that does not produce a 
 
 ---
 
-### The key
+### Isolate the kernel
 
-The cache key is `name + ':' + JSON.stringify(args)`. Two calls with the same tool name and identical argument objects produce the same key and collide — they share one cache slot. Two calls that differ in any argument value produce different keys and are stored independently.
+A TTL cache has an irreducible kernel: four parts that *are* the pattern. Strip anything else and you still have a working cache. Strip any of these and you don't.
 
 ```
-call A:  name="search", args={q:"react"}
-         key = "search:{\"q\":\"react\"}"
-                            │
-                            ▼
-         ┌──────────────────────────────────┐
-         │  cache Map                       │
-         │  "search:{\"q\":\"react\"}"  →  │
-         │    {result:…, expiresAt:1e12}    │
-         └──────────────────────────────────┘
-
-call B:  name="search", args={q:"vue"}
-         key = "search:{\"q\":\"vue\"}"
-                            │
-                            ▼
-         ┌──────────────────────────────────┐
-         │  cache Map                       │
-         │  "search:{\"q\":\"react\"}"  →  │
-         │    {result:…, expiresAt:1e12}    │  ← untouched
-         │  "search:{\"q\":\"vue\"}"    →  │
-         │    {result:…, expiresAt:1e12}    │  ← new entry
-         └──────────────────────────────────┘
+callTool(name, args):
+  key       = name + ':' + JSON.stringify(args)      ─┐
+  entry     = map.get(key)                            │
+  if entry and entry.expiresAt > Date.now():          │  KERNEL
+    return entry.result          ← HIT                │  (the
+  result    = liveCall(name, args)                    │   pattern,
+  if result is not an error:                          │   minus
+    map.set(key, {result, expiresAt: now + ttl})      │   nothing)
+  return result                  ← MISS, then FILL   ─┘
 ```
 
-Call A and call B never interfere. But two calls to `callTool("search", {q:"react"})` at different times share the slot — the second one will hit if the first entry has not expired.
+Four load-bearing pieces: the key construction, the expiry check, the no-error-write guard, and the post-call fill. No size cap, no LRU, no `skipCache` override — those are *hardening* layered on top.
 
 ---
 
-### The entry and expiry check
+### Name each part by what breaks when removed
 
-The stored value is `{ result: unknown; expiresAt: number }`. The read guard is:
+The way the reader learns which parts are load-bearing is by removing each and watching the pattern collapse. None of these is decoration.
 
 ```
-const cached = this.cache.get(cacheKey);
-if (cached && cached.expiresAt > Date.now()) {
-  return { result: cached.result, durationMs: 0, fromCache: true };
-}
+Removed                          What breaks
+──────────────────────────       ─────────────────────────────────────
+key = name + JSON.args           Unrelated calls collide on the same
+                                 slot. callTool("search",{q:"react"})
+                                 returns the result of {q:"vue"} —
+                                 the cache becomes a corrupter.
+
+expiresAt > Date.now() check     Stale results serve forever. The
+                                 cache becomes a permanent freeze
+                                 instead of a refreshable layer.
+
+isError guard before write       A 429 or a tool failure POISONS the
+                                 slot for the full TTL. Every caller
+                                 reads the error; no retry reaches
+                                 the server until expiry.
+
+post-call map.set on success     The map exists but never fills.
+                                 Every call is a miss. You have the
+                                 data structure but not the cache.
 ```
 
-`expiresAt` is an absolute millisecond timestamp, not a duration. `Date.now()` returns the current timestamp. The comparison `expiresAt > Date.now()` is `true` while time has not yet passed the deadline, and `false` the moment it does. No background timer, no scheduled cleanup — the staleness check happens inline on every read.
+This is the difference between a reader who memorised "TTL cache has four parts" and one who knows *which four parts*. The first reader can list them. The second can defend the design by naming the bug each one prevents.
 
 ---
 
-### Write-on-success only
+### Separate skeleton from optional hardening
 
-After the live call returns, the code checks `(result as any)?.isError === true` before writing. An error result exits immediately without touching the Map. Only a successful result is committed.
+The kernel above is the minimum. Everything around it is hardening — useful, but layered on. Saying which is which is part of the pattern.
 
 ```
-live call returns result
-         │
-    isError === true?
-     │           │
-    Yes          No
-     │           │
-  return      cache.set(cacheKey, {
-(no write)      result,
-                expiresAt: Date.now() + ttl
-              })
+SKELETON (in McpClient — required)        HARDENING (some present, some not)
+────────────────────────────────────      ──────────────────────────────────
+key = name + ':' + JSON.stringify(args)   ┌ LRU / size cap          (absent)
+expiry check on read                      ├ key normalization       (absent)
+isError guard before write                ├ shared store (Redis)    (absent)
+fill on miss                              ├ stale-while-revalidate  (absent)
+                                          └ skipCache override      (present)
 ```
 
-This is the poisoned-cache guard. If a 429 or a tool failure were cached, every caller for the next `ttl` milliseconds would get the error without any retry reaching the server.
+`McpClient` ships the four kernel pieces plus exactly one piece of optional hardening — `skipCache`. It omits LRU (so unbounded growth is real), key normalization (so `{a,b}` and `{b,a}` collide as different keys), a shared store (per-instance, so a cold start re-bootstraps), and stale-while-revalidate (so a miss blocks on the live call). The breakpoint that flips any of those choices lives in Tradeoffs.
 
 ---
 
@@ -474,3 +474,4 @@ Your tech lead says: "Expired entries stay in the Map forever — this leaks mem
 
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers
+Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
