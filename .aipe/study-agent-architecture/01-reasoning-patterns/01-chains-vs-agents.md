@@ -5,7 +5,6 @@
 
 > The dividing line between steps an engineer wrote and steps a model decides at runtime. blooming insights sits on BOTH sides of this line at once: the route file picks the next agent (a chain), and each agent loops over tools on its own (an agent) — and the boundary between them is live in the same request.
 
-**See also:** → 02-react.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
 
 ---
 
@@ -166,7 +165,7 @@ blooming insights: a chain of agents
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Chain half — the deterministic pipeline**
 **File:** `app/api/agent/route.ts`
@@ -221,80 +220,6 @@ The chain breaks when the order stops being fixed — when "which stage next" de
 - ReAct (`02-react.md`) → the specific shape of the loop inside each agent stage
 - Routing (`06-routing.md`) → how the `?q=` path picks an agent — the chain's one model-decided edge
 - Multi-agent orchestration (`../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`) → what the chain becomes when the order goes model-driven
-
----
-
-## Tradeoffs
-
-The decision here was *where to draw the boundary* — a deterministic route owning the stage order, autonomous loops owning the work inside each stage. The alternative most teams reach for is an LLM supervisor that decides the order too.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Chain-of-agents (chosen)    │ LLM supervisor (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ an if-ladder in route.ts    │ a supervisor prompt + its   │
-│                  │ (~50 lines)                 │ own loop + handoff protocol │
-│ Latency          │ stage order is free (no LLM)│ +1 model call per ordering  │
-│                  │                             │ decision                    │
-│ Debugging        │ order bug → read route.ts;  │ order bug → replay the      │
-│                  │ work bug → replay one loop  │ supervisor's reasoning too  │
-│ Complexity       │ two clear layers, one seam  │ a third reasoning layer to  │
-│                  │                             │ reason about                │
-│ Predictability   │ same order every run        │ order can drift run-to-run  │
-│ Cost/run         │ pays for 3 agent loops only │ pays for loops + supervisor │
-│                  │                             │ turns                       │
-│ Failure blast    │ a bad stage fails alone     │ a confused supervisor mis-  │
-│                  │                             │ routes the whole run        │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up runtime flexibility in the ordering. The route can't decide to skip diagnosis for a "trivial" anomaly or run diagnosis twice for a confusing one — the `if`-ladder in `route.ts` L224–L249 is fixed. If a new analyst flow needed a conditional fourth stage, that's a code change, not a prompt tweak.
-
-We also gave up a small amount of "smart" routing inside the investigation. Every anomaly goes diagnostic → recommendation, even ones where the diagnosis is obvious. A supervisor might short-circuit those. We pay a fixed two-stage cost regardless.
-
-### What the alternative would have cost
-
-If we had built an LLM supervisor to own the stage order, the up-front cost would have been a whole extra reasoning layer: a supervisor prompt, its own `runAgentLoop`, and a handoff protocol between supervisor and workers. Every investigation would pay an extra model call (~1–3s under the ~1 req/s MCP limit) just to be told "diagnose first" — a decision we already know. And debugging would get harder: a wrong recommendation could now be the supervisor mis-ordering, the diagnostic mis-investigating, or the recommendation mis-proposing — three suspects instead of two.
-
-### The breakpoint
-
-This stays the right call until the stage order needs to depend on what a stage *found* — e.g. "if the diagnosis is inconclusive, route to a deep-dive specialist instead of recommendation." The day a stage's output has to change which stage runs next, the `if`-ladder can't express it cleanly and the supervisor earns its overhead.
-
-### What wasn't actually a tradeoff
-
-A single mega-agent with all tools was not a real alternative for the investigation flow. Cramming detect + diagnose + recommend into one prompt with one tool budget would blur the per-stage tool subsets (`lib/mcp/tools.ts`) and the per-stage caps that bound latency under the rate limit. The split into stages isn't a compromise — it's what makes the budgets per-job.
-
----
-
-## Tech reference (industry pairing)
-
-### Anthropic Messages API (tool use)
-
-- **Codebase uses:** `@anthropic-ai/sdk`, `anthropic.messages.create({ tools, messages })` inside `runAgentLoop` (`lib/agents/base.ts` L102). Model `claude-sonnet-4-6` (L9).
-- **Why it's here:** it's the engine of the agent half — the `tool_use` blocks it returns are how the model "writes the next step" of the loop.
-- **Leading today:** Anthropic tool use — innovation-leading for agent loops, 2026.
-- **Why it leads:** native `tool_use`/`tool_result` content blocks make the ReAct loop a first-class API shape; the model emits structured tool calls instead of you parsing free text.
-- **Runner-up:** OpenAI function calling / Responses API — equivalent loop shape, the larger installed base.
-
-### Next.js Route Handler (the chain layer)
-
-- **Codebase uses:** an App Router route handler at `app/api/agent/route.ts`, `export async function GET` (L112), streaming NDJSON.
-- **Why it's here:** the route handler IS the chain — its `if`-ladder is the deterministic supervisor that picks the next agent.
-- **Leading today:** Next.js App Router handlers — adoption-leading for full-stack TS endpoints, 2026.
-- **Why it leads:** co-locates the API with the app, runs on the edge or Node, and streams responses natively — the streamed trace is built on this.
-- **Runner-up:** a standalone Hono/Express service — more control over the runtime, at the cost of a separate deploy.
-
----
-
-## Summary
-
-Chains vs agents is the question of who writes the steps: in a chain the engineer hardcodes the order and the LLM fills each slot; in an agent the model decides each next action at runtime. blooming insights is both — `route.ts` is a deterministic `if`-ladder that picks the next agent (monitoring → diagnostic → recommendation), and each agent is a `runAgentLoop` ReAct loop the model drives. The constraint that made this right is knowability: the *stage order* is fixed (so code owns it), but the *queries inside a stage* aren't (so the model owns them). The cost is fixed ordering — to make the route choose stages at runtime, you'd promote the `if`-ladder to an LLM supervisor and pay for a third reasoning layer.
-
-- The boundary is one seam: `route.ts` owns the stage order; `runAgentLoop` owns what happens inside a stage.
-- A chain bug lives in known code (read `route.ts`); an agent bug is a wrong path (replay the loop's tool calls) — name which you have before debugging.
-- The diagnosis is handed step→step by the *route* (a return value, then `sessionStorage bi:diag:<id>`), not by an agent deciding to.
-- The inner loops don't change if the outer chain ever becomes an LLM supervisor — that's why the boundary is the thing worth naming.
-- Worth it while the stage order is knowable up front; promote to a supervisor only when a stage's output must change which stage runs next.
 
 ---
 
@@ -403,5 +328,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-react.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > The control envelope around an autonomous loop — caps on iteration, validators on output, capability gating on scope, read-only-by-contract on tools, and a guarded one-time auto-reconnect on revoked auth. blooming insights ships all five, and the one with the biggest blast-radius reduction is "MCP tools are read-only, so the LLM's output never triggers a side effect directly."
 
-**See also:** → `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → `04-agent-evaluation.md` · → mechanics: `../../study-ai-engineering/06-production-serving/03-prompt-injection.md` · → `../../study-ai-engineering/04-agents-and-tool-use/06-error-recovery.md`
 
 ---
 
@@ -278,7 +277,7 @@ Five layers around the loop — every freedom has its bound
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Iteration & budget caps:**
 **File:** `lib/agents/base.ts`
@@ -367,98 +366,6 @@ The envelope breaks down when the loop has to perform irreversible side effects 
 - Prompt injection per-call defense (`../../study-ai-engineering/06-production-serving/03-prompt-injection.md`) → the input-side defense complementing the contract; this file is the loop-envelope view
 - Error recovery (`../../study-ai-engineering/04-agents-and-tool-use/06-error-recovery.md`) → recovery as a per-call discipline; the envelope view is "what bounds the recovery"
 - Capability gating mechanics (`../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`) → the codebase-level walk of `runnableCategories`
-
----
-
-## Tradeoffs
-
-The decision here was *to compose five envelope layers, each catching a distinct failure mode*. The alternative most teams reach for is "trust the model + log everything + fix issues reactively."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Five layers (chosen)        │ Trust + log (alternative)   │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ each layer is small (~10–30 │ none up front; large later  │
-│                  │ lines); 5 layers compose    │ when an incident forces it  │
-│ Runtime cost     │ near-zero (caps + validators│ near-zero (no caps to check)│
-│                  │ are constant-time checks)   │                              │
-│ Failure surface  │ each freedom has its bound; │ five failure modes live in  │
-│                  │ failures degrade to safe    │ wait for someone to find    │
-│                  │ defaults                    │ them in production           │
-│ Blast radius     │ read-only contract collapses│ writable tools = prompt     │
-│                  │ prompt-injection to "I can  │ injection has a real attack │
-│                  │ read more things"            │ surface                      │
-│ Cost predictabili│ per-investigation cost      │ runaway loops = bill spikes  │
-│ ty               │ bounded by budget × cost/   │                              │
-│                  │ tool                         │                              │
-│ Recovery         │ parse failure → safe default│ parse failure → 500 to UI    │
-│ Debugging        │ each layer's failure is     │ blast-radius events buried  │
-│                  │ named and logged             │ in unstructured logs        │
-│ Hire-ability     │ "I built a control envelope" │ "we'll add guards when      │
-│                  │ is senior posture            │ something breaks" is junior │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up some agent flexibility. The 6-call cap means the diagnostic agent can't go on a 10-call deep dive when the data genuinely needs it — that's by design (the route would blow its 60s budget under the rate limit) but it's a real ceiling on diagnostic depth. The read-only tool contract means the recommendation agent can't ever "just execute" a low-risk suggestion — every recommendation is text for a human, which is the right shape but does add a click for actions the model could do safely if we trusted it (which, given the prompt-injection surface, we shouldn't).
-
-We gave up some convenience. Adding a new tool requires deciding which per-agent allow-list it belongs in (or whether it belongs in any). Adding a new output shape requires writing a type guard in `validate.ts`. Both are small costs each time and they prevent the "convenience tool that became a security hole" outcome.
-
-### What the alternative would have cost
-
-Trust + log would have meant: at some point — and that point is *when*, not *if* — a malformed output reaches the UI, a model gets stuck in a loop and burns the bill for a day, or a prompt-injection demo gets posted to social media. The reactive cost of each incident is much higher than the proactive cost of building the envelope: the incident itself, plus the time to add the layer after the fact under the worse pressure of "we just had an incident" instead of "we're designing this well."
-
-### The breakpoint
-
-The current envelope stays right until the product needs an agent to take a write action. Concrete triggers:
-- A "schedule this campaign" feature where the agent's output is the action, not a recommendation → action gating layer earns its build cost (human-in-the-loop confirm step, idempotency key, audit log, or all three)
-- Multi-tenant production with adversarial users → input sanitization layer becomes non-optional (prompt-injection detection on user input, not just downstream defense)
-- A new tool is genuinely write-shaped (cannot reasonably be a read) → split into "proposal" mode where the LLM picks args and a separate "execute" mode where a verified service performs the write
-
-### What wasn't actually a tradeoff
-
-A purely deterministic system (no LLM at all) wasn't a real alternative — the value proposition is the model's ability to reason across the workspace. The right question wasn't "should we have the model" but "how do we shape what the model is allowed to do." The envelope is the answer.
-
-A purely permissive system (no caps, no validators, no contract) wasn't a real alternative either at production. Vercel's 300s timeout would have eventually been the only cap, and "the route times out" is a much worse failure mode than "the agent emitted `[]` honestly because it couldn't find anomalies in time."
-
----
-
-## Tech reference (industry pairing)
-
-### TypeScript type guards (output validators)
-
-- **Codebase uses:** `parseAgentJson` + `isAnomalyArray` / `isDiagnosis` / `isRecommendationArray` in `lib/mcp/validate.ts`. Each guard is a `v is T` runtime predicate.
-- **Why it's here:** untyped JSON crosses the LLM-to-route boundary; the guards convert it to typed values with a safe-default fallback at every call site.
-- **Leading today:** TypeScript type guards (hand-written or Zod-driven) — adoption-leading for boundary validation, 2026.
-- **Why it leads:** hand-written guards are zero-dependency and predicate-typed for the compiler; Zod adds schema composition when the shape grows.
-- **Runner-up:** Zod — `z.array(anomalySchema).safeParse(parsed)` for richer error messages and schema composition.
-
-### Vercel `maxDuration`
-
-- **Codebase uses:** `export const maxDuration = 300` at `app/api/agent/route.ts` L20.
-- **Why it's here:** the absolute outer ceiling above the per-agent caps — even if every inner cap somehow let the loop continue, the function dies at 300s.
-- **Leading today:** Vercel Functions config — adoption-leading for Next.js serverless, 2026.
-- **Why it leads:** declarative per-route timeout, no separate infra config; first-party support for the streaming route shape we use.
-- **Runner-up:** AWS Lambda's `Timeout` setting via SAM/Serverless framework — same idea, more setup.
-
-### `sessionStorage` reconnect guard
-
-- **Codebase uses:** `sessionStorage.getItem('bi:reconnecting')` / `setItem` / `removeItem` in `app/page.tsx` L394 / L410 / L416 / L427.
-- **Why it's here:** the one-time guard makes auto-reconnect rearmable per session but never infinite within one — exactly the right durability for "this tab, once per revocation."
-- **Leading today:** `sessionStorage` for tab-scoped client guards — adoption-leading on the web, 2026.
-- **Why it leads:** synchronous API, tab-scoped lifetime matches the guard's intent (page reload doesn't clear; tab close does).
-- **Runner-up:** a React state flag — works while the component is mounted; loses the guard on a route navigation that unmounts it.
-
----
-
-## Summary
-
-Guardrails are the control envelope around an autonomous loop: every freedom the model has gets a cap, every output gets a validator, every tool the loop can call is read-only by contract, every scope is gated before the loop spends budget, and even the auth-recovery path is bounded. blooming insights composes five layers: input scoping via `runnableCategories` (`categories.ts` L116–L160), iteration + budget caps with the forced-final tool-strip (`base.ts` L73–L101), the read-only MCP tool contract (`tools.ts` L5–L40 — every entry is a read), output validation via `parseAgentJson` + type guards (`validate.ts`), and a one-time guarded auto-reconnect on revoked tokens (`page.tsx` L394–L427 keyed on `bi:reconnecting`). The constraint that forced this is the model's two non-negotiables — it cannot be trusted to bound itself, and its outputs cannot be trusted to be structurally valid — so the envelope translates those facts into bounded failure modes. The cost is reduced agent flexibility (no 10-call deep dives, no agent-driven writes), which is by design.
-
-- Every degree of freedom the loop has gets a cap or a validator.
-- Read-only tools by contract collapse the prompt-injection blast radius to "I can read more things."
-- The forced-final turn strips tools and appends a synthesis instruction — the model must answer because there's no other action available.
-- Parse failures and shape failures degrade to safe defaults (`[]`, `null`), never garbage to the UI.
-- Defense-in-depth: none of the five layers is sufficient alone; together they bound the system under any plausible (or adversarial) input.
 
 ---
 
@@ -588,5 +495,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → `04-agent-evaluation.md` · → mechanics: `../../study-ai-engineering/06-production-serving/03-prompt-injection.md` · → `../../study-ai-engineering/04-agents-and-tool-use/06-error-recovery.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

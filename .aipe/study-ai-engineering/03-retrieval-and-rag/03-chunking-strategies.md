@@ -5,7 +5,6 @@
 
 > Chunking decides the unit of retrieval — too large and one chunk dilutes its own meaning, too small and it loses the context to be understood — and the unit must match the question; blooming insights does not chunk for retrieval, but `schemaSummary` is a crude truncate-the-schema "chunk," so this is study material grounded in a real analog.
 
-**See also:** → 01-embeddings.md · → 04-vector-databases.md · → 10-incremental-indexing.md · → 11-rag.md
 
 ---
 
@@ -145,7 +144,7 @@ The split decided in the Service layer fixes, permanently, the smallest piece an
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings over chunked documents — there is no document corpus and no retrieval-time chunking.
 
@@ -188,46 +187,6 @@ Every strategy is a different answer to "what is the atomic retrievable unit," a
 
 ---
 
-## Tradeoffs
-
-### Semantic chunking vs. the rank-truncation in use vs. fixed-size
-
-| Dimension | Semantic / per-record | Rank-truncation (`schemaSummary`) | Fixed-size + overlap |
-|---|---|---|---|
-| Retrieval precision | High (one topic per chunk) | N/A (no retrieval — feeds prompt) | Medium (boundaries cut blindly) |
-| Implementation cost | High (boundary detection) | Low (sort + slice) | Lowest (split every N) |
-| Long-tail recall | High | Low — drops below the cut | Medium |
-| Context preservation | High (chunk = coherent unit) | High within the kept slice | Needs overlap |
-| Right when | Documents with clear structure | Fixed prompt budget, ranked data | Unstructured text, speed-first |
-
-**What we gave up (by not having it).** `schemaSummary`'s rank-truncation gives up long-tail recall: any event below #20 by volume is dropped before the model sees it, so a question about a low-frequency event silently fails. Today this is acceptable because the prompt cannot hold the full schema and high-volume events are usually the relevant ones — but it is a real recall hole.
-
-**What the alternative would have cost.** Proper semantic chunking + retrieval (embed each event with its properties as a chunk, retrieve the relevant ones per query) would fix the long-tail hole but adds an embedding step, a vector index, the chunk-size tuning loop, and the staleness problem when the schema changes — disproportionate machinery for a schema that mostly fits the top-20 cut.
-
-**The breakpoint.** Rank-truncation is correct while the relevant events are reliably in the high-volume head. It breaks when workspaces routinely ask about low-volume events (new features, rare flows) that fall below the cut — at that point you need query-driven retrieval (embed and chunk the schema, retrieve per question) instead of a static rank-truncated summary.
-
----
-
-## Tech reference (industry pairing)
-
-### text splitter / chunker
-
-- **Codebase uses:** `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) — rank-truncation; `truncate` (`lib/agents/base.ts` L31–L34) — first-N character cut. Neither is a retrieval chunker.
-- **Why it's here (absent for retrieval):** no document corpus is retrieved; the only "splitting" is fitting a too-large schema/result into a prompt budget.
-- **Leading today:** LangChain `RecursiveCharacterTextSplitter` leads by adoption; semantic chunkers lead on retrieval quality (2026).
-- **Why it leads:** recursive splitting preserves structure (paragraph → sentence → char) so boundaries fall at meaning seams by default.
-- **Runner-up:** LlamaIndex `SentenceSplitter` / `SemanticSplitterNodeParser` — node-based splitting with embedding-detected topic boundaries.
-
-### chunk overlap
-
-- **Codebase uses:** nothing — `truncate` keeps a single slice with no overlap.
-- **Why it's here (absent):** there is one cut, not a sequence of chunks, so there is no boundary to protect.
-- **Leading today:** 10–20% overlap is the standard default for fixed-size chunking (2026).
-- **Why it leads:** re-includes boundary text in both neighbors so a straddling answer survives whole in at least one chunk.
-- **Runner-up:** zero overlap with semantic boundaries — when cuts already fall at meaning seams, overlap is redundant.
-
----
-
 ## Project exercises
 
 ### Chunk past investigations per finding for retrieval
@@ -247,19 +206,6 @@ Every strategy is a different answer to "what is the atomic retrievable unit," a
 - **Files to touch:** `lib/mcp/chunking.ts` (per-event chunks), `lib/mcp/embeddings.ts` (embed chunks), `lib/agents/monitoring.ts` (`schemaSummary` becomes query-aware), `test/agents/monitoring.test.ts`.
 - **Done when:** a question about a deliberately low-volume event (ranked below #20) still surfaces that event in the summary, where the old `slice(0, 20)` dropped it.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-Chunking decides the atomic unit of retrieval: a query can only recover a whole chunk, so the boundary fixes the search resolution and dictates whether an answer is retrievable at all. blooming insights does not chunk for retrieval, but `schemaSummary` is a real, crude analog — rank-truncation that keeps the top-20 events by volume and silently drops the long tail, with the same failure mode as any chunker (the relevant piece below the cut is lost). Proper chunking splits at meaning boundaries (per finding, per record) with tuned size and overlap so each chunk embeds to a sharp single-topic point.
-
-**Key points:**
-- The chunk is the atomic retrievable unit — the boundary *is* the search resolution.
-- `schemaSummary` is rank-truncation chunking: it keeps the volume head and drops the long tail.
-- Too-large chunks blur into a vague average; too-small chunks lose interpretive context.
-- Overlap protects answers that straddle a fixed boundary.
-- Split at the granularity of the expected questions, not at universal defaults.
 
 ---
 
@@ -334,3 +280,8 @@ A colleague says "just make each whole investigation one chunk — simpler." Arg
 ### Quick check — code reference test
 
 What chunking strategy does blooming insights use today, where, and what does it silently drop? (Answer: rank-truncation — `schemaSummary` in `lib/agents/monitoring.ts` L15–L48 sorts events by `eventCount` and keeps the top 20 (`MAX_EVENTS`), 10 properties each, 30 customer properties — silently dropping every relevant event below the volume cut.)
+
+## See also
+
+→ 01-embeddings.md · → 04-vector-databases.md · → 10-incremental-indexing.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

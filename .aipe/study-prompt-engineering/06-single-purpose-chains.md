@@ -5,7 +5,6 @@
 
 > blooming insights splits the analyst into four single-job agents — detect, diagnose, recommend, answer — each prompt scoping itself and explicitly disclaiming the others (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5), then chains diagnose→recommend in `route.ts` L145–162. One job per link buys you two things a monolith can't: you always know which link failed, and you can route cheap jobs to a cheap model.
 
-**See also:** → 01-anatomy.md · → 07-output-mode-mismatch.md · → 02-structured-outputs.md · → 09-chain-of-thought.md
 
 ---
 
@@ -195,7 +194,7 @@ Each link does one verb; the disclaimers are the boundaries; the diagnosis is a 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -266,55 +265,6 @@ The unit of debuggability is the link. The moment two jobs share a prompt, you'v
 
 ---
 
-## Tradeoffs
-
-### Single-purpose chain (this codebase) vs. one multi-purpose prompt
-
-| Dimension | This codebase (four single-job links) | One multi-purpose prompt |
-|---|---|---|
-| Failure attribution | Per-link (agent-tagged trace) | None — one blob |
-| Model routing | Per-job (Haiku classify, Sonnet agents) | One model for all |
-| Output contract per step | One crisp shape, one validator | Fuzzy — multiple shapes at once |
-| Round-trips / latency | Higher — one loop per link | Lower — one call |
-| Unit testability | Each agent in isolation | Only end-to-end |
-| Information across steps | Lossy (typed handoff) | Full (shared context) |
-
-**What we gave up.** Round-trips and full cross-step context. Each link is a separate agent loop, so the chain costs more calls than a monolith, and the typed `Diagnosis` handoff (L158) drops the diagnostic agent's full reasoning. We accept both because attributable failures and per-job model routing are worth more than the saved calls.
-
-**What the alternative would have cost.** Debuggability and cost control. A multi-purpose prompt would be one call with full shared context, but a wrong output would be unattributable (which job failed?), the trivial classification would run on the expensive model, and the `## Output` section couldn't cleanly declare one shape for the validator to check (→ 07-output-mode-mismatch.md).
-
-**The breakpoint.** Single-purpose chaining is right while failures need to be attributable and jobs differ enough in difficulty to route. It stops being worth it when two adjacent links are *always* run together, never independently debugged, and need each other's full context — at which point merging them into one prompt saves a round-trip without losing attribution you were actually using. None of the current four links meet that bar: each is debugged and validated independently.
-
----
-
-## Tech reference (industry pairing)
-
-### Prompt decomposition with role disclaimers
-
-- **Codebase uses:** each `## Role` scopes one verb and disclaims the others (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5, `query.md` L5).
-- **Why it's here:** the disclaimers keep each model in its lane so the link's output stays narrow enough to hand off cleanly.
-- **Leading today (2026):** explicit subtask decomposition is standard in both Anthropic and OpenAI agent guidance.
-- **Why it leads:** narrow, single-responsibility prompts drift less and produce checkable single-shape outputs.
-- **Runner-up:** a single planner prompt that emits subtasks for sub-agents — more flexible, less deterministic, harder to test.
-
-### Code-wired chaining (vs. model-orchestrated)
-
-- **Codebase uses:** `route.ts` L145–162 wires diagnose→recommend as plain control flow; the `Diagnosis` is the typed handoff at L158.
-- **Why it's here:** deterministic, inspectable, unit-testable orchestration — the chain order is a code path, not a model decision.
-- **Leading today (2026):** code-orchestrated chains (LangGraph, plain control flow) lead for production reliability; model-orchestrated multi-agent leads for open-ended tasks.
-- **Why it leads:** deterministic control flow is debuggable and testable; the model decides *within* a link, not *across* links.
-- **Runner-up:** an orchestrator agent that calls the others as tools — more autonomous, less predictable.
-
-### Model routing per subtask
-
-- **Codebase uses:** `classifyIntent` on `claude-haiku-4-5` (`intent.ts` L14, `max_tokens: 16`); the agents on `claude-sonnet-4-6` (`base.ts` L9).
-- **Why it's here:** the one-word classification doesn't need a capable model; routing it to Haiku is the cost win decomposition makes possible.
-- **Leading today (2026):** task-based model routing (cheap model for narrow tasks, capable model for reasoning) is standard cost practice.
-- **Why it leads:** matches spend to required capability per job.
-- **Runner-up:** a single mid-tier model for everything — simpler, leaves money on the table for the trivial tasks.
-
----
-
 ## Project exercises
 
 ### Skip the recommendation link on an inconclusive diagnosis
@@ -334,19 +284,6 @@ The unit of debuggability is the link. The moment two jobs share a prompt, you'v
 - **Files to touch:** `lib/agents/base.ts` (accept a per-call model param instead of the fixed `AGENT_MODEL`), `lib/agents/recommendation.ts` (pass the cheaper model), `test/agents/recommendation.test.ts`.
 - **Done when:** the recommendation link runs on the overridden model while the diagnostic link stays on `AGENT_MODEL`, and existing recommendation tests pass.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights decomposes "be an analyst" into four single-job agents — detect, diagnose, recommend, answer — each prompt scoping itself to one verb and explicitly disclaiming the adjacent links' jobs (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5, `query.md` L5). The diagnose→recommend chain is wired as deterministic code in `route.ts` L145–162, with the typed `Diagnosis` as the handoff from link one to link two (L158); the query agent is a standalone entry. The payoff is operational: every streamed event is agent-tagged (L116–131) so a wrong end-result localizes to the link that produced it, and per-job model routing (Haiku classifier at `intent.ts` L14, Sonnet agents at `base.ts` L9) spends capability only where the job needs it. A multi-purpose prompt would lose all three — attribution, routing, and a crisp per-step output contract.
-
-**Key points:**
-- One verb per link; each `## Role` disclaims the others' jobs — the disclaimers are the typed boundaries.
-- The chain is wired in code (`route.ts` L145–162), not chosen by the model — deterministic and unit-testable.
-- The `Diagnosis` is a typed handoff (L158), so the boundary between links is a checked shape, not free text.
-- Agent-tagged trace (L116–131) localizes failures to a named link — the debugging payoff.
-- Model routing (Haiku classify, Sonnet agents) is possible *only* because the jobs are separated — the cost payoff.
 
 ---
 
@@ -419,3 +356,8 @@ A reviewer says: "Merge diagnose and recommend into one prompt — it'd be one c
 ### Quick check — code reference test
 
 In the investigation flow, what is the typed value passed from the diagnostic link to the recommendation link, and on which line? (Answer: the `Diagnosis` returned by `diagAgent.investigate` (L153) is passed into `recAgent.propose(inv, diagnosis, …)` at `app/api/agent/route.ts` L158 — the typed handoff between the two single-purpose links.)
+
+## See also
+
+→ 01-anatomy.md · → 07-output-mode-mismatch.md · → 02-structured-outputs.md · → 09-chain-of-thought.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > `McpClient` enforces a minimum gap between every outbound MCP call and wraps each call in a bounded retry loop so a transient 429 never kills an agent run.
 
-**See also:** → 01-ttl-cache.md · → ../01-system-design/04-caching-and-rate-limiting.md
 
 ---
 
@@ -236,7 +235,7 @@ Full path from `callTool` entry to result. Stands alone.
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/mcp/client.ts`
 **Function / class:** `McpClient.callTool` + `liveCall` + `isRateLimited` + `parseRetryAfterMs`
@@ -342,64 +341,6 @@ The proactive policy handles steady-state. The reactive policy handles edge case
 - **Token bucket algorithm** (`Bottleneck`, `p-throttle` npm packages) — allows bursts proportional to idle time while respecting the average rate.
 - **Exponential backoff with full jitter** — `delay = random(0, base * 2^attempt)`; the AWS whitepaper "Exponential Backoff And Jitter" (2015) is the reference.
 - **Distributed rate limiting** (Upstash Rate Limit, Redis sliding window) — replaces per-process `lastCallAt` with a shared atomic counter visible to all instances.
-
----
-
-## Tradeoffs
-
-### Comparison: fixed spacing + jitterless backoff bounded retry vs. alternatives
-
-| Dimension | This codebase (fixed gap + exp backoff, no jitter) | Token bucket + exp backoff w/ jitter |
-|---|---|---|
-| Complexity | Zero deps; one timestamp field; one loop counter; backoff + cap math | `Bottleneck` or custom bucket + random jitter math |
-| Burst handling | None — every inter-call gap is ≥ 1100 ms regardless | Allows bursts when credit has accumulated |
-| Thundering herd on retry | Yes — all retries compute the same wait and wake simultaneously | No — jitter spreads wakeups across a window |
-| Cross-instance coordination | No — per-process `lastCallAt` only | Still no (needs Redis for distributed coordination) |
-| Correct under single-process steady load | Yes | Yes |
-| State to tune | `minIntervalMs`, `maxRetries`, `retryDelayMs`, `retryCeilingMs` | Bucket capacity, refill rate, backoff base, jitter cap |
-
-**Gave up:**
-- **Burst absorption.** After 10 seconds of silence the client could legitimately fire 10 requests in succession and still average 1/sec. The fixed delay blocks this even when it is safe.
-- **Jitter on retry.** The backoff is deterministic, so concurrent callers that hit a 429 together compute identical waits and produce a synchronized retry wave.
-
-**Alternative's cost:**
-- A real token bucket (`Bottleneck`, `p-throttle`) adds a package dependency and configuration surface (`reservoir`, `reservoirRefreshInterval`, `maxConcurrent`) that is disproportionate to the current single-process, single-user target.
-- Adding jitter on top of the existing backoff requires tuning a jitter cap; for three retries the benefit is minimal — the complexity is not worth it until retry storms are observed.
-
-**Breakpoint:**
-This design is correct for one process serving one user at a flat ~1 req/sec. It needs a token bucket + distributed coordination the moment multiple concurrent serverless instances share one user's Bloomreach rate-limit quota.
-
----
-
-## Tech reference (industry pairing)
-
-### setTimeout-promise spacing
-
-- **`Bottleneck`** (npm) — industry leader for Node.js rate limiting. Supports token bucket (`reservoir`), concurrency cap (`maxConcurrent`), priority queues. Drop-in replacement for `liveCall`'s spacing logic with burst support.
-- **`p-throttle`** (npm) — lightweight fixed-rate throttle for promise-returning functions. Single-purpose: N calls per interval. Direct analogue to `minIntervalMs`.
-- **`p-limit`** (npm) — concurrency limiter, not a rate limiter. Use when the constraint is max concurrent calls, not calls per second.
-- **`async-throttle`** / **`throat`** (npm) — runner-ups for simpler throttle use-cases; fewer features than Bottleneck, more than p-throttle.
-- **Upstash Rate Limit** (`@upstash/ratelimit`) — Redis-backed, works across serverless instances. The production fix when `lastCallAt` can no longer be per-process.
-
-### bounded retry
-
-- **`p-retry`** (npm) — industry standard for retrying promise-returning operations. Supports `retries`, `minTimeout`, `maxTimeout`, exponential factor, jitter, custom `onFailedAttempt` hook. Direct replacement for the `while (isRateLimited)` loop.
-- **`cockatiel`** (npm) — resilience library: retry, circuit breaker, timeout, fallback, bulkhead. Use when retry alone is insufficient and you need circuit-breaking to stop hammering a dead service.
-- **`axios-retry`** — automatic retry plugin for Axios HTTP clients. Handles 429 and 5xx with configurable exponential backoff. Runner-up when the HTTP client is Axios.
-- **`fetch-retry`** (npm) — wraps `fetch` with retry. Zero-dependency, minimal API. Runner-up for simple fetch-based cases.
-- **AWS SDK v3 retry behavior** — built-in exponential backoff with full jitter, the reference implementation. Documented in the AWS whitepaper "Exponential Backoff And Jitter" (2015); directly informs `p-retry` defaults.
-
----
-
-## Summary
-
-`McpClient.liveCall` enforces a minimum inter-call gap by computing `elapsed = Date.now() - lastCallAt` and sleeping the deficit before every transport call. `callTool` wraps `liveCall` in a bounded `while (isRateLimited && retries < maxRetries)` loop whose sleep is a parsed retry-after window or exponential backoff off `retryDelayMs`, capped at `retryCeilingMs`. Defaults in `lib/mcp/connect.ts`: `minIntervalMs = 1100`, `maxRetries = 3`, `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`.
-
-- `liveCall` (`lib/mcp/client.ts` L148–L163) is the only entry point to the transport; every live call — initial and retry — passes through the spacing gate
-- `lastCallAt` (`lib/mcp/client.ts` L81) is the only state the spacing gate needs; it is set after the transport returns, measuring gap from end of previous call not start
-- `isRateLimited` (`lib/mcp/client.ts` L18–L22) inspects the result object (not a thrown exception) for `isError === true` plus a text match on `/rate limit|too many requests/i`
-- The retry loop (`lib/mcp/client.ts` L121–L132) caps at `maxRetries` retries; total possible transport calls per `callTool` invocation is `maxRetries + 1`
-- Fixed interval spacing is not a token bucket — no burst credit accumulates; per-process `lastCallAt` breaks under horizontal scaling; the exponential backoff carries no jitter, so concurrent retries can wake together
 
 ---
 
@@ -524,6 +465,11 @@ Under what conditions does the parsed-hint path beat the raw backoff? Is jitter 
 - What is the default `minIntervalMs` on the `McpClient` constructor, and what value does `connect.ts` override it to? (200 ms default per `lib/mcp/client.ts` L88; 1100 ms in `lib/mcp/connect.ts` L92.)
 - Does the retry loop re-enter the spacing gate? (Yes — it calls `liveCall`, not the transport directly; cite `lib/mcp/client.ts` L131.)
 
+## See also
+
+→ 01-ttl-cache.md · → ../01-system-design/04-caching-and-rate-limiting.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now prefers a parsed retry-after window / exponential backoff capped at `retryCeilingMs` (defaults `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

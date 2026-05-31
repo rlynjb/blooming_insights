@@ -5,7 +5,6 @@
 
 > The most common multi-agent topology — a central supervisor decomposes a task, delegates to specialist workers, synthesizes their results. blooming insights does NOT have an LLM supervisor; the route file is a *hard-coded* supervisor (code decomposes the user journey, picks the agent), which is the same shape with the supervisor role played by an `if`-ladder instead of a model.
 
-**See also:** → `./01-when-not-to-go-multi-agent.md` · → `./03-sequential-pipeline.md` · → `./06-swarm-handoff.md` · → `../06-orchestration-system-design-templates/` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → routing primitive: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 
@@ -284,7 +283,7 @@ Supervisor-worker — the two flavors
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented as an LLM supervisor — and deliberately so.**
 
@@ -365,93 +364,6 @@ It also breaks when one worker's output is so large that the supervisor's contex
 - `./06-swarm-handoff.md` → what supervisor-worker becomes when the central bottleneck is the constraint
 - `./07-graph-orchestration.md` → supervisor-worker expressed as an explicit state machine, with checkpointing
 - `../06-orchestration-system-design-templates/` → the "design a multi-agent research assistant" template that names exactly what an LLM supervisor on top of this codebase's workers would look like
-
----
-
-## Tradeoffs
-
-The decision was: **keep the supervisor role, but implement it as code.** The alternative is the LLM-supervisor version of the same role.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Code supervisor (chosen)    │ LLM supervisor (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ ~50 lines in route.ts       │ supervisor prompt + own     │
-│                  │                             │ loop + worker-as-tool       │
-│                  │                             │ schemas + handoff protocol  │
-│ Latency / run    │ 0 extra LLM calls           │ +1 model call per ordering  │
-│                  │                             │ decision (~1–3s under MCP   │
-│                  │                             │ rate limit)                 │
-│ Token cost / run │ workers only                │ workers + supervisor turns  │
-│                  │                             │ (typically 2-5x total)      │
-│ Decomposition    │ knowable at code-write time │ runtime, can adapt          │
-│ flexibility      │ only                        │                             │
-│ Debug surface    │ 2 suspects (route OR worker)│ 3 suspects (supervisor,     │
-│                  │                             │ workers, synthesis)         │
-│ Context window   │ never bloats                │ supervisor accumulates      │
-│                  │                             │ every worker's output       │
-│ Failure modes    │ shares all of `./09`'s      │ adds: synthesis failure,    │
-│ added            │ except synthesis-failure    │ infinite tool-call cascade  │
-│ Synthesis        │ a function call (typed      │ an LLM merge (may fabricate │
-│                  │ Diagnosis → propose)        │ or average contradictions)  │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up runtime flexibility in decomposition. The route can't introspect the user's question and decide "this anomaly needs a deep-dive specialist, not the generic diagnostic agent" — that branching has to be a code change. The decomposition is whatever the product team encoded in the query-string contract.
-
-We also gave up *adaptive synthesis*. When the diagnostic agent returns and the recommendation agent runs, the merge is a function call (the diagnosis is handed in as an arg). An LLM supervisor could merge them into a single narrative or surface contradictions; the code supervisor just hands one to the next.
-
-### What the alternative would have cost
-
-If we'd built an LLM supervisor, the up-front cost would have been an entire fourth agent (the supervisor) with its own prompt, its own `runAgentLoop`, its own tool subset (the *workers* would be its tools), and a synthesis instruction. Every investigation would pay an extra ~1–3s under the MCP rate limit for the supervisor's reasoning turn, *plus* additional turns if the supervisor needed multiple decisions. Token cost would land in the 2-5x range typical of supervisor-worker systems. Debugging would now have to walk three trajectories per run: the supervisor's reasoning, the worker's loop, and the synthesis turn.
-
-### The breakpoint
-
-This stays the right call until the user journey can't be expressed as a finite `if`-ladder — e.g. when "anomaly type" branches into 20+ specialist workers, or when the user can type a free-form goal that has to be parsed into an arbitrary sub-task plan. The day the route file becomes a switchboard with more cases than a single screenful of `if`s, an LLM supervisor's reasoning over the same decisions becomes cheaper to maintain than the code.
-
-### What wasn't actually a tradeoff
-
-A "supervisor agent that just hands off to the right worker without doing anything else" was not a real alternative — that's just an LLM doing what an `if` does, with extra steps. If the supervisor's only job is routing-by-input, an `if`-ladder strictly dominates: same decision, no LLM cost. The supervisor agent earns its overhead only when its job goes beyond "pick a worker" into "decompose into multiple sub-jobs, decide their order, possibly retry."
-
----
-
-## Tech reference
-
-### Anthropic Messages API tool_use (supervisor-as-tools mechanic)
-
-- **Codebase uses:** `runAgentLoop` (`lib/agents/base.ts` L102) calls `anthropic.messages.create({ tools, messages })` — the same primitive that a tools-style supervisor would use to call workers-as-tools (it currently calls MCP tools, but the shape is identical).
-- **Why it's here:** it's the primitive that *could* support an LLM supervisor without a framework — define workers as tools, pass them to a supervisor's `runAgentLoop`. The codebase doesn't do this; it just calls the workers directly from `route.ts`.
-- **Leading today:** Anthropic tool use — innovation-leading for tools-style supervisor implementations, 2026.
-- **Why it leads:** the `tool_use` content block makes worker-as-tool a first-class primitive — no framework wrapper required.
-- **Runner-up:** OpenAI Agents SDK `handoffs` API — handoff-style supervisor with structured control transfer baked in.
-
-### LangGraph (the most common LLM-supervisor framework)
-
-- **Codebase uses:** not used. Listed here for the alternative landscape.
-- **Why it's here:** LangGraph's `StateGraph` is what teams reach for when they want an LLM supervisor with checkpointing and human-in-the-loop pauses on top.
-- **Leading today:** LangGraph — innovation-leading for graph-style supervisor-worker orchestration with state, 2026.
-- **Why it leads:** explicit state machine, checkpointing for pause/resume, first-class human-in-the-loop interrupts — the things `route.ts`'s `if`-ladder cannot give you.
-- **Runner-up:** OpenAI Agents SDK — simpler model (handoffs as tools), less ceremony, no built-in checkpointing.
-
-### Next.js App Router (the "code supervisor" runtime)
-
-- **Codebase uses:** `app/api/agent/route.ts` is a Next.js App Router route handler; the `GET` function IS the supervisor.
-- **Why it's here:** the runtime that lets the code supervisor stream worker outputs as NDJSON in order — the synthesis is "stream worker A's events, then worker B's events."
-- **Leading today:** Next.js App Router — adoption-leading for full-stack TS endpoints, 2026.
-- **Why it leads:** co-locates the supervisor with the rest of the app, streams natively, runs on Node or edge — the streamed trace is built on this.
-- **Runner-up:** Hono / Express + separate stream server — more control over runtime, at the cost of a separate deploy.
-
----
-
-## Summary
-
-Supervisor-worker is one role (decompose-delegate-merge) over a set of specialist workers; the supervisor can be implemented as an LLM (adaptive, expensive), as code (predictable, free), as a queue, or as a human. blooming insights has the role played by code — `app/api/agent/route.ts` L199–L249 is a "hard-coded supervisor" that decomposes the user journey via query-string fields, picks the worker agent by `if`-ladder, and hands one worker's typed output to the next via a function call. The constraint that made this right is that the user journey has exactly three product flows; the decomposition is knowable up front. The cost is fixed decomposition (no runtime adaptation) and synthesis-by-function-call instead of synthesis-by-LLM. To promote to an autonomous supervisor, see `../06-orchestration-system-design-templates/` — the workers stay the same; only the outer supervisor implementation changes.
-
-- Supervisor-worker is the role, not the implementation — code can play the role (and does, in `route.ts`).
-- The supervisor's three jobs (decompose, delegate, synthesize) are present in every flavor; only *who does the reasoning* changes.
-- Tools-style keeps control at the supervisor (one trajectory, debuggable, context-bloat risk); handoff-style transfers control (fragmented trajectory, swarm-style failure modes).
-- blooming insights' supervisor is `route.ts`'s `if`-ladder; it skips reasoning because the user journey is the decomposition.
-- Worth it while the decomposition is finite and knowable; promote to LLM supervisor when the route file becomes a switchboard.
 
 ---
 
@@ -595,5 +507,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./01-when-not-to-go-multi-agent.md` · → `./03-sequential-pipeline.md` · → `./06-swarm-handoff.md` · → `../06-orchestration-system-design-templates/` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → routing primitive: `../01-reasoning-patterns/01-chains-vs-agents.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Peer specialist agents transfer control to each other at runtime — no central supervisor; the model decides when to hand off. blooming insights does NOT have handoff: control is centralized in the deterministic route, and no agent calls another agent. The topology that earns its overhead when peer specialists need model-decided routing the route's `if`-ladder can't express.
 
-**See also:** → `./02-supervisor-worker.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` (infinite handoff) · → `./01-when-not-to-go-multi-agent.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
 
 ---
 
@@ -277,7 +276,7 @@ Swarm / handoff — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.**
 
@@ -363,100 +362,6 @@ It also breaks when the context-passing protocol drops information. If `Diagnost
 - `./02-supervisor-worker.md` → the centralized-control alternative
 - `./07-graph-orchestration.md` → swarm expressed as a state graph with explicit nodes and transition edges (the "make it inspectable" version)
 - `../06-orchestration-system-design-templates/` → the "swarm support assistant" template
-
----
-
-## Tradeoffs
-
-The decision was: **centralized control in the route — no peer handoff.** The alternative is to add `transfer_to_<peer>` tools to each agent and let model-decided routing happen at runtime.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Centralized route (chosen)  │ Swarm / handoff (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build cost       │ if-ladder in route.ts       │ transfer_to_* tools + handoff│
-│                  │                             │ runtime + max-hops counter   │
-│ Latency / run    │ no extra LLM cost for       │ +1 LLM call per handoff      │
-│                  │ routing (route is code)     │ decision                     │
-│ Token cost / run │ pays for the chosen path    │ pays for handoff decisions + │
-│                  │                             │ context-passing overhead     │
-│ Runtime          │ none — order is fixed       │ peer routing adapts to       │
-│ adaptability     │                             │ runtime context              │
-│ Failure modes    │ shares all of `./09`'s,     │ ADDS: infinite handoff,      │
-│                  │ minus infinite-handoff      │ context-loss-on-handoff,     │
-│                  │ (structurally absent)       │ ping-pong between peers      │
-│ Debug shape      │ stage-localized — bug is in │ trajectory fragmented across │
-│                  │ one prompt or one route     │ N agents, follow the hops    │
-│                  │ branch                      │                              │
-│ Single point of  │ yes — the route             │ no — distributed across      │
-│ truth            │                             │ agents                       │
-│ Onboarding cost  │ any engineer reads an       │ engineer must understand each│
-│                  │ if-ladder                   │ agent's handoff rules        │
-│ When right       │ when next-agent decision is │ when next-agent decision     │
-│                  │ knowable up front           │ needs runtime context the    │
-│                  │                             │ route can't have             │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up the ability for agents to redirect mid-run. The `QueryAgent` can't decide "this question is actually an investigation request" and hand off to `DiagnosticAgent`. The `DiagnosticAgent` can't decide "this diagnosis needs deeper context, let me hand off to a hypothetical `DeepDiveAgent`." The path is locked at request entry.
-
-We also gave up *peer-decided context*. The route's pipeline handoff (function call from diag to rec) carries the typed `Diagnosis`, but the route doesn't know what other context the recommendation agent might want. A handoff initiated by `DiagnosticAgent` itself could pack more context based on what the diagnostic agent actually learned during the loop.
-
-### What the alternative would have cost
-
-If we'd built handoff from day one, the up-front cost would be per-agent `transfer_to_<peer>` tools (one per peer it can hand to), a handoff-aware `runAgentLoop` (catches the handoff tool_use, persists context, starts the next agent's loop), and a `MAX_HOPS` counter to prevent infinite handoff. Per-run cost would be one extra LLM decision per handoff (~1–3s under MCP rate limit) — minor compared to the agent loop costs.
-
-The bigger cost is operational: a fragmented trajectory. Today every investigation has a clean stage-by-stage trace. With handoff, the trace becomes "agent A turns 1–3, handoff, agent B turns 1–2, handoff back, agent A turn 4..." — you have to follow the hops to debug. UI surfaces (the `ProcessStepper`) would need to be re-thought; today they assume a fixed stage progression.
-
-### The breakpoint
-
-This stays the right call until peer specialists need *runtime* routing that the route can't express — e.g. when the QueryAgent regularly hits anomaly-investigation territory and the user would benefit from a mid-conversation transition to a real investigation flow. Or when the diagnostic agent's job grows to 4–5 specialties (segment-X diagnostic, segment-Y diagnostic, funnel diagnostic, retention diagnostic) and a generic supervisor would have to decide which specialist runs from data only the running agent has seen.
-
-### What wasn't actually a tradeoff
-
-A "centralized supervisor with handoff-style delegation" (where the supervisor decides handoffs but the agents don't decide themselves) is not really handoff — it's tools-style supervisor-worker with a different name. The cross-reference is `./02-supervisor-worker.md`. Real handoff requires the *peer* to decide it's time to transfer; if the supervisor is making the call, you're back in supervisor-worker territory.
-
-A "shared blackboard" where agents write to a shared state and the next agent picks up based on the state is also not handoff — it's `./08-shared-state-and-message-passing.md`. Handoff is *active control transfer*: agent A explicitly hands off; agent B explicitly receives. The shared-blackboard alternative is *passive context*: state exists; whoever runs next reads it.
-
----
-
-## Tech reference
-
-### OpenAI Swarm / Agents SDK handoffs
-
-- **Codebase uses:** not used.
-- **Why it's here:** OpenAI's Swarm (2024 demo) and Agents SDK (2025 production) made `handoffs` a first-class primitive — a tool that returns an `Agent` object signals "transfer to this agent." This is the cleanest implementation of the handoff pattern available off-the-shelf.
-- **Leading today:** OpenAI Agents SDK handoffs — innovation-leading for handoff-style multi-agent in production, 2026.
-- **Why it leads:** handoffs are tools, so they reuse the existing tool-calling infrastructure; the SDK enforces a `max_turns` counter; context can be passed structured (via the handoff tool's input_schema).
-- **Runner-up:** LangGraph `Command(goto=...)` — handoff as an explicit graph edge; more ceremony, more inspectable.
-
-### LangGraph subgraphs and Command
-
-- **Codebase uses:** not used.
-- **Why it's here:** LangGraph models handoff as graph edges with explicit `goto` directives — each node can return `Command(goto='next_node', update=context)`, which lets the graph framework move control with full state tracking.
-- **Leading today:** LangGraph — innovation-leading for graph-style multi-agent with checkpointed state, 2026.
-- **Why it leads:** explicit state graph means every handoff is a named edge; recursion limits are first-class; checkpointing lets you pause-resume mid-handoff.
-- **Runner-up:** CrewAI delegation — simpler model, less explicit state, less checkpointing.
-
-### Anthropic Messages API tool_use (the handoff substrate)
-
-- **Codebase uses:** `runAgentLoop` in `lib/agents/base.ts` L48–L176 — the same primitive a handoff system would use. A handoff would be a special tool_use the runtime intercepts.
-- **Why it's here:** Anthropic's tool_use is the substrate; the only thing missing from this codebase is a runtime that detects `transfer_to_*` tool calls and switches the active agent.
-- **Leading today:** Anthropic tool use — innovation-leading for typed agent loops with structured outputs, 2026.
-- **Why it leads:** `tool_use` blocks with structured input are the right shape for "transfer with this typed context" — no framework wrapper required.
-- **Runner-up:** OpenAI Responses API — equivalent shape, larger installed base.
-
----
-
-## Summary
-
-Swarm / handoff is peer specialist agents transferring control to each other at runtime — no central supervisor, model-decided routing. Implemented as a special tool call (`transfer_to_<peer>`) the runtime catches; bounded by a handoff counter (`MAX_HOPS`) to prevent infinite-handoff failures. blooming insights does not have peer handoff: control is centralized in `app/api/agent/route.ts` L199–L249, and no agent's tool subset (`lib/mcp/tools.ts`) contains a `transfer_to_*` tool. The constraint that made this right is that the user journey has three knowable flows and the next-agent decisions in each flow don't need runtime context the route doesn't already have. The cost is fixed routing — the QueryAgent can't redirect mid-conversation to an investigation flow even if that would serve the user better. The breakpoint: peer specialists with runtime routing needs the route can't express, OR a specialty explosion (4–5+ sub-specialists per stage) where centralized routing becomes a switchboard.
-
-- Handoff is peer agents transferring control via a tool call; the runtime intercepts the call and switches the active agent.
-- Infinite handoff is the failure mode (A → B → A → B); always bound it with a `MAX_HOPS` counter.
-- Same-family peers with vague scoping ping-pong; sharp per-agent prompts with explicit stay/handoff rules are required.
-- Context-passing protocol matters: full history (token-expensive), summary (lossy), or typed message (cleanest — like blooming insights' `Diagnosis`).
-- Worth it when peer routing needs runtime context the route can't have; otherwise centralized routing wins.
 
 ---
 
@@ -612,5 +517,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./02-supervisor-worker.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` (infinite handoff) · → `./01-when-not-to-go-multi-agent.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

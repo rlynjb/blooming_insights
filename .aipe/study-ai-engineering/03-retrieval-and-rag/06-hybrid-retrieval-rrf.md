@@ -5,7 +5,6 @@
 
 > Hybrid retrieval runs a dense (meaning) and a sparse (exact-term) search in parallel and merges their rankings — Reciprocal Rank Fusion combines two ranked lists using only positions, no score calibration — so a query gets both the synonym hits and the exact-term hits; blooming insights runs only one retrieval (sparse EQL), so this is study material and a buildable target.
 
-**See also:** → 05-dense-vs-sparse.md · → 07-reranking.md · → 01-embeddings.md · → 11-rag.md
 
 ---
 
@@ -140,7 +139,7 @@ The fusion node is the whole point: it merges two orderings using only positions
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via a single sparse path — `execute_analytics_eql` against Bloomreach — so there is no second (dense) retriever to fuse and no rank fusion anywhere.
 
@@ -182,47 +181,6 @@ RRF wins the "any scores, robustly" row because it discards the scores. The gene
 
 ---
 
-## Tradeoffs
-
-### RRF rank fusion vs. weighted score sum vs. single-retriever
-
-| Dimension | RRF (rank fusion) | Weighted score sum | Single retriever |
-|---|---|---|---|
-| Handles incomparable scales | Yes (ignores scores) | No — needs normalization | N/A |
-| Per-corpus tuning | None (one default k) | High (weights + normalization) | None |
-| Keeps score magnitude signal | No | Yes | Yes |
-| Recall on mixed queries | High (both axes) | High | Lower (one axis) |
-| Infrastructure | Two indexes | Two indexes | One |
-| Right when | Combining different-metric rankings | Scores carry tunable signal | One axis suffices |
-
-**What we gave up (by not having it).** Nothing today — there is only one retriever (sparse EQL), so there is nothing to fuse. The latent cost appears only once a dense path exists for free-text search: without fusion, you would have to pick dense-or-sparse per query and accept the loser's failure mode on the other half of queries.
-
-**What the alternative would have cost.** Adding hybrid + RRF to the analytics path would be pure overhead — analytics has no meaning axis, so the dense leg contributes nothing and you would maintain a second index for no recall gain. Even on the free-text corpus, the cost is a second index kept in sync and the small fusion compute; weighted-sum fusion would cost additional per-corpus calibration RRF avoids.
-
-**The breakpoint.** Single-retriever (sparse) is correct while every query is exact analytics. Hybrid + RRF earns its place the moment the free-text investigation corpus is queried with a mix of exact-term and paraphrase queries — where neither dense nor sparse alone covers both, and fusing their rankings recovers the union without score calibration.
-
----
-
-## Tech reference (industry pairing)
-
-### Reciprocal Rank Fusion
-
-- **Codebase uses:** nothing — one retriever, no fusion.
-- **Why it's here (absent):** there is no second ranked list to fuse; the dense leg does not exist.
-- **Leading today:** RRF is the default hybrid-search fusion in Weaviate, Qdrant, OpenSearch, and pgvector setups (2026).
-- **Why it leads:** scale-free (ignores raw scores), needs no per-corpus tuning, beats elaborate score-combination methods empirically.
-- **Runner-up:** weighted score normalization (min-max or z-score then weighted sum) — keeps score magnitude but requires calibration.
-
-### hybrid (dense + sparse) search
-
-- **Codebase uses:** the sparse leg only — `execute_analytics_eql` (`lib/mcp/tools.ts` L11/L16).
-- **Why it's here (absent as hybrid):** no dense leg yet; analytics has no meaning axis to fuse in.
-- **Leading today:** built-in hybrid search in managed vector DBs (Weaviate, Qdrant) leads adoption (2026).
-- **Why it leads:** one query returns exact-term and semantic hits with RRF fusion handled internally.
-- **Runner-up:** Elasticsearch/OpenSearch BM25 + dense-vector field with RRF — hybrid on a search engine many teams already run.
-
----
-
 ## Project exercises
 
 ### Add hybrid search over past investigations with RRF fusion
@@ -242,19 +200,6 @@ RRF wins the "any scores, robustly" row because it discards the scores. The gene
 - **Files to touch:** new `scripts/rrf-vs-scoreadd.ts`, `lib/mcp/retrieval.ts` (both fusion methods), `test/mcp/retrieval.test.ts`.
 - **Done when:** the harness shows naive addition lets a high-BM25 low-cosine doc dominate, while RRF keeps a both-lists document on top.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Hybrid retrieval runs a dense (meaning) and a sparse (exact-term) search in parallel and fuses their ranked lists; Reciprocal Rank Fusion does the merge using only rank *positions* — `Σ 1/(k + rank)`, `k = 60` — so the cosine-vs-BM25 scale mismatch never matters and no per-corpus calibration is needed. blooming insights runs only the sparse leg (`execute_analytics_eql`), so there is nothing to fuse yet; hybrid earns its place only when a dense path exists for free-text past-investigation search, where exact-term and paraphrase queries both occur.
-
-**Key points:**
-- Dense and sparse scores are on incomparable scales — you cannot add them directly.
-- RRF fuses by position, not score, so it needs no normalization or tuning beyond one constant `k`.
-- A document ranked well in *both* lists beats one ranked #1 in only one — cross-list agreement wins.
-- RRF discards score magnitude; when magnitude is signal, weighted normalization is the alternative.
-- Hybrid is overhead for exact analytics; it earns its place only on a mixed-query free-text corpus.
 
 ---
 
@@ -328,3 +273,8 @@ A colleague wants to add hybrid search to the analytics agents "for completeness
 ### Quick check — code reference test
 
 How many retrieval paths does blooming insights run, and what would hybrid need before it could fuse anything? (Answer: one — the sparse `execute_analytics_eql` path (`lib/mcp/tools.ts` L11/L16); hybrid needs a second, dense retriever (the embedding path from `05`) over a free-text corpus before there are two ranked lists to fuse with RRF.)
+
+## See also
+
+→ 05-dense-vs-sparse.md · → 07-reranking.md · → 01-embeddings.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > The model emits a `tool_use` block naming a tool and its arguments; your code runs the tool and feeds the result back as a `tool_result` — the model is the brain that decides, your loop is the hands that act. blooming insights wires Bloomreach MCP tools into Claude via `filterToolSchemas`, and `runAgentLoop` executes each call through an injected `McpCaller`.
 
-**See also:** → 01-agents-vs-chains.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -168,7 +167,7 @@ A reader who sees only this diagram should grasp: the model names the tool, the 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -250,54 +249,6 @@ The model emits arguments as free-form JSON conforming to the tool's `input_sche
 
 ---
 
-## Tradeoffs
-
-### Comparison: MCP tool calling via injectable McpCaller vs alternatives
-
-| Dimension | This codebase (MCP + McpCaller seam) | Hard-coded SDK calls in the loop | Constrained-decoding tool args |
-|---|---|---|---|
-| Tool discovery | Runtime via `listTools` (any MCP server) | Compile-time, fixed | Runtime or compile-time |
-| Testability | High — inject a fake `McpCaller` | Low — must mock the SDK/network | Depends |
-| Argument validity | Advisory schema; model can emit bad args | Same | Enforced at token level |
-| Coupling | Loop knows only the interface | Loop knows the concrete client | Tied to provider feature |
-| Provider portability | Tool layer is MCP-agnostic | Locked to one SDK shape | Locked to providers that support it |
-
-**What we gave up.** Argument-level validation. The loop forwards the model's `input` straight to `mcp.callTool` (L144) with no schema check between model and backend. A malformed EQL string reaches Bloomreach and comes back as an error `tool_result`. We accept "fail at the backend, let the model retry" over "validate every argument shape in the loop" because the MCP server already validates and returns structured errors, and adding a second validation layer would duplicate the schema and rot independently.
-
-**What the alternative would have cost.** Hard-coding the Anthropic SDK calls and the Bloomreach client directly in the loop would have removed the `McpCaller` indirection — but every unit test would then need to mock the network or hold a real API key, and swapping the cache/retry behavior would mean editing the loop instead of swapping a constructor argument. The injectable seam is one interface for a large testability win.
-
-**The breakpoint.** This design is right while wrong tool arguments are rare and recoverable. It stops being right if a wrong argument can cause an *expensive or irreversible* side effect (a write, a bulk export, a billable operation). At that point you must validate arguments in the dispatcher before the call, not after — the model-as-untrusted-input principle becomes a hard gate rather than a retry path. blooming insights is read-only analytics, so the breakpoint has not been reached.
-
----
-
-## Tech reference (industry pairing)
-
-### @anthropic-ai/sdk tool use (tool_use / tool_result)
-
-- **Codebase uses:** `params.tools = toolSchemas` (`base.ts` L101); reads `tool_use` blocks (L116); builds `tool_result` blocks keyed by `tool_use_id` (L161–L167).
-- **Why it's here:** It is the wire protocol that turns a model's request into an executable call and feeds the answer back.
-- **Leading today:** Anthropic tool use and OpenAI function calling are the two adoption-leading protocols in 2026.
-- **Why it leads:** First-class block types, parallel tool calls, and large context windows make agentic loops viable without a framework.
-- **Runner-up:** Gemini function calling — capable, growing, slightly less mature multi-tool ergonomics.
-
-### Model Context Protocol (MCP)
-
-- **Codebase uses:** Bloomreach tools are discovered via `conn.mcp.listTools()` (`route.ts` L203) and mapped by `filterToolSchemas`; transported through `McpClient`/`SdkTransport`.
-- **Why it's here:** It decouples the tool set from the code — the available actions are whatever the MCP server exposes, not a hard-coded list.
-- **Leading today:** MCP is the innovation-leading tool-interop standard in 2026, with fast-growing adoption.
-- **Why it leads:** Runtime discovery, a uniform tool shape across servers, and provider-agnostic transport.
-- **Runner-up:** OpenAI plugins / custom function registries — provider-specific, less portable.
-
-### JSON Schema (input_schema)
-
-- **Codebase uses:** `McpToolDef.inputSchema` is passed through as `input_schema` (`tool-schemas.ts` L19), the contract the model fills.
-- **Why it's here:** It tells the model the shape of arguments a tool accepts.
-- **Leading today:** JSON Schema is the adoption-leading tool-argument contract in 2026.
-- **Why it leads:** Universal, language-agnostic, and natively understood by every major model's tool layer.
-- **Runner-up:** Provider-proprietary argument schemas — narrower, non-portable.
-
----
-
 ## Project exercises
 
 ### Validate tool arguments in the dispatcher before the call
@@ -317,19 +268,6 @@ The model emits arguments as free-form JSON conforming to the tool's `input_sche
 - **Files to touch:** `lib/agents/base.ts` (L150), `lib/mcp/events.ts` (L7), `app/api/agent/route.ts` (`hooksFor`, L181–L195), `app/debug/page.tsx`.
 - **Done when:** Every tool call in a trace shows its raw result size and a truncation flag, and a result over 16,000 chars is visibly marked truncated.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-A model can only emit tokens, so it never runs a tool — it emits a `tool_use` block describing the call it wants, and your code runs it and feeds back a `tool_result`. blooming insights maps Bloomreach MCP tools into the Anthropic `Tool[]` shape with `filterToolSchemas` (`tool-schemas.ts` L9–L21), executes each call through the injectable `McpCaller` seam (`base.ts` L16–L22), and pairs every result to its request by `tool_use_id` before pushing it back as a user turn (`base.ts` L129–L171). Every MCP tool carries a `project_id` injected into the system prompt. The brain decides; the hands act.
-
-Key points:
-- The model describes the call; your loop (`base.ts` L144) makes it — "the model called the API" is always a simplification.
-- `filterToolSchemas` is the registry of legal requests; `McpCaller` is the dispatcher; `tool_result` keyed by `tool_use_id` is the reply.
-- Results are truncated at `MAX_TOOL_RESULT_CHARS = 16_000` (L29) before re-entering the context, and errors become `is_error` results rather than crashes.
-- `project_id` is injected into the prompt (`.replace('{project_id}')`), not invented by the model.
-- The dispatcher is the trust boundary; validation, scoping, and rate limiting live there, not in the model's path.
 
 ---
 
@@ -410,5 +348,10 @@ A reviewer says: "Drop the `McpCaller` interface and call the Bloomreach client 
 
 What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps its size? (Answer: `truncate(JSON.stringify(result))` — capped at `MAX_TOOL_RESULT_CHARS = 16_000`, `lib/agents/base.ts` L29 / L150.)
 
+## See also
+
+→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTools` (L203) and `hooksFor` (L181–195) refs, and updated the per-agent `project_id`-injection line numbers.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

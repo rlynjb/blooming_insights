@@ -5,7 +5,6 @@
 
 > Read a chunked byte stream where JSON objects may arrive split across network boundaries, reassemble complete newline-delimited records in a string buffer, parse each, and keep state consistent by reconciling paired start/end events in place.
 
-**See also:** → ../01-system-design/05-streaming-ndjson.md · → ../01-system-design/07-client-stream-handoff.md
 
 ---
 
@@ -271,7 +270,7 @@ The diagram stands alone: a chunk arrives as bytes, gets decoded as text with `{
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/hooks/useInvestigation.ts`
 **Function / class:** `useInvestigation` — the reader loop inside the effect's async IIFE (L184–L208) and `handle` (L97–L151)
@@ -376,60 +375,6 @@ The reverse scan runs twice per `tool_call_end`: once against `cItems` (the plai
 
 ---
 
-## Tradeoffs
-
-| Dimension | This implementation | Alternative: SSE + `EventSource` | Alternative: streaming NDJSON parser lib |
-|-----------|--------------------|------------------------------------|------------------------------------------|
-| Framing complexity | Manual: `split('\n')` + `pop()` — ~3 lines | Browser-native: `EventSource` handles framing | Library handles framing, exposes object events |
-| Multi-byte safety | `TextDecoder({ stream: true })` — correct but must remember the flag | Built into the browser SSE implementation | Built into the library |
-| Reconnect on drop | None — stream closes, UI stops | `EventSource` reconnects automatically with `Last-Event-ID` | Depends on fetch wrapper used |
-| Backpressure | None — `buf` grows unbounded if server is faster than consumer | None — `EventSource` buffers in the browser | Depends on library |
-| Dependency count | Zero — Web Streams API + `String.prototype.split` | Zero — `EventSource` is a browser built-in | One npm dependency |
-| Auth headers | `fetch` accepts `Authorization` header | `EventSource` cannot send custom headers in the browser (requires a wrapper or query-param token) | Same as fetch — full header control |
-
-**What was given up.** The hand-rolled loop has no backpressure, no max-buffer guard, and no reconnect. If the server drops the connection mid-stream, the investigation stops and the user sees a stale "analyzing…" indicator. The investigation reader was consolidated into the `useInvestigation` hook, but the feed (`app/page.tsx`) still hand-rolls its own copy of the loop — the pattern is shared by convention, not by code.
-
-**What the alternative costs.** SSE (`EventSource`) would remove the manual framing code entirely, but `EventSource` in the browser cannot send `Authorization` headers — the server-side OAuth token that `/api/agent` needs would have to move to a query parameter or cookie, which changes the auth surface. Using `eventsource-parser` as a library adds a dependency and still requires the `fetch`+`getReader()` shell around it; it replaces the `split`/`pop` lines, not the loop structure.
-
-**The breakpoint.** The current approach is correct and sufficient for this workload: events are small (tens of bytes to a few kilobytes), the stream is short-lived (one investigation run), and tools run sequentially so reconciliation is unambiguous. If the agent were to stream large tool results (tens of kilobytes per event), emit events at high frequency, or run tools concurrently, the lack of backpressure and the LIFO reconciliation assumption would both need revisiting.
-
----
-
-## Tech reference (industry pairing)
-
-### Web Streams reader + TextDecoder
-
-- **`ReadableStream.getReader()`** — acquires an exclusive lock on the stream and returns a `ReadableStreamDefaultReader`. Only one reader can be active at a time. `reader.read()` returns `Promise<{done: boolean, value: Uint8Array}>`. When `done` is `true`, `value` is `undefined` and the stream is closed.
-- **`TextDecoder`** — decodes a `Uint8Array` to a string using a specified encoding (default UTF-8). The `stream: true` option in `decode()` tells the decoder to preserve its internal state (incomplete multi-byte character buffers) between calls, producing correct output when a multi-byte sequence straddles a chunk boundary.
-- **`String.prototype.split(separator)`** — splits a string on every occurrence of `separator` and returns an array. `"a\nb\n".split('\n')` returns `["a", "b", ""]` — the trailing newline produces an empty string as the last element. This is why `lines.pop()` works: the last element is always either empty (safe to discard) or a partial record (must be buffered).
-- **`Array.prototype.pop()`** — removes and returns the last element of an array, mutating the array in place. Used here to extract the trailing partial in one expression rather than slicing.
-- **Runner-up: `eventsource-parser`** — an npm library (by Sanity) that accepts SSE-formatted text and emits parsed events; structurally identical to this pattern but handles the SSE envelope (`data:`, `event:`, `id:` fields) rather than raw NDJSON.
-
-### NDJSON framing
-
-- **NDJSON (Newline-Delimited JSON)** — an informal specification (ndjson.org) where each line of a text stream is a complete, valid JSON value. The newline character `\n` (U+000A) is the record separator. JSON strings cannot contain a literal unescaped `\n`, so the delimiter is unambiguous within a well-formed stream.
-- **Chunked Transfer Encoding (HTTP/1.1)** — the mechanism by which the server sends `Transfer-Encoding: chunked` and writes the response body in variable-size pieces without knowing the total content length in advance. Each chunk is prefixed with its byte count in hex. The browser's `ReadableStream` exposes these chunks as individual `read()` values, but chunk boundaries are not guaranteed to align with NDJSON record boundaries.
-- **Delimiter-based framing** — the general strategy of using a known byte value (or sequence) as the boundary between records in a stream. The receiver buffers bytes until it sees the delimiter, then processes the accumulated bytes as a record. Contrast with *length-prefix framing*, where the sender writes the record length before the record so the receiver knows exactly how many bytes to accumulate.
-- **Reverse scan for reconciliation** — iterating backward through an array to find the most-recently-added matching element. O(n) in the number of items, but n is bounded by the total number of events in one investigation run (tens to low hundreds). The backward direction ensures LIFO semantics: if the same tool appeared multiple times, the most recent `running` entry is paired with the `end` event.
-- **Runner-up: `ndjson` npm package** — wraps NDJSON parsing as a Node.js `Transform` stream; useful server-side. On the browser side, `eventsource-parser` covers the SSE variant of this pattern.
-
----
-
-## Summary
-
-**Part 1 — what and why.** Chunked HTTP streams deliver bytes at arbitrary boundaries. NDJSON uses `\n` as the record delimiter, but a record can arrive split across two network chunks. A string buffer accumulates decoded text across `reader.read()` iterations; `split('\n')` + `pop()` extracts complete records and retains the trailing partial. `TextDecoder({ stream: true })` prevents corruption of multi-byte UTF-8 sequences that straddle chunk boundaries. When a complete line is available, `JSON.parse` recovers the `AgentEvent` object and `handleEvent` dispatches it to React state. `tool_call_start` and `tool_call_end` are paired by a backward scan through the items array that finds the most recent `running` entry with a matching `toolName`.
-
-**Part 2 — key properties.**
-
-- `buf = lines.pop() ?? ''` is the entire buffer mechanism — one assignment, no data structures.
-- `{ stream: true }` on `TextDecoder.decode` is required for correctness on non-ASCII content; omitting it produces silent data corruption.
-- The reverse scan for reconciliation is correct under sequential tool dispatch; it mis-pairs if the same tool runs concurrently.
-- No max-buffer guard means a server that never writes `\n` will grow `buf` unbounded.
-- The reader loop now lives in the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208); the feed (`app/page.tsx` L418–L443) still hand-rolls its own copy — the consolidation is half-done.
-- Zero runtime dependencies: `ReadableStream`, `TextDecoder`, and `String.prototype.split` are all Web Platform APIs available in every modern browser.
-
----
-
 ## Interview defense
 
 **What they are really asking:** can you reason about byte-stream boundaries, explain why a naive `JSON.parse(chunk)` fails, and articulate the invariant that makes the buffer-and-split approach correct? At senior level: can you name the failure modes (no max-buffer guard, LIFO mis-pair on concurrent tools)?
@@ -509,5 +454,10 @@ Show every variable at every step: `buf` before and after each chunk, `lines`, `
 - What is the time complexity of the reverse scan in `tool_call_end`? (O(n) where n = number of items in the trace so far)
 - Name the two files in this codebase that implement the `split('\n')` + `pop()` buffer loop. (`lib/hooks/useInvestigation.ts` and `app/page.tsx`)
 
+## See also
+
+→ ../01-system-design/05-streaming-ndjson.md · → ../01-system-design/07-client-stream-handoff.md
+
 ---
 Updated: 2026-05-28 — repointed the reader-loop + reverse-scan reconciliation refs from `app/investigate/[id]/page.tsx` (now removed) to the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208, L86–L121) and the feed's own loop (`app/page.tsx` L418–L443); noted the hook's started-guard + no-cancel-on-cleanup StrictMode decision
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

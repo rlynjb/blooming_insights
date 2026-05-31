@@ -5,7 +5,6 @@
 
 > RAG grounds a model's answer in retrieved context — classically by embedding a document corpus and pulling the nearest chunks into the prompt; blooming insights does the *retrieval* but not the *embedding index*: it retrieves live via MCP tool calls + EQL against Bloomreach, a deliberate "no RAG until a feature provably needs it" decision because the data is a fresh live API with exact analytics, where an embedding index would be stale and lossy.
 
-**See also:** → ../04-agents-and-tool-use/02-tool-calling.md · → 05-dense-vs-sparse.md · → 09-stale-embeddings.md · → 12-graphrag.md · → 01-embeddings.md
 
 ---
 
@@ -146,7 +145,7 @@ Both columns are RAG; the codebase chose the live-tool retriever because its dat
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (embedding-RAG); implemented as live-tool retrieval.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — a deliberate "no RAG until a feature provably needs it" decision.
 
@@ -190,59 +189,6 @@ The senior insight is that "RAG" is not synonymous with "embedding index." RAG i
 
 ---
 
-## Tradeoffs
-
-### Live-tool retrieval (current) vs. embedding-RAG
-
-| Dimension | Live tool call (current) | Embedding-RAG index |
-|---|---|---|
-| Freshness | Always current (60s TTL) | Stale until re-embedded (09) |
-| Answer exactness | Exact aggregates | Fuzzy nearest-neighbor |
-| Per-query latency | Network call, rate-limited | Microsecond cosine |
-| Semantic ("like this") recall | No | Yes |
-| Operational burden | None — read the source | Index build, freshness, incremental update (09/10) |
-| Right when | Data is a fresh, exact, queryable API | Static, fuzzy, free-text corpus |
-
-**What we gave up.** Semantic recall and microsecond retrieval. blooming insights cannot answer "find past investigations similar to this one" because it has no embedding index, and each retrieval pays a rate-limited network round-trip rather than a microsecond cosine. For its actual workload — a few deep, exact investigations — neither loss bites: the questions are exact analytics, and the latency budget (`maxDuration = 300`, `maxToolCalls` bounded) accommodates sequential live calls.
-
-**What the alternative would have cost.** Embedding-RAG over the analytics data would buy nothing the live tool lacks and add every cost it avoids: a stale, lossy copy of data that is already a fresh, exact API; an embedding pipeline; a vector store; a freshness policy (`09`); incremental indexing (`10`); and the loss of exactness (an embedding of a number is a fuzzy point, not the number). It is the textbook over-engineering of forcing the canonical pattern onto data it does not fit.
-
-**The breakpoint.** Live-tool retrieval is correct as long as every query is an exact question against the live API. Embedding-RAG becomes warranted the instant a feature needs *fuzzy recall over free text* — concretely, "find past investigations similar to this one" over the stored narratives in `lib/state/investigations.ts`. That single feature, and only it, justifies building the index files 01–10 describe. The rule: no embedding index until a feature provably needs semantic recall over non-API data.
-
-### What wasn't actually a tradeoff
-
-Grounding quality. Both retrievers ground the answer in real data — the choice between them does not sacrifice grounding, only the *kind* of retrieval. Live tools ground in exact current analytics; an index would ground in embedded snapshots. blooming insights gave up nothing on grounding by choosing live retrieval; it gained freshness and exactness.
-
----
-
-## Tech reference (industry pairing)
-
-### live-tool / agentic retrieval (the chosen retriever)
-
-- **Codebase uses:** `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11/L16) via the agent loop (`lib/agents/base.ts`); MCP transport (`lib/mcp/transport.ts`).
-- **Why it's here:** the data is a fresh, exact, queryable API — a live read beats a stale, lossy index.
-- **Leading today:** MCP-based and function-calling tool retrieval lead agentic grounding (2026).
-- **Why it leads:** always-current, exact results with no index to build or keep fresh.
-- **Runner-up:** direct API/SQL retrieval wired as a tool — the same live-read idea without MCP.
-
-### embedding-RAG (the deferred retriever)
-
-- **Codebase uses:** nothing — no embeddings, vector store, or chunking.
-- **Why it's here (absent):** the data is a live exact API, not a static fuzzy corpus; an index would be stale and lossy.
-- **Leading today:** LangChain/LlamaIndex over a vector DB (Pinecone/Qdrant/pgvector) lead classic RAG (2026).
-- **Why it leads:** fast semantic retrieval over static document corpora the model was not trained on.
-- **Runner-up:** managed RAG services (Vertex AI Search, Azure AI Search) — turnkey index + retrieval.
-
-### grounding / hallucination mitigation
-
-- **Codebase uses:** live retrieval grounds every diagnosis/recommendation in real query results (the agent loop feeds `tool_result` back before synthesis).
-- **Why it's here:** ungrounded answers hallucinate event names and numbers; live results pin the answer to real data.
-- **Leading today:** retrieval grounding (RAG or tool-retrieval) leads hallucination mitigation (2026).
-- **Why it leads:** the answer is conditioned on retrieved facts, not training-time priors.
-- **Runner-up:** citation/attribution requirements forcing the model to point at its retrieved evidence.
-
----
-
 ## Project exercises
 
 ### Build the one threshold-crossing feature: semantic search over past investigations
@@ -262,19 +208,6 @@ Grounding quality. Both retrievers ground the answer in real data — the choice
 - **Files to touch:** new `docs/adr/retrieval-strategy.md` (the decision record), cross-referencing `lib/mcp/tools.ts`, `lib/mcp/client.ts`, and `lib/agents/base.ts`.
 - **Done when:** the ADR names the three data properties (freshness, exactness, queryable source), maps each to why live retrieval wins, and states the one feature that would justify adding embedding-RAG.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-RAG is retrieve-then-generate, and its "retriever" is a swappable interface with two implementations: a pre-built embedding index (classic RAG) and a live source query (the blooming insights way). blooming insights does retrieval-augmented generation with a *live tool* as the retriever — the agent calls `execute_analytics_eql` against Bloomreach and grounds its answer in the fresh result — and deliberately has no embedding index because its data is a fresh, exact, queryable API where an index would be a stale, lossy copy to maintain. The threshold rule: add embedding-RAG only when a feature's data is *not* a live exact API, which is true of exactly one prospective feature — semantic search over past investigations.
-
-**Key points:**
-- RAG = retrieve-then-generate; the retriever is pluggable (live tool vs. embedding index).
-- blooming insights uses the live-tool retriever — it grounds answers in fresh, exact analytics.
-- An embedding index over the analytics data would be stale (09), lossy, and an operational burden (10).
-- Live retrieval gives up semantic ("like this") recall and microsecond latency — neither bites the actual workload.
-- The one threshold that justifies embedding-RAG: semantic search over free-text past investigations.
 
 ---
 
@@ -349,5 +282,10 @@ A reviewer says "every serious AI product uses a vector database; add one." Defe
 
 Does blooming insights do RAG, and what is its retriever? (Answer: yes — it does retrieval-augmented generation with a *live tool* as the retriever: the agent loop runs `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11/L16) against Bloomreach and grounds the answer in the fresh result; it deliberately has no embedding-index retriever because the data is a fresh, exact, queryable API where an index would be stale and lossy.)
 
+## See also
+
+→ ../04-agents-and-tool-use/02-tool-calling.md · → 05-dense-vs-sparse.md · → 09-stale-embeddings.md · → 12-graphrag.md · → 01-embeddings.md
+
 ---
 Updated: 2026-05-28 — corrected one stale ref: `maxDuration: 60` → `maxDuration = 300`. Case-B rationale (live tool retrieval over embedding-RAG) unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

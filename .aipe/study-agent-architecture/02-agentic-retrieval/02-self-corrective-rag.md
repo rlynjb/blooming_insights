@@ -5,7 +5,6 @@
 
 > A grader sits between *retrieve* and *generate* and asks "is this chunk actually relevant and the answer actually grounded in it?" — if not, fall back (rewrite, widen, escalate). blooming insights has no such grader on the agentic-RAG loop; the closest adjacent checks are the monitoring agent's volume-check prompt and the diagnostic agent's hypothesis-testing structure, both of which validate the *premise* of retrieval rather than the *relevance* of a retrieved chunk.
 
-**See also:** → 01-agentic-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/04-reflexion-self-critique.md` · → `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
 
 ---
 
@@ -252,7 +251,7 @@ The self-corrective RAG pattern (canonical, with where this codebase sits)
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case B — the relevance grader is not implemented on the retrieval path.** The honest sentence: there is no model-graded relevance check between `execute_analytics_eql` results and the next agent turn — the loop in `runAgentLoop` (`lib/agents/base.ts` L161–L171) wraps the tool result and feeds it back unmodified.
 
@@ -320,94 +319,6 @@ The grader can lie. A self-grader (same model family) shares blind spots with th
 - Reflexion / self-critique (`../01-reasoning-patterns/04-reflexion-self-critique.md`) → the grader-as-critic pattern at the *answer* layer, not the retrieval layer
 - Retrieval routing (`03-retrieval-routing.md`) → grader-driven routing between multiple retrievers when one fails
 - LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/` files on judge calibration
-
----
-
-## Tradeoffs
-
-The decision was *whether to gate retrieval with a relevance check before generating from it.* This codebase did not add the gate (Phase A); the alternative is the textbook self-corrective form (Phase B).
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ No grader (chosen — now)    │ Grader added (alternative)  │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Per-turn cost    │ 1× model call (reason)      │ 2× model calls (reason +    │
-│                  │                             │ grade)                      │
-│ Per-investigation│ ~6 model calls + 6 EQL      │ ~12 model calls + 6 EQL     │
-│ Latency          │ ~1× LLM RTT per turn        │ ~2× LLM RTT per turn        │
-│ Failure mode     │ off-topic retrieval reaches │ off-topic retrieval is      │
-│ caught           │ the answer (caught only by  │ caught at the retrieval     │
-│                  │ downstream hypothesis test) │ step                         │
-│ Failure mode     │ wrong-window retrieval      │ wrong-window retrieval is   │
-│ caught (premise) │ caught by monitoring        │ caught by monitoring        │
-│                  │ volume-check prompt         │ volume-check (same)         │
-│ Debuggability    │ a wrong answer needs        │ a wrong answer might come   │
-│                  │ trajectory replay to find   │ from grader bias, not just  │
-│                  │ where retrieval went off    │ retrieval                   │
-│ Ops burden       │ none beyond the loop        │ grader model choice + bias  │
-│                  │                             │ calibration                 │
-│ Self-grader risk │ N/A                         │ same-family bias; needs a   │
-│                  │                             │ different model or rules    │
-│ Loop complexity  │ retrieve → observe → next   │ retrieve → grade → fallback │
-│                  │                             │ ladder → observe → next     │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up early detection of off-topic retrieval. A diagnostic agent whose model emits an EQL that returns aggregates from the wrong event (e.g., a different funnel) will reason on those numbers as if they were the right ones, until the *downstream* hypothesis-testing step notices the inconsistency — if it notices at all. The cost is occasional confidently-wrong diagnoses no in-loop check catches.
-
-We also gave up the explicit fallback ladder. Without a grader-driven fallback, the loop has no "rewrite this query" branch. If the model retrieved badly on turn 1, it has to notice on turn 2 by reasoning ("hm, this doesn't look right") rather than via a structural signal. Some models do this well; not all do, and trusting the model to notice its own bad retrieval is exactly the blind spot self-corrective RAG was named to address.
-
-### What the alternative would have cost
-
-If we had built a relevance grader, every turn would cost 2× model calls (reason + grade) instead of 1×. Across a 6-tool-call diagnostic, that's ~6 extra Claude calls per investigation — at current pricing, a noticeable per-run hike, and the latency would push closer to (but probably not over) the 300s route budget. We would also have had to pick the grader's model family and calibrate its bias against the retriever's model — non-trivial ops work for a quality win we have not measured.
-
-### The breakpoint
-
-This stays the right call until two things converge: (a) the codebase ships a feature where retrieval can plausibly return *off-topic* results (a vector index over free-text narratives, a web search tool — anything where chunk relevance is fuzzier than typed EQL aggregates), AND (b) the feature's answers go to users without a human review step. Today, EQL's typed structure keeps retrieval mostly on-topic and the investigation flow has implicit human review (the user reads the diagnosis before acting on it). Either of those changing flips this from "fine to skip" to "needed."
-
-### What wasn't actually a tradeoff
-
-"Just trust the model to validate retrieval itself in the same reasoning step" was not a real alternative. That's exactly the conflation self-corrective RAG was named to prevent. A model reading its own retrieved context will confabulate around it; mixing "evaluate the retrieval" and "reason from the retrieval" into one step is the same as not evaluating, because the same priors that surfaced the chunk approve the chunk. The split into two model calls is the whole point — if you collapse them you've removed the gate while keeping its overhead in disguise.
-
----
-
-## Tech reference
-
-### LLM-as-judge (the grader pattern)
-
-- **Codebase uses:** not implemented for retrieval grading; conceptually adjacent in the diagnostic agent's hypothesis-test prompt (`lib/agents/prompts/diagnostic.md` L21–L25), which uses the model to score whether evidence supports a candidate hypothesis — judge-shaped but applied to reasoning, not to retrieval.
-- **Why it's here:** the grader IS an LLM-as-judge instance, scoring "is this chunk relevant to that question" the same way LLM-as-judge scores "is this answer good for that question."
-- **Leading today:** OpenAI / Anthropic structured-output graders — adoption-leading for production judge calls, 2026.
-- **Why it leads:** structured outputs make the grader's score machine-readable, and the same providers' models can act as graders without a separate stack.
-- **Runner-up:** a fine-tuned smaller judge model (open-source) — cheaper per call, narrower in scope, more ops burden.
-
-### Bloomreach EQL (the structured retriever)
-
-- **Codebase uses:** the EQL strings the agents emit and `execute_analytics_eql` runs against Bloomreach (`lib/mcp/tools.ts`).
-- **Why it's here:** EQL's typed shape (events, aggregates, windows) is what makes the absence of a relevance grader survivable today — retrieval is structurally constrained to return what the query asked for.
-- **Leading today:** EQL — domain-specific; not a general retrieval pattern.
-- **Why it leads:** typed aggregates against named events keep retrieval results structurally on-topic by construction — an EQL that runs returns numbers about the event it named.
-- **Runner-up:** raw event export + SQL — same structural guarantee, more ops.
-
-### Self-RAG / CRAG (the named patterns)
-
-- **Codebase uses:** neither implemented; cited as the textbook shape this file teaches.
-- **Why it's here:** they're the two industry-standard names for "a grader between retrieve and generate."
-- **Leading today:** Self-RAG-style inline reflection tokens — adoption-leading inside specialized retrieval frameworks, 2026.
-- **Why it leads:** keeps the grader inside the same model call (no second LLM RTT), which is cheaper than the external-judge form.
-- **Runner-up:** CRAG-style external grader — slower per call but cleaner failure surface (the grader is observable, replayable, and replaceable).
-
----
-
-## Summary
-
-Self-corrective RAG inserts a relevance/groundedness grader between retrieve and generate, plus a fallback path (rewrite, widen, escalate) for when the grader rejects a chunk. blooming insights does not implement this on its agentic-RAG retrieval path — `runAgentLoop` (`lib/agents/base.ts` L48–L176) feeds tool results back to the model unmodified. Two adjacent checks exist: the monitoring agent's volume-check prompt (`prompts/monitoring.md` ~L31) gates retrieval's *premise* (the window has data), and the diagnostic agent's hypothesis-testing structure (`prompts/diagnostic.md` L21–L25) gates the *answer's* groundedness. Neither closes the gap a relevance grader would. The reason it works today is that EQL's typed structure keeps retrieval mostly on-topic by construction; the day the codebase adds a fuzzier retriever (vector search over narratives), the gap becomes a real failure mode.
-
-- The grader's job is two checks: relevance (does this chunk fit the question?) and groundedness (does the answer follow from this chunk?).
-- "Retrieval succeeded" ≠ "answer is right" — the grader exists because the gap is real and silent without it.
-- The fallback ladder is rewrite → widen → escalate, each with a cap to bound correction cost.
-- This codebase has adjacent gates (premise check before retrieval, hypothesis test on the answer) but no relevance gate on the retrieval result itself.
-- The breakpoint is a fuzzier retriever + answers going to users without review; both have to flip before the grader earns its 2× per-turn cost.
 
 ---
 
@@ -519,5 +430,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 01-agentic-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/04-reflexion-self-critique.md` · → `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

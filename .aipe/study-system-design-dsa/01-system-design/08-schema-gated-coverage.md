@@ -5,7 +5,6 @@
 
 > A pipeline stage that tests a fixed checklist against the live data schema before doing any work, then streams the per-item verdict to the UI so the grid fills tile-by-tile and shows honest "no data" placeholders for what the workspace can't support.
 
-**See also:** → 01-request-flow.md · → 05-streaming-ndjson.md · → 06-multi-agent-orchestration.md · → ../02-dsa/07-coverage-gate.md
 
 ---
 
@@ -143,7 +142,7 @@ The gate is a free, in-memory checkpoint that does two jobs at once: it bounds t
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `app/api/briefing/route.ts` (gate + stream), `lib/agents/categories.ts` (the gate functions), `components/feed/CoverageGrid.tsx` (the UI), `app/page.tsx` (the client accumulator)
 **Function / class:** the `GET` handler's coverage stage; `schemaCapabilities` / `coverageReport` / `runnableCategories`; `CoverageGrid`; the briefing `handle()` switch
@@ -215,59 +214,6 @@ Compute the cheap gate before the expensive work, and let one computation serve 
 - **Persist the coverage report** alongside insights so the investigate page and exports can show "this briefing covered 7/10 categories" without recomputing.
 - **Onboarding nudges** — invert the gate (capability → categories it would unlock) to tell a workspace "emit `search` events to unlock search-failure monitoring."
 - **Per-category budget hints** — fold each category's expected EQL cost into the gate so the agent can prioritise under a tight 300 s ceiling, not just include/exclude.
-
----
-
-## Tradeoffs
-
-| Dimension | Gate-then-run-then-stream (this) | Run everything, filter results after | Hard-coded category set |
-|---|---|---|---|
-| Budget spent on unsupported categories | none (filtered before run) | full — every category queried | none, but wrong set per workspace |
-| Adapts to a varying schema | yes (live gate) | yes (but after paying) | no — breaks off the coded schema |
-| UI honesty about gaps | explicit ghost tiles + note | gaps look like "no result" | gaps invisible |
-| Extra computation | one in-memory gate pass | none up front, wasted calls later | none |
-| Reveal cadence | per-item stream (paced in demo) | all-at-once after the full run | n/a |
-| Coupling | registry dep tokens ↔ schema names | none | none (but unsafe) |
-| Failure mode | misnamed event → ghost (visible) | misnamed event → empty result (silent) | wrong workspace → broken cards |
-
-**What was given up.** The progressive tile-by-tile reveal is real only in the demo replay; on a live run the gate resolves instantly and the grid fills in one flush. We accepted that because faking a delay on a live run is the cosmetic dishonesty the product avoids — the live "watch it work" moment is the EQL trace, not the gate.
-
-**Alternative cost.** Running all 10 categories and filtering empties afterward avoids the gate entirely but spends scarce ~1 req/s calls on guaranteed-empty queries — and under a 300 s ceiling those wasted calls can be the difference between finishing and timing out. A hard-coded category set is simplest but is incorrect for any workspace whose schema differs from the one it was coded against, which is the whole reason the gate exists.
-
-**Breakpoint.** Gate-then-run is right while the schema check is cheap relative to the work it guards and the registry is small. It needs reworking when the gate itself becomes expensive (hundreds of categories recomputed per request → cache it) or when "runnable" needs to be a ranking under budget rather than a binary include/exclude (fold per-category cost into the gate).
-
----
-
-## Tech reference (industry pairing)
-
-### Capability gating / graceful degradation
-
-- **Codebase uses:** `lib/agents/categories.ts` gate consumed in `app/api/briefing/route.ts` to scope the monitoring agent and drive the coverage grid's three tile states.
-- **Why it's here:** workspaces have varying schemas and the MCP budget is scarce — running only the supported categories and showing honest ghosts beats faking tiles or wasting calls.
-- **Leading today (adoption-leading, 2026):** runtime feature detection + progressive enhancement on the web (`in`/`supports` checks driving UI fallbacks) — the same gate-then-degrade shape.
-- **Why it leads:** it decouples the product from any one backend's exact capabilities; the surface adapts instead of assuming.
-- **Runner-up:** server-driven UI / GraphQL field gating — the server tells the client which features its schema can back; structurally identical to streaming `coverage_item`s.
-
-### NDJSON progressive disclosure
-
-- **Codebase uses:** `BriefingEvent` superset (`app/api/briefing/route.ts` L54–L58) streams `coverage_item` per category over the same `ReadableStream` channel as the agent trace; the client accumulates into the grid.
-- **Why it's here:** the grid should fill in step with the per-category checklist log, not pop in whole — and the demo replays it at `REPLAY_DELAY_MS` so the creds-free demo discloses like a live run.
-- **Leading today (innovation-leading, 2026):** streamed server components / RSC streaming and SSE-driven progressive UIs — incremental reveal of a server result as it's produced.
-- **Why it leads:** perceived performance and a visible sense of work, without holding the whole payload to first paint.
-- **Runner-up:** plain SSE (`EventSource`) — same incremental delivery, but `fetch` + a reader loop (used here) allows the POST/headers/refactor flexibility `EventSource` lacks. See `05-streaming-ndjson.md`.
-
----
-
-## Summary
-
-The briefing route gates a fixed 10-category checklist against the live workspace schema *before* running the monitoring agent. `schemaCapabilities` flattens the schema into a set; `coverageReport` classifies every category (full / limited / unavailable); `runnableCategories` hands the agent only the supported subset, so the scarce ~1 req/s budget is never spent on the impossible. The same verdict is streamed to the feed one `coverage_item` at a time (paired with a checklist log line), and `CoverageGrid` renders all 10 tiles from the registry — resolved tiles for reported categories, pending skeletons while loading, dashed "no data source" ghosts for unavailable ones, plus a coverage note. The gate is a cheap in-memory checkpoint that both bounds the expensive stage and produces the UI's coverage state from one computation.
-
-- **Checklist step:** **2** request/response flow (a stage between schema-bootstrap and agent-run) · **6** scale concerns (gate before spending a constrained budget) · touches **5** failure handling (degrade to ghosts instead of erroring).
-- Gate first, run second: the free schema check filters the categories the agent is allowed to query.
-- One computation, two consumers: `coverageReport` is both the agent's scope (via `runnableCategories`) and the grid's data.
-- The verdict streams per-category (`coverage_item`) over a local `BriefingEvent` superset, leaving the shared `AgentEvent` contract untouched.
-- Three verdicts → three honest tile states; unsupported categories are shown as ghosts, never faked or hidden.
-- The tile-by-tile reveal is a demo-replay property (`REPLAY_DELAY_MS`); on a live run the gate resolves instantly and the EQL trace is the visible work.
 
 ---
 
@@ -353,3 +299,8 @@ Your PM says: "The ghost tiles look broken — just hide categories the workspac
 - What event type carries one category's verdict, and why isn't it added to the shared `AgentEvent` union? (See `05-streaming-ndjson.md`.)
 - What are the four tile states the grid can render, and which one is *not* a gate verdict?
 - On a live run, is the tile-by-tile reveal real? What *is* the genuinely incremental work that follows the gate?
+
+## See also
+
+→ 01-request-flow.md · → 05-streaming-ndjson.md · → 06-multi-agent-orchestration.md · → ../02-dsa/07-coverage-gate.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Every blooming insights investigation already emits a live trace — an NDJSON stream of `reasoning_step` / `tool_call_start` / `tool_call_end{durationMs}` events that the UI renders as the agent's visible work (a sticky `StatusLog` sidebar on both investigate steps, an inline panel on the feed, each row timestamped and the reasoning text pretty-printed by `TraceContent`), the briefing route narrates per tool call with `describeToolCall`, the `/debug` page exercises one call at a time, and the investigation cache replays event-for-event. The trace is not an add-on; it is the product surface.
 
-**See also:** → 01-eval-set-types.md · → 02-eval-methods.md · → ../04-agents-and-tool-use/03-react-pattern.md · → ../01-llm-foundations/05-streaming.md · → ../06-production-serving/01-caching.md
 
 ---
 
@@ -227,7 +226,7 @@ One captured `AgentEvent[]` stream feeds three consumers — the live UI (read b
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -304,66 +303,6 @@ The abstraction is identical across domains: a timed operation is a span, an ord
 
 ---
 
-## Tradeoffs
-
-### Hand-built NDJSON trace (product-facing) vs. a tracing platform vs. plain logs
-
-| Dimension | This codebase (NDJSON AgentEvent stream) | Langfuse/LangSmith platform | Plain `console.log` |
-|---|---|---|---|
-| Setup cost | Already built — typed union + hooks | SDK + account + instrumentation | Zero |
-| User-facing | Yes — the trace IS the UI | No — operator dashboard only | No |
-| Span timing | Yes — `durationMs` per call | Yes — automatic | Manual, error-prone |
-| Cross-run aggregation | No — one trace at a time | Yes — p50/p95, error rates | No |
-| Queryable store | No — in-memory + dev file | Yes — indexed, retained | No |
-| Replay | Yes — same events, verbatim | Yes — and counterfactual | No |
-| Cost/token tracking | No | Yes — built in | No |
-
-**What we gave up.** Cross-run aggregation and a queryable store. blooming insights can show you one investigation's trace in perfect detail — every step, every duration — but cannot answer "what is the p95 latency of `execute_analytics_eql` across the last 200 runs" because traces are not persisted to anything queryable (`lib/state/investigations.ts` is an in-memory Map plus a dev-only JSON file). It also gave up cost/token visibility — no event carries token counts, so you cannot trace spend per investigation.
-
-**What the alternative would have cost.** A platform (Langfuse) gives aggregation, storage, and cost tracking out of the box — but it is an operator-facing dashboard, not a product surface, and the codebase's central design bet is that the trace *is* the product (the user watches the agent reason and query in real time). Adopting a platform would not replace the NDJSON stream to the UI; it would sit alongside it. Plain logs are free and useless for this — unstructured text cannot be replayed, rendered into the timestamped `StatusLog`/`TraceContent` view, or narrated per-call the way `describeToolCall` labels each query.
-
-**The breakpoint.** The hand-built trace is exactly right while the goal is *show the user the work* and *debug one run at a time*. It stops being sufficient the moment you need to answer questions *across* runs — "which tool regressed," "what is our error rate," "where is the latency budget going on average." At that point you must persist traces to a queryable store (or adopt a platform) and add span aggregation; the existing `AgentEvent` schema is already the right shape to ship to one.
-
-**What wasn't actually a tradeoff.** Building the trace by hand did not cost reliability — because timing happens at the single `mcp.callTool` choke-point (`lib/agents/base.ts` L144–L149), every span is instrumented by construction, with no per-call instrumentation to forget. A platform's auto-instrumentation buys the same completeness; the hand-built version achieves it through the funnel.
-
----
-
-## Tech reference (industry pairing)
-
-### typed trace event schema (`AgentEvent` / NDJSON)
-
-- **Codebase uses:** `AgentEvent` discriminated union (`lib/mcp/events.ts` L4–L12) encoded as NDJSON (`encodeEvent` L15–L17); `ToolCall` span record (`lib/mcp/types.ts` L34–L42).
-- **Why it's here:** a typed, streamable schema lets one event list serve live UI, capture, and replay.
-- **Leading today:** OpenTelemetry is the adoption-leading trace schema/standard (2026); for LLM specifically, OTel GenAI semantic conventions are emerging.
-- **Why it leads:** vendor-neutral span model with broad backend support; instrument once, export anywhere.
-- **Runner-up:** proprietary SDK event schemas (LangSmith run trees) — richer LLM-specific fields, vendor-locked.
-
-### span + duration instrumentation
-
-- **Codebase uses:** `durationMs` captured at `lib/agents/base.ts` L144–L149 from `mcp.callTool`'s `{ result, durationMs }` return; surfaced as `tool_call_end{durationMs}` (`events.ts` L7).
-- **Why it's here:** per-call latency is the primary debugging signal for a slow run; timing at the choke-point guarantees coverage.
-- **Leading today:** OpenTelemetry spans with auto-instrumentation lead for adoption (2026).
-- **Why it leads:** automatic start/stop/duration capture with context propagation; no manual timing code.
-- **Runner-up:** manual `performance.now()` bracketing — what this codebase effectively does, simpler but per-call.
-
-### LLM observability platform
-
-- **Codebase uses:** none — observability is hand-built and product-facing; no Langfuse/LangSmith/Phoenix.
-- **Why it's here (the gap):** there is no queryable trace store, no cross-run aggregation, no token/cost tracking.
-- **Leading today:** Langfuse and LangSmith are innovation- and adoption-leading LLM observability platforms (2026); Arize Phoenix leads open-source.
-- **Why it leads:** queryable trace storage, span aggregation (p50/p95), cost/token tracking, and eval integration in one place.
-- **Runner-up:** Helicone (proxy-based, lowest-friction) and OpenLLMetry (OTel-native LLM tracing).
-
-### trace replay
-
-- **Codebase uses:** event-for-event replay from the investigation cache (`app/api/agent/route.ts` L127–L141, `REPLAY_DELAY_MS=180` L105; store at `lib/state/investigations.ts` L22–L41).
-- **Why it's here:** a cached investigation reproduces the agent's visible work without re-calling the model/MCP — fast, free, deterministic demo and debug.
-- **Leading today:** platform-backed replay (LangSmith run replay) leads (2026), including counterfactual re-runs with a changed prompt.
-- **Why it leads:** stores inputs as well as outputs, enabling re-execution with modified prompts/models, not just verbatim playback.
-- **Runner-up:** recorded-fixture replay (VCR-style) — deterministic, but verbatim only, like this codebase.
-
----
-
 ## Project exercises
 
 ### Persist traces to an `ai_trace` table
@@ -392,19 +331,6 @@ The abstraction is identical across domains: a timed operation is a span, an ord
 - **Files to touch:** `lib/state/investigations.ts` (store inputs alongside events), `app/api/agent/route.ts` (a `replayWith` mode), reads `lib/agents/prompts/diagnostic.md`.
 - **Done when:** a stored investigation can be re-run with an alternate `diagnostic.md` against its original inputs and the two traces compared.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-blooming insights already implements LLM observability end to end, by hand. A typed `AgentEvent` union (`lib/mcp/events.ts` L4–L12) is the trace schema; `tool_call_start`/`tool_call_end{durationMs}` is a span; `ToolCall` (`lib/mcp/types.ts` L34–L42) carries the span data; `durationMs` is captured at the single `mcp.callTool` choke-point (`lib/agents/base.ts` L144–L149); `hooksFor`/`send` (`app/api/agent/route.ts` L172–L195) stream the trace live and capture it; the `useInvestigation` hook reads the NDJSON into a timestamped `TraceItem[]` rendered by `StatusLog`/`ReasoningTrace`/`TraceContent`; `describeToolCall` (`app/api/briefing/route.ts` L28–L33) labels each tool call with the real query; `/debug` exercises one call; and `getCachedInvestigation`/`saveInvestigation` (`lib/state/investigations.ts` L22–L41) make the trace replayable event-for-event. The trace is the product surface — the user watches the work. Absent: a platform (Langfuse), span aggregation, a queryable store, and counterfactual replay.
-
-**Key points:**
-- A `tool_call_start`/`tool_call_end{durationMs}` pair is one span; the ordered `AgentEvent` list is the trace — the Network-tab waterfall for an agent.
-- Timing at the single `mcp.callTool` choke-point (`base.ts` L144–L149) makes every span instrumented by construction.
-- One captured `collected: AgentEvent[]` serves live UI, persistence, and replay.
-- Observability here is product-facing — the trace *is* the UI (`route.ts` L181–L195 → `useInvestigation` → `StatusLog`/`TraceContent`), not an operator dashboard.
-- Honest gaps: no platform, no cross-run aggregation, no queryable store, replay is verbatim-only.
 
 ---
 
@@ -479,5 +405,10 @@ A colleague says "drop the custom NDJSON trace and just add Langfuse." Argue wha
 
 Where is a tool call's `durationMs` captured, and why does capturing it there guarantee every span in the trace is timed? (Answer: at `lib/agents/base.ts` L144–L149, inside `runAgentLoop`'s per-tool block, from `mcp.callTool`'s `{ result, durationMs }` return — and because every agent's tool calls flow through this single loop, every span is timed by construction, with no per-call instrumentation to forget.)
 
+## See also
+
+→ 01-eval-set-types.md · → 02-eval-methods.md · → ../04-agents-and-tool-use/03-react-pattern.md · → ../01-llm-foundations/05-streaming.md · → ../06-production-serving/01-caching.md
+
 ---
 Updated: 2026-05-28 — Replaced the dead `summarizeTrace` view with the real briefing narration (`describeToolCall`, route L28–L33); documented the grown UI surface (StatusLog sticky sidebar on both investigate steps, ReasoningTrace per-line timestamps via the `TraceItem` type in ReasoningTrace.tsx, TraceContent markdown/JSON renderer with no `dangerouslySetInnerHTML`, the StrictMode-safe `useInvestigation` hook); re-derived all route.ts/types.ts/investigations.ts refs. NDJSON + AgentEvent contract unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

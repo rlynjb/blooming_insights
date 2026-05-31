@@ -5,7 +5,6 @@
 
 > blooming insights routes at two levels: each agent is handed only its relevant tool SUBSET (`monitoringTools` / `diagnosticTools` / `recommendationTools`) so the model cannot reach for the wrong tool, and free-form `?q=` queries are routed by a heuristic-first, LLM-second intent classifier (`parseIntent` then `classifyIntent`) to the right agent surface.
 
-**See also:** → 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -176,7 +175,7 @@ A reader who sees only this diagram should grasp: intent routing picks the surfa
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -260,54 +259,6 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 
 ---
 
-## Tradeoffs
-
-### Comparison: static subsets + heuristic-first intent vs alternatives
-
-| Dimension | This codebase | Single agent, all tools, prompt-only scoping | Always-LLM intent (no heuristic) |
-|---|---|---|---|
-| Wrong-tool prevention | Structural — tool absent from menu | Hope — prompt asks it not to | N/A |
-| Tool-selection accuracy | High — small menu per agent | Degrades with ~40-tool menu | N/A |
-| Intent cost (common case) | Free (heuristic resolves it) | N/A | One haiku call every query |
-| Adaptivity to cross-subset needs | Low — static partition | High — all tools available | N/A |
-| Misclassification path | Heuristic default + haiku fallback | N/A | Model only — no cheap path |
-
-**What we gave up.** Adaptivity. A static subset cannot grow at runtime; if a diagnosis needs a tool that lives only in `recommendationTools`, the diagnostic agent cannot reach it. We accept this because the overlap between subsets (shared `execute_analytics_eql`, shared `list_scenarios`) covers the common cross-cutting needs, and the cost of a too-broad menu (degraded selection accuracy across all queries) outweighs the cost of an occasional gap. We also gave up perfect intent accuracy on the heuristic path — "what changed?" defaults to `'diagnostic'` because it lacks the literal keyword — accepting the haiku fallback as the safety net.
-
-**What the alternative would have cost.** A single agent with all ~40 tools and prompt-only scoping ("only use diagnostic tools") would be simpler to wire but would rely on the model's instruction-following to avoid wrong tools — a probabilistic guarantee that degrades exactly when the menu is large. Always calling `classifyIntent` (skipping `parseIntent`) would add a haiku round-trip to every single query, including the unambiguous ones the heuristic resolves for free.
-
-**The breakpoint.** Static subsets are right while the tool catalog is small enough to partition by hand and the partitions cover real needs. They stop being right when the catalog grows past a few dozen tools or the cross-subset needs become frequent — at which point semantic tool retrieval (embed tool descriptions, retrieve top-k per query) replaces the hand-maintained `const` arrays. The intent heuristic's breakpoint is when keyword matching's miss rate on real phrasing exceeds the cost of always classifying — then drop `parseIntent` from the front and always call the model.
-
----
-
-## Tech reference (industry pairing)
-
-### Static tool subsets via filterToolSchemas
-
-- **Codebase uses:** `const` name arrays in `lib/mcp/tools.ts`, applied by `filterToolSchemas` (`tool-schemas.ts` L15) to produce each agent's `params.tools`.
-- **Why it's here:** Removing wrong tools from the menu is more robust than prompting against them.
-- **Leading today:** Per-agent / per-task static tool scoping is the adoption-leading approach in 2026; semantic tool retrieval is innovation-leading.
-- **Why it leads:** Deterministic, debuggable, and trivially correct for small catalogs.
-- **Runner-up:** Semantic tool retrieval (embed tool descriptions, top-k) — scales to large catalogs, adds a retrieval dependency.
-
-### Intent classification (heuristic + small model)
-
-- **Codebase uses:** `parseIntent` substring heuristic + `classifyIntent` haiku call (`intent.ts` L6–L31), wired at `route.ts` L211.
-- **Why it's here:** A free deterministic check resolves the common case; a cheap model resolves ambiguity.
-- **Leading today:** Small-model / heuristic request classification is the adoption-leading router in 2026.
-- **Why it leads:** Fast, cheap, and good enough for a 3-way classification with a deterministic fallback.
-- **Runner-up:** Embedding-based intent classification (nearest-centroid over labeled examples) — more robust to phrasing, needs a labeled set and an embedding model.
-
-### claude-haiku-4-5 (the classifier model)
-
-- **Codebase uses:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` with `max_tokens: 16` (`intent.ts` L14, L20).
-- **Why it's here:** Intent classification is a trivial task; the cheapest/fastest model with a tight token cap is the right tool.
-- **Leading today:** Small fast models (Haiku-class, GPT-mini-class) are adoption-leading for routing/classification in 2026.
-- **Why it leads:** Sub-second latency and low cost for tasks that do not need frontier reasoning.
-- **Runner-up:** A fine-tuned tiny classifier — cheaper per call at scale, more setup.
-
----
-
 ## Project exercises
 
 ### Confidence-gate the intent classifier to skip the haiku call
@@ -327,19 +278,6 @@ Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinel
 - **Files to touch:** `lib/agents/query.ts` (L24, L36 — accept and apply the subset for the intent); `app/api/agent/route.ts` (pass intent through, L214); `test/agents/query.test.ts`.
 - **Done when:** A `'monitoring'` query's `runAgentLoop` is handed only `monitoringTools`, verified by a unit test with a fake MCP, and a `'diagnostic'` query gets `diagnosticTools`.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights routes at two levels. Router 1 is static tool scoping: each agent is constructed with only its tool subset (`monitoringTools` / `diagnosticTools` / `recommendationTools` in `lib/mcp/tools.ts`), applied by `filterToolSchemas` (`tool-schemas.ts` L15) so the model's menu (`params.tools`, `base.ts` L101) never contains a wrong tool — routing by construction. Router 2 is dynamic intent classification for the free-form `?q=` path: `parseIntent` (a free substring heuristic, `intent.ts` L6–L12) first, `classifyIntent` (a haiku call capped at 16 tokens, L17–L31) as the fallback, with the heuristic normalizing the model's output. The two compose at the route: intent picks the surface and framing, subset-scoping bounds what each surface can do.
-
-Key points:
-- Subset-scoping prevents the wrong tool by *removing it from the menu*, not by prompting against it.
-- `queryTools` is the deliberate exception — the de-duplicated union of all three subsets for the answer-anything agent.
-- Intent routing is heuristic-first, LLM-second: `parseIntent` resolves the common case for free; `classifyIntent` (haiku, 16 tokens) handles ambiguity.
-- `classifyIntent` runs its model output back through `parseIntent` (L30) — the heuristic is both the front and the normalizer.
-- Static subsets break at large catalogs (→ semantic tool retrieval); the intent heuristic breaks on keyword-free phrasing (→ the haiku fallback).
 
 ---
 
@@ -418,5 +356,10 @@ A reviewer says: "Hand-maintaining three tool arrays is a maintenance burden —
 
 What does `classifyIntent` do with the haiku model's text output before returning it, and why? (Answer: it passes it through `parseIntent` — `intent.ts` L30 — to coerce a possibly-noisy one-word answer into a valid `Intent`, defaulting to `'diagnostic'`.)
 
+## See also
+
+→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15 and refreshed the `route.ts` query-branch refs (L210–L218); noted the investigation chain is now `step`-gated (`step=diagnose`/`step=recommend`) and fixed the `bootstrapTools`/`list_voucher_pools`/per-agent subset line numbers.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

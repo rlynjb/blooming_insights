@@ -5,7 +5,6 @@
 
 > Independent sub-jobs run simultaneously; a merger combines the results. blooming insights does NOT fan out — the pipeline is sequential, user-gated, and the ~1 req/s MCP rate limit makes wide concurrency a poor fit. The topology that earns its overhead the day independent sub-questions across multiple domains arrive in one request.
 
-**See also:** → `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
 
 ---
 
@@ -282,7 +281,7 @@ Parallel fan-out — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.**
 
@@ -363,96 +362,6 @@ It also breaks when the merge is an LLM and the worker outputs contradict each o
 - `./03-sequential-pipeline.md` → the shape fan-out becomes when sub-jobs are dependent (this codebase)
 - `./09-coordination-failure-modes.md` → "tool-call cascade" and "synthesis failure" — both fan-out-amplified
 - `../06-orchestration-system-design-templates/` → the "multi-agent research assistant" template, which uses fan-out as standard
-
----
-
-## Tradeoffs
-
-The decision was: **sequential pipeline today; fan-out deferred.** The alternative is to introduce fan-out for multi-domain queries.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Sequential (chosen)         │ Parallel fan-out            │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Wall-clock       │ sum of sub-job times        │ max of sub-job times +      │
-│ latency          │                             │ merge time                  │
-│ Provider calls   │ pays for one path through   │ pays for N worker loops +   │
-│ / run            │ the agents                  │ optional merge LLM call     │
-│ Rate-limit risk  │ none — single concurrent    │ high — needs semaphore to   │
-│                  │ stream                      │ stay under provider limit   │
-│ Hidden-dep risk  │ none — order enforces deps  │ HIGH — silent failures when │
-│                  │                             │ "independent" jobs share    │
-│                  │                             │ context                     │
-│ Merge correctness│ free (function call between │ contested — function-call   │
-│                  │ stages)                     │ merge fine, LLM merge can   │
-│                  │                             │ fabricate / average         │
-│ Debugging        │ stage-localized             │ N concurrent trajectories;  │
-│                  │                             │ harder to interleave        │
-│ Build cost       │ none extra — sequential is  │ +semaphore lib, +merge      │
-│                  │ already there               │ logic, +sub-question split  │
-│ Stops being      │ when independent sub-jobs   │ stops being right when      │
-│ right when…      │ across multiple domains     │ provider rate limit makes   │
-│                  │ arrive in one request       │ N=1 the practical cap       │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up wall-clock parallelism for the QueryAgent's multi-domain path. A user who asks "give me funnel + conversion + retention + segment breakdowns for the last 30 days" gets ~5 seconds of sequential MCP calls inside the single QueryAgent loop. A fan-out shape would give ~max(t_funnel, t_conversion, t_retention, t_segment) ≈ 2 seconds (under perfect concurrency, before the rate-limit cap).
-
-We also gave up the "research assistant" shape entirely. The diagnostic agent today investigates one anomaly at a time, sequentially making EQL queries. A fan-out diagnostic could investigate multiple hypotheses in parallel. We chose not to because the single-anomaly path is fast enough at current usage and the data dependencies between hypotheses (the second hypothesis often refines the first) make naive fan-out hide-the-dependency-prone.
-
-### What the alternative would have cost
-
-If we'd built fan-out from day one, the up-front cost would have been a semaphore library, a sub-question splitter (either deterministic code or an LLM planner), and a merge step. Per-run cost would have been N worker LLM loops instead of 1, plus an optional merge LLM call. Under the MCP rate limit (~1 req/s, `connect.ts` L92), the concurrency cap would have been ~N=2 — meaning fan-out would only halve the latency on multi-domain queries, at 4–5x the LLM cost.
-
-The hidden cost: the debugging surface multiplies. A sequential trajectory has one timeline; a fan-out trajectory has N concurrent timelines that interleave at the merge step. Replay tooling has to reconstruct concurrent trajectories from a stream — non-trivial.
-
-### The breakpoint
-
-This stays the right call until users start arriving with *multi-domain* questions in a single request — e.g. "compare last week's revenue across our top 5 segments AND tell me the funnel drop-off AND which features changed." The day the QueryAgent's average latency exceeds ~8 seconds on these requests *and* the queries are decomposable into independent sub-domains, fan-out earns its overhead. The MCP rate limit also has to be relaxed (raised to ~3–5 req/s) for the parallelism win to be meaningful — otherwise the semaphore cap collapses fan-out back to sequential.
-
-### What wasn't actually a tradeoff
-
-Fanning out the *pipeline stages* (monitoring + diagnostic + recommendation in parallel) was not a real alternative. The recommendation agent's signature literally requires the diagnosis as an input — `propose(anomaly, diagnosis, hooks)`. Parallelizing these stages would mean running recommendation with no diagnosis, which TypeScript wouldn't compile and the model would have nothing to recommend from. The pipeline's stages aren't independent; that's settled.
-
----
-
-## Tech reference
-
-### p-limit (the semaphore primitive)
-
-- **Codebase uses:** not used today — listed for the alternative landscape.
-- **Why it's here:** `p-limit` is the standard concurrency cap library in the TS ecosystem; you'd reach for it the day fan-out lands. The MCP layer's `minIntervalMs: 1100` already does a baby version of this for tool calls.
-- **Leading today:** `p-limit` — adoption-leading for in-process concurrency caps in Node/TS, 2026.
-- **Why it leads:** zero deps, one function (`pLimit(n)`), works with native `Promise.all`. The same shape every JS developer recognizes.
-- **Runner-up:** `bottleneck` — token-bucket-style rate limiter with time-window caps; the right tool when the constraint is "X requests per second," not "X concurrent in flight."
-
-### Anthropic Messages API tool_use (per-worker loop)
-
-- **Codebase uses:** `runAgentLoop` in `lib/agents/base.ts` L48–L176; each fan-out worker would be a separate `runAgentLoop` call running concurrently.
-- **Why it's here:** the same loop primitive that runs sequentially today would be the per-worker primitive in a fan-out — `Promise.all(workers.map(w => runAgentLoop(w.config)))`.
-- **Leading today:** Anthropic tool use — innovation-leading for ReAct loops with structured tool calls, 2026.
-- **Why it leads:** typed tool calls + isolated per-loop budgets make per-worker isolation trivial — each worker's loop sees only its own tools and tool_results.
-- **Runner-up:** OpenAI Responses API — equivalent per-loop semantics, larger installed base.
-
-### LangGraph Send / Map-Reduce (the framework version)
-
-- **Codebase uses:** not used.
-- **Why it's here:** LangGraph's `Send` API is the canonical framework primitive for fan-out — it emits N node invocations from one upstream node, runs them in parallel, and joins results at a downstream "reduce" node.
-- **Leading today:** LangGraph Send — innovation-leading for graph-style fan-out with checkpointing, 2026.
-- **Why it leads:** first-class fan-out in a state graph (the join point is also a checkpoint), explicit "what fanned out" trace, built-in retry on per-shard failure.
-- **Runner-up:** OpenAI Agents SDK parallel handoffs — simpler model (handoffs are tools), less checkpointing ceremony.
-
----
-
-## Summary
-
-Parallel fan-out is `Promise.all()` with a merge — independent sub-jobs run as concurrent ReAct loops, with the merge either a function call (deterministic) or another agent (synthesis with reasoning). blooming insights does not fan out today: the pipeline is sequential because the data dependency between diagnostic and recommendation is real (the function signature enforces it), and the ~1 req/s MCP rate limit (`connect.ts` L92, `minIntervalMs: 1100`) means a concurrency cap of N=1–2 collapses fan-out's latency win back to sequential. The breakpoint where fan-out would earn its overhead: multi-domain queries in a single request (4 independent domains, each a sub-question) — at which point the QueryAgent's sequential MCP calls become the bottleneck and the rate limit becomes worth relaxing. See `../06-orchestration-system-design-templates/` for the refactor toward a multi-agent research assistant.
-
-- Fan-out is `Promise.all()` with a merge step — each promise is a ReAct loop, the merge is a function call or an agent.
-- Two conditions for the win: sub-jobs genuinely independent AND upstream can absorb N concurrent calls (semaphore cap, rate limit).
-- blooming insights doesn't fan out — pipeline is sequential by data dependency, MCP rate limit makes wide concurrency moot.
-- The breakpoint: multi-domain queries arriving in one request, AND the MCP rate limit raised enough to make N>1 meaningful.
-- The hidden failure mode: "fan-out hides the dependency" — independent-looking sub-jobs that actually need each other produce plausible-but-wrong outputs that the merger averages.
 
 ---
 
@@ -608,5 +517,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

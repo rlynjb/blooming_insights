@@ -5,7 +5,6 @@
 
 > The morning briefing is a fixed three-step chain — monitoring → diagnostic → recommendation — where each step does one job and its typed output is the next step's input. The investigation half is split across TWO HTTP requests: `/api/agent?step=diagnose` runs the diagnostic agent, the client stashes the resulting `Diagnosis` in sessionStorage (`bi:diag:<id>`), then `/api/agent?step=recommend` runs the recommendation agent with that diagnosis handed back via the `?diagnosis=` param — not a single in-process `await` chain. (The legacy combined-capture run, `step == null`, still sequences both with `await` in one request.) Inside each step a smaller chain runs: the tool-use loop gathers evidence, then a separate `synthesize()` call turns it into JSON.
 
-**See also:** → 01-context-window.md · → 02-lost-in-the-middle.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md · → ../01-llm-foundations/04-structured-outputs.md
 
 ---
 
@@ -206,7 +205,7 @@ The route owns the order — two `step`-gated requests live, one `await` sequenc
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -257,57 +256,6 @@ The chain trades flexibility for predictability and isolation. When the stages a
 
 ---
 
-## Tradeoffs
-
-### Fixed prompt chain vs. one mega-prompt
-
-| Dimension | This codebase (3-step chain) | One mega-prompt (detect+diagnose+recommend) |
-|---|---|---|
-| Prompt size per call | Small — one job each | Large — all rules, all catalogs at once |
-| Tool surface per call | Subset (6/6/4) | All tools always visible |
-| Failure isolation | Per link; degrades to a safe default | One failure corrupts the whole answer |
-| Intermediate validation | `isDiagnosis` between steps; `diagnosis` event streamed | None — no intermediate to validate or stream |
-| Latency | Compounds per link (3 sequential calls) | One call, but unbounded internal looping |
-| Per-step optimization | Possible (cheaper model per link) | Impossible — one call, one model |
-
-**What we gave up.** Latency and a small amount of token overhead. Three sequential links means three round-trips minimum, plus a possible `synthesize()` call per link — more wall-clock and more total tokens than one call. And the typed handoff means the intermediate `Diagnosis` is serialized and re-read by the next step — now literally *across the wire* (sessionStorage → `?diagnosis=` param) on the two-step live path, not just in a local variable. For a per-step 300-second budget those costs are real but affordable.
-
-**What the alternative would have cost.** A single mega-prompt holding detection rules, diagnostic strategy, and the recommendation catalog would be large, would expose every tool at every moment (inviting the model to call the wrong one), and would have no seam to validate the intermediate diagnosis or to stream a `diagnosis` event before recommendations exist. A failure mid-prompt would yield a tangled partial answer with no clean fallback per stage.
-
-**The breakpoint.** The sequential `await` chain is correct for a fixed 3-step path. It breaks when the workflow needs to branch on an intermediate result (low-confidence diagnosis → re-investigate) or to run links in parallel (two diagnostic hypotheses at once). At that point the route's `if/await` becomes a hand-rolled state machine and should be replaced with a graph runner. That event — branching or parallel links — is the trigger to graduate from a chain to a graph.
-
-**Not actually a tradeoff:** splitting gather from `synthesize()` inside a link. The micro-chain costs one extra call only when the loop's final turn fails to produce JSON; on the happy path it costs nothing, and it buys a clean-context extraction that is far more reliable than parsing the loop's tangled final turn.
-
----
-
-## Tech reference (industry pairing)
-
-### prompt chaining (sequential LLM pipeline)
-
-- **Codebase uses:** `step`-gated sequencing in the route (`app/api/agent/route.ts` L224–L249) across two client-driven requests for the live path — diagnostic then recommendation, the typed `diagnosis` handed between them via sessionStorage (`bi:diag:<id>`) → `?diagnosis=`; a single `await` sequence for the combined-capture run. No framework.
-- **Why it's here:** the briefing's stages are fixed (detect → explain → act), so a hand-wired chain is simpler and more transparent than any orchestration library.
-- **Leading today:** for fixed workflows, plain code (`await` / promise chains) leads adoption (2026); Anthropic's "Building effective agents" explicitly recommends starting with code-wired chains before reaching for a framework.
-- **Why it leads:** a fixed path needs no graph engine; ordinary control flow is the most debuggable, lowest-overhead way to express it.
-- **Runner-up:** LangChain LCEL (`|` pipe composition) — a declarative chain DSL when you want composability without a full graph.
-
-### graph orchestration (when the chain must branch)
-
-- **Codebase uses:** nothing — the chain is a straight `await` line with no branching.
-- **Why it's here (absent):** the briefing path is fixed; there is no conditional or parallel step, so a graph engine would be overhead.
-- **Leading today:** LangGraph leads adoption (2026) for branching, cyclic, and parallel agent/chain orchestration with typed state and checkpoints.
-- **Why it leads:** it expresses conditional edges and parallel nodes that sequential `await` cannot, with state flowing through a typed schema.
-- **Runner-up:** Anthropic Agent SDK / OpenAI Swarm — higher-level agent orchestration with built-in loops and handoffs.
-
-### per-step model selection (the un-taken optimization)
-
-- **Codebase uses:** one model for all links — `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9); haiku is used only for intent (`lib/agents/intent.ts` L14).
-- **Why it's here (not wired):** the chain enables per-link model choice, but every link reads the same constant; routing simpler links to a cheaper model is deferred.
-- **Leading today:** model tiering / model routing (cheap model for easy steps, strong model for hard steps) leads adoption (2026) as the first cost lever in multi-step pipelines.
-- **Why it leads:** earlier/simpler links in a chain are often easy enough for a cheaper, faster model, cutting cost and latency with no quality loss on those steps.
-- **Runner-up:** a learned router that picks the model per request by predicted difficulty (RouteLLM-style).
-
----
-
 ## Project exercises
 
 ### Route simpler chain links to a cheaper model
@@ -327,19 +275,6 @@ The chain trades flexibility for predictability and isolation. When the stages a
 - **Files to touch:** `app/api/agent/route.ts` (the step-3 branch at L244–L249, where the handed-over diagnosis is already parsed at L227), `lib/mcp/types.ts` (`Diagnosis.confidence` already exists at L71 — derived by `diagnosisConfidence`, `lib/insights/derive.ts` L54–L63).
 - **Done when:** a `FALLBACK` diagnosis short-circuits the recommendation link and the stream emits a clear inconclusive message instead of an empty `Recommendation[]`.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-The morning briefing is a fixed three-step prompt chain — monitoring detects, diagnostic explains, recommendation acts — where each step does one job with its own prompt, tool subset, and validator, and its typed output is the next step's input. The investigation half is split across two `step`-gated HTTP requests (`app/api/agent/route.ts` L224–L249): `?step=diagnose` produces the `Diagnosis`, the client stashes it in sessionStorage (`bi:diag:<id>`), and `?step=recommend` runs `propose` with that diagnosis handed back via `?diagnosis=`. The whole stream body is wrapped in `try/catch` so a failure at one link degrades to a safe default (`[]`, `FALLBACK`, `[]`) instead of crashing. Inside two of the links runs a micro-chain: the tool-use loop gathers evidence, then a separate `synthesize()` call turns it into validated JSON. Every link currently runs on one model — the per-step model optimization the chain enables is real and un-taken.
-
-**Key points:**
-- A chain is a fixed sequence of single-job model calls — wired by `await` for the combined-capture run, or by two client-driven `step`-gated requests for the live path; the code owns the order, not the model.
-- Each link has a focused prompt, a small tool set, a validator, and an isolated failure boundary.
-- The handoff is typed — `diagnosis` flows from `?step=diagnose` into `?step=recommend` via sessionStorage `bi:diag:<id>` → `?diagnosis=` (route.ts L227, L238–L247).
-- Two links contain a gather→synthesize micro-chain (loop → `synthesize()`).
-- The chain enables per-step model tiering, which the codebase has not wired — all links use `AGENT_MODEL` (base.ts L9).
 
 ---
 
@@ -413,6 +348,11 @@ A reviewer says: "Collapse the three agents into one prompt that detects, diagno
 
 Which two `await` calls in `app/api/agent/route.ts` run the investigation chain's two links, and how does the `Diagnosis` get from the first to the second on the live path? (Answer: `await diagAgent.investigate(inv, …)` (L238) then `await recAgent.propose(inv, diagnosis!, …)` (L247); on the live path they run in *separate* `step`-gated requests, so the `Diagnosis` is handed over via the client's sessionStorage `bi:diag:<id>` → `?diagnosis=` param (re-parsed at L227), not a shared local variable.)
 
+## See also
+
+→ 01-context-window.md · → 02-lost-in-the-middle.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md · → ../01-llm-foundations/04-structured-outputs.md
+
 ---
 Updated: 2026-05-28 — Rewrote the chain orchestration as the two-step `?step=diagnose`/`?step=recommend` split with the `bi:diag:<id>` sessionStorage handoff (was a single in-process `await` chain); `maxDuration` 60→300; re-derived all route.ts/diagnostic.ts/recommendation.ts/monitoring.ts/useInvestigation.ts line refs.
 Updated: 2026-05-29 — Added "The monitoring link is gated to the workspace's runnable categories": `scan(hooks?, categories=[])` (monitoring.ts L69) injects a per-category checklist via the `{categories}` slot (L73–L86), gated by `runnableCategories` (categories.ts L157–L160) at briefing route L204/L223; cross-refs the new capability-gating file.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

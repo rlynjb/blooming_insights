@@ -5,7 +5,6 @@
 
 > blooming insights routes a cheap haiku classifier at the edge, caps every agent with a hard `maxToolCalls` budget, truncates tool results to 16k chars, and caches tool calls — but every *agent* still runs on sonnet, never caches the prompt prefix, and emits no cost telemetry, so the output-token-heavy `synthesize()` call quietly dominates the bill.
 
-**See also:** → 01-llm-caching.md · → 04-rate-limiting-backpressure.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
 
 ---
 
@@ -223,7 +222,7 @@ A reader who sees only this diagram should grasp: routing and shrinking are most
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 Partially implemented — strong on routing-at-the-edge and shrinking, absent on prompt caching, in-agent cascade, and visibility.
 
@@ -290,52 +289,6 @@ Edge routing has a ceiling: the classifier itself can be wrong, sending an easy 
 
 ---
 
-## Tradeoffs
-
-| Dimension | This codebase | Add in-agent cascade | Add cost meter (see) |
-|---|---|---|---|
-| Cost removed | strong model on classification | strong model on easy agent runs | none directly — enables targeting |
-| Setup complexity | done | medium — verifier + escalation path | low — read `res.usage`, sum, emit |
-| Failure mode | classifier misroutes | cheap pass fails → double-pay | none — pure observability |
-| Quality risk | none added | cheap model may degrade output | none |
-| Payoff visibility | invisible (no meter) | invisible without a meter | makes all payoffs visible |
-
-**What we gave up.** Running every agent on sonnet means blooming insights pays the strong-model rate even for runs where a cheap pass would have produced a valid diagnosis. With no cost meter, the output-heavy `synthesize()` line item is invisible — a prompt edit that doubles its tokens would not be noticed until the monthly bill. The team gave up the ability to prioritize: they optimized the levers that were structurally obvious rather than the one the data would have pointed at.
-
-**What the alternative would have cost.** An in-agent cascade adds a verifier-and-escalate path: run haiku, check `isDiagnosis`, fall back to sonnet on failure. When the cheap pass fails you pay *both* models, so the cascade only nets out if the cheap pass succeeds often enough. For a reasoning-heavy diagnosis task it might not — which is a legitimate reason to defer it. The cost meter, by contrast, is nearly free (read a field already returned) and is the prerequisite for knowing whether the cascade would even help.
-
-**The breakpoint.** The current setup is right while live runs are rare and demos replay from cache (zero Claude cost). The moment live runs become frequent, the sonnet-everywhere choice and the absence of prompt caching compound, and the missing cost meter becomes the bottleneck to fixing either — you cannot optimize what you cannot measure. The trigger is the first month the LLM bill is large enough to question; at that point the cost meter is the first thing to build, before any other lever.
-
----
-
-## Tech reference (industry pairing)
-
-### model routing (haiku vs sonnet)
-
-- **Codebase uses:** `classifyIntent` on `claude-haiku-4-5-20251001` (`lib/agents/intent.ts` L14) vs `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9) for agents.
-- **Why it's here:** a one-word classification does not need sonnet's reasoning; haiku at `max_tokens: 16` is pennies.
-- **Leading today:** Anthropic model tiers — haiku/sonnet/opus (adoption-leading for Claude apps, 2026); learned routers like RouteLLM (innovation-leading, 2026).
-- **Why it leads:** explicit tiers make the cost-quality choice legible; learned routers pick the cheapest model that will pass per query.
-- **Runner-up:** OpenAI's tiered models (gpt-mini vs full) with the same cheap-classifier pattern.
-
-### token budgeting
-
-- **Codebase uses:** `maxToolCalls` (6/6/4/6), `max_tokens` caps (4096 default, 2048 synthesis, 16 classifier), `truncate(16_000)`.
-- **Why it's here:** bounds tokens and latency so an agent cannot run up the bill against the 300s route ceiling.
-- **Leading today:** framework-level budgets (LangGraph `recursion_limit`, Anthropic Agent SDK turn caps) (adoption-leading, 2026).
-- **Why it leads:** budgets are enforced by the orchestration layer, not hand-rolled per agent.
-- **Runner-up:** a hand-rolled turn/tool counter — exactly what `runAgentLoop` does.
-
-### cost accounting (`res.usage`)
-
-- **Codebase uses:** nothing — `res.usage` is returned on every response and read nowhere.
-- **Why it's here:** it is the missing "see" lever; the output-heavy `synthesize()` calls are the unmonitored line item.
-- **Leading today:** Helicone, Langfuse, OpenLLMetry (adoption-leading LLM cost/trace dashboards, 2026); Vercel AI SDK usage hooks (innovation-leading for Next.js, 2026).
-- **Why it leads:** they wrap the provider client and aggregate usage across requests with zero per-call code.
-- **Runner-up:** a hand-rolled accumulator summing `res.usage` per request — the exercise below.
-
----
-
 ## Project exercises
 
 ### Per-run cost meter from `res.usage`
@@ -355,19 +308,6 @@ Edge routing has a ceiling: the classifier itself can be wrong, sending an easy 
 - **Files to touch:** `lib/agents/base.ts` (parameterize the `model` at L93), `lib/agents/diagnostic.ts` (`investigate` L45–L83 — add the escalation path).
 - **Done when:** runs where haiku's output passes `isDiagnosis` cost measurably less; runs where it fails show the double-pay clearly in the cost meter — proving you measured the tradeoff rather than assumed it.
 - **Estimated effort:** 1–2 days.
-
----
-
-## Summary
-
-blooming insights pulls the cost levers that were structurally obvious: a cheap haiku classifier at the edge (`lib/agents/intent.ts`), hard `maxToolCalls` budgets (6/6/4/6), 16k tool-result truncation, and a 60s tool cache. It skips the harder, higher-value levers — prompt caching of the repeated prefix, a cheap-first cascade *within* agents (all run sonnet), and any per-request cost telemetry. Because output tokens cost several times more than input tokens, the output-heavy `synthesize()` calls are the dominant line item — and with `res.usage` read nowhere, nobody is watching it. The cost meter is the prerequisite buildable target; it tells you whether any other lever is worth pulling.
-
-**Key points:**
-- Cost = input·in$ + output·out$ summed over calls; output tokens dominate, so the JSON-emitting `synthesize()` calls are the line item.
-- Routing happens once at the edge (haiku classifier) but never *inside* agents — every agent is sonnet (`lib/agents/base.ts` L9).
-- Shrink levers are mostly built: `maxToolCalls` budgets (L90), 16k truncation (L29), 60s tool cache.
-- The unbuilt levers are prompt caching, an in-agent cascade, and cost telemetry — and `res.usage` is read by nobody.
-- You cannot optimize the line item you cannot see; the cost meter comes before the cascade.
 
 ---
 
@@ -445,8 +385,13 @@ A teammate wants to add a haiku-first cascade to every agent immediately. Defend
 
 Which model does the intent classifier use, on which line, and what is its `max_tokens`? (Answer: `claude-haiku-4-5-20251001` at `lib/agents/intent.ts` L14, `max_tokens: 16` at L20.)
 
+## See also
+
+→ 01-llm-caching.md · → 04-rate-limiting-backpressure.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
+
 ---
 Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived drifted refs: synthesize ranges (diagnostic L87–L126, recommendation L82–L132), route TRUNC/start()/done (L99/L170/L251), tool-cache range (client.ts L97–L146), monitoring maxToolCalls L84.
 
 ---
 Updated: 2026-05-29 — Added a "gate before spend" shrink lever: `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204) gates the monitoring agent's category checklist before it spends any of the ~1 req/s MCP budget (monitoring.ts L73–86 / scan call L223/240). Verified maxDuration L20 already cites 300. Cross-ref ../04-agents-and-tool-use/07-capability-gating.md.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

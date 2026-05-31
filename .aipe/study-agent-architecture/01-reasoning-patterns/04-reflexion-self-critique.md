@@ -5,7 +5,6 @@
 
 > A second model pass that grades the first's output and triggers a retry on failure. blooming insights does NOT use this as a critic; the diagnostic and recommendation agents do run a tool-less `synthesize()` retry on parse failure, but that's a *forced synthesis recovery* — same model, same evidence, no separate judgment.
 
-**See also:** → 02-react.md · → 03-plan-and-execute.md · → 06-routing.md · → prompt mechanics: `../../study-prompt-engineering/10-self-critique.md` · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
 
 ---
 
@@ -190,7 +189,7 @@ The three positions you can take
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented as a critic loop (Case B with nuance).** There is no separate model call that grades a producer's output. The closest existing surface is the *forced synthesis recovery* in diagnostic and recommendation — a same-model tool-less retry when the main loop didn't emit parseable JSON.
 
@@ -272,84 +271,6 @@ When the failure mode is wrong-but-plausible reasoning, same-family critique fai
 - `03-plan-and-execute.md` → the other common escalation; plan-and-execute fixes "wrong path," reflexion fixes "wrong answer on the right path"
 - `06-routing.md` → routing can short-circuit the need for a critic by sending different inputs to different specialists from the start
 - `../../study-prompt-engineering/10-self-critique.md` → the prompt-level mechanics of asking a model to grade itself (and where same-model judgment falls down)
-
----
-
-## Tradeoffs
-
-The decision here was *to handle parse failures with forced synthesis (same model, no tools) and ship the parsed answer unjudged*, rather than adding a critic loop. The alternative most teams reach for is "add a critic to grade every output before shipping."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Forced synthesis (chosen)   │ Critic loop (alternative)   │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Per-run cost     │ +1 LLM call only on parse   │ +1 LLM call EVERY run        │
-│                  │ failure (~5–10% of runs)    │ (+ retried generator on rej) │
-│ Latency          │ +~1–2s only on recovery     │ +~1–2s every run (critic)    │
-│                  │ path                         │ + N×(producer+critic) if    │
-│                  │                             │ retries fire                 │
-│ Substantive      │ none — repo accepts that    │ unreliable — same-family    │
-│ correctness check │ user reads the conclusion   │ shared blind spots          │
-│ Format /          │ guaranteed (tool-less       │ catches it, but parser does │
-│ completeness     │ "commit now" prompt)        │ too — overlap                │
-│ Build time       │ ~30 lines per agent           │ +critic prompt + verdict    │
-│                  │                              │ schema + retry orchestration│
-│ Debugging        │ 1 trace + 1 recovery call    │ 1 trace + N critic calls +  │
-│                  │ if it fired                  │ retries; surface explodes    │
-│ Failure blast    │ if parse fails twice, fall   │ if critic fails open, every │
-│                  │ back to a stub               │ run wastes the budget        │
-│ Mitigates wrong- │ NO — doesn't try to          │ MAYBE — only if critic uses │
-│ but-plausible    │                              │ different judgment           │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up the chance to catch substantive-reasoning errors before they reach the user. A diagnosis that confidently misattributes a revenue drop ships to the user unfiltered; the user's read is the only check. We accept that the user is in the loop for substantive correctness (this is an analyst tool, not an automated decision system, so a human always reads the conclusion before acting on it).
-
-We also gave up the (smaller) chance to catch format or completeness errors a same-family critic would catch — but the parser at `lib/mcp/validate.ts` already enforces structural correctness, and the forced synthesis pass at `diagnostic.ts` L97 already handles "didn't emit JSON." The overlap means a critic would catch ~the same things we already catch, at 2x cost.
-
-### What the alternative would have cost
-
-If we had added a critic to every investigation, every diagnostic run would pay an extra ~1–2 seconds of latency under the MCP budget plus extra tokens for the critic call. With ~5–10% of runs hitting parse failures (where the existing forced synthesis handles it), the *new* runs the critic would catch are mostly the ones we'd consider already-acceptable — the parseable ones. Worse, the critic's failures-to-catch (the wrong-but-plausible ones) are exactly the cases we'd most want it for, and the cases it's structurally worst at. We'd be paying 100% more tokens for catching the cases the parser already covers, while still missing the cases we'd most want to catch.
-
-### The breakpoint
-
-Forced-synthesis-only stays the right call as long as (a) the user reads the conclusion before acting, and (b) the wrong-but-plausible failure mode is rare enough that the user's read catches it. The day this becomes an automated decision system (the diagnosis triggers a campaign change without a human review), the user-as-final-judge model breaks and we need a different judgment in the loop — and that means a different-model critic or a programmatic check, not a same-family self-critique.
-
-### What wasn't actually a tradeoff
-
-A "retry the whole loop on parse failure" was not a real alternative. The diagnostic loop already burned its `maxToolCalls: 6` budget before parse failure — re-running the loop with the same budget would just hit the same wall. The forced synthesis pass solves the actual failure (the model spent its budget on tool calls and never committed) by removing tools and demanding commitment. Retrying the loop would have spent another 6 tool calls to produce the same un-committed result.
-
----
-
-## Tech reference (industry pairing)
-
-### Anthropic Messages API (the second tool-less call)
-
-- **Codebase uses:** `anthropic.messages.create` at `lib/agents/diagnostic.ts` L97 and `lib/agents/recommendation.ts` L96 — a second, tool-less LLM call invoked only when the main `runAgentLoop` returned an unparseable `finalText`. System prompt at L101 (diagnostic): "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data."
-- **Why it's here:** the recovery is the cheap fix for the most common failure (model burned its budget without emitting JSON), and it's *not* trying to grade correctness — it's forcing commitment.
-- **Leading today:** Anthropic Messages API — adoption-leading for structured-output agent workflows, 2026.
-- **Why it leads:** same SDK as the main loop; no extra dependency; the model-agnostic message shape means the recovery call doesn't have to know about the loop's internals.
-- **Runner-up:** OpenAI Responses API + JSON-schema mode — equivalent shape; the JSON-schema parameter would let the recovery enforce the output shape at the API level rather than via a fenced-block prompt.
-
-### Same-model recovery vs different-model critique
-
-- **Codebase uses:** same model (`claude-sonnet-4-6`, via `AGENT_MODEL` at `lib/agents/base.ts` L9) for both the main loop and the forced synthesis call. No second model family is involved in the recovery path.
-- **Why it's here:** the recovery isn't *judging* the producer; it's running the producer again with a different prompt (no tools, commit-now instruction). No different judgment needed.
-- **Leading today:** different-family critic — innovation-leading for high-stakes self-correction, 2026.
-- **Why it leads:** mitigates same-family shared-blind-spot bias; a Sonnet producer judged by a GPT-4 critic catches more substantive errors than Sonnet-judges-Sonnet. (Cost: two SDKs in the runtime, two API contracts to maintain.)
-- **Runner-up:** programmatic checks (Zod / JSON Schema + business-rule assertions) — no model judgment at all, but only works for failures expressible as schema or rule violations.
-
----
-
-## Summary
-
-Reflexion / self-critique is the pattern where a critic model grades the producer's output and triggers a retry — useful for catching format and recognition failures, structurally limited for catching wrong-but-plausible reasoning because the critic shares the producer's training distribution and blind spots. In this codebase, no critic step exists; the closest analog is the forced synthesis recovery in `DiagnosticAgent.synthesize()` (`lib/agents/diagnostic.ts` L87–L126) and `RecommendationAgent.synthesize()` (`lib/agents/recommendation.ts` L82–L132) — a same-model tool-less retry that runs only when the main loop's output didn't parse, not a critic. The constraint that made this right is the user-as-final-judge model (analyst reads every conclusion) plus the structural-vs-substantive split: the parser already catches structural failures, and a same-family critic can't reliably catch substantive ones. The cost is that wrong-but-plausible diagnoses ship to the user unfiltered.
-
-- No critic loop exists; the synthesize() call is a recovery, not a judgment.
-- A same-family critic catches format and recognition errors reliably; catches substantive reasoning errors poorly because of shared priors.
-- Forced synthesis fixes "loop didn't emit JSON" at +1 LLM call only on the failure path (~5–10% of runs); a critic loop would add the call on every run.
-- The user reading the conclusion is the substantive correctness check; the day this becomes an automated decision system, that check needs to move into the runtime.
-- Worth it as forced synthesis only; add a different-family critic the day a substantive failure mode shows up that a tighter prompt can't fix.
 
 ---
 
@@ -470,5 +391,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function + the recovery-vs-critic distinction matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-react.md · → 03-plan-and-execute.md · → 06-routing.md · → prompt mechanics: `../../study-prompt-engineering/10-self-critique.md` · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

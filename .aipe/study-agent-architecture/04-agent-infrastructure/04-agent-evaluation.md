@@ -5,7 +5,6 @@
 
 > Evaluating an agent is harder than evaluating one LLM call because the unit of evaluation is the trajectory, not just the final answer. blooming insights has ~169 vitest tests TDD'd with injected fakes that check the loop's *shape* (parse failures, budget enforcement, forced-final path), and the streamed reasoning trace IS an inspectable trajectory per run — but the automated trajectory-eval harness that would grade those trajectories does not exist yet.
 
-**See also:** → `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/05-evals-and-observability/04-llm-observability.md` · → `../../study-ai-engineering/05-evals-and-observability/01-eval-set-types.md` · → `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`
 
 ---
 
@@ -234,7 +233,7 @@ What's built (✓) vs what's not yet (✗)
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — partial (loop-shape testing + inspectable trajectory).**
 
@@ -293,98 +292,6 @@ Trajectory eval breaks down when the "right" trajectory isn't unique — when tw
 - LLM observability (`../../study-ai-engineering/05-evals-and-observability/04-llm-observability.md`) → the per-call observability story that complements trajectory-level eval
 - LLM-as-judge bias (`../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`) → the evaluator paradox in detail
 - Eval set types (`../../study-ai-engineering/05-evals-and-observability/01-eval-set-types.md`) → how to construct the frozen input set a trajectory harness needs
-
----
-
-## Tradeoffs
-
-The decision here was *to ship loop-shape unit tests plus a structured inspectable trajectory, and defer the automated trajectory-eval harness*. The alternative most teams reach for is "stand up LangSmith / Braintrust / Anthropic Eval from day one."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Tests + trace (chosen)      │ Trajectory harness (alt)    │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ ~169 fast unit tests + the  │ ~169 unit tests + frozen    │
-│                  │ trace was free (it's the     │ inputs + MCP fixtures +     │
-│                  │ stream)                      │ scorer + golden diff CI     │
-│ CI cost / run    │ ~few seconds (no network)    │ minutes if real MCP; cost   │
-│                  │                              │ of replay fixtures otherwise│
-│ Catches          │ loop invariants, parse       │ +tool-choice regressions,   │
-│                  │ fallbacks, budget caps        │ +cost drift, +trajectory    │
-│                  │                              │ efficiency drift             │
-│ Misses           │ tool-choice regressions,     │ nothing beyond what frozen  │
-│                  │ silent cost drift, recovery  │ inputs cover (so cover well)│
-│                  │ degradation                  │                             │
-│ Determinism      │ fully deterministic (fakes)  │ requires MCP fixtures or    │
-│                  │                              │ a mock server               │
-│ Maintenance      │ low — test seams are stable  │ medium — fixtures drift     │
-│                  │                              │ when prompts/tools change    │
-│ Confidence       │ "the loop is safe"           │ "the loop is safe AND       │
-│                  │                              │  efficient AND correct"     │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up automated detection of trajectory drift. A prompt change that improves answer quality and silently adds 3 tool calls per investigation will not be caught by the 169 unit tests — they don't measure step count against an expected budget per input shape. Same for tool-choice drift: if the model starts preferring `list_email_campaigns` when `list_sms_campaigns` is the right call for an SMS-related anomaly, and it happens to produce a passable recommendation, the unit tests won't notice. Only an eyeball pass through the trace or the bill would.
-
-We also gave up the ability to A/B test prompts or models with a single command. To compare model A vs model B today, you'd run both by hand against real anomalies and compare by eye. A trajectory-eval harness would make that a CI job.
-
-### What the alternative would have cost
-
-If we had stood up a trajectory-eval harness from day one, we'd be paying: (1) the build cost of frozen MCP fixtures (or a mock server) — probably ~1 week of work because the loomi MCP surface is non-trivial, (2) the maintenance cost of those fixtures drifting whenever the Bloomreach API changed, (3) CI minutes per PR running the trajectory scorer, and (4) the design work of choosing metrics that don't penalise valid trajectory variation. Whichever pieces are wrong on day one are pieces you fight all year. The cheap version (skip fixtures, hit real MCP in CI) would mean paying real API + rate-limit cost on every PR, which is also non-zero.
-
-### The breakpoint
-
-The current shape stays right until model-quality drift becomes load-bearing. Concrete triggers:
-- A prompt change ships and the bill goes up unexpectedly the next month — you need automated cost-per-trajectory tracking
-- Multiple model providers are in scope and you have to pick — you need cross-model trajectory comparison
-- A user-visible regression slips through and the cost of "we should have caught that" exceeds the build cost of the harness
-The day one of those hits, the cheapest build is: frozen MCP fixtures (so trajectories are deterministic), a small frozen input set (10–30 anomalies covering the categories), and a scorer that compares against a golden trajectory plus a soft-pass for "this is different but the diagnosis still validates."
-
-### What wasn't actually a tradeoff
-
-A pure end-to-end "live test" running against real Bloomreach wasn't a real alternative for routine CI. It would burn the rate-limit budget on tests instead of real users, and the determinism would be terrible (real data shifts). A trajectory-eval harness has to either freeze MCP responses (fixtures) or replace MCP with a mock — there's no third option that produces deterministic CI signals.
-
-A judge-only eval (no golden, just "LLM-grade this trajectory") wasn't a real alternative either. The evaluator paradox is too severe without a deterministic golden anchor; an LLM judging an LLM of the same family produces high false-positive rates on subtle bugs.
-
----
-
-## Tech reference (industry pairing)
-
-### Vitest
-
-- **Codebase uses:** `vitest` runs the ~169 unit tests under `tests/`, with the loop-shape invariants asserted via injected fakes through the `McpCaller` interface (`base.ts` L16) and a fake Anthropic client.
-- **Why it's here:** the test runner sits at the test seam; its speed (no compile step, native ESM) makes the full suite cheap to run on every save.
-- **Leading today:** Vitest — innovation-leading for TypeScript test runners, 2026.
-- **Why it leads:** Vite-native, fast cold start, drop-in for many Jest tests, first-class TS support.
-- **Runner-up:** Jest — adoption-leading still in many existing codebases; slower cold start.
-
-### Streamed trace as `AgentEvent[]`
-
-- **Codebase uses:** `AgentEvent` discriminated union in `lib/mcp/events.ts`; emitted over NDJSON from `app/api/agent/route.ts`; persisted via `lib/state/investigations.ts`; consumed by `lib/hooks/useInvestigation.ts`.
-- **Why it's here:** the trace is *the product* (the investigation page renders it live) and *the audit log* (cached per insightId for replay) in one. Trajectory eval would consume the same data; no separate logging layer needed.
-- **Leading today:** structured event streams + NDJSON — adoption-leading for streamed LLM responses, 2026.
-- **Why it leads:** each line is a self-contained JSON object the client can parse incrementally; no SSE complexity needed.
-- **Runner-up:** Server-Sent Events (SSE) — equivalent for live streaming, slightly heavier client API; OpenTelemetry spans — richer for distributed tracing but bigger lift.
-
-### Trajectory-eval tooling (NOT used, named for context)
-
-- **Codebase uses:** none. No `langsmith`, `braintrust`, `helicone`, or comparable trajectory-eval dependency is in `package.json`.
-- **Why it's here:** named so the absence is explicit — the build cost hasn't been earned by a concrete pain point yet.
-- **Leading today:** LangSmith — adoption-leading 2026 for LangChain users; Braintrust — innovation-leading for non-LangChain agent eval; Anthropic's evaluation features — first-party, growing.
-- **Why it leads:** LangSmith integrates with the ecosystem most teams already use; Braintrust treats trajectories and human-graded sets as first-class.
-- **Runner-up:** a hand-rolled scorer over `AgentEvent[]` — what this codebase would build first because the trace is already structured.
-
----
-
-## Summary
-
-Agent evaluation expands the unit of eval from {input → output} to {input → trajectory → output}, because the trajectory is what determines cost, robustness, and the failure surface. blooming insights has the substrate in place: ~169 vitest tests TDD'd with injected `McpCaller` + Anthropic fakes pin down the loop's invariants (forced-final tool removal, budget caps, parse-failure safe defaults, schema-gated category list), and every run produces an `AgentEvent[]` trajectory that's streamed live and cached server-side for replay (`route.ts` L254, `lib/state/investigations.ts`). What's honestly absent is the automated trajectory-eval harness — no frozen input set, no MCP fixtures, no trajectory scorer, no golden-diff CI. The constraint deferring the harness is that the agent loop hits a rate-limited remote MCP server, so deterministic trajectory eval requires fixtures or a mock that aren't built yet. The cost is model-quality drift ships without automated detection above hand spot-checks of the trace.
-
-- Final-output eval is a strict subset of trajectory eval; passing the former says nothing about the latter.
-- The trajectory exists as typed `AgentEvent[]` records — inspectable, replayable, ready to score.
-- The 169 unit tests grade the loop's shape (invariants); they don't grade trajectory quality.
-- The evaluator paradox is real — agent-as-judge shares blind spots with the actor; mitigate with cross-family judges + frozen goldens + human spot-checks.
-- The harness earns its build cost the day model-quality drift starts mattering more than it does today; until then, the inspectable trace + safety unit tests are the floor.
 
 ---
 
@@ -522,5 +429,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/05-evals-and-observability/04-llm-observability.md` · → `../../study-ai-engineering/05-evals-and-observability/01-eval-set-types.md` · → `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

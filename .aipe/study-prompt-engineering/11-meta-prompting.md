@@ -5,7 +5,6 @@
 
 > Meta-prompting is using a model to draft or improve the prompts you feed to other model calls — the human writes a goal, the model drafts a prompt, the human reviews and edits it, and the edited prompt enters the repo. blooming insights' four prompts are entirely hand-written `.md` files; nothing in the codebase generates a prompt. The workflow saves real time on the initial draft of a complex prompt and almost none on small tweaks — and its failure mode is a prompt that reads like LLM output instead of an engineering spec.
 
-**See also:** → 01-anatomy.md · → 03-prompts-as-code.md · → 05-eval-driven-iteration.md · → 10-self-critique.md
 
 ---
 
@@ -166,7 +165,7 @@ A reader who sees only this should grasp: meta-prompting acts at authoring time,
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** Nothing in blooming insights generates a prompt; the four agent prompts (`lib/agents/prompts/monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md`) are hand-written `.md` files loaded verbatim via `readFileSync` (`lib/agents/diagnostic.ts` L13, `monitoring.ts` L12, `recommendation.ts` L14, `query.ts` L13).
 
@@ -212,55 +211,6 @@ The deep idea: a model is good at producing structure-complete first drafts and 
 
 ---
 
-## Tradeoffs
-
-### Meta-prompt a draft vs. hand-author from scratch (current state)
-
-| Dimension | This codebase (hand-authored) | Meta-prompted draft + human review |
-|---|---|---|
-| Time to first complete draft | Slow (blank file) | Fast (0→70% from goal + schema) |
-| Time on small tweaks | Trivial (edit the line) | Worse (round-trip overhead) |
-| Reads like a spec | Yes — terse, imperative | Only after review kills the hedging |
-| Domain correctness (EQL) | Author's knowledge | Draft may invent syntax; reviewer must catch |
-| Anatomy consistency | Author re-derives each time | Meta-prompt enforces the house anatomy |
-| Reviewable diff in git | Yes (→ 03) | Yes — same `.md` artifact |
-
-**What we gave up.** A fast on-ramp for *new* prompts. Today every new agent prompt starts from a blank file or a copy of an existing one and is hand-edited; the anatomy (Role / Hard rules / EQL reminders / Output / `{schema}`) gets re-derived by hand each time. A meta-prompt that encodes the house anatomy would scaffold that draft in one call.
-
-**What the alternative would have cost.** A meta-prompting helper is dev-time code to maintain, and — more importantly — it shifts the work from authoring to reviewing. If the review is rushed, the cost is a prompt that reads like LLM output: hedged, padded, with rules the model treats as optional, and possibly invented EQL syntax. The hand-authored prompts have zero of those risks because a human wrote every load-bearing line deliberately.
-
-**The breakpoint.** Hand-authoring is fine while there are four stable prompts edited occasionally. Meta-prompting earns its place when (a) the system grows to many agents and the per-prompt authoring cost adds up, or (b) a complex new prompt needs drafting from scratch and the 0→70% leap is worth a review pass. It does NOT earn its place for tweaks or for prompts under hourly eval-driven iteration — there, hand-editing wins.
-
----
-
-## Tech reference (industry pairing)
-
-### model-drafted prompt (human-in-the-loop meta-prompting)
-
-- **Codebase uses:** nothing; the four prompts in `lib/agents/prompts/` are hand-authored and loaded via `readFileSync` (`lib/agents/diagnostic.ts` L13).
-- **Why it's here:** it is not — but a dev-time drafting helper would write into the same directory the runtime already reads.
-- **Leading today:** model-drafted-then-human-reviewed prompts as a starting point (2026), endorsed in vendor prompting guides; the human review is the part everyone agrees is mandatory.
-- **Why it leads:** it captures the 0→70% leap on complex prompts while keeping a human's judgment on which rules are load-bearing.
-- **Runner-up:** prompt-library templates / starter packs — faster than blank, but generic and not schema-aware.
-
-### automated prompt optimization (APE / DSPy / OPRO)
-
-- **Codebase uses:** nothing; there is no eval harness to score candidates against (→ 05-eval-driven-iteration.md).
-- **Why it's here:** it is not — it presupposes the `evals/` loop that does not yet exist.
-- **Leading today:** DSPy-style compile/optimize against a metric and OPRO-style optimizer loops (2026) for teams that have an eval set.
-- **Why it leads:** it closes the loop with a measured score instead of human taste, optimizing prompts the way you'd optimize any objective.
-- **Runner-up:** manual A/B of prompt variants on a golden set — the same idea by hand, no optimizer.
-
-### the prompt artifact (where the output lands)
-
-- **Codebase uses:** `.md` files in `lib/agents/prompts/`, version-controlled and git-reviewed (→ 03-prompts-as-code.md), with `{schema}`/`{project_id}` placeholders replaced at load.
-- **Why it's here:** prompts-as-code makes a generated prompt indistinguishable in kind from a hand-written one — same review, same diff, same loader.
-- **Leading today:** version-controlled prompt files (and prompt registries for larger systems) in 2026.
-- **Why it leads:** whatever drafts the prompt, the artifact must be a reviewable, diffable file — which is exactly what this repo already has.
-- **Runner-up:** managed prompt registries (e.g. hosted prompt stores) — more tooling, useful at scale, overkill for four prompts.
-
----
-
 ## Project exercises
 
 ### Build a dev-time prompt-drafting helper
@@ -280,20 +230,6 @@ The deep idea: a model is good at producing structure-complete first drafts and 
 - **Files to touch:** new `scripts/lint-prompts.ts` or `test/agents/prompts.test.ts`; scans `lib/agents/prompts/*.md`.
 - **Done when:** the linter passes on the current four hand-written prompts and fails if a Hard-rule line is rewritten with a hedging phrase.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-Meta-prompting uses a model to draft or improve the prompts you feed other model calls, at *authoring* time, not runtime: human writes a goal plus context, model drafts, human reviews and edits, the edited prompt enters the repo. It is leverage on the initial draft of a complex prompt and a tax on small tweaks and high-iteration prompts, and its load-bearing step is the human review — because a generated draft defaults to hedged, padded prose, and a prompt only enforces rules it states as imperatives. blooming insights does none of this; its four prompts are hand-written `.md` specs loaded verbatim, which is exactly why they read like specs and why every rule is an absolute.
-
-**Key points:**
-- Meta-prompting acts at authoring time; the runtime path (`readFileSync` → `runAgentLoop`) never sees the meta-prompt.
-- It saves real time on the 0→70% draft of a complex prompt and loses time on small tweaks and hourly eval-driven iteration.
-- The meta-prompt must encode the house anatomy (→ 01) or it drafts a generic prompt that ignores `{schema}`, the tool-call budget, and the JSON shape.
-- The failure mode is hedging drift: "try to" / "where possible" where the spec needs "Never" / "no exceptions"; review must convert soft rules to imperatives.
-- Generated drafts can invent unsupported EQL syntax (the `customers matching` trap, `diagnostic.md` L35) — only a domain reviewer catches it.
-- Automated prompt optimization (APE/DSPy/OPRO) is the next step but presupposes the eval harness (→ 05) that does not exist yet.
 
 ---
 
@@ -369,6 +305,11 @@ A reviewer says: "Just have the model generate all our prompts going forward." S
 
 If a meta-prompting helper produced a new agent prompt, what would have to be true about its placeholders for the existing loader to use it unchanged? (Answer: it must contain the `{schema}` and `{project_id}` placeholders the loader replaces — e.g. `lib/agents/diagnostic.ts` L45–48 does `PROMPT.replace('{schema}', …).replace(/\{project_id\}/g, …)` — plus any agent-specific placeholder like `{anomaly}`; without them the replace calls leave literal placeholder text in the system prompt.)
 
+## See also
+
+→ 01-anatomy.md · → 03-prompts-as-code.md · → 05-eval-driven-iteration.md · → 10-self-critique.md
+
 ---
 Updated: 2026-05-29 — Added a note distinguishing the new `{categories}` injection (dynamic prompt assembly / template interpolation, → 03-prompts-as-code.md) from meta-prompting; Case B verdict unchanged.
 Updated: 2026-05-29 — Resynced the stale `diagnostic.md` "customers matching" ban ref L33→L35 (pre-existing drift) across all three citations.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

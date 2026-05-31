@@ -5,7 +5,6 @@
 
 > When you use a model to score another model's output, the judge is itself a non-deterministic model with systematic biases — it favors the first option, the longer answer, and outputs from its own family — and a judge with uncorrected bias produces an eval score that measures the bias, not the quality.
 
-**See also:** → 02-eval-methods.md · → 01-eval-set-types.md · → 04-llm-observability.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md
 
 ---
 
@@ -163,7 +162,7 @@ The model is the instrument; the harness is the protocol that subtracts its know
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights has no LLM-as-judge — there is no judge model wired for evaluation, no pairwise comparison code, and no debiasing protocol, because (per `01-eval-set-types.md` and `02-eval-methods.md`) there is no eval harness at all.
 
@@ -208,56 +207,6 @@ Every bias is a confound — a variable correlated with the score that is not qu
 
 ---
 
-## Tradeoffs
-
-### Debiased cross-family judge vs. raw same-family judge vs. human-only
-
-| Dimension | Debiased cross-family judge | Raw same-family judge (sonnet judges sonnet) | Human-only |
-|---|---|---|---|
-| Self-preference | Removed (different family) | Severe — flatters its own output | None |
-| Position bias | Removed (order randomized/averaged) | Present — winner flips on swap | Low (humans also have some) |
-| Verbosity bias | Controlled (rubric/length cap) | Present — rewards padding | Low |
-| Cost per case | 1–2 judge calls (both orders) | 1 judge call | Human time |
-| Scalability | High | High | Low |
-| Trustworthiness of the number | High after calibration | Low — number measures bias | Highest (it IS the ground truth) |
-| Setup effort | Protocol + a second-provider key | Drop-in (SDK already present) | Recruit + train raters |
-
-**What we gave up (by not having it).** Nothing today — there is no judge — but the latent cost is the seductiveness of the wrong default. The repo ships the Anthropic SDK and runs sonnet; the path of least resistance is a sonnet-judges-sonnet eval, which is *worse than no eval* because it returns a flattering number with a methodology that guarantees flattery. The cost of skipping debiasing is a quality metric that systematically over-reports.
-
-**What the alternative would have cost.** A raw same-family judge costs one API key and zero protocol code — and produces a number that moves with position, length, and family rather than quality. Human-only evaluation produces the most trustworthy number and does not scale to running on every prompt edit. The debiased cross-family judge is the middle that is both scalable and honest, at the cost of a second provider credential and the swap-and-average protocol.
-
-**The breakpoint.** A raw judge (any biases) is tolerable *only* for throwaway exploratory spot-checks where you eyeball the outputs anyway. The instant a judge score drives a decision — ship this prompt, swap this model — debiasing becomes mandatory, because the decision inherits the bias. Self-preference correction specifically becomes mandatory the moment the judge family equals the agent family, which in blooming insights is the default (`claude-sonnet-4-6` on both sides) unless you deliberately choose otherwise.
-
----
-
-## Tech reference (industry pairing)
-
-### position-bias correction
-
-- **Codebase uses:** nothing — no pairwise judging exists.
-- **Why it's here (absent):** prompt/model A/B comparison is a future need with no current code.
-- **Leading today:** swap-and-average (run both orders, require consistency) is the standard position-bias control (2026).
-- **Why it leads:** deterministically cancels order effects per case rather than relying on aggregate randomization.
-- **Runner-up:** per-case random order — cheaper (one call), only cancels in aggregate over many cases.
-
-### verbosity-bias correction
-
-- **Codebase uses:** nothing — but `Diagnosis` (`lib/mcp/types.ts` L64–L73) is naturally bounded, easing the control.
-- **Why it's here (absent):** no holistic judge yet to exhibit length preference.
-- **Leading today:** per-criterion rubric scoring plus explicit length-neutral judge instructions (2026).
-- **Why it leads:** scores presence of required content, not length, so padding cannot win.
-- **Runner-up:** hard length caps — simpler, can suppress legitimately longer correct answers.
-
-### self-preference correction / cross-family judging
-
-- **Codebase uses:** nothing — agents run `claude-sonnet-4-6` (`lib/agents/base.ts` L9); no separate judge family is configured.
-- **Why it's here (absent):** no judge exists; the naive default would be same-family.
-- **Leading today:** cross-family judges and multi-family juries (averaging GPT/Claude/Gemini-class judges) are the standard self-preference control (2026).
-- **Why it leads:** the judge's style preferences no longer align with the system under test, so a high score reflects quality.
-- **Runner-up:** reference-guided judging — anchor to a golden answer to dampen self-style preference without a second provider.
-
----
-
 ## Project exercises
 
 ### Build a debiased LLM-as-judge for diagnosis quality
@@ -277,19 +226,6 @@ Every bias is a confound — a variable correlated with the score that is not qu
 - **Files to touch:** `evals/calibrate.ts`, reads `evals/fixtures/golden.json`, uses `evals/scorers/judge.ts`.
 - **Done when:** the script outputs a judge-human agreement score for the sample and flags it pass/fail against a threshold.
 - **Estimated effort:** 1hr–1day
-
----
-
-## Summary
-
-An LLM-as-judge is a non-deterministic model with reproducible systematic biases: position (favors the first option), verbosity (favors the longer answer), and self-preference (favors its own family). Each has a mechanical correction — randomize/average order, cap or rubric-control length, judge cross-family — and after correcting them you calibrate the judge against human scores. In blooming insights the live trap is concrete: the agents run `claude-sonnet-4-6` (`lib/agents/base.ts` L9), so the naive default of judging sonnet with sonnet is textbook self-preference. The debiased judge lives in `evals/scorers/judge.ts` and must use a different model family.
-
-**Key points:**
-- A raw judge scores `f(quality, position, length, family)`; debiasing isolates `f(quality)`.
-- Position → randomize/average both orders; verbosity → cap length or per-criterion rubric; self-preference → cross-family judge.
-- Judging `claude-sonnet-4-6` with `claude-sonnet-4-6` (`lib/agents/base.ts` L9) is self-preference by construction.
-- A clean number from a biased judge is worse than no number — you will act on it.
-- Calibrate against humans; an uncalibrated judge score is decorative.
 
 ---
 
@@ -364,5 +300,10 @@ A colleague argues "cross-family judging is overkill — we'll just tell the jud
 
 What model do the diagnostic and recommendation agents run on, and why does that make the choice of judge model a bias decision? (Answer: `claude-sonnet-4-6` — `AGENT_MODEL` at `lib/agents/base.ts` L9 — so judging their output with another `claude-sonnet-4-6` call is self-preference bias by construction; the judge must be a different family for the score to reflect quality rather than the judge recognizing its own style.)
 
+## See also
+
+→ 02-eval-methods.md · → 01-eval-set-types.md · → 04-llm-observability.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md
+
 ---
 Updated: 2026-05-28 — Re-derived `Diagnosis` ref (types.ts L64–L73). `AGENT_MODEL` (base.ts L9) and `CLASSIFIER_MODEL` (intent.ts L14) verified unchanged — the sonnet-judges-sonnet self-preference trap still holds. Still Case B (no judge wired).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

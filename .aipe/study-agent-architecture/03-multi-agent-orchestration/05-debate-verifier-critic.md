@@ -5,7 +5,6 @@
 
 > Two (or more) agents argue, critique, or judge each other to refine output quality. blooming insights does NOT have a debate or critic agent — `synthesize` retry in `runAgentLoop` is a *forced re-pass* on the same model, not a separate critic. The topology that earns its overhead the day a second perspective measurably catches errors the producer alone misses.
 
-**See also:** → `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → forced-final-turn mechanic: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 
@@ -269,7 +268,7 @@ Debate vs verifier-critic — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.**
 
@@ -346,94 +345,6 @@ It also breaks when the critic is *more* confident than the producer. A critic t
 - `./09-coordination-failure-modes.md` → "synthesis failure" (when a critic averages contradictions instead of surfacing them)
 - `./07-graph-orchestration.md` → debate as a graph with N rounds + judge node + clear termination
 - `../06-orchestration-system-design-templates/` → the "verifier-critic over diagnostic output" refactor for this codebase
-
----
-
-## Tradeoffs
-
-The decision was: **no critic, no debate — forced-synthesis re-pass only.** The alternative is to add a verifier-critic over the diagnostic output.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Forced re-pass (chosen)     │ Verifier-critic (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ LLM calls / run  │ 1 producer loop             │ 1 producer + 1 critic per   │
-│                  │                             │ round (2N total)            │
-│ Token cost / run │ producer cost only          │ producer + critic cost      │
-│ Quality gain     │ none — same model finalizes │ ~5% (same family) to        │
-│                  │ itself                      │ ~30% (different family)     │
-│ Latency / run    │ producer's loop only        │ +1–3s per critic round      │
-│ Same-family risk │ N/A (no critic exists)      │ HIGH — rubber stamp if not  │
-│                  │                             │ a different model family    │
-│ Build cost       │ none extra                  │ critic prompt + review      │
-│                  │                             │ rubric + revise() entry     │
-│                  │                             │ point on producer           │
-│ Failure mode     │ producer's blind spots ship │ critic's confidence drift   │
-│                  │ directly                    │ (round cap as backstop)     │
-│ Stops being      │ when ship-wrong-rate        │ when error cost stops       │
-│ right when…      │ exceeds tolerance           │ exceeding critic cost       │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up an explicit quality gate on the diagnostic output. Today, the diagnostic agent's `Diagnosis` flows straight to the recommendation agent — if the diagnosis is subtly wrong (a hypothesis contradicted by the evidence, an `affectedCustomers` count that doesn't match the segment description), there's no automated check. The user catches it or doesn't.
-
-We also gave up the ability to *learn* from critic rejections. A critic loop produces a labeled dataset over time: "outputs the producer made, outputs the critic rejected, reasons why." That's a fine-tuning signal we can't capture without a critic in the loop.
-
-### What the alternative would have cost
-
-If we'd built a verifier-critic over the diagnostic output, the up-front cost would be a `DiagnosticReviewAgent` class with its own prompt (a strict rubric: "check the conclusion follows from the evidence; check all hypotheses are addressed; check `affectedCustomers.count` matches `segmentDescription`'s scope"), a `revise()` method on `DiagnosticAgent` that takes a critique and re-runs, and a wrapper in the route that runs the producer-critic loop with a round cap.
-
-Per-run cost: each critic round adds ~1–3s under the MCP rate limit + the critic's tokens. If the critic is Haiku (cheap) reviewing Sonnet (expensive), the cost addition is ~10–20% per round. If both are Sonnet (rubber-stamp risk), it's ~50–100% per round. At 1–2 rounds typical, the budget impact is meaningful.
-
-The hidden cost: the critic itself has to be evaluated. Who critiques the critic? You ship a critic that rejects 30% of outputs and have no way to know whether 30% of outputs are actually wrong or the critic is hallucinating issues. The mitigation is a labeled eval set for the critic itself — yet another infrastructure layer.
-
-### The breakpoint
-
-This stays the right call until the diagnostic agent's "confident wrong" rate becomes a visible product problem — measurably, users complaining about wrong diagnoses or skipping recommendations because they don't trust the diagnosis. At that point a verifier-critic with a *different model family* (e.g. GPT-4 critiquing Sonnet, or a deterministic rubric checker against the `Diagnosis` schema) earns its overhead. Same-family critic remains a non-starter at any scale.
-
-### What wasn't actually a tradeoff
-
-A "critic that's the same model with a stricter prompt" was not a real alternative. The LLM-as-judge literature documents that same-family critics catch ~5% of errors and miss the rest — the rubber-stamp regime is structurally hard-coded into self-preference bias. Shipping a same-family critic would double the token cost for marginal quality gain. Symmetric debate (two Sonnet agents arguing) has the same problem twice over — both debaters share blind spots, both miss the same errors, the judge has the same blind spots and confidently picks the wrong winner.
-
----
-
-## Tech reference
-
-### Anthropic Messages API tool_use (the producer mechanic)
-
-- **Codebase uses:** `runAgentLoop` in `lib/agents/base.ts` L48–L176 — the same primitive a critic would run; only the prompt and tool schemas change.
-- **Why it's here:** the critic in a hypothetical verifier-critic loop would be a `runAgentLoop` with a different `system` prompt (a rubric) and an empty `toolSchemas` (it reviews; it doesn't act).
-- **Leading today:** Anthropic Messages API — innovation-leading for typed agent loops with structured outputs, 2026.
-- **Why it leads:** typed tool calls + JSON-mode structured outputs make the critic's "approve / reject + reason" envelope easy to enforce.
-- **Runner-up:** OpenAI Responses API with structured outputs — equivalent shape, larger installed base.
-
-### Different-model-family critic (the orthogonality requirement)
-
-- **Codebase uses:** not used today. Listed for the refactor.
-- **Why it's here:** the LLM-as-judge research consistently shows that critic effectiveness scales with orthogonality between producer and critic — same family = rubber stamp; different family = real review.
-- **Leading today:** mixed-provider critic setups — innovation-leading for high-stakes agent outputs, 2026.
-- **Why it leads:** the cost gap between providers is small (most are within 2x on price), and the orthogonality gain is large; one provider's hallucinations are usually visible to another's stronger reasoning.
-- **Runner-up:** same-family critic with a deterministic rubric (schema check + fact lookup against a database) — a hybrid; the rubric provides the orthogonality the same-family model can't.
-
-### LLM-as-judge bias literature (the failure-mode reference)
-
-- **Codebase uses:** not directly — the cross-reference is the guide file `.aipe/study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`.
-- **Why it's here:** every critic decision in this codebase would have to defend itself against the LLM-as-judge bias literature; the file names the specific biases (self-preference, position, verbosity) to mitigate.
-- **Leading today:** "LLM-as-Judge with MT-Bench" and related papers — adoption-leading for documenting same-family bias, 2026.
-- **Why it leads:** these papers gave the field the vocabulary ("self-preference bias") to reject same-family critic architectures with evidence, not vibes.
-- **Runner-up:** human-in-the-loop spot-checks — slower but immune to same-family bias; used as the ground truth for critic eval sets.
-
----
-
-## Summary
-
-A verifier-critic is one agent producing and a *different* agent reviewing; debate is two symmetric agents arguing with a judge picking the winner. The architecture works only when the critic / judge has a genuinely different perspective from the producer — same-family critics are documented rubber stamps. blooming insights does not implement either: the closest mechanic is the forced-synthesis turn in `runAgentLoop` (`base.ts` L90–L101), which strips tools and appends a `synthesisInstruction` on the same model and same trajectory — a re-pass, not a critic. The constraint that made this right is that the diagnostic agent's "confident wrong" rate is not visibly hurting the product, and a same-family critic would double the cost for marginal quality gain. The breakpoint: ship-wrong rate exceeds tolerance AND a different model family critic is available to provide real orthogonality.
-
-- A critic is a second agent whose only job is to review — not produce — and it has to come from a different model family OR run a deterministic check the producer can't.
-- Debate is two symmetric proposers with a judge; ~3–10% quality gain typical, ~2N+1 LLM calls per output.
-- blooming insights has neither — the forced-synthesis turn in `base.ts` L90 is a re-pass on the same model, not a critic.
-- Same-family critic = rubber stamp (~5% catch rate) because of self-preference bias documented in LLM-as-judge literature.
-- Worth it when error cost > critic cost AND the critic is genuinely orthogonal. Skip when either condition fails.
 
 ---
 
@@ -590,5 +501,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → forced-final-turn mechanic: `../01-reasoning-patterns/01-chains-vs-agents.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > blooming insights uses negative-constraint "forbidden" instructions pervasively — "do NOT re-run variations of the same query," "Never report a change derived from an empty window," "Do NOT use customers matching," "Do NOT include an `id` field" — but it uses *no* rotating formulas, correctly: its repeated chains emit structured output (phrasing never converges) and its one prose agent is one-shot per question, not repeated for the same user.
 
-**See also:** → 02-structured-outputs.md · → 01-anatomy.md · → 09-chain-of-thought.md · → 06-single-purpose-chains.md
 
 ---
 
@@ -163,7 +162,7 @@ The codebase ships the negative-constraint half and omits the rotation half, bec
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A for negative constraints · Case B for rotating formulas.**
 
@@ -235,55 +234,6 @@ Anthropic's prompt guide and the OpenAI cookbook both recommend positive over ne
 
 ---
 
-## Tradeoffs
-
-### Negative constraints + no rotation (this codebase) vs. positive-only vs. rotation-everywhere
-
-| Dimension | This codebase (negatives, no rotation) | Positive framing only | Rotation on all repeated output |
-|---|---|---|---|
-| Encodes specific incidents | Yes — one "do NOT" per bug | Awkward for some bugs | N/A |
-| Salience backfire risk | Present (mitigated by paired positives) | None | N/A |
-| Fights phrasing convergence | N/A — not needed | N/A | Yes, but solves a non-problem here |
-| Cost on structured output | None | None | Wasted — JSON has no phrasing |
-| Prompt growth / cruft | Accumulates without evals | Cleaner | Adds unneeded rotation logic |
-| Correct for this output shape | Yes | Partially | No |
-
-**What we gave up.** Some prompt cleanliness and salience-safety. The negative constraints accumulate into dense "Never"/"do NOT" blocks, and each one re-introduces the forbidden token into context. The codebase accepts this because each negative encodes a real incident and is paired with a positive alternative where it matters (`diagnostic.md` L35).
-
-**What the alternative would have cost.** Positive-only framing would have made some constraints awkward ("issue each distinct query exactly once" is clumsier than "do NOT re-run variations") and could not cleanly express the empty-window ban. Rotation-everywhere would have added machinery to fight a convergence problem that structured output does not have — pure cost, since JSON sameness is the contract, not a defect.
-
-**The breakpoint.** No rotation is correct while every repeated generation is structured and the only prose is one-shot. The decision flips the moment a recurring prose generation for a fixed recipient ships — a daily digest, a weekly email summary — at which point phrasing convergence becomes real and forbidden-openings + rotating formulas become necessary. The trigger is a *feature*, not a metric: the day "same prose, same user, over time" becomes true.
-
----
-
-## Tech reference (industry pairing)
-
-### negative constraints (forbidden instructions)
-
-- **Codebase uses:** `monitoring.md` L17/L37, `diagnostic.md` L35, `recommendation.md` L82 — "do NOT" / "Never" rules, one per known incident.
-- **Why it's here:** to fence off specific behaviors (re-running queries, reporting empty windows), unsupported syntax (`customers matching`), and model-owned identity — each a real failure.
-- **Leading today:** positive framing is the default-leading guidance in 2026 (Anthropic prompt guide, OpenAI cookbook); negative constraints lead for specific-behavior and forbidden-syntax cases where the positive form is awkward.
-- **Why it leads:** the model attends to the salient token, so positives avoid priming the bad thing — but specific behavioral/syntax bans are clearer stated negatively.
-- **Runner-up:** structured-output validation (`validate.ts` type guards) — enforces some constraints (id-less shape) in code so the prompt does not have to (→ 02-structured-outputs.md).
-
-### rotating formulas (anti-convergence — NOT used here)
-
-- **Codebase uses:** nothing — no agent rotates openings or structures.
-- **Why it's here:** named as correctly absent; the convergence problem it solves requires prose repeated for one user over time, which no agent does.
-- **Leading today:** rotating formula pools + forbidden openings lead for recurring consumer-facing prose (digests, captions, notifications) in 2026.
-- **Why it leads:** they keep repeated prose from converging on a robotic house phrasing.
-- **Runner-up:** higher temperature / sampling diversity — increases variance but does not target the *opening* convergence the way a curated rotation pool does.
-
-### structured output as the convergence-eliminator
-
-- **Codebase uses:** `monitoring.md` L69–L97, `diagnostic.md` L59–L103, `recommendation.md` L47–L91 — JSON output on every repeated chain.
-- **Why it's here:** structured output has no phrasing to converge, so it removes the need for rotation on the repeated generations.
-- **Leading today:** structured output (tool-use / response_format) leads for repeated machine-consumed generations in 2026 (→ 02-structured-outputs.md).
-- **Why it leads:** sameness is the contract — identical structure is correct, not robotic.
-- **Runner-up:** templated prose with slotted values — structured-ish output that still reads as language; needed when a human reads every instance.
-
----
-
 ## Project exercises
 
 ### Add forbidden openings + rotating formulas to a new recurring prose digest
@@ -303,19 +253,6 @@ Anthropic's prompt guide and the OpenAI cookbook both recommend positive over ne
 - **Files to touch:** `lib/agents/prompts/monitoring.md`, `lib/agents/prompts/diagnostic.md`, a small eval harness counting redundant tool calls, `test/agents/monitoring.test.ts`.
 - **Done when:** the positive-framed prompts produce equal-or-fewer redundant tool calls than the negative ones on the eval set, decided on the count.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Forbidden patterns split into two halves with different triggers, and blooming insights ships one and correctly omits the other. The negative-constraint half is used pervasively — "do NOT re-run variations" (`monitoring.md` L17), "Never report a change derived from an empty window" (`monitoring.md` L37), "Do NOT use a `customers matching` clause" (`diagnostic.md` L35), "Do NOT include an `id` field" (`recommendation.md` L82) — each a specific incident compressed into a line the model reads every call. The rotating-formula half is absent, and correctly: the three repeated chains emit JSON (no phrasing to converge, `monitoring.md` L69–L97 etc.), and the one prose agent is one-shot per question (`query.md` L49, `route.ts` L135–L143), so neither condition for phrasing convergence holds. The decision flips only if a recurring prose digest for the same user ships — at which point forbidden openings + rotating formulas would earn their place.
-
-**Key points:**
-- A "do NOT" instruction is a production incident compressed into one line — scar tissue, read every call.
-- blooming insights uses negative constraints heavily and pairs them with positive alternatives where salience backfire would bite (`diagnostic.md` L35).
-- Rotating formulas fight phrasing convergence, which needs prose generated repeatedly for the same user over time.
-- Rotation is correctly absent: repeated chains are structured (no phrasing) and the prose agent is one-shot (no repetition).
-- The decision flips only with a recurring prose digest — a feature not yet built.
 
 ---
 
@@ -389,6 +326,11 @@ A reviewer says: "The agents generate text all day — add anti-repetition to al
 
 Name two forbidden ("do NOT" / "Never") instructions in the prompts and the bug each prevents. (Answer: `monitoring.md` L37 "Never report a change derived from an empty or zero window" — prevents bogus ±100% swings off an empty data tail; `recommendation.md` L82 "Do NOT include an `id` field" — prevents the model inventing identity the system assigns via `crypto.randomUUID()` after validation.)
 
+## See also
+
+→ 02-structured-outputs.md · → 01-anatomy.md · → 09-chain-of-thought.md · → 06-single-purpose-chains.md
+
 ---
 Updated: 2026-05-29 — Resynced monitoring.md refs after the `{categories}` shift: "do NOT re-run variations" L11→L17, "Never report … empty window" L31→L37, CRITICAL block L25–31→L31–37, the empty-window narrative L14–31→L20–37, and the structured-output JSON range L50–73→L69–97. (diagnostic.md L33 / recommendation.md L64 left per scope — see note.)
 Updated: 2026-05-29 — Resynced the sibling-prompt refs previously left per scope: diagnostic.md "customers matching" ban L33→L35, recommendation.md id-ban L64→L82, query.md prose L36→L49, and the diagnostic dense-forbidden-block ref L36–42→L38–50 (the "## Common EQL errors" block).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

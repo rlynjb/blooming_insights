@@ -5,7 +5,6 @@
 
 > diagnostic.md tells the model to "generate 2–3 hypotheses before your first tool call" (L20) and then requires that reasoning back as a *structured* field — `hypothesesConsidered[].reasoning` (L69–L75) — so CoT here is captured in a typed thinking field, not free-form prose; sonnet-4-6 reasons internally regardless, so the scaffolding earns its place by shaping OUTPUT STRUCTURE, not by eliciting hidden reasoning.
 
-**See also:** → 08-few-shot.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 04-token-budgeting.md
 
 ---
 
@@ -200,7 +199,7 @@ The reasoning is forced up front, externalized live by ReAct, and captured durab
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented (structured CoT in the diagnostic agent).**
 
@@ -273,55 +272,6 @@ On a model that already reasons, the marginal value of "reason carefully" is sma
 
 ---
 
-## Tradeoffs
-
-### Structured CoT (typed field) vs. free-form CoT vs. no CoT
-
-| Dimension | This codebase (structured `hypothesesConsidered`) | Free-form CoT prose | No CoT |
-|---|---|---|---|
-| Inspectability | High — typed, per-hypothesis | Low — one prose blob | None |
-| Testability | High — assert array shape/length | None — unparseable | N/A |
-| Output token cost | Moderate — reasoning per hypothesis | Moderate–high — open-ended | Lowest |
-| Anti-anchoring | Yes — breadth forced before action | Partial | No |
-| Faithfulness guarantee | None — post-hoc | None | N/A |
-| Fit for a 1-word classifier | N/A | Breaks it | Correct choice |
-
-**What we gave up.** Output tokens and some latency on the diagnostic path. Generating a `reasoning` string per hypothesis costs tokens the monitoring agent does not spend, and forcing 2–3 hypotheses can manufacture strawmen when the cause is obvious. The codebase accepts this on diagnosis because inspectable competing hypotheses are the product.
-
-**What the alternative would have cost.** Free-form CoT would have produced reasoning you cannot test, render as distinct hypotheses, or diff across runs — a prose dumping ground. No CoT would have produced a bare conclusion with no visible alternatives, undebuggable when wrong. The structured form buys inspectability for the token cost; the alternatives are cheaper but lose the thing that makes a wrong diagnosis investigable.
-
-**The breakpoint.** Structured CoT is right while diagnoses are read and audited by humans and the multi-hypothesis framing fits the task. It stops being worth it where the output is a measurement (monitoring), a downstream summary (recommendation), or a single token (classifier) — at which point CoT is pure cost, and in the classifier's case it breaks the output entirely. The trigger to *remove* CoT is "the task is no longer multi-hypothesis reasoning"; the trigger to *add* self-consistency on top is measured variance across runs (→ 10).
-
----
-
-## Tech reference (industry pairing)
-
-### structured CoT (`hypothesesConsidered[]`)
-
-- **Codebase uses:** `diagnostic.md` L69–L75 — reasoning captured as typed `{ hypothesis, supported, reasoning }` objects, required by `isDiagnosis`.
-- **Why it's here:** to make the diagnostic agent's competing-hypothesis reasoning inspectable, testable, and renderable rather than a prose blob.
-- **Leading today:** structured/typed reasoning fields and provider extended-thinking modes lead in 2026 over bare "think step by step."
-- **Why it leads:** on models that reason internally, the value is in capturing the reasoning as data, not eliciting it.
-- **Runner-up:** native extended thinking (Anthropic thinking blocks) — private reasoning the provider manages; pairs well with a typed *reported* field.
-
-### "reason before act" ordering (hypotheses before first tool call)
-
-- **Codebase uses:** `diagnostic.md` L20 — enumerate 2–3 hypotheses before the first `execute_analytics_eql` call.
-- **Why it's here:** anti-anchoring — commit the hypothesis space while context is clean, before any query result biases the conclusion.
-- **Leading today:** plan-before-act prompting and ReAct-style interleaved reasoning lead in 2026.
-- **Why it leads:** forcing breadth before depth reduces premature convergence on the first observation.
-- **Runner-up:** ReAct alone — interleaves reasoning and action but does not force the up-front hypothesis enumeration this prompt adds.
-
-### zero-shot CoT ("think step by step" — NOT used here)
-
-- **Codebase uses:** nothing — no agent uses the bare elicitation phrasing; CoT is always structured into the output.
-- **Why it's here:** named as the historical baseline — the 2022 form whose elicitation value has faded on frontier models.
-- **Leading today:** bare zero-shot CoT is largely superseded in 2026 by internal reasoning + structured capture.
-- **Why it leads (historically):** it unlocked reasoning on 2022-era models with no examples.
-- **Runner-up:** few-shot CoT (worked reasoning exemplars) — stronger than zero-shot when the reasoning pattern is non-obvious (→ 08-few-shot.md).
-
----
-
 ## Project exercises
 
 ### Add a self-consistency vote over the diagnostic's supported hypothesis
@@ -341,19 +291,6 @@ On a model that already reasons, the marginal value of "reason carefully" is sma
 - **Files to touch:** `lib/agents/diagnostic.ts` (post-validation quality check), `lib/mcp/types.ts` (a quality flag on the diagnosis), `test/agents/diagnostic.test.ts`.
 - **Done when:** a diagnosis whose hypotheses are near-duplicates or strawmen is flagged, and a genuinely diverse set is not.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Chain-of-thought on a modern model is not about eliciting hidden reasoning — sonnet-4-6 (`base.ts` L9) reasons internally — it is about forcing that reasoning into a structured, inspectable output. blooming insights' diagnostic agent forces breadth before depth ("generate 2–3 hypotheses before your first tool call," `diagnostic.md` L20) and captures the result as a typed `hypothesesConsidered[]` array of `{ hypothesis, supported, reasoning }` objects (`diagnostic.md` L69–L75), required by `isDiagnosis` — the textbook "reasoning in a thinking field, not free prose." The ReAct loop externalizes process reasoning as a live Thought stream (`base.ts` L108–L113) alongside it. And CoT is withheld exactly where it would hurt: the numeric monitoring output, the downstream recommendation rationale, and the 16-token classifier where step-by-step reasoning would consume the entire budget.
-
-**Key points:**
-- On frontier models, CoT's value migrated from *eliciting* reasoning to *shaping and capturing* it as structure.
-- "Generate 2–3 hypotheses before your first tool call" forces breadth before depth — anti-anchoring against the first query result.
-- `hypothesesConsidered[]` captures CoT as a typed field — queryable, assertable, renderable — and is part of the `isDiagnosis` contract.
-- ReAct externalizes the live process reasoning (`onText` → `reasoning_step`); the typed array is the durable artifact.
-- CoT is deliberately absent from monitoring, recommendation, and the classifier — where it is cost without payoff, or breaks the output outright.
 
 ---
 
@@ -427,5 +364,10 @@ A reviewer says: "Add a reasoning field to every agent's output for transparency
 
 In which output field does the diagnostic agent capture its chain-of-thought, and what does each element contain? (Answer: `hypothesesConsidered`, an array of `{ hypothesis, supported, reasoning }` objects — `diagnostic.md` L69–L75, required by `isDiagnosis` in `validate.ts`.)
 
+## See also
+
+→ 08-few-shot.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 04-token-budgeting.md
+
 ---
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md `hypothesesConsidered` shape L54–60→L69–75, field-rules ref L71→L90, monitoring output L50–73→L69–97, recommendation output L46–65→L49–74. (`diagnostic.md` L20 "generate 2–3 hypotheses" verified still correct — left unchanged.)
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

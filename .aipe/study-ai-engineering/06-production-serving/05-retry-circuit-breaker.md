@@ -5,7 +5,6 @@
 
 > `McpClient.callTool` retries a rate-limited call up to `maxRetries = 3` times with EXPONENTIAL backoff (`retryDelayMs · 2^(retries-1)`, base 10s, capped at `retryCeilingMs = 20s`), preferring a Retry-After window parsed from the error text plus a 500 ms buffer — bounded and correct, with backoff but no jitter — and there is no circuit breaker, so during a sustained provider outage every call still runs the full retry sequence before failing.
 
-**See also:** → 04-rate-limiting-backpressure.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
 
 ---
 
@@ -191,7 +190,7 @@ A reader who sees only this diagram should grasp: bounded retry on 429 is built 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 Partially implemented — bounded rate-limit retry with exponential backoff and Retry-After honoring is built; jitter and a circuit breaker are not.
 
@@ -245,53 +244,6 @@ The deterministic (un-jittered) backoff creates a thundering herd: if an agent f
 
 ---
 
-## Tradeoffs
-
-| Dimension | This codebase (bounded retry + backoff) | Add jitter | Add circuit breaker |
-|---|---|---|---|
-| Transient blip | recovers (up to 3 retries, backs off harder) | recovers, desynchronized | recovers (breaker stays closed) |
-| Rate-limit window | honored (parsed Retry-After + 500ms) | unchanged | unchanged |
-| Concurrent retry herd | synchronized (same deterministic wait) | desynchronized by jitter | reduced — breaker may open |
-| Sustained outage | every call pays ~51s tax | same — jitter doesn't fail fast | fails fast after trip — cheap |
-| Setup complexity | done — backoff + hint parse | low — one randomization term | medium — state machine + cooldown |
-| Failure mode | outage amplification, run timeout | reduced herd, still slow on outage | fast fail, clear error |
-
-**What we gave up.** The backoff is built and Retry-After-aware — the one thing it gave up is jitter, so concurrent retries that compute the same wait stay synchronized into a herd. The absence of a breaker gave up fast-fail behavior during a sustained outage — every call grinds through its full ~51s retry sequence, and a couple such calls can eat a large slice of the 300s route budget so the run times out instead of failing cleanly. For a single-user demo where Bloomreach outages are rare and concurrency is low, that was a defensible trade — the retry handles the common case (a transient 429, honoring the stated window) correctly, and the outage case is rare enough that the amplification has not bitten.
-
-**What the alternative would have cost.** Jitter is nearly free — one randomization term on the already-computed `waitMs`. The circuit breaker costs more: a small state machine (failure counter, open/closed/half-open, cooldown timer) living in instance state, plus tuning the failure threshold and cooldown duration. For a low-traffic, single-user tool, that state machine is more apparatus than the current failure rate justifies — which is why it was deferred, not built.
-
-**The breakpoint.** The bounded, exponential-backoff retry is sufficient while Bloomreach outages are rare and traffic is single-user. It breaks when either changes: under concurrency, the synchronized (un-jittered) backoff retries form a herd (jitter becomes necessary), and during a sustained outage at any traffic level, the per-call ~51s retry tax exhausts the route budget and amplifies the outage (the breaker becomes necessary). The trigger is the first real provider outage observed under load — at that point the breaker moves from "nice to have" to "required."
-
----
-
-## Tech reference (industry pairing)
-
-### bounded retry with exponential backoff + Retry-After
-
-- **Codebase uses:** `while (isRateLimited(result) && retries < this.maxRetries)` (`lib/mcp/client.ts` L122–L132), `maxRetries = 3` (L89); `backoffMs = retryDelayMs · 2^(retries-1)` (L125, base 10s), `parseRetryAfterMs` (L31–L38) + `RETRY_BUFFER_MS = 500` (L16), capped at `retryCeilingMs = 20_000` (L94).
-- **Why it's here:** turns a transient 429 into a recovered call without looping forever, and waits out the server's *stated* penalty window when it parses one.
-- **Leading today:** `p-retry` (adoption-leading promise retry, 2026); AWS SDK v3 built-in retry (innovation-leading reference, 2026).
-- **Why it leads:** `p-retry` bundles backoff, jitter, and `shouldRetry` predicates; AWS SDK ships the reference backoff-with-jitter implementation. The codebase's hand-rolled loop matches all but the jitter.
-- **Runner-up:** `fetch-retry` for a zero-dependency `fetch` wrapper.
-
-### jitter
-
-- **Codebase uses:** nothing — the backoff (`lib/mcp/client.ts` L125) and parsed hint (L124) grow the wait but add no randomization, so concurrent callers compute identical waits.
-- **Why it's here:** the named limitation; deterministic delays synchronize concurrent retries into a herd.
-- **Leading today:** AWS decorrelated jitter (adoption-leading, 2026); `p-retry` / `exponential-backoff` (innovation-leading libraries, 2026).
-- **Why it leads:** jitter desynchronizes concurrent retries on top of the growth the codebase already has.
-- **Runner-up:** full jitter (`random(0, base·2^attempt)`) — simplest effective variant.
-
-### circuit breaker
-
-- **Codebase uses:** nothing — no failure counter, no open/closed state, no fast-fail path.
-- **Why it's here:** the missing mechanism; a sustained outage makes every call pay the full retry tax.
-- **Leading today:** `opossum` (adoption-leading Node circuit breaker, 2026); `cockatiel` (innovation-leading combined retry+breaker+timeout, 2026).
-- **Why it leads:** `opossum` is a focused breaker with metrics; `cockatiel` composes breaker, retry, timeout, and fallback into one policy.
-- **Runner-up:** a hand-rolled counter + timestamp state machine in `McpClient`.
-
----
-
 ## Project exercises
 
 ### Add jitter and a fail-fast circuit breaker
@@ -311,19 +263,6 @@ The deterministic (un-jittered) backoff creates a thundering herd: if an agent f
 - **Files to touch:** `lib/mcp/client.ts` (`isRateLimited` at L18–L22 generalized to an `isRetryable` predicate; the loop condition at L122).
 - **Done when:** a transient server-error result is retried and a non-retryable client error is not — verified by tests with a fake transport returning each error class.
 - **Estimated effort:** <1hr.
-
----
-
-## Summary
-
-blooming insights retries a rate-limited MCP call up to `maxRetries = 3` times (`lib/mcp/client.ts` L122–L132), targeting exactly the recoverable case via `isRateLimited` (L18–L22) and re-applying the 1100 ms spacing on each retry. Each wait prefers the server's stated Retry-After window (parsed by `parseRetryAfterMs` L31–L38, plus a 500 ms buffer) and otherwise uses exponential backoff `retryDelayMs · 2^(retries-1)` off a 10s base (L125), capped at a 20s ceiling (L94). The retry is bounded, targeted, Retry-After-aware, and exponential — a correct foundation — missing only jitter (concurrent retries compute identical waits and synchronize into a herd). There is no circuit breaker, so a sustained Bloomreach outage makes every call pay its full ~51s retry sequence before failing, amplifying the outage and risking the 300s route budget. The buildable target is jitter plus a fail-fast breaker.
-
-**Key points:**
-- Retry recovers from transient blips; a circuit breaker protects against sustained outages — they are complements.
-- The retry loop is bounded (`maxRetries = 3`, L89) and targeted (`isRateLimited`, L18–L22) — correct for a 429.
-- The wait is exponential backoff off a 10s base, capped at 20s (L94), and prefers a parsed Retry-After window + 500ms (L124–L129) — but has no jitter (concurrent retries herd).
-- There is no breaker — during an outage every call pays the full ~51s retry tax and can exhaust the 300s route budget.
-- The fix is jitter plus an open/half-open/closed breaker that fails fast.
 
 ---
 
@@ -401,5 +340,10 @@ A teammate says "the bounded retry with backoff is fine, we don't need a circuit
 
 How many total transport attempts does `callTool` make in the worst case for a rate-limited call, and which constant determines it? (Answer: 4 — 1 initial + `maxRetries = 3`, `lib/mcp/client.ts` L89, loop L122–L132.)
 
+## See also
+
+→ 04-rate-limiting-backpressure.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
+
 ---
 Updated: 2026-05-28 — Corrected the retry framing from "fixed 1200ms delay" to the real exponential backoff (10s base, 20s ceiling) with parsed Retry-After + 500ms buffer; re-derived all client.ts line refs; worst-case retry tax now ~51s and the route budget is 300s.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

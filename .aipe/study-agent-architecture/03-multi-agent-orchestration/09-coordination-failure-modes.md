@@ -5,7 +5,6 @@
 
 > The failures that don't exist in single-agent systems. Walk the table and show which ones blooming insights' design PREVENTS structurally vs CONTROLS with mechanisms. Thesis: deterministic orchestration buys you fewer failure modes — infinite handoff and synthesis failure are structurally absent because no autonomous handoff and no LLM merge exist.
 
-**See also:** → `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
 
 ---
 
@@ -358,7 +357,7 @@ The full failure-mode landscape
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — the failure-prevention story is concrete, with each failure anchored to specific code.**
 
@@ -473,95 +472,6 @@ The mechanical-control argument breaks when the mechanism is poorly calibrated. 
 - `./05-debate-verifier-critic.md` → the "synthesis failure" failure in detail
 - `./08-shared-state-and-message-passing.md` → the "context bloat" failure in detail
 - `../05-production-serving/` → cost-aware production controls beyond what this file covers
-
----
-
-## Tradeoffs
-
-The decision was: **structurally prevent the failures that the architectural choices retire; mechanically control the failures that remain.** The alternative is to add the failures back (LLM supervisor, autonomous handoff, shared blackboard) and rely on mechanisms for all of them.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Structural + mechanical     │ All-mechanical (alternative)│
-│                  │ (chosen)                    │                             │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build cost       │ 3 structural choices +      │ 6 mechanisms (handoff       │
-│                  │ 3 mechanisms                │ counter, merge schema,       │
-│                  │                             │ context summarization, etc.)│
-│ On-call burden   │ ~3 failure modes to        │ ~6 failure modes to monitor,│
-│                  │ monitor (the mechanical     │ alert on, write runbooks    │
-│                  │ ones)                       │ for                         │
-│ Capability loss  │ no runtime adaptive         │ keeps adaptive routing;     │
-│                  │ routing; no LLM merge        │ runtime decides ordering    │
-│ Token cost / run │ low (no supervisor LLM, no  │ +supervisor LLM cost,       │
-│                  │ merger LLM)                 │ +merger LLM cost            │
-│ Quality ceiling  │ bounded by single-agent     │ adaptive routing might      │
-│                  │ quality + curated handoffs  │ improve quality marginally  │
-│ Debug shape      │ 3 places to look (the 3     │ 6 places to look (every     │
-│                  │ mechanisms)                 │ mechanism)                  │
-│ Calibration risk │ 3 mechanisms to calibrate   │ 6 mechanisms to calibrate   │
-│ When right       │ when capability loss is     │ when adaptive routing is    │
-│                  │ acceptable (this codebase)  │ worth the failure surface   │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up runtime-adaptive routing (the cost of structurally absent infinite handoff and synthesis failure). The route can't reorder stages based on what an agent found; the supervisor role is played by code, so it can't reason about what a worker said before picking the next worker. Cross-ref `./01-when-not-to-go-multi-agent.md` and `./02-supervisor-worker.md` for the full architectural cost.
-
-We also gave up the *possibility* of higher-quality outputs from adaptive coordination. A well-tuned LLM supervisor with good handoffs *might* produce better answers on edge cases than a fixed pipeline. We don't know — we haven't measured because we didn't ship it.
-
-### What the alternative would have cost
-
-If we'd built the all-mechanical version (autonomous orchestration with mechanisms for every failure), the up-front cost would have been an LLM supervisor + handoff infrastructure + shared state schema + 6 monitoring layers. Per-run cost would be the 2-5x token tax + supervisor latency. On-call burden would be ~6 failure modes to monitor instead of 3 — each one requiring alerts, runbooks, and dashboard panels.
-
-The hidden cost is *failure compounding*. Mechanisms can fail too: a `MAX_HOPS` counter could be set wrong, a synthesis schema could be too permissive, a context summarizer could drop critical signals. Each mechanism is its own surface area for bugs. Structural prevention eliminates this surface area entirely.
-
-### The breakpoint
-
-This stays the right call until capability loss from the structural choices becomes a visible product problem — e.g. when users complain about "the system doesn't adapt to what it learns" or when quality on edge-case anomalies measurably drops. At that point, the all-mechanical version's adaptive routing earns its overhead, and the 6-failure-mode monitoring stack becomes the cost of admission.
-
-### What wasn't actually a tradeoff
-
-A "mechanism-free, structurally-only" version was not a real alternative. Tool-call cascade, cost blowup, and token revocation aren't preventable by architecture — they're inherent to running agent loops with LLM workers against an MCP server. You can't structurally prevent an agent from calling tools (that's its job); you can only cap how many. So the mechanisms have to be there regardless of architecture. The choice is whether you have 3 mechanisms (today) or 6 (if you also added LLM supervisor + autonomous handoff + shared state).
-
----
-
-## Tech reference
-
-### Anthropic Messages API (the forced-final-turn primitive)
-
-- **Codebase uses:** `runAgentLoop` in `lib/agents/base.ts` L48–L176 — the `params.tools` field is conditional on `forceFinal`, leveraging that Anthropic's API treats absent tools as "model cannot emit tool_use."
-- **Why it's here:** this is the load-bearing mechanism for tool-call cascade prevention; stripping tools forces text emission.
-- **Leading today:** Anthropic Messages API — innovation-leading for agent loops with explicit tool/no-tool control per turn, 2026.
-- **Why it leads:** the tool parameter is per-request, not session-level, so you can flip it within a loop; the model's behavior on absent tools is well-defined ("must emit text").
-- **Runner-up:** OpenAI Responses API — equivalent shape; requires `tool_choice: 'none'` to force text.
-
-### sessionStorage as a recovery flag
-
-- **Codebase uses:** `sessionStorage.setItem('bi:reconnecting', '1')` in `app/page.tsx` L416, cleared on success at L394/L427.
-- **Why it's here:** per-tab persistence is exactly the right scope for "we tried once already during this user session"; survives a redirect-to-OAuth + redirect-back round trip.
-- **Leading today:** `sessionStorage` for per-tab transient state — adoption-leading for browser-scoped recovery flags, 2026.
-- **Why it leads:** synchronous, per-tab (no cross-tab contamination), cleared on tab close (no permanent state pollution).
-- **Runner-up:** in-memory React state — would be lost on the OAuth redirect; `sessionStorage` wins specifically because of redirect survival.
-
-### Per-stage `maxToolCalls` as a budget primitive
-
-- **Codebase uses:** each agent declares its own `maxToolCalls` value passed to `runAgentLoop` (`monitoring.ts` L101, `diagnostic.ts` L62, `recommendation.ts` L57, `query.ts` L41).
-- **Why it's here:** the cap is the bound on tool-call cascade per agent; per-stage values let each agent be calibrated to its own typical work.
-- **Leading today:** per-agent iteration caps — adoption-leading for production agent systems, 2026.
-- **Why it leads:** every agent framework (LangGraph, OpenAI Agents SDK, CrewAI) ships per-agent budgets as first-class because they're the simplest, hardest-to-bypass bound.
-- **Runner-up:** global token-budget caps — bounds cost but not iteration count; per-stage iteration caps are more predictable.
-
----
-
-## Summary
-
-The coordination failure cluster is where multi-agent systems silently lose to their single-agent baselines: infinite handoff, tool-call cascade, context bloat, synthesis failure, cost blowup, token revocation mid-run. blooming insights' deterministic orchestration STRUCTURALLY PREVENTS three (infinite handoff: no `transfer_to_*` tools anywhere in `lib/mcp/tools.ts`; synthesis failure: no LLM merge — the inter-stage handoff is a function call with typed `Diagnosis`; context bloat: message passing, not shared state) and MECHANICALLY CONTROLS three (tool-call cascade: per-agent `maxToolCalls` caps + forced-final-turn in `lib/agents/base.ts` L90–L101; cost blowup: Haiku classifier + Sonnet workers + per-stage budgets; token revocation: one-time guarded auto-reconnect in `app/page.tsx` L394–L427 with `sessionStorage 'bi:reconnecting'` flag). The thesis: structural prevention is cheaper than mechanical control because absent failures need no monitoring. The cost: capability loss (no adaptive routing, no LLM merge); the breakpoint where the all-mechanical version earns its overhead is when capability loss becomes a visible product problem.
-
-- Three failures structurally absent: infinite handoff (no handoff tools), synthesis failure (no LLM merger), context bloat (message passing).
-- Three failures mechanically controlled: tool-call cascade (caps + forced final), cost blowup (mixed-model + budgets), token revocation (one-time guarded reconnect).
-- Structural prevention costs upfront architectural choice; pays back as zero on-call burden for the retired failures.
-- Mechanical control needs calibration: each mechanism is a line of code with a specific value that needs occasional review.
-- Worth it while capability loss is acceptable; if adaptive routing becomes a hard requirement, the all-mechanical version earns its overhead.
 
 ---
 
@@ -718,5 +628,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

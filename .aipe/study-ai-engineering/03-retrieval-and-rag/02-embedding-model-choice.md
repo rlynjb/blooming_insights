@@ -5,7 +5,6 @@
 
 > Choosing an embedding model is choosing three numbers — dimension, per-token cost, and domain-fit on *your* data — and the right model is the smallest, cheapest one that holds retrieval quality on your own corpus; blooming insights embeds nothing, so this is study material and a buildable target.
 
-**See also:** → 01-embeddings.md · → 04-vector-databases.md · → 09-stale-embeddings.md · → 11-rag.md
 
 ---
 
@@ -127,7 +126,7 @@ The dimension chosen in the Service layer is paid forever in the State layer's s
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings — so there is no embedding model selected, no dimension, and no retrieval benchmark.
 
@@ -169,55 +168,6 @@ The same selection discipline spans both model families. The mistake — in both
 
 ---
 
-## Tradeoffs
-
-### Small/cheap embedding model vs. large/capable one
-
-| Dimension | Small (384–768, e.g. bge-small / self-hosted) | Large (1536–3072, e.g. text-embedding-3-large) |
-|---|---|---|
-| Retrieval quality on prose | Lower | Higher |
-| Retrieval quality on short structured terms | Often equal | Marginal gain |
-| Storage per vector | ~1.5–3 KB | ~6–12 KB |
-| Cosine latency | Faster (shorter loop) | Slower |
-| Per-call cost | Often $0 (self-hosted) | Per-token |
-| Right when | Short terms, cost-sensitive, on-prem | Long documents, fine distinctions needed |
-
-**What we gave up (by not having it).** Nothing today — there is no index, so dimension and cost are not paid. The latent cost is that when embeddings are added, picking the model by reflex (grab the biggest) would over-pay on storage and latency for ~80 short event names a small model separates perfectly.
-
-**What the alternative would have cost.** Defaulting to a 3072-dimension model "to be safe" would 8× the cosine compute and storage versus a 384-dimension model, for terms short enough that the larger model adds no separating power — a pure tax. Conversely, defaulting to the smallest model without measuring risks under-separating genuinely close terms and producing wrong matches.
-
-**The breakpoint.** A small, cheap (or self-hosted) model is correct while the corpus is short structured terms embedded once. The choice flips toward a larger model when the corpus becomes long natural-language documents (e.g. embedding full past-investigation narratives, `09`/`12`) where fine semantic distinctions matter and the small model's blurring produces wrong neighbors.
-
----
-
-## Tech reference (industry pairing)
-
-### hosted embedding model
-
-- **Codebase uses:** nothing — no embedding model configured.
-- **Why it's here (absent):** no retrieval index exists; schema is delivered as text.
-- **Leading today:** OpenAI `text-embedding-3-large`/`-small` lead by adoption; Voyage `voyage-3` and Cohere `embed-v3` lead on retrieval benchmarks (2026).
-- **Why it leads:** strong general semantics, dimension flexibility (Matryoshka truncation), one-line API.
-- **Runner-up:** Cohere `embed-v3` with its dedicated `search_query`/`search_document` input types that tune the vector for retrieval direction.
-
-### open-weight / self-hosted embedding model
-
-- **Codebase uses:** nothing.
-- **Why it's here (absent):** no embedding step to host.
-- **Leading today:** `BAAI/bge` family and `nomic-embed-text` lead self-hosted retrieval (2026).
-- **Why it leads:** competitive quality with zero per-call cost and data never leaving the boundary.
-- **Runner-up:** `sentence-transformers/all-MiniLM-L6-v2` — tiny (384-dim), fast, the default starter for cost-sensitive on-box retrieval.
-
-### retrieval benchmark (MTEB)
-
-- **Codebase uses:** nothing — no model evaluation.
-- **Why it's here (absent):** no model to evaluate.
-- **Leading today:** MTEB is the standard cross-model embedding benchmark (2026).
-- **Why it leads:** broad task coverage (retrieval, clustering, reranking) and a public leaderboard.
-- **Runner-up:** BEIR — retrieval-only, the predecessor MTEB absorbed; still cited for zero-shot retrieval.
-
----
-
 ## Project exercises
 
 ### Benchmark two embedding models on the real schema and pick by recall@k
@@ -237,19 +187,6 @@ The same selection discipline spans both model families. The mistake — in both
 - **Files to touch:** `lib/mcp/embeddings.ts` (dimension param + truncation), `scripts/bench-embeddings.ts` (sweep dimensions), `test/mcp/embeddings.bench.test.ts`.
 - **Done when:** the report shows recall at each truncated dimension and names the smallest dimension that holds quality, with the vector cache sized accordingly.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Choosing an embedding model is choosing three traded numbers — dimension (paid forever in storage and every cosine), cost-per-token (or zero if self-hosted), and domain fit measured on *your* data — and the right answer is the smallest, cheapest model that holds retrieval quality on your own corpus, not the leaderboard leader. blooming insights embeds nothing, but it already lives the underlying discipline in its chat-model tiering: cheap haiku for the easy intent job, capable sonnet for the analysts. The embedding choice is that same call in a different model family, and the costliest mistake is switching models later, which forces a full re-index.
-
-**Key points:**
-- There is no globally best embedding model — only the cheapest sufficient one for *your* data.
-- Dimension is paid three times: storage, bandwidth, and every cosine comparison.
-- MTEB is a starting filter; the decision is recall@k on your own query→term pairs.
-- Vectors from different models are incompatible — switching models means re-embedding everything.
-- The codebase's haiku-vs-sonnet tiering is the same "smallest sufficient model" logic.
 
 ---
 
@@ -325,3 +262,8 @@ A colleague wants to default to a 3072-dimension model "to never be limited late
 ### Quick check — code reference test
 
 What model-selection discipline does blooming insights already demonstrate, and where? (Answer: cheap-small-vs-capable tiering — `claude-haiku-4-5` for the 16-token intent classification in `lib/agents/intent.ts` L14, `claude-sonnet-4-6` for the analyst agents in `lib/agents/base.ts` L9 — the same "smallest sufficient model" logic the embedding choice requires.)
+
+## See also
+
+→ 01-embeddings.md · → 04-vector-databases.md · → 09-stale-embeddings.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Models bill and bound work in tokens, not characters; blooming insights does no token counting at all — it bounds every prompt and tool result with *character* budgets (`MAX_TOOL_RESULT_CHARS = 16_000`, route `TRUNC = 4000`, `schemaSummary` caps) plus per-call `max_tokens`, a deliberately coarse proxy for the real unit.
 
-**See also:** → 01-what-an-llm-is.md · → 06-token-economics.md · → 04-structured-outputs.md
 
 ---
 
@@ -168,7 +167,7 @@ The Service layer governs input size in characters; the only token-denominated c
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not the "real" tokenizer — the honest analog is character budgeting.** blooming insights never calls a tokenizer and never reads `res.usage`; it bounds prompts and tool results by `string.length` and bounds output by `max_tokens`, treating ~4 chars/token as an unstated, coarse proxy for the real unit.
 
@@ -219,48 +218,6 @@ The proxy's accuracy depends entirely on the *content*. blooming insights feeds 
 
 ---
 
-## Tradeoffs
-
-### Character budget vs. real token counting
-
-| Dimension | This codebase (character proxy) | Real tokenizer counting |
-|---|---|---|
-| Measurement cost | Zero — `s.length` | A tokenizer pass per string, or read `res.usage` after the call |
-| Accuracy | Loose; ±25–50% vs. true tokens depending on content | Exact |
-| Truncation quality | Byte offset; can cut mid-JSON | Can cut at a token / structure boundary |
-| Window-edge safety | Slop swamps margin near the limit | Tight, reliable margin |
-| Dependencies | None | Tokenizer lib or usage parsing |
-
-**What we gave up.** Knowing how big the prompt actually is. With a character budget, "are we near the context window?" is unanswerable; the codebase trusts that 16,000-char results × six calls stays comfortably inside the window, which is true today but unverified. There is also no record of input tokens consumed, which couples directly to the cost-visibility gap in → 06-token-economics.md.
-
-**What the alternative would have cost.** A tokenizer dependency and a tokenizer pass over every tool result and the schema summary — measurable latency on large payloads, plus the maintenance of keeping the tokenizer version matched to the model. Reading `res.usage` is far cheaper (it is already returned) but only measures *after* the call, so it cannot pre-bound truncation.
-
-**The breakpoint.** The character proxy is correct while bounded payloads stay well inside the window. It breaks the moment a truncated-but-still-large prompt sits near the window edge: there, the 4:1 estimate's ±40% error is larger than the remaining margin, and a "safe" 16,000-char result can push a long conversation over. That event — a prompt within ~20% of the window — is the trigger to count tokens for real.
-
-**Not actually a tradeoff:** the `max_tokens` caps. Those *are* real token controls and cost nothing extra; the proxy story is only about *input* sizing.
-
----
-
-## Tech reference (industry pairing)
-
-### subword tokenizer (BPE)
-
-- **Codebase uses:** nothing — there is no tokenizer; `truncate` and the `schemaSummary` caps approximate token budgeting with character/list-length counts.
-- **Why it's here (absent):** the system bounds input by characters because `s.length` is free and the 4:1 rule is adequate at current payload sizes.
-- **Leading today:** `tiktoken` (OpenAI's BPE) leads adoption (2026); Anthropic ships `@anthropic-ai/tokenizer` for Claude-accurate counts.
-- **Why it leads:** model-matched tokenization gives exact counts, which is the only way to budget tightly against the context window.
-- **Runner-up:** `gpt-tokenizer` (pure-JS, dependency-light) and SentencePiece (for non-OpenAI models).
-
-### `max_tokens` (output cap)
-
-- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (diagnostic.ts L99 / recommendation.ts L98), `16` classifier (`lib/agents/intent.ts` L20).
-- **Why it's here:** it is the one hard token limit the SDK exposes that the code sets directly; the `16` on the classifier forces a single-word answer and caps that call's cost to near-nothing.
-- **Leading today:** every major provider exposes an output token cap (2026); it is universal, not differentiated.
-- **Why it leads:** it bounds the most variable cost component (output tokens cost more than input — see → 06-token-economics.md) with one integer.
-- **Runner-up:** stop sequences — bound output by content rather than count.
-
----
-
 ## Project exercises
 
 ### Add real token accounting from `res.usage`
@@ -280,19 +237,6 @@ The proxy's accuracy depends entirely on the *content*. blooming insights feeds 
 - **Files to touch:** `lib/agents/base.ts` (`truncate`, `MAX_TOOL_RESULT_CHARS` → a token budget), new `lib/mcp/tokens.ts`, `test/agents/base.test.ts`.
 - **Done when:** a 60KB JSON tool result is truncated to a configured token budget at a valid boundary, and the count is verified against the tokenizer.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-The model bounds and bills in tokens — subword pieces produced by a tokenizer the codebase never runs. blooming insights substitutes a character budget for a token budget: `truncate` caps each tool result at `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts`), `schemaSummary` caps the schema to ~20 events × 10 props, and the route's separate `TRUNC = 4000` bounds only the UI stream. The one real token control is `max_tokens` on the output — `4096`/`2048`/`16`. The proxy is coarse (≈4 chars/token, looser for JSON) but free, and correct enough until a payload approaches the window edge.
-
-**Key points:**
-- Tokens, not characters, are the model's unit for the context window, `max_tokens`, and cost.
-- blooming insights bounds input by characters because `s.length` is free; ≈4 chars/token is the unstated proxy.
-- `16_000` protects the model window; `4000` protects the UI stream — two different budgets for two different reasons.
-- `max_tokens` (`4096`/`2048`/`16`) is the only real token-denominated control in the codebase.
-- The proxy breaks at the window edge, where the 4:1 error exceeds the safety margin — that is when real token counting earns its cost.
 
 ---
 
@@ -367,6 +311,11 @@ A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` to stop truncatin
 
 What `max_tokens` value forces the intent classifier to answer in one word, and where is it set? (Answer: `16` — `lib/agents/intent.ts` L20.)
 
+## See also
+
+→ 01-what-an-llm-is.md · → 06-token-economics.md · → 04-structured-outputs.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); character-budget facts and `base.ts`/`monitoring.ts`/`intent.ts` refs verified unchanged.
 Updated: 2026-05-29 — Corrected the two stale diagnostic-synthesis `max_tokens` citations from L94 to L99 (verified against current `diagnostic.ts`: `max_tokens: 2048` is at L99).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

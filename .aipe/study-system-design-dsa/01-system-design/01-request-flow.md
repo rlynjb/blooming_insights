@@ -5,7 +5,6 @@
 
 > A single `GET /api/briefing` call moves through session resolution, OAuth-gated MCP connection, workspace schema bootstrap, an AI agent run, and in-process state before JSON lands in the browser — understanding every hop is what lets you predict latency, debug auth failures, and reason about where state lives.
 
-**See also:** → 02-oauth-boundary.md · → 04-caching-and-rate-limiting.md · → 05-streaming-ndjson.md
 
 ---
 
@@ -293,7 +292,7 @@ MCP / Provider layer
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `app/page.tsx`
 **Function / class:** `HomePage` (default export); the `[mode, ready]` briefing fetch effect
@@ -431,75 +430,6 @@ Every gate that short-circuits means the layers below never execute. This is the
 
 ---
 
-## Tradeoffs
-
-```
-Dimension             Per-request agent run           Precomputed / cron'd feed
-──────────────────────────────────────────────────────────────────────────────
-Freshness             Live at request time            Stale by up to cron interval
-Latency               Up to 300 s (function limit)    ~100 ms (DB/file read)
-Auth coupling         MCP auth required per request   Auth only at cron time
-Cost (AI tokens)      Per page load                   Per cron tick (amortized)
-Serverless limits     Fits 300 s maxDuration (Pro)     Cron job separate from handler
-MCP rate limit        6 agent calls + 4 schema calls  Same, but batched not user-driven
-Failure surface       User-visible timeout/error       Background failure, silent stale
-```
-
-### Sub-block 1 — what we gave up
-
-A per-request agent run means every page load pays the full MCP + Claude latency. At ~1 req/s MCP rate, 4 sequential schema calls alone take ~4.4 seconds minimum. Add 6 agent tool calls and 8 Claude turns and a cold start can easily hit 20–40 seconds. The `maxDuration = 300` ceiling (`route.ts` L17, Vercel Pro) is the hard wall. Users who land on the page while the agent is still running see the spinner (`status === 'loading'`) for the entire duration.
-
-### Sub-block 2 — what the alternative would have cost
-
-A precomputed feed (cron job writes `lib/state/demo-insights.json` on a schedule, route always reads the file) would reduce page-load latency to milliseconds and eliminate the per-user auth dependency. The cost: the feed is stale. A metric spike at 2:47 AM is invisible until the next cron tick. The cron job needs its own auth token, its own error alerting, and a way to surface "last updated at" so users know when the data is from. The cached demo path (the `?demo=cached` short-circuit, `route.ts` L76–151) is exactly this pattern — a committed snapshot serving as the cron output, now replayed as a paced NDJSON stream rather than returned as one JSON body.
-
-### Sub-block 3 — the breakpoint
-
-The per-request model holds at low traffic. The breakpoint is the intersection of two constraints: the 300-second function limit (`maxDuration = 300`, Vercel Pro) and the ~1 req/s MCP rate ceiling (verified live, `connect.ts` L81–88). At 1 concurrent user the budget is comfortable. At 2+ concurrent users both sessions share the same MCP server rate limit — the second user's request starts queuing behind the first. At ~5 concurrent users the MCP server begins returning 429s before the function times out. The `McpClient`'s 1100 ms spacing (`connect.ts` L92) prevents the client from exceeding the limit per session but does not coordinate across sessions. That is the event that makes the cron/precompute model the right call.
-
----
-
-## Tech reference (industry pairing)
-
-### Next.js App Router route handlers
-
-- **Codebase uses:** `export async function GET(req: NextRequest)` in `app/api/briefing/route.ts`; `export const maxDuration = 300`; `NextResponse.json()` (pre-stream) + a `ReadableStream` NDJSON response
-- **Why it's here:** App Router co-locates the API route with the frontend in one Next.js project; the `GET` export is the route handler; `maxDuration` is the Vercel serverless function timeout
-- **Leading today (2026):** Next.js App Router is the de facto standard for React full-stack apps; server components + route handlers in one project is the dominant pattern for Next.js 13+ deployments
-- **Why it leads:** Zero-config deployment on Vercel, TypeScript-first, RSC + route handlers in one mental model, active ecosystem and LTS commitment from Vercel
-- **Runner-up:** Remix (similar file-based routing, stronger progressive enhancement, owned by Shopify since 2022)
-
-### MCP client/transport (Model Context Protocol)
-
-- **Codebase uses:** `@modelcontextprotocol/sdk` `Client` + `StreamableHTTPClientTransport` in `lib/mcp/connect.ts` L15–18, L42–44; `McpClient` wrapper in `lib/mcp/client.ts` adding rate-limit spacing
-- **Why it's here:** Bloomreach exposes its analytics/CDP tools via an MCP server; the SDK handles OAuth, streaming, and tool-call framing so the agent code only calls `mcp.callTool(name, args)`
-- **Leading today (2026):** MCP is Anthropic's open protocol for connecting AI agents to external tools; adoption is accelerating across IDE tools, data platforms, and SaaS APIs; it is the primary way to give Claude structured tool access
-- **Why it leads:** Open spec (not Anthropic-proprietary in usage), vendor-neutral tool definitions, streaming transport, built-in OAuth support via `OAuthClientProvider`
-- **Runner-up:** OpenAI function calling / tool use over REST (older pattern, not a protocol — each vendor implements its own transport)
-
-### Cookie-based session (`bi_session`)
-
-- **Codebase uses:** `lib/mcp/session.ts` `getOrCreateSessionId` reads/writes `bi_session` with `httpOnly: true, sameSite: 'lax'`; the session id keys the `BloomreachAuthProvider`'s in-memory OAuth state
-- **Why it's here:** The MCP OAuth flow requires per-user token storage; a cookie is the simplest way to carry a session id from the browser to the server without a login system; `httpOnly` prevents JS access
-- **Leading today (2026):** `httpOnly` cookies for session ids remain the standard — `sameSite: 'lax'` is the default for new cookies in all major frameworks (Next.js, Remix, SvelteKit)
-- **Why it leads:** Automatic browser handling, CSRF mitigation via `sameSite`, no client-side JS required to send it, compatible with server-side rendering
-- **Runner-up:** JWT in `Authorization: Bearer` header (requires explicit client-side storage + header injection; no automatic browser handling; common in SPAs calling separate APIs)
-
----
-
-## Summary
-
-The request flow for `/api/briefing` is a multi-hop pipeline: the browser's `useEffect` fetch → a demo short-circuit gate (now a paced NDJSON replay, not a JSON blob) → session cookie resolution → OAuth-gated MCP connection → workspace schema bootstrap → a coverage gate that matches the schema to the 10-category checklist and runs only the runnable categories → an AI agent run gated to those categories → `Anomaly`-to-`Insight` mapping → NDJSON stream → card render. The constraint that forced this shape is the MCP server's ~1 req/s rate limit and the requirement that insights be live at page load time — the agent must run synchronously in the request, which pushes the function toward the 300-second `maxDuration` ceiling (Vercel Pro). The cost is latency: every page load pays the full agent round-trip, and the in-process state stores (`Map` in `insights.ts`, module-level `cached` in `schema.ts`) are process-scoped, which breaks under multi-instance serverless deployment.
-
-- **Shape:** A strict sequential pipeline where each `await` is a layer boundary and a failure domain; short-circuit at any gate returns a distinct JSON error shape.
-- **Rule:** The demo `?demo=cached` path is a structural short-circuit, not a feature flag — it bypasses every layer after the file-existence check.
-- **Tradeoff:** Per-request agent runs give live data but spend the full latency budget; a precomputed feed would be milliseconds but stale.
-- **State:** `WorkspaceSchema` and `Insight` maps are in-process — warm within a function lifetime, reset on cold start; this is a hidden state ownership decision.
-- **Failure handling:** Each layer returns a structured error shape (`{needsAuth}` at 401, `{error}` at 500 pre-stream, an NDJSON `error` event mid-stream, `done`-with-no-`insight` for empty) so the client can branch correctly; the agent degrades to `[]` rather than throwing.
-- **System-design checklist:** This file is primarily **step 2 — Request-response flow**; it also touches step 4 (state ownership: in-process maps), step 5 (failure handling: per-layer error shapes), and step 6 (scale concerns: the 300 s ceiling + concurrent-user MCP rate-limit breakpoint).
-
----
-
 ## Interview defense
 
 ### What an interviewer is really asking
@@ -615,8 +545,13 @@ Without reading the file, answer:
 4. What does the route export to tell Vercel the function timeout? (Check: `app/api/briefing/route.ts` L17)
 5. What file does the demo path read from, and where is the path constructed? (Check: `app/api/briefing/route.ts` L19 (`DEMO_FILE`), L84–87)
 
+## See also
+
+→ 02-oauth-boundary.md · → 04-caching-and-rate-limiting.md · → 05-streaming-ndjson.md
+
 ---
 Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now streams NDJSON (`describeToolCall`/`trunc`, no `summarizeTrace`) with `maxDuration = 300`; `connectMcp` is async and wrapped in `withAuthCookies`; setup is in a try/catch returning the real error; noted the runtime `localStorage` `bi:mode` demo/live toggle and `anomalyToInsight`'s `impact`/`history`/`deriveInsightFields`.
 
 ---
 Updated: 2026-05-29 — added Hop 5.5 coverage gate (`schemaCapabilities`/`coverageReport`/`runnableCategories`, `categories.ts`) with ASCII diagram + folded it into the primary diagram, pseudocode, and Summary; documented the demo path as a paced NDJSON replay (`REPLAY_DELAY_MS = 140`) instead of a plain-JSON blob; updated `MonitoringAgent.scan(hooks, runnable)` to its gated 2-arg signature; re-derived all `route.ts` (now L75–265) and `monitoring.ts` (now L61–121) line refs against the grown files.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > An embedding is a function from a string to a fixed-length array of floats where geometric closeness encodes semantic similarity; blooming insights does not use them — it fuzzy-matches schema terms with exact substring checks and hands the model a truncated `schemaSummary`, so this is study material and a buildable target, not a present feature.
 
-**See also:** → 02-embedding-model-choice.md · → 05-dense-vs-sparse.md · → 11-rag.md · → ../04-agents-and-tool-use/04-tool-routing.md
 
 ---
 
@@ -138,7 +137,7 @@ The model assigns coordinates once; the State layer caches them; the Service lay
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — there is no embedding model call, no vector, and no cosine similarity anywhere in the repo.
 
@@ -181,47 +180,6 @@ Every string-comparison tool you already use solves a *surface* problem. Embeddi
 
 ---
 
-## Tradeoffs
-
-### Embedding-based term matching vs. the substring matching in use
-
-| Dimension | Embedding match | `String.includes` (current `parseIntent` style) |
-|---|---|---|
-| Finds synonyms | Yes (`sales`→`purchase`) | No — needs shared characters |
-| Setup cost | Embedding model + vector cache + cosine code | Zero — one method call |
-| Per-query cost | One embed call + N dot products | One string scan |
-| Explainability | Opaque (1536 floats) | Trivial (matched substring) |
-| Exact-ID matching | Worse — blurs near-identical IDs | Exact |
-| Survives renames | Partially (meaning persists) | No |
-
-**What we gave up (by not having it).** Nothing today, because the *model* does the fuzzy schema-term selection at inference time when it reads `schemaSummary`. The cost is latent: the model re-reads the schema text on every run and spends tokens doing the matching the substring approach cannot do. An embedding layer would let *code* pre-filter the schema to the relevant slice before the model ever sees it — fewer tokens, faster runs.
-
-**What the alternative would have cost.** Building the embedding layer adds an embedding-model dependency, an embed call at bootstrap (latency + cost), a vector cache to maintain, and the staleness problem (`09-stale-embeddings.md`) when the schema changes. For a workspace with ~80 events that fit comfortably in `schemaSummary`'s 20-event cap, the model reads the whole thing anyway — the embedding layer is solving a problem the current scale does not have.
-
-**The breakpoint.** The substring/whole-schema approach is correct while the schema fits in the prompt. It breaks when a workspace has hundreds of events and properties such that `schemaSummary`'s truncation (top-20 events, top-10 props) silently drops the relevant ones. At that point you cannot rely on the model reading "the whole schema" — you need code-level semantic pre-selection, and that requires embeddings.
-
----
-
-## Tech reference (industry pairing)
-
-### text embedding model
-
-- **Codebase uses:** nothing — no embedding call anywhere; `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) delivers schema as plain text for the model to read.
-- **Why it's here (absent):** the schema fits in the prompt, so the model does the fuzzy matching at inference; no separate embedding step is needed at current scale.
-- **Leading today:** OpenAI `text-embedding-3-small`/`-large` lead by adoption; Voyage and Cohere `embed-v3` lead on retrieval-quality benchmarks (2026).
-- **Why it leads:** strong general-domain semantics, simple API, dimension flexibility (`text-embedding-3` supports truncating dimensions).
-- **Runner-up:** open-weight `BAAI/bge` / `nomic-embed` run locally with no per-call cost — the choice when data cannot leave the box.
-
-### cosine similarity
-
-- **Codebase uses:** nothing — no vector comparison exists.
-- **Why it's here (absent):** there are no vectors to compare.
-- **Leading today:** cosine similarity is the default similarity metric for normalized text embeddings (2026).
-- **Why it leads:** scale-invariant (compares direction, not magnitude), reduces to a dot product for unit vectors, and matches how most models are trained.
-- **Runner-up:** dot product (faster, but magnitude-sensitive) and Euclidean distance (equivalent to cosine for unit vectors).
-
----
-
 ## Project exercises
 
 ### Embed the workspace schema for code-level fuzzy term matching
@@ -241,19 +199,6 @@ Every string-comparison tool you already use solves a *surface* problem. Embeddi
 - **Files to touch:** `lib/agents/intent.ts` (add the embedding fallback before defaulting), `lib/mcp/embeddings.ts` (reuse the embedder), `test/agents/intent.test.ts`.
 - **Done when:** a paraphrase like "what's behind the drop" routes to `diagnostic` via the embedding fallback even though it contains none of the substring keywords, and the substring path still short-circuits exact matches with no embed call.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-An embedding is a function from a string to a fixed-length float array where geometric closeness encodes semantic similarity, turning the unanswerable string question "do these mean the same?" into the trivial arithmetic question "how close are these points?" via cosine similarity. blooming insights has none — it delivers the schema as truncated text (`schemaSummary`) and lets the model do the fuzzy matching, and its only term-matching code (`parseIntent`) uses exact substring checks, which is precisely what embeddings exist to replace. The embedding layer is a real buildable target the moment a workspace's schema outgrows the prompt.
-
-**Key points:**
-- An embedding is the inverse of a hash: similar inputs produce *nearby* outputs, not distant ones.
-- Cosine similarity reduces meaning-comparison to one dot product over two float arrays.
-- The intelligence is in the model that assigns coordinates; the comparison is grade-school math.
-- Embeddings blur exact distinctions — worse than `===` for ID matching, better than everything for meaning.
-- blooming insights does fuzzy matching at inference (model reads `schemaSummary`); the breakpoint is a schema too large for the prompt.
 
 ---
 
@@ -328,3 +273,8 @@ A colleague says "just embed everything, embeddings are always better than strin
 ### Quick check — code reference test
 
 Does blooming insights compute any vector similarity, and what does the only term-matching code in the repo use instead? (Answer: no vector similarity exists; `parseIntent` in `lib/agents/intent.ts` L6–L12 uses exact `String.includes` substring checks — the surface-level matching embeddings exist to replace.)
+
+## See also
+
+→ 02-embedding-model-choice.md · → 05-dense-vs-sparse.md · → 11-rag.md · → ../04-agents-and-tool-use/04-tool-routing.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

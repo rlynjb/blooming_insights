@@ -5,7 +5,6 @@
 
 > All four blooming insights prompts share one skeleton — Role → Hard rules → method → EQL reminders → Output → `{schema}` — where the `.md` file is a constant system prompt and the per-call payload (`{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, the `userPrompt`) is injected at runtime, and the `synthesisInstruction` is appended dead last on the forced-final turn.
 
-**See also:** → 02-structured-outputs.md · → 03-prompts-as-code.md · → 06-single-purpose-chains.md · → 07-output-mode-mismatch.md
 
 ---
 
@@ -194,7 +193,7 @@ The shape is authored once; the bytes the model receives are assembled per turn 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented (richly).**
 
@@ -257,54 +256,6 @@ The skeleton is for humans (review, diff, reuse); the assembly is for the model.
 
 ---
 
-## Tradeoffs
-
-### One uniform `.md` skeleton vs. bespoke per-agent prompts
-
-| Dimension | This codebase (shared skeleton + injection) | Bespoke prompt per agent |
-|---|---|---|
-| Time to add an agent | Low — fill in six known sections | High — design structure from scratch |
-| Diffability / review | High — same shape, changes stand out | Low — every prompt reads differently |
-| Risk of section drift | Medium — four files can diverge | High — no shared shape to enforce |
-| Placeholder safety | Closed, greppable set | Ad-hoc, easy to miss one |
-| Flexibility per agent | Constrained to the skeleton | Total |
-
-**What we gave up.** Per-agent freedom. The skeleton means the recommendation agent has to express "Available tools" inside a slot where the others have "EQL reminders" — a slightly forced fit. A fully bespoke prompt could be shaped exactly to each agent's needs.
-
-**What the alternative would have cost.** Reviewability. Four prompts with four different shapes means every review starts from zero, every new agent reinvents structure, and the "each Role disclaims the others" rule has no shared home to live in. The uniform skeleton is what makes the four-agent system legible as a system.
-
-**The breakpoint.** The shared skeleton is right while the agents are variations on "scoped read-only analyst with a JSON output." It stops being right the moment an agent needs a fundamentally different interaction shape — e.g. a multi-turn conversational agent that maintains state across user messages. At that point forcing it into the six-section mold costs more than a bespoke prompt would, and you split it out.
-
----
-
-## Tech reference (industry pairing)
-
-### String-replace placeholder injection
-
-- **Codebase uses:** `lib/agents/diagnostic.ts` L45–48 — chained `.replace` calls, `/g` on `{project_id}`, plain on single-occurrence placeholders.
-- **Why it's here:** zero dependencies, trivially testable, and the placeholder set is small and known — a templating library would be overkill.
-- **Leading today (2026):** typed prompt templating — Anthropic/OpenAI SDK message builders, plus libraries like Jinja-style or `Prompt` objects that validate variables — lead for larger prompt suites.
-- **Why it leads:** missing-variable detection and escaping, which raw `.replace` cannot give you.
-- **Runner-up:** template literals with typed interpolation — keeps it in-language while restoring compile-time variable checking.
-
-### System vs. user message split
-
-- **Codebase uses:** the `.md` constant is the `system` (`base.ts` L98); the per-call task is the first `user` message (`base.ts` L80, e.g. `monitoring.ts` L70).
-- **Why it's here:** it maps the constant-vs-per-call distinction onto the API's own role distinction — system carries the stable instructions, user carries the request.
-- **Leading today (2026):** the system/user/assistant role split is the universal substrate (Anthropic, OpenAI, Gemini all share it).
-- **Why it leads:** providers weight and (for some) cache the system block differently from turn content; keeping the constant in `system` is what makes prefix caching possible later.
-- **Runner-up:** stuffing everything into one user message — simpler, but loses the role-based handling and the cache boundary.
-
-### Recency-weighted final instruction (synthesis append)
-
-- **Codebase uses:** `lib/agents/base.ts` L96–98 — `synthesisInstruction` concatenated to the end of `system` on the forced-final turn.
-- **Why it's here:** the model weights the last instruction it reads most; appending the hard-stop last is what reliably breaks the "keep querying" momentum.
-- **Leading today (2026):** placing the most critical instruction last (or repeating it at the end) is standard practice in both vendors' prompt guides.
-- **Why it leads:** empirically robust across model versions; cheap (one string concat).
-- **Runner-up:** a separate final user message carrying the instruction — equivalent effect, one more message in the transcript.
-
----
-
 ## Project exercises
 
 ### Add a placeholder-coverage test
@@ -324,19 +275,6 @@ The skeleton is for humans (review, diff, reuse); the assembly is for the model.
 - **Files to touch:** new `lib/agents/prompts/_hard-rules.md`; the four agent `.ts` files (compose at `readFileSync`); the four prompt `.md` files (remove the duplicated lines).
 - **Done when:** changing the `project_id` rule in one place changes it for all four agents, and existing agent tests still pass.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-A production prompt in blooming insights is a constant `.md` skeleton (Role → Hard rules → method → EQL reminders → Output → `{schema}`), the same six sections in the same order across all four agents, with each Role explicitly disclaiming the others' jobs. That constant is Layer 1; per-call values (`{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, plus the separately-passed `userPrompt`) are stamped in by `.replace` at runtime as Layer 2; and the `synthesisInstruction` is appended last on the forced-final turn as Layer 3 (`base.ts` L96–98). System equals the constant, user equals the per-call task — constant-vs-per-call is the system-vs-user split made literal.
-
-**Key points:**
-- One six-section skeleton, four instances; the headings line up across the files.
-- Each `## Role` names and disclaims the other agents' jobs — decomposition encoded in prose (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5).
-- The placeholder set is closed and greppable: `{schema}`, `{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, `{categories}` (monitoring-only, a runtime-built checklist).
-- `userPrompt` is a separate function argument, not in the `.md` — system is constant, user is per-call.
-- The synthesis nudge lives in one place (`base.ts` L96–98), appended last to exploit recency, and only on the forced-final turn.
 
 ---
 
@@ -411,5 +349,10 @@ A reviewer says: "Just inline the synthesis instruction into each prompt's `## O
 
 In `lib/agents/base.ts`, what exactly is the `system` value on the forced-final turn, and what else changes on that turn? (Answer: `` `${system}\n\n${synthesisInstruction}` `` at L98 when `forceFinal && synthesisInstruction`; additionally `params.tools` is *not* set at L101, removing the tools so the model must produce a final answer.)
 
+## See also
+
+→ 02-structured-outputs.md · → 03-prompts-as-code.md · → 06-single-purpose-chains.md · → 07-output-mode-mismatch.md
+
 ---
 Updated: 2026-05-29 — Corrected stale monitoring.md section line refs (Role L3 / Hard rules L13 / method L20 / EQL reminders L49 / Output L69 / schema L99) and added the `## Your category checklist` section (L7, `{categories}` slot L11) as monitoring's seventh section and a 4th per-call injection placeholder (`monitoring.ts` L69–86).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

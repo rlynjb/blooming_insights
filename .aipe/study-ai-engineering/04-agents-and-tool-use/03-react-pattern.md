@@ -5,7 +5,6 @@
 
 > ReAct interleaves Thought (the model reasons in text), Action (it emits a tool call), and Observation (your code runs the tool and feeds the result back). blooming insights makes each step a streamed NDJSON event — `onText` → reasoning_step is the Thought, `tool_call_start` is the Action, `tool_call_end` + result-as-next-user-turn is the Observation — so the reasoning trace is a live product surface, consumed by `useInvestigation` (the StrictMode-safe reader hook) and rendered on the investigate page.
 
-**See also:** → 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design-dsa/01-system-design/05-streaming-ndjson.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -212,7 +211,7 @@ A reader who sees only this diagram should grasp: three phases, each tapped by a
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -286,54 +285,6 @@ The streamed Thought is whatever text the model emits between tool calls — it 
 
 ---
 
-## Tradeoffs
-
-### Comparison: streamed ReAct vs alternatives
-
-| Dimension | This codebase (streamed ReAct) | Plan-then-execute | Final-answer-only agent |
-|---|---|---|---|
-| Adaptivity to surprises | High — re-reasons each Observation | Low — plan fixed up front | High internally, invisible |
-| Round-trips / latency | One per Thought→Action cycle | Fewer (batch plan) | Same as ReAct internally |
-| Debuggability | High — every phase is an event | Medium — plan + results | None — black box |
-| UX (live progress) | Live trace on the page | Plan then results dump | Spinner then answer |
-| Faithfulness guarantee | None — Thought may rationalize | None | None |
-
-**What we gave up.** Round-trips. Each Thought→Action→Observation cycle is a separate `anthropic.messages.create` call (`base.ts` L102), so a 6-tool investigation is ~7 model round-trips plus the synthesis call. A plan-then-execute agent could batch the tool plan into fewer model calls. We accept the extra round-trips because per-step re-reasoning is what lets the agent adapt to empty or surprising results — and the streamed trace turns those round-trips into visible progress rather than dead silence.
-
-**What the alternative would have cost.** A final-answer-only agent would be simpler and slightly cheaper (no per-phase hooks, no NDJSON), but it would be undebuggable: a wrong diagnosis would offer no trace to inspect, no place to see which Observation the model misread. The entire debugging story would become "re-run with logging and hope it reproduces." The streamed trace is cheap to add (three hooks) and pays for itself the first time a diagnosis goes wrong.
-
-**The breakpoint.** Streamed ReAct is right while traces are read by humans and the per-step round-trips fit the route's `maxDuration` budget (300s; a live diagnose→recommend run is ~100–115s under the ~1 req/s MCP limit). It stops being right at high tool counts where per-step re-reasoning blows the latency budget — at which point batching (plan-and-execute) for the exploration phase, while keeping ReAct for the final synthesis, becomes the move. The trace surface stays; only the loop's round-trip discipline changes.
-
----
-
-## Tech reference (industry pairing)
-
-### @anthropic-ai/sdk tool use (Action/Observation blocks)
-
-- **Codebase uses:** `tool_use` blocks are the Action (`base.ts` L116); `tool_result` blocks pushed at L171 are the Observation re-entering the context.
-- **Why it's here:** It is the API-level expression of ReAct's act/observe phases.
-- **Leading today:** Anthropic tool use and OpenAI function calling are the adoption-leading substrates in 2026.
-- **Why it leads:** Native interleaving of text reasoning and tool blocks in one message stream.
-- **Runner-up:** Gemini function calling — comparable mechanics, growing adoption.
-
-### NDJSON over fetch ReadableStream (the trace transport)
-
-- **Codebase uses:** `encodeEvent` writes `JSON.stringify(e)+'\n'` (`events.ts` L15); `useInvestigation` reads with `getReader()` + `TextDecoder` and splits on `\n` (`useInvestigation.ts` L184–L201).
-- **Why it's here:** Each ReAct phase is one self-contained JSON object; line-delimited JSON streams them with zero framing overhead and no `EventSource` constraints.
-- **Leading today:** NDJSON / line-delimited streaming and SSE are the two adoption-leading agent-trace transports in 2026.
-- **Why it leads:** Works over plain `fetch`, supports POST bodies, and parses incrementally line by line.
-- **Runner-up:** Server-Sent Events (`EventSource`) — simpler client API, but GET-only and less flexible framing.
-
-### ReAct (the reasoning pattern)
-
-- **Codebase uses:** The Thought/Action/Observation cycle is `runAgentLoop`'s per-turn structure with hooks on each phase.
-- **Why it's here:** It is the pattern that makes per-step re-reasoning and an observable trace possible.
-- **Leading today:** ReAct is the adoption-leading agent reasoning pattern in 2026; Reflexion and Plan-and-Execute are innovation-leading refinements.
-- **Why it leads:** Robustness to surprising observations plus a natural, inspectable trace.
-- **Runner-up:** Plan-and-Execute / ReWOO — fewer round-trips, less adaptive.
-
----
-
 ## Project exercises
 
 ### Tag reasoning steps as hypothesis vs thought from the trace
@@ -353,19 +304,6 @@ The streamed Thought is whatever text the model emits between tool calls — it 
 - **Files to touch:** `lib/state/investigations.ts` (L30–L41); new `app/api/agent/trace/[id]/route.ts`; `lib/mcp/events.ts` (reuse `encodeEvent`).
 - **Done when:** Hitting the trace route for a completed investigation returns valid JSONL with one `AgentEvent` per line, replayable by `decodeEvent`.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-ReAct interleaves Thought (the model's text reasoning), Action (a `tool_use` block), and Observation (the tool result fed back). blooming insights taps each phase with a `runAgentLoop` hook — `onText` → `reasoning_step` thought (`base.ts` L108–L113), `onToolCall` → `tool_call_start` (L138), `onToolResult` → `tool_call_end` (L159) — and streams them as NDJSON over a `fetch` `ReadableStream`. The Observation does double duty: `tool_call_end` renders it on the page, and the `messages.push` at L171 feeds it back so the next Thought is conditioned on it. The trace is a live product surface, which makes the loop debuggable by reading.
-
-Key points:
-- Thought = model text (`onText`), Action = `tool_use` (`onToolCall`, fired before the call), Observation = result (`onToolResult` + L171).
-- The Observation re-enters the context at `base.ts` L171, conditioning the next Thought — that feedback edge is the spine of ReAct.
-- Every phase is an NDJSON event streamed over `fetch` (no `EventSource`), rendered live on the investigate page.
-- The trace is a debugging and UX surface, not a correctness proof — a plausible Thought can precede a wrong Action.
-- The Observation fed back is truncated (16k cap), so a Thought can be conditioned on a partial result.
 
 ---
 
@@ -445,6 +383,11 @@ A reviewer says: "Showing users the model's raw reasoning is a liability — it 
 
 Which line in `lib/agents/base.ts` turns an Observation into input for the model's next Thought, and what role does that message take? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`; the result enters as a `user` turn.)
 
+## See also
+
+→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design-dsa/01-system-design/05-streaming-ndjson.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page.tsx` to `lib/hooks/useInvestigation.ts` (StrictMode-safe `startedRef` reader, shared by both step pages) and refreshed all `route.ts` hook/stream and `ReasoningStep` line refs.
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Models attend most reliably to content at the *start* and *end* of the context and least reliably to the middle; blooming insights has no retrieval to reorder, but it deliberately places its load-bearing content at the end — the `synthesisInstruction` is appended LAST to the system prompt on the final turn (`lib/agents/base.ts` L98), and tool results arrive as the MOST RECENT user turn (L171) — keeping what matters where attention is strongest. The real fix (retrieval + reranking) is absent here.
 
-**See also:** → 01-context-window.md · → 03-prompt-chaining.md · → ../03-retrieval-and-rag/07-reranking.md · → ../04-agents-and-tool-use/02-tool-calling.md
 
 ---
 
@@ -176,7 +175,7 @@ The Service layer places the must-obey directive and the freshest evidence at th
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet mitigated by retrieval.** blooming insights has no RAG, no embeddings, and no reranker, so there is no retrieval-ordering step to push the most relevant content to the high-attention ends — it gathers evidence live via MCP tool calls and relies purely on *conversation* recency for placement. What it does, deliberately, is keep its load-bearing content at the end of the context.
 
@@ -233,49 +232,6 @@ Placement and curation are complementary, not competing. Placement is what you d
 
 ---
 
-## Tradeoffs
-
-### Recency placement vs. retrieval + reranking
-
-| Dimension | This codebase (recency placement) | Retrieval + reranking |
-|---|---|---|
-| Infrastructure | None — string concat + array push | Embedding store + reranker model/API |
-| What it controls | *Where* content sits | *What* is in context and *where* |
-| Effectiveness on a short context | Adequate — shallow sag | Overkill |
-| Effectiveness on a long mixed context | Weak — middle still full | Strong — irrelevant content removed |
-| Measurement | None | Reranker scores are inspectable |
-| Cost per call | Zero | Embedding + rerank latency and spend |
-
-**What we gave up.** Any control over *what* sits in the middle of the context. Recency placement reorders the conversation but cannot remove an irrelevant tool result from the transcript — once a tool was called, its result is in the window. With five of six results in the sag on a long run, the model may underweight evidence it actually needs, and nothing in the codebase detects when that happens.
-
-**What the alternative would have cost.** A reranker adds an embedding/scoring step between gathering results and feeding them back (a new call per batch at L171), plus the infrastructure of an embedding store if retrieval feeds it. For contexts already bounded to ~96,000 characters of tool results, the sag is shallow enough that the reranker's cost would buy little — which is exactly why the codebase deferred it.
-
-**The breakpoint.** Recency placement is sufficient while contexts are short and evidence is uniformly relevant. It breaks when a single run accumulates many mixed-relevance results — say a query agent that calls a dozen tools and most return noise. There the middle is both long and full of distractors, placement cannot rescue the buried signal, and the system needs retrieval to drop the noise plus reranking to order the rest. That event — long contexts with low signal-to-noise — is the trigger to build the retrieval/rerank path.
-
-**Not actually a tradeoff:** appending the `synthesisInstruction` last. Placing the must-obey directive at the strong end costs nothing and would survive any future retrieval design unchanged.
-
----
-
-## Tech reference (industry pairing)
-
-### context ordering / recency placement
-
-- **Codebase uses:** plain placement — `synthesisInstruction` concatenated to the end of the system prompt (`lib/agents/base.ts` L98) and tool results pushed as the most-recent turn (L171). No library.
-- **Why it's here:** it is the free lever against the U-curve when you cannot remove content; the contexts are short enough that placement alone is adequate.
-- **Leading today:** prompt-construction practice (system-prompt structuring, putting instructions at the end of the user turn) leads adoption (2026); it is convention, not a package.
-- **Why it leads:** it costs nothing and reliably moves the must-obey content out of the sag.
-- **Runner-up:** explicit section delimiters / XML-style tags that signal structure so the model can locate sections regardless of position.
-
-### reranking (the real fix, absent here)
-
-- **Codebase uses:** nothing — there is no reranker; placement is the only mitigation.
-- **Why it's here (absent):** blooming insights has no retrieval to rerank; contexts are short enough that the sag has not justified the infrastructure.
-- **Leading today:** Cohere Rerank and cross-encoder rerankers (BGE-reranker, `mxbai-rerank`) lead adoption (2026) for ordering retrieved passages by relevance.
-- **Why it leads:** a cross-encoder scores query-document relevance directly, so the top hits can be placed at the high-attention ends and the rest dropped — curing the middle problem at the source.
-- **Runner-up:** RRF (reciprocal rank fusion) over hybrid retrieval — cheaper, no model, fuses ranked lists. Covered in → ../03-retrieval-and-rag/07-reranking.md.
-
----
-
 ## Project exercises
 
 ### Measure the synthesis call's position sensitivity
@@ -295,19 +251,6 @@ Placement and curation are complementary, not competing. Placement is what you d
 - **Files to touch:** `lib/agents/base.ts` (`runAgentLoop`, reorder before L171), new `lib/mcp/rerank.ts`, `test/agents/base.test.ts`.
 - **Done when:** the batch fed back at L171 is verifiably reordered by relevance score, with the lowest-relevance results placed in the middle by design.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Models attend most reliably to the start and end of a context and least reliably to the middle — a reproducible U-shaped bias (Liu et al. 2023). blooming insights has no retrieval to reorder, so its mitigation is purely positional: the `synthesisInstruction` is appended LAST to the system prompt on the final turn (`lib/agents/base.ts` L98) so the must-obey directive sits at the strong end, and tool results are pushed as the MOST RECENT user turn (L171) so the freshest evidence is at the recency edge. The `synthesize()` fallback collapses the context to nothing, removing the middle entirely. This is a thin surface — the substantive fix is retrieval plus reranking (Case B, → ../03-retrieval-and-rag/07-reranking.md), which this codebase has deliberately not built because its contexts are short.
-
-**Key points:**
-- Attention is U-shaped over position; the middle is a dead zone for recall.
-- Placement is a correctness lever, not formatting — the same fact is recalled at the end and lost in the middle.
-- blooming insights uses recency: directive appended last (base.ts L98), results as the most-recent turn (L171).
-- `synthesize()` collapses the context so there is no middle to lose anything in.
-- The real fix — retrieval + reranking — is absent; recency placement is a thin mitigation that holds only while contexts are short.
 
 ---
 
@@ -382,5 +325,10 @@ A reviewer says: "Recency placement is enough — we don't need a reranker." Def
 
 On the forced-final turn, where in the system prompt does the must-obey directive sit, and which line places it there? (Answer: at the *end* — `lib/agents/base.ts` L98 concatenates `synthesisInstruction` after the base `system` prompt.)
 
+## See also
+
+→ 01-context-window.md · → 03-prompt-chaining.md · → ../03-retrieval-and-rag/07-reranking.md · → ../04-agents-and-tool-use/02-tool-calling.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted `synthesize()` ranges (diagnostic L87–L126, recommendation L82–L132, compact message L105–L113) and per-agent `synthesisInstruction` text refs (diagnostic L63–L67, monitoring L85–L89); the recency-placement `base.ts` refs (L95–L98, L171) verified unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

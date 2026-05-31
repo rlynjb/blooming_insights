@@ -5,7 +5,6 @@
 
 > Explore N reasoning paths in parallel, score each, pick the best. blooming insights correctly does NOT use this — branching multiplies token cost by the branch factor, the MCP rate limit is ~1 req/s, and the per-investigation ceiling is 300s. ToT's cost shape is the opposite of what this codebase can afford.
 
-**See also:** → 02-react.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
 
 ---
 
@@ -199,7 +198,7 @@ The three positions you can take
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (Case B — and correctly so).** No agent branches over candidate thoughts. All four run linear ReAct trajectories via `runAgentLoop` (`lib/agents/base.ts` L48–L176).
 
@@ -269,86 +268,6 @@ When the scorer can't distinguish good branches from plausible ones — and same
 - `03-plan-and-execute.md` → a cheaper escalation than ToT when the structure of the answer is knowable up front
 - `04-reflexion-self-critique.md` → a different family of escalation that adds *quality checking* rather than *branch exploration*
 - `06-routing.md` → branching's much cheaper cousin — pick one path before committing, instead of exploring N
-
----
-
-## Tradeoffs
-
-The decision here was *to stay at pure ReAct and explicitly not adopt Tree of Thoughts*, even though it's a recognized advanced pattern. The alternative would have been "add ToT to the diagnostic agent because it handles the most open-ended task."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Pure ReAct (chosen)         │ Tree of Thoughts (alt)      │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Per-run cost     │ 1× per-step                 │ b^d × per-step + scorer     │
-│                  │ ~6 tool calls × ~1s ≈ ~6s   │ b=3,d=3: ~162s MCP alone    │
-│                  │ of MCP work                 │ (under 1 req/s spacing)     │
-│ Latency          │ ~100–115s diagnostic→rec    │ > 300s ceiling at b=3,d=3   │
-│                  │ (fits under 300s)           │ ~150–200s at b=2, d=2       │
-│ Token cost       │ 1× generation per turn       │ b^d × generation + b^d ×    │
-│                  │                              │ scoring                     │
-│ Build time       │ existing runAgentLoop        │ new tree-runner, scorer     │
-│                  │ unchanged                    │ prompt, beam logic, pruning │
-│ Debugging        │ replay one trajectory        │ replay a tree (multi-path   │
-│                  │                              │ trace + scorer verdicts)    │
-│ Quality on       │ adequate — smooth answer     │ negligible improvement —    │
-│ smooth surface   │ surface, loop re-decides     │ branches converge anyway    │
-│ Quality on       │ poor — committed path can't  │ better — branch exploration │
-│ cliff surface    │ recover from wrong start     │ avoids unrecoverable starts │
-│ Fit to MCP rate  │ trivial — one in-flight call │ poor — multiplies the in-   │
-│ limit            │ at a time                    │ flight pressure             │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up explicit exploration of alternative reasoning paths. If a diagnostic investigation could have benefited from "what would three different starting queries have found," we don't get that — the agent picks one starting query and runs forward. We accept that the answer surface is smooth enough that this loss doesn't change the diagnosis quality measurably for the categories we cover.
-
-We also gave up the interview-bingo-card check ("yes we use Tree of Thoughts"). The honest framing is more valuable: "we considered ToT and ruled it out on the budget arithmetic, here's the calculation." That's a stronger signal than having adopted a pattern that doesn't fit.
-
-### What the alternative would have cost
-
-If we had built ToT for the diagnostic agent at b=2, d=2 (the minimal shape), every investigation would fire 4 partial trajectories instead of 1. Each trajectory still gets `maxToolCalls: 6` to be useful, and the MCP spacing serializes them, so the realistic cost is ~24s of MCP per partial trajectory × 4 = ~96s just for the branching exploration, plus a scorer call per node — pushing total runtime well past the current ~115s and approaching the 300s ceiling with no remaining headroom for the recommendation stage. At b=3, d=3 (canonical ToT), the ceiling breaks before the first answer comes back.
-
-The token cost compounds: each branch needs full per-step context (the prior tool results), so the scorer is doing long-context judgments on every node. The token bill multiplies in the same direction as the latency, and the per-run cost shifts from ~$0.05/investigation to ~$0.20–0.50 — without a measurable quality win on smooth-surface tasks.
-
-### The breakpoint
-
-ToT would start to earn its keep when (a) the answer surface develops cliffs (e.g. if diagnostic queries unlocked structurally different evidence trees depending on the starting query, like investigating a campaign-attributed drop vs a segment-attributed drop), AND (b) the MCP rate limit lifts (so the b^d multiplier doesn't break the ceiling), AND (c) a reliable scorer exists (so pruning isn't random). All three conditions together. Currently zero of three hold.
-
-### What wasn't actually a tradeoff
-
-A "deep ReAct with maxToolCalls=20" was not a real alternative to ToT. ToT solves "explore multiple paths"; a deeper ReAct solves "explore one path further." They address different failure modes. The diagnostic agent's failures aren't "loop ran out of budget exploring one path" (the forced synthesis at `diagnostic.ts` L75 handles the rare budget-exhaustion case); they're occasional substantive failures that more depth on the same path doesn't catch. So "just give the loop more turns" was never a credible ToT replacement, and naming it as one would be sloppy.
-
----
-
-## Tech reference (industry pairing)
-
-### LangChain / LangGraph (tree-search agent runners)
-
-- **Codebase uses:** N/A — not a dependency.
-- **Why it's here as a reference:** LangGraph's StateGraph + the LangChain ToT examples are the most accessible industry-standard implementation of branch-and-score agent reasoning. Naming what we considered and rejected.
-- **Leading today:** LangGraph — innovation-leading for explicit-state agent orchestration, 2026.
-- **Why it leads:** treats the agent's state and transitions as a graph, which makes ToT-style beam search expressible as a node type rather than custom loop machinery. The graph also lets you swap a ToT node for a ReAct node without changing surrounding code.
-- **Runner-up:** raw `Anthropic.messages.create` with custom tree-walking in app code — what you'd use to prototype ToT here without adopting a framework; the loss is reusing none of LangGraph's checkpointing or visualisation.
-
-### Anthropic Messages API (in a ToT it would be the branch+scorer call)
-
-- **Codebase uses:** `anthropic.messages.create` (`lib/agents/base.ts` L102) for the linear ReAct loop. A hypothetical ToT would call the same API as both branch-generator and scorer.
-- **Why it's here:** any ToT in this codebase would extend the existing Anthropic surface — there's no need for a different model API to do tree search. The cost shape is the limit, not the API.
-- **Leading today:** Anthropic Messages API — adoption-leading for production LLM apps, 2026.
-- **Why it leads:** typed content blocks, native tool-use blocks, and a long-context window that lets a scorer read partial trajectories without truncation; same SDK serves all the patterns in this family.
-- **Runner-up:** OpenAI Responses API — equivalent capability, slightly different message shape; for ToT specifically, neither leads — the bottleneck is cost, not API.
-
----
-
-## Summary
-
-Tree of Thoughts is the pattern where the model explores K candidate next thoughts at each step, scores each, and prunes — a beam search over reasoning paths. In this codebase, no agent uses ToT, and that's the correct choice given the constraints: the MCP rate limit is ~1 req/s, the per-investigation ceiling is 300s, current runs sit at ~100–115s, and the diagnostic answer surface is smooth (most reasonable starting queries converge to similar diagnoses). Even the minimal beam-search shape (b=2, d=2) would push runtimes past 200s with negligible quality improvement on smooth-surface tasks. The constraint that made this right is structural: ToT's cost is multiplicative in the branch factor, and a rate-limited / time-ceilinged system on a smooth answer surface can't afford that multiplier without breaking the ceiling. The cost is that we explicitly do NOT explore alternative reasoning paths — we commit to one ReAct trajectory and let the loop re-decide within it.
-
-- ToT's cost is b^d × per-step; for b=3, d=3 that's 27x — past the 300s ceiling here.
-- The answer surface for diagnostic investigations is smooth: branches converge, so branching doesn't reduce error meaningfully.
-- ReAct's per-step re-decision is the cheap version of "exploration" that fits the MCP rate limit and the time ceiling.
-- The breakpoint to ToT requires all three: cliff surface + rate limit lifted + reliable scorer. Zero hold today.
-- Worth knowing the pattern so you can name why you didn't use it — that's the interview-grade answer for systems with these constraints.
 
 ---
 
@@ -472,5 +391,10 @@ Without opening any files:
 
 Open and verify. ✓ The "no" answer, the rate-limit / ceiling numbers, and the three conditions are what matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-react.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Every call has a finite context window and a per-call output ceiling; blooming insights spends its budget deliberately — `schemaSummary` caps the injected `{schema}` (20 events / 10 props / 30 customer-props), `MAX_TOOL_RESULT_CHARS=16_000` caps each observation, per-agent `maxToolCalls` (6/6/4/6) caps transcript growth, and `max_tokens` (4096 / 2048 / 16) caps output — but the static system+schema prefix sits in the wrong place for prefix caching, which the codebase does not use at all.
 
-**See also:** → 01-anatomy.md · → 02-structured-outputs.md · → 03-prompts-as-code.md · → 08-few-shot.md
 
 ---
 
@@ -205,7 +204,7 @@ The window is finite; four caps keep the sum under the practical fraction, and t
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented (with a named gap).**
 
@@ -284,55 +283,6 @@ The hard window is where the call *errors*. The practical window is where the ca
 
 ---
 
-## Tradeoffs
-
-### Static hand-tuned caps (no caching) vs. measured budgets + prefix caching
-
-| Dimension | This codebase (static caps, no caching) | Measured budgets + prefix caching |
-|---|---|---|
-| Setup cost | Zero — constants in code | Token counter + prompt reorder + cache_control |
-| Input cost per multi-turn run | Full prefix re-billed every turn | Prefix cached after turn 1 (fraction of cost) |
-| Precision of the cap | Proxy (chars / item counts) | Exact (measured tokens) |
-| Truncation fidelity | Char-slice, can sever JSON | Token/row-aware, preserves structure |
-| Provider coupling | None | Caching is per-provider |
-| Visibility into actual usage | None — never counted | Logged token count per call |
-
-**What we gave up.** Cheap multi-turn calls and visibility. Every turn re-bills the full prefix because nothing is cached, and nothing in the code knows how many tokens a call actually used — the caps are proxies, not measurements. A 6-tool run pays for the schema 7 times.
-
-**What the alternative would have cost.** Setup work and a provider coupling. Token counting needs a counter wired in before every `create`; caching needs the prompts reordered (schema to the front) and `cache_control` set, and caching is an Anthropic-specific feature, so it couples this layer to the provider the way native JSON mode would. The codebase chose static caps to ship the four agents without that work — defensible while call volume is low.
-
-**The breakpoint.** Static caps are right while investigation volume is low enough that the re-billed prefix is a rounding error. The moment volume rises — many investigations per day, each ~7 turns re-sending the schema — the un-cached prefix becomes the dominant input-token line item, and turning on prefix caching (after reordering `{schema}` to the front) pays for itself immediately. Caching is held back by the prompt layout, not by inability.
-
----
-
-## Tech reference (industry pairing)
-
-### `schemaSummary` (bounded prefix injection)
-
-- **Codebase uses:** `lib/agents/monitoring.ts` L16–L49 — caps the raw schema to 20 events / 10 props / 30 customer-props before injecting `{schema}`.
-- **Why it's here:** the raw workspace schema is ~112KB; injecting it raw would dominate every call's input tokens.
-- **Leading today:** retrieval-over-injection (pull only the relevant schema slice per query) and structured context compaction lead for large-context apps in 2026.
-- **Why it leads:** sending only what the call needs beats sending a fixed cap of everything.
-- **Runner-up:** a fixed bounded summary (this codebase's choice) — simpler, no retrieval index, predictable cost.
-
-### `truncate` / `MAX_TOOL_RESULT_CHARS` (observation cap)
-
-- **Codebase uses:** `lib/agents/base.ts` L29–L34 — char-slice every tool result to 16,000 chars.
-- **Why it's here:** MCP results are unbounded; one large result would flood the transcript.
-- **Leading today:** token-aware, structure-preserving truncation (keep whole rows up to a token budget) leads in 2026.
-- **Why it leads:** preserves more usable signal per byte than a blind char-slice.
-- **Runner-up:** summarize-then-truncate — an extra model call to compress the result before re-entry; more faithful, more expensive.
-
-### `cache_control` (prefix caching — NOT used here)
-
-- **Codebase uses:** nothing — there is no `cache_control` in `base.ts`, `intent.ts`, or any agent.
-- **Why it's here:** it is the named gap; the static system+schema prefix is the textbook cache target, but the layout (`{schema}` last) and the absence of the flag mean the prefix is re-billed every turn.
-- **Leading today:** Anthropic prompt caching (`cache_control`) and OpenAI automatic prefix caching lead for repeated-prefix workloads in 2026.
-- **Why it leads:** repeated multi-turn calls reuse the prefix at a fraction of the input cost.
-- **Runner-up:** none worth naming — for a fixed-prefix multi-turn loop like this, prefix caching is the standard answer; the only reason it is absent is it was not wired in.
-
----
-
 ## Project exercises
 
 ### Turn on prefix caching for the static system+schema prefix
@@ -352,19 +302,6 @@ The hard window is where the call *errors*. The practical window is where the ca
 - **Files to touch:** `lib/agents/base.ts` (count + log + token-aware `truncate`), `lib/mcp/types.ts` (a usage field on `ToolCall` or a new event), `test/agents/base.test.ts`.
 - **Done when:** every agent call logs an actual token count, and `truncate` clips by token budget rather than a fixed 16,000 chars without severing a JSON row mid-object.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Token budgeting is hygiene, not optimization: every call fills a finite window from the prefix, the transcript, and the output reservation, and each source needs a cap. blooming insights caps three of them at the seam — `schemaSummary` bounds the injected `{schema}` to 20 events / 10 props / 30 customer-props (`monitoring.ts` L16–L49), `truncate()` clips every observation to 16,000 chars (`base.ts` L29–L34), and `maxToolCalls` (6/6/4/6) plus `max_tokens` (4096 / 2048 / 16) bound transcript growth and output. It leaves the fourth lever untouched: no prefix caching, and `{schema}` is appended *last* in all four prompts — behind the volatile placeholders it varies less than — which is a prefix-caching anti-pattern that makes the cacheable prefix short and re-bills the schema on every turn.
-
-**Key points:**
-- A finite window is filled from the prefix, the transcript, and the output reservation; budgeting caps each source independently.
-- `schemaSummary` caps the largest variable input (the ~112KB schema) to a constant summary, shared across all four agents.
-- `truncate()` caps each observation at 16,000 chars; `maxToolCalls` caps how many observations ever enter the transcript.
-- `max_tokens` is a hard output cap, not a quality knob — the classifier's 16 enforces a one-word format through the budget.
-- The gap: no `cache_control`, and `{schema}` placed last — the largest stable input sits where it can neither anchor a cacheable prefix nor avoid lost-in-the-middle.
 
 ---
 
@@ -438,5 +375,10 @@ A reviewer says: "The schema is 112KB and re-sent every turn — that's wasteful
 
 What is `MAX_TOOL_RESULT_CHARS`, where is it defined, and what does `truncate` append when it clips? (Answer: `16_000`, defined at `lib/agents/base.ts` L29; `truncate` returns `s.slice(0, 16_000) + '\n…[truncated]'` — L31–L34.)
 
+## See also
+
+→ 01-anatomy.md · → 02-structured-outputs.md · → 03-prompts-as-code.md · → 08-few-shot.md
+
 ---
 Updated: 2026-05-29 — Resynced monitoring refs after the `{categories}` shift: `schemaSummary` L15–48→L16–49, monitoring `maxToolCalls` L74→L101, `{schema}` placement L75–77→L99–101, plus the ~112KB comment L14→L15 and the `.replace('{schema}',…)` call L62→L84.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

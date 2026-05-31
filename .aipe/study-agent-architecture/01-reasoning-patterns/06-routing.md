@@ -5,7 +5,6 @@
 
 > Pick the right handler before committing to a loop. blooming insights uses a heuristic-first then LLM-second router for free-form `?q=` queries — and this is the BRIDGE to multi-agent: the same pattern that picks a tool inside one agent picks an agent across many.
 
-**See also:** → 01-chains-vs-agents.md · → 02-react.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` · → multi-agent: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
 
 ---
 
@@ -238,7 +237,7 @@ The router in blooming insights — and what it bridges to
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **The heuristic-first layer**
 **File:** `lib/agents/intent.ts`
@@ -305,96 +304,6 @@ When the input distribution shifts (new users, new phrasings) and the heuristic'
 - `02-react.md` → inside a single agent, tool selection is itself a routing decision the model makes per turn
 - `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` → the mechanics of tool-level routing (deterministic vs LLM-decided), this codebase angle is the *placement* in the agent dispatch
 - Multi-agent supervisor (when written): the router's destinations become whole agents; the shape is the same
-
----
-
-## Tradeoffs
-
-The decision here was *to use heuristic-first with LLM fallback for the free-form `?q=` path, and skip routing entirely on the investigation path*. The alternative most teams reach for is "LLM router for everything" or "no router, one agent handles everything."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Heuristic + LLM (chosen)    │ LLM-only / no-router        │
-│                  │                             │ alternatives                │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Per-input cost   │ 0 for heuristic matches,    │ LLM-only: always 1 LLM      │
-│                  │ 1 small LLM call otherwise  │ call; no-router: every      │
-│                  │                             │ agent runs blind             │
-│ Latency          │ ~0ms for hits, ~200–500ms   │ LLM-only: always 200–500ms; │
-│                  │ for LLM fallback             │ no-router: pays full         │
-│                  │                             │ wrong-agent latency on miss  │
-│ Build time       │ 2 functions in intent.ts;   │ LLM-only: simpler (one      │
-│                  │ a "default" branch in       │ function); no-router: simplest│
-│                  │ parseIntent                 │ but biggest debugging cost  │
-│ Debugging        │ trace shows classified      │ LLM-only: same; no-router:  │
-│                  │ intent + reasoning_step      │ have to figure out from     │
-│                  │ event before agent runs     │ the answer which agent ran  │
-│ Failure mode     │ ambiguous input → LLM may   │ LLM-only: LLM down → no      │
-│                  │ misclassify; bound by 1     │ routing; no-router: wrong   │
-│                  │ word vocab                  │ agent runs, wrong tools,    │
-│                  │                             │ wrong answer                │
-│ Bridge to multi- │ same shape lifts to agent   │ LLM-only: same; no-router:  │
-│ agent             │ routing                     │ doesn't generalize           │
-│ Vocabulary drift │ heuristic must update for   │ LLM-only: prompt update;    │
-│                  │ new intents; LLM prompt too │ no-router: nothing to update│
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up the simplicity of a single-layer router. With two layers (heuristic + LLM), there are two places intents are defined — `parseIntent` at L6–L12 and the classifier's system prompt at `intent.ts` L21–L23 — and they need to stay aligned. A new intent type means adding a substring check, updating the prompt, and (probably) a code change to add a new `Intent` type. That's the cost of keeping the heuristic.
-
-We also gave up the option of using the LLM router for cross-cutting context — the Haiku call at `intent.ts` L17–L31 only sees the query string, not the user's prior history, the workspace's tracked KPIs, or whether the user has open insights. A more sophisticated router could use that context to pick better, at higher cost.
-
-### What the alternative would have cost
-
-If we had built an LLM-only router (no heuristic), every `?q=` would pay one Haiku call even for trivially-routable queries — small cost individually but real at scale. If we had built no router at all and just used the QueryAgent for everything, the agent's tool set is already the union of all agents' tools (`lib/mcp/tools.ts` L38–L40: `queryTools = [...new Set(monitoringTools + diagnosticTools + recommendationTools)]`), so it'd technically work — but the model would have to pick from a much larger tool list per turn (worse choices), and the answers would lose the intent-specific shaping the prompt template at `query.ts` L28 provides via `{intent}`.
-
-### The breakpoint
-
-This stays the right call until either (a) the heuristic's coverage drops noticeably because user phrasings shift away from the simple substring matches, or (b) the intent vocabulary grows past ~5 categories (at which point the substring approach becomes brittle and a small fine-tuned classifier or embeddings-based router becomes cheaper to maintain). Until then, three substring checks and one Haiku call is right-sized.
-
-### What wasn't actually a tradeoff
-
-A regex-only router (no LLM at all) was not a real alternative for free-form questions. The space of how users phrase "what should I do about this drop" is too varied to enumerate as regex, and the cost of misrouting (running the wrong agent with the wrong tools) is bigger than the cost of one Haiku call. So "ditch the LLM router and use only regex" was never a credible path — the question was only "where to put the regex" (as a fast-path heuristic), not "should we have the LLM at all."
-
----
-
-## Tech reference (industry pairing)
-
-### claude-haiku-4-5 (the classifier model)
-
-- **Codebase uses:** `claude-haiku-4-5-20251001` at `lib/agents/intent.ts` L14, `max_tokens: 16`. Called only once per free-form query (no caching for queries since they're free-form text).
-- **Why it's here:** classification is a small, well-bounded task — pick one of three labels — that doesn't need the larger model's depth. Haiku is fast and cheap and the output is parsed back through `parseIntent` so any phrasing variation is normalized.
-- **Leading today:** Haiku-class small models (Claude Haiku, GPT-4o-mini, Gemini Flash) — adoption-leading for cheap classification calls, 2026.
-- **Why it leads:** sub-second latency, sub-cent cost, structured-output prompts that constrain output to one word work reliably enough that downstream code can treat the label as data.
-- **Runner-up:** an embedding-based classifier (compute one embedding, nearest-neighbor against labeled centroids) — cheaper per call at scale, requires building a labeled training set this codebase doesn't have.
-
-### parseIntent (the deterministic normalizer)
-
-- **Codebase uses:** `parseIntent` at `lib/agents/intent.ts` L6–L12 — three substring checks plus `'diagnostic'` default. Used both as the fast-path heuristic AND as the output normalizer for `classifyIntent`.
-- **Why it's here:** dual role — it's the cheap layer for inputs that happen to use the canonical words, AND the safety net for the LLM's output (so even "I think this is a monitoring query" parses to `'monitoring'`). A single function maintained in one place.
-- **Leading today:** rule-first / LLM-fallback routing — adoption-leading for production agent dispatch, 2026.
-- **Why it leads:** combines the cost characteristics of rules with the coverage of an LLM; the LLM handles the long tail while rules handle the obvious cases.
-- **Runner-up:** pure LLM routing — simpler code, higher per-call cost; pure rules — cheapest but coverage degrades silently as user phrasings shift.
-
-### Next.js Route Handler (where dispatch actually happens)
-
-- **Codebase uses:** `app/api/agent/route.ts` GET handler — `q && !insightId` branch at L210–L218 fires `classifyIntent` and dispatches to `QueryAgent`. Investigation branch at L224–L249 does deterministic `if`-ladder dispatch (no LLM router).
-- **Why it's here:** the route handler is the single seam where "which path runs" is decided — it co-locates the LLM router call, the agent construction, and the streaming output.
-- **Leading today:** Next.js App Router handlers — adoption-leading for full-stack TS endpoints, 2026.
-- **Why it leads:** same handler can stream NDJSON, run async LLM calls, and dispatch to typed agent constructors — no separate server framework required.
-- **Runner-up:** dedicated FastAPI / Hono router — more explicit, more control; cost is a separate deployment.
-
----
-
-## Summary
-
-Routing is the dispatcher pattern applied to natural-language inputs — pick the right handler before committing to it, with a cheap-then-expensive layer split. In this codebase, the free-form `?q=` path uses `parseIntent` (heuristic, `lib/agents/intent.ts` L6–L12) as the fast path AND as the output normalizer for `classifyIntent` (LLM, `lib/agents/intent.ts` L17–L31, Haiku model). The investigation path (`?insightId=…`) does NOT use this router; it dispatches deterministically via the route's `if`-ladder. The constraint that made this right is cost-per-input: a Haiku classifier costs ~$0.0001 per call, far less than running the wrong agent and producing a bad answer, but worth saving on inputs the heuristic can match. The cost is two intent vocabularies to keep aligned (the heuristic's substrings and the LLM prompt's labels).
-
-- Two-layer router: `parseIntent` (heuristic, deterministic) then `classifyIntent` (Haiku, LLM-decided) — both produce the same `Intent` vocabulary.
-- The LLM call only fires on the free-form `?q=` path; investigations use the route's `if`-ladder (the chain layer).
-- The heuristic is reused TWICE: as the fast-path matcher AND as the normalizer on the LLM's text output.
-- Routing is the bridge from single-agent (tool routing inside a loop) to multi-agent (supervisor picking agents) — same shape, scaled up.
-- Worth it while three substring checks + one Haiku call covers the space; promote to a richer classifier when the intent vocabulary grows past ~5 categories.
 
 ---
 
@@ -509,5 +418,10 @@ Without opening any files:
 
 Open and verify. ✓ Files + function names + the path-firing rule matter; line numbers drifting is fine.
 
+## See also
+
+→ 01-chains-vs-agents.md · → 02-react.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` · → multi-agent: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Memory as a dedicated component, separate from the context window — split into working, episodic, and long-term tiers by how durable each one is. blooming insights has the first tier (the per-run `messages[]` array) and a partial second (per-investigation cache + sessionStorage handoff). The third tier (semantic/vector long-term) is honestly not built.
 
-**See also:** → `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/05-agent-memory.md`
 
 ---
 
@@ -232,7 +231,7 @@ The three tiers, mapped to this codebase
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Working memory (Case A — built):**
 **File:** `lib/agents/base.ts`
@@ -305,96 +304,6 @@ Episodic memory breaks down when the access pattern stops being point-lookup —
 - Context engineering (`01-context-engineering.md`) → memory has to fit *into* the curated window
 - Agentic RAG (`../02-agentic-retrieval/01-agentic-rag.md`) → what long-term memory looks like when it's a control loop, not a fixed retrieval step
 - Two-layer memory mechanics (`../../study-ai-engineering/04-agents-and-tool-use/05-agent-memory.md`) → the codebase-level walk of the short/long split; this file extends to the three-tier model
-
----
-
-## Tradeoffs
-
-The decision here was *to ship working + partial-episodic and defer long-term*. The alternative most teams reach for is "stand up a vector store from day one so we have semantic recall available."
-
-┌──────────────────┬──────────────────────────────┬──────────────────────────────┐
-│ Cost dimension   │ Two-tier (chosen)            │ Three-tier with vector DB    │
-├──────────────────┼──────────────────────────────┼──────────────────────────────┤
-│ Build time       │ a Map + sessionStorage keys  │ embeddings pipeline + store  │
-│                  │ (~30 lines total)             │ + retrieval policy + eviction│
-│ Infra            │ none beyond Next.js          │ Pinecone/Qdrant/pgvector +   │
-│                  │                              │ an embedding model            │
-│ Per-run cost     │ free                          │ embed(write) + embed(read)   │
-│                  │                              │ per relevant fact             │
-│ Failure surface  │ Map evicts on cold start;    │ stale facts retrieved as if  │
-│                  │ stash gone when tab closes   │ current; bad embedding skew  │
-│                  │ (both expected)               │ (silent)                      │
-│ Access pattern   │ exact key only — point lookup│ relevance retrieval — fuzzy  │
-│ Capabilities     │ cross-step handoff ✓         │ cross-run preferences ✓      │
-│                  │ cross-run recall ✗            │ cross-run recall ✓           │
-│ Debugging        │ "did the key get stashed?"   │ "did the right chunk get     │
-│                  │ trivially answerable          │ retrieved, and was it stale?"│
-│ Hire-ability     │ frontend devs recognise it    │ needs vector-DB literacy     │
-└──────────────────┴──────────────────────────────┴──────────────────────────────┘
-
-### What we gave up
-
-We gave up cross-run recall and any persistent "this user prefers…" surface. Every investigation starts fresh above the working tier. If the user resolves an anomaly with "this is expected, ignore similar ones," there's no place to record that and no mechanism to apply it next time. The product knows what to do with each anomaly in isolation, not across a history.
-
-We also gave up resilience on the server-side cache. The `Map` in `investigations.ts` is per-Vercel-instance and per-warm-container — a cold start loses it. The client stash and the dev cache file paper over this for the demo and dev flows, but a real multi-instance setup would push this into Redis or a row store.
-
-### What the alternative would have cost
-
-If we had stood up a vector DB from day one, we'd be paying for an embedding model on every save and every retrieve, an extra infrastructure dependency (Pinecone/Qdrant/pgvector), and the retrieval-policy design work that nobody mentions in the framework demos — what to embed, when to retrieve, how to rank, how to evict, how to avoid retrieving stale facts after the underlying data changed. The cost of *not having a place* to put the third tier yet is small; the cost of having a *misconfigured* third tier is large because it silently poisons the agent's reasoning with stale recall.
-
-### The breakpoint
-
-The two-tier shape stays the right call until the product gains a cross-investigation access pattern. Concrete triggers:
-- "Remember my dismissals" → every dismissal is now a fact to retrieve later → long-term tier earns its place
-- "Don't re-suggest a recommendation I already declined" → cross-run state on recommendations
-- "Compare this anomaly to past ones in this workspace" → workspace-scoped semantic search
-The day one of those ships, the cheapest move is `pgvector` (already-have Postgres in the stack will gain it) rather than a fresh vector DB.
-
-### What wasn't actually a tradeoff
-
-Putting everything in working memory wasn't a real option. Even today, without long-term memory, working memory wouldn't survive the route boundary — the diagnosis has to leave one run and enter another, and the route is a stateless function. The cross-step handoff was always going to need episodic memory; the question was just where to put it (client stash + server map turned out to be enough for the access pattern).
-
-A persistent server-only memory (skip the client stash) wasn't a real option either at this stage, because the route runs in serverless and "warm container that holds your state" isn't a reliable assumption. The client stash is the durable half of the episodic tier precisely because the server half can vanish on a cold start.
-
----
-
-## Tech reference (industry pairing)
-
-### In-memory `Map` (episodic, server side)
-
-- **Codebase uses:** `const mem = new Map<string, AgentEvent[]>()` in `lib/state/investigations.ts` L11, with `getCachedInvestigation` / `saveInvestigation` as the read/write seam.
-- **Why it's here:** zero-infrastructure point-lookup cache for in-flight investigations within a warm Vercel container — exactly matches the access pattern (key = `insightId`).
-- **Leading today:** in-process LRU / Map cache — adoption-leading for stateless serverless caches, 2026.
-- **Why it leads:** zero dependencies, predictable performance, and the cold-start invalidation is implicit (no stale-cache bugs across deploys).
-- **Runner-up:** Redis / Upstash — durable across instances, the obvious next step when point-lookup needs to survive cold starts.
-
-### sessionStorage (episodic, client side)
-
-- **Codebase uses:** `sessionStorage.setItem(stashKey(step, id), ...)` and `sessionStorage.setItem(diagHandoffKey(id), ...)` in `lib/hooks/useInvestigation.ts` L133, L139.
-- **Why it's here:** survives the client navigation between step 2 and step 3, dies when the tab closes — exactly matches the lifetime of "this investigation, this user, this tab."
-- **Leading today:** sessionStorage for cross-route handoffs — adoption-leading on the web, 2026.
-- **Why it leads:** synchronous, no permission prompt, tab-scoped lifetime matches the multi-step UX expectation.
-- **Runner-up:** URL search params — works for serializable, small handoffs; loses on larger payloads (a JSON diagnosis pushes the URL limit).
-
-### Vector DB (long-term, NOT used)
-
-- **Codebase uses:** none. No `pinecone`, `qdrant`, `pgvector`, `weaviate`, or embedding-model dependency is in `package.json`.
-- **Why it's here:** the third tier is absent by design — no access pattern justifies it yet.
-- **Leading today:** pgvector — adoption-leading 2026 for teams already on Postgres; Pinecone / Qdrant innovation-leading for dedicated vector workloads.
-- **Why it leads:** pgvector keeps the vector store in the same DB as relational state, removes a moving part, and is fast enough for sub-million-fact corpora.
-- **Runner-up:** Qdrant — dedicated, supports rich filters and hybrid search; worth it when the corpus or query rate exceeds Postgres-comfortable limits.
-
----
-
-## Summary
-
-Agent memory tiers split an agent's knowledge by lifetime — working (this run, in-context), episodic (recent, exact-key), long-term (persistent, retrieved by relevance) — the same way browser storage splits state across React state / sessionStorage / localStorage. blooming insights has tier 1 (the `messages[]` array in `base.ts` L79–L172) and a partial tier 2 (the server-side `Map` in `lib/state/investigations.ts` plus the client-side `sessionStorage` stash + `bi:diag` handoff in `lib/hooks/useInvestigation.ts`). Tier 3 is honestly absent — no vector store, no embeddings, no semantic recall. The constraint that made this right is the current access pattern: every task is workspace- and anomaly-scoped, and exact-key lookup covers the cross-step handoff. The cost is no cross-run recall — there's no "remember this user's preferences" surface, and adding one means building the third tier.
-
-- Memory is storage layering by durability; pick the tier by lifetime, not convenience.
-- Working = `messages[]` (dies on function return). Episodic = `Map` + `sessionStorage` (dies on cold start / tab close). Long-term = absent.
-- The diagnosis handoff between step 2 and step 3 is the load-bearing episodic case: stashed at `bi:diag:<id>`, read back by the route.
-- Exact-key lookup is enough today because every "retrieve past" is "retrieve *this* past thing."
-- The day a cross-run, fuzzy-recall feature ships, the third tier earns its build cost; until then it's correctly absent.
 
 ---
 
@@ -516,5 +425,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/05-agent-memory.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

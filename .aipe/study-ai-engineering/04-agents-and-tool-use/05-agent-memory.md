@@ -5,7 +5,6 @@
 
 > blooming insights has two memory layers: short-term is the `messages` array accumulated within a single `runAgentLoop` run (gone when the run ends), and long-term is exact-keyed investigation snapshot replay (`getCachedInvestigation`: memory → dev file → demo seed). There is no semantic / vector recall — that is the RAG-inside-an-agent pattern, deliberately deferred.
 
-**See also:** → 01-agents-vs-chains.md · → 03-react-pattern.md · → 06-error-recovery.md · → ../03-retrieval-and-rag/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md
 
 ---
 
@@ -193,7 +192,7 @@ A reader who sees only this diagram should grasp: short-term memory lives inside
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A (partial).** Short-term and exact-key long-term memory are implemented; semantic/vector memory is not.
 
@@ -266,54 +265,6 @@ The short-term array grows unbounded within a run — every tool result (truncat
 
 ---
 
-## Tradeoffs
-
-### Comparison: exact-key snapshot memory vs semantic memory
-
-| Dimension | This codebase (exact-key + per-run buffer) | Vector/semantic memory | No long-term memory at all |
-|---|---|---|---|
-| "Show this exact investigation again" | Instant replay | Possible but overkill | Re-run live every time |
-| "Find similar past investigations" | Impossible — no similarity | Native — top-k by cosine | Impossible |
-| Setup complexity | Trivial — `Map` + JSON files | High — embed model + vector DB | None |
-| Survives cold start | No (Map) / seed-only (file) | Yes (external store) | N/A |
-| Cost | Near zero | Embedding + storage per investigation | Re-compute cost every visit |
-
-**What we gave up.** Learning from experience. Because the store is exact-keyed, the agent cannot benefit from past investigations of similar anomalies — two visually identical mobile-conversion drops with different `insightId`s are investigated independently, from scratch, every time. We accept this because the current product need is "make a repeat visit instant and demo-able," which exact-key replay serves perfectly, and the embedding infrastructure for similarity is unjustified until a "similar investigations" feature is actually on the roadmap.
-
-**What the alternative would have cost.** A vector store would have added an embedding model call per investigation, a vector database to operate, an embedding-staleness story (re-embed when the schema changes), and a similarity-threshold tuning problem — substantial infrastructure for a feature no one has asked for. The "no RAG until a feature needs it" decision (../03-retrieval-and-rag/) applies identically to agent memory: defer the semantic layer until similarity is a requirement, not a guess.
-
-**The breakpoint.** Exact-key memory is right while the access pattern is "retrieve this specific investigation." It stops being right the moment a feature requires "retrieve investigations like this one" — recommended-next-investigations, dedup of recurring anomalies, or seeding the diagnostic prompt with prior conclusions. At that point you add the vector layer beside the exact-key store; you do not replace it (exact-key replay stays the right tool for the repeat-visit case).
-
----
-
-## Tech reference (industry pairing)
-
-### In-process Map + JSON files (exact-key long-term store)
-
-- **Codebase uses:** `mem` `Map`, `CACHE_FILE`, `DEMO_FILE` three-tier lookup in `lib/state/investigations.ts` (L22–L41).
-- **Why it's here:** It is the simplest durable store that serves exact-key replay and works with a committed demo seed.
-- **Leading today:** Keyed caches (Redis, in-memory + file) are the adoption-leading exact-key store in 2026; durable session stores lead for cross-instance.
-- **Why it leads:** Trivial, debuggable, zero dependencies for the single-instance case.
-- **Runner-up:** Redis / Durable Objects — survive cold starts and coordinate across instances; needed at scale.
-
-### Conversation buffer (short-term memory)
-
-- **Codebase uses:** The `messages: MessageParam[]` array in `runAgentLoop` (`base.ts` L79–L171).
-- **Why it's here:** The model needs its full prior turns each call to reason over multi-step evidence.
-- **Leading today:** In-context conversation buffers are the adoption-leading short-term memory in 2026.
-- **Why it leads:** It is the native mechanism — the model reasons over what is in its context, nothing else.
-- **Runner-up:** Summarized / windowed buffers — compress old turns to stay under the context window for long runs.
-
-### Vector memory (the absent semantic layer)
-
-- **Codebase uses:** Not used — named as the extension for "similar past investigations."
-- **Why it's here:** It is the standard way to give an agent semantic recall over its own history.
-- **Leading today:** pgvector and Pinecone are the adoption-leading vector stores for agent memory in 2026.
-- **Why it leads:** Mature similarity search, metadata filtering, and managed scaling.
-- **Runner-up:** Qdrant / Weaviate — strong open-source options with hybrid search.
-
----
-
 ## Project exercises
 
 ### Build a "similar past investigations" semantic memory
@@ -333,19 +284,6 @@ The short-term array grows unbounded within a run — every tool result (truncat
 - **Files to touch:** `lib/agents/diagnostic.ts` (L46–L49 system construction); `lib/agents/prompts/diagnostic.md` (a `{prior_finding}` slot); `lib/state/investigation-memory.ts`.
 - **Done when:** A diagnosis of a recurring anomaly cites or explicitly rules out the prior finding, and a novel anomaly's prompt contains no prior-finding text.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights has two memory layers and lacks a third. Short-term memory is the `messages` array inside one `runAgentLoop` run (`base.ts` L79–L171) — the model reasons over its full prior turns each call, and the array is discarded when the run returns. Long-term memory is exact-keyed snapshot replay: `getCachedInvestigation` (`investigations.ts` L22–L28) looks up an `insightId` across a process `Map`, a dev file, and a committed seed, and the route replays the stored events — sliced to the requested step by `filterByStep` — paced at 180ms (`route.ts` L127–L141). There is no semantic / vector memory — the store answers "this exact investigation" but not "investigations like this one," a deliberate deferral matching the codebase's "no RAG until a feature needs it" stance.
-
-Key points:
-- Short-term memory = the per-run `messages` array; it is the substrate of multi-step reasoning and is garbage-collected on return.
-- Agents do not share short-term memory; the only handoff is the `diagnosis` argument the route passes.
-- Long-term memory = exact-keyed snapshot replay (`Map` → dev file → demo seed), `localStorage` semantics, not search semantics.
-- There is no embeddings/vector recall — "similar past investigations" is impossible today and is the primary buildable target.
-- Memory shape is destiny: an exact-key store cannot answer similarity questions; choose storage by the question you must answer.
 
 ---
 
@@ -424,8 +362,13 @@ A colleague says: "Just add a vector DB now so the agent can learn from history.
 
 In `getCachedInvestigation`, what are the three sources checked in order, and what is returned on a complete miss? (Answer: in-process `mem` Map → dev `CACHE_FILE` (only when `PERSIST`) → committed `DEMO_FILE`; returns `null` on a miss — `lib/state/investigations.ts` L22–L28.)
 
+## See also
+
+→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 06-error-recovery.md · → ../03-retrieval-and-rag/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md
+
 ---
 Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: replay is now `step`-filtered (`filterByStep`, L127–141) and `saveInvestigation` (L254) fires only on the combined `step==null` capture run; the split live steps hand off via sessionStorage.
 
 ---
 Updated: 2026-05-29 — Added a "cross-step memory" sub-section (with diagram) on the two-step investigation's diagnosis handoff: step 2 serializes to `sessionStorage['bi:diag:<id>']` (useInvestigation.ts L138–139), step 3 re-hydrates via `parseDiagnosis` (route.ts L227); demo path replays the snapshot `filterByStep` (route.ts L129). Framed as memory carried across HTTP requests, distinct from in-loop message memory.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > When a topology fans out — one supervisor spawns many workers in parallel — the workers can fire concurrent tool calls faster than the provider's rate limit allows; backpressure is the discipline of bounding that concurrency with a semaphore and signaling the supervisor to stop spawning when the queue fills. blooming insights has *no fan-out*: the agents are sequential and user-gated. The 1.1s inter-call spacing in `McpClient.liveCall` (set by `minIntervalMs: 1100` in `lib/mcp/connect.ts` L92) is serial rate-limit compliance for *one* call chain, not concurrency backpressure.
 
-**See also:** → 01-cross-turn-caching.md · → 03-per-tool-circuit-breaking.md · → `../03-multi-agent-orchestration/04-parallel-fan-out.md` · → single-call rate limiting: `../../study-ai-engineering/06-production-serving/04-rate-limiting-backpressure.md`
 
 ---
 
@@ -315,7 +314,7 @@ The canonical fan-out backpressure shape — and where this codebase sits
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case B — fan-out backpressure is not implemented; the topology is sequential and user-gated.** The honest sentence: the agents run one at a time in a chain (route picks the next agent), and within each agent the tool calls are serial inside `runAgentLoop` — there's no point where K parallel calls happen, so the semaphore + queue + upward signal pattern doesn't apply yet.
 
@@ -394,100 +393,6 @@ Even with the full pattern, fan-out backpressure has a sharp edge: the upward si
 - Parallel fan-out (multi-agent topology): `../03-multi-agent-orchestration/04-parallel-fan-out.md` → the topology this pattern exists for
 - Single-call rate limiting (the simpler pattern): `../../study-ai-engineering/06-production-serving/04-rate-limiting-backpressure.md` → the spacing pattern this codebase implements
 - Per-tool circuit breaking: `03-per-tool-circuit-breaking.md` → the related failure-control discipline (rate-limit vs sustained outage)
-
----
-
-## Tradeoffs
-
-The decision was *what topology to ship and therefore what rate-control pattern to build.* This codebase shipped sequential, user-gated agents (Phase A) with serial spacing; the alternative is a parallel fan-out topology requiring the full backpressure pattern (Phase B).
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Sequential + serial spacing │ Parallel + backpressure     │
-│                  │ (chosen)                    │ (alternative)               │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Topology         │ chain of agents (monitoring │ supervisor → N workers      │
-│                  │ → diagnostic → recommend)   │                             │
-│ Concurrency      │ 1 call at a time            │ K concurrent calls (semaphore│
-│ Rate-limit       │ 1100 ms spacing per call    │ K = rate_limit × per_call_t │
-│ compliance       │                             │ (with K=1 → serial-like)    │
-│ Code surface     │ ~10 lines of timestamp-     │ semaphore + queue + upward  │
-│                  │ and-sleep                   │ signal + supervisor wiring  │
-│ Latency for      │ sum of all calls (serial)   │ max of K parallel batches   │
-│ N-call task      │                             │                             │
-│ Producer-side    │ none (one call at a time)   │ supervisor pauses decompos. │
-│ control          │                             │ when queue full              │
-│ Multi-tenant      │ each user has their own    │ shared semaphore across     │
-│ behavior         │ McpClient with its own       │ users requires external rate│
-│                  │ lastCallAt — independent    │ control (proxy / token       │
-│                  │ from other users (but they  │ bucket)                      │
-│                  │ also share upstream limit!) │                              │
-│ Failure mode     │ slow under load (sum of     │ runaway supervisor if signal│
-│                  │ calls); no fan-out latency  │ ignored; complex debugging  │
-│                  │ win available               │                              │
-│ Debuggability    │ one trajectory, sequential  │ multiple concurrent          │
-│                  │                             │ trajectories per task        │
-│ When it earns its│ one user / serial chain;    │ multi-step tasks that        │
-│ place            │ user gating in UI            │ decompose into independent  │
-│                  │                             │ sub-questions                │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up parallel-latency wins. A diagnostic that could decompose into 5 independent sub-questions takes 5× the wall-clock time of a single sub-question because the calls are serialized through `liveCall`'s spacing. A parallel fan-out with K=5 could complete in ~1× the per-call time; we don't have that lever.
-
-We also gave up the producer-pause discipline. The serial pattern doesn't have a "producer" in the sense the parallel pattern does — the next call only happens when the prior one returns, so there's nothing to pause. The day a supervisor agent ships, it would have no signal to read from to know whether to keep decomposing.
-
-### What the alternative would have cost
-
-If we had built fan-out backpressure day one, the code surface would have grown by a semaphore implementation, a bounded queue, and a wiring path that surfaces queue-full state to the supervisor's context. The supervisor's prompt would need a section on "when the queue is full, prefer narrower decomposition" — non-trivial prompt engineering. And the debugging surface would have widened from one sequential trajectory to N concurrent trajectories per task, each with their own observation order. All of this would have bought *nothing* — there's no supervisor in the topology to pause; the semaphore would never have more than one in flight; the queue would always be empty. Building it eagerly is over-engineering for a topology that doesn't exist.
-
-### The breakpoint
-
-This stays the right call until two things happen together: (a) the topology shifts to parallel — a supervisor agent decomposes a task into independent worker agents that run concurrently (cross-ref: `../03-multi-agent-orchestration/04-parallel-fan-out.md`), AND (b) the parallel workers each issue tool calls that share the same upstream rate limit. Either alone isn't enough — a supervisor that delegates to one worker is still serial, and a parallel topology against an upstream with no rate limit doesn't need a semaphore. Both together flips the cost-benefit and the semaphore + queue + upward signal become necessary.
-
-### What wasn't actually a tradeoff
-
-"Just raise the upstream rate limit and parallelize" was not a real alternative. The rate limit isn't a knob we control — Bloomreach enforces ~1 req/s per user globally, and asking for a higher limit (if it were possible) would only shift the breakpoint. The structural fix to scale concurrency *correctly* is the fan-out backpressure pattern; without it, more concurrency just means more 429s faster. The chosen pattern matches the rate limit and the topology; the alternative would require a different rate limit AND a different topology, which is two systemic changes pretending to be one.
-
----
-
-## Tech reference
-
-### Semaphore (the concurrency primitive)
-
-- **Codebase uses:** not implemented; the serial-spacing pattern in `McpClient.liveCall` (`lib/mcp/client.ts` L148–L163) is the simpler version for the simpler topology.
-- **Why it's here:** the semaphore IS the K-bounded concurrency cap; named as the missing piece for a parallel topology.
-- **Leading today:** in-process semaphore patterns (Node.js `p-limit`, custom counting Promises) — adoption-leading for in-process concurrency control, 2026.
-- **Why it leads:** zero dependencies, correct for single-process parallel calls.
-- **Runner-up:** Redis-backed distributed semaphore — necessary when multiple processes share the rate limit, overkill when they don't.
-
-### Bounded queue + upward signal (the producer-pause primitive)
-
-- **Codebase uses:** not implemented.
-- **Why it's here:** the bounded queue is the consumer-side buffer; the upward signal is the conversation back to the producer. Together they're what makes "rate-limited" different from "unbounded queue behind a throttle."
-- **Leading today:** Reactive Streams patterns (request-N signals) — innovation-leading for producer-consumer rate control, 2026.
-- **Why it leads:** the request-N signal makes backpressure first-class in the protocol; producers know exactly how many items the consumer wants next.
-- **Runner-up:** synchronous queue with a `enqueue → block until space` semantic — simpler, less flexible.
-
-### Bloomreach rate limit (the upstream constraint that sized the spacing)
-
-- **Codebase uses:** the spacing value (1100 ms) in `lib/mcp/connect.ts` L92 was chosen against Bloomreach's observed ~1 req/s/user limit and stated `1 per 10 second` window on retries (see comments in `connect.ts` L81–L88).
-- **Why it's here:** the rate limit is what sets K (concurrency cap) in the fan-out math. K = rate_limit × per_call_time; with rate_limit=1/s and call_time~1s+, K≈1.
-- **Leading today:** per-user fixed-window rate limits — adoption-leading for B2B analytics APIs, 2026.
-- **Why it leads:** simple to implement, simple to communicate to clients ("don't exceed N req/s").
-- **Runner-up:** token-bucket with burst allowance — more client-friendly (lets clients catch up after idle), more ops to tune.
-
----
-
-## Summary
-
-Fan-out backpressure is the discipline that bounds parallel tool calls with a semaphore AND signals the producing supervisor to pause when the queue fills. blooming insights doesn't implement it because the topology is sequential and user-gated — `route.ts` picks one agent at a time and `runAgentLoop` runs tool calls serially within each agent. What exists instead is `McpClient.liveCall`'s 1100 ms fixed-interval spacing (`lib/mcp/client.ts` L148–L163, configured by `minIntervalMs: 1100` in `connect.ts` L92) — serial rate-limit compliance for *one* call chain, not concurrency backpressure. The cap math (K ≈ rate_limit × per_call_time) gives K≈1 against Bloomreach's ~1 req/s limit, which is why serial spacing satisfies the limit; the structural difference is that the semaphore + queue + upward signal pattern coordinates a *parallel producer*, which is something this codebase doesn't have.
-
-- Backpressure has two layers: a semaphore bounds outbound concurrency, an upward signal bounds inbound production.
-- Serial spacing is the simpler pattern for the simpler topology (one chain, one caller); it's not a smaller backpressure.
-- K (the concurrency cap) ≈ rate_limit × per_call_time. Bloomreach: 1 req/s × ~1s ≈ K=1 → serial-equivalent.
-- The 1.1s in `liveCall` is rate-limit compliance for one chain, not concurrency backpressure.
-- Breakpoint: a parallel fan-out topology (supervisor + concurrent workers). Until then, the absent semaphore is correctly absent.
 
 ---
 
@@ -598,5 +503,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 01-cross-turn-caching.md · → 03-per-tool-circuit-breaking.md · → `../03-multi-agent-orchestration/04-parallel-fan-out.md` · → single-call rate limiting: `../../study-ai-engineering/06-production-serving/04-rate-limiting-backpressure.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

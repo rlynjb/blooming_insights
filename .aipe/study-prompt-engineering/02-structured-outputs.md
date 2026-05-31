@@ -5,7 +5,6 @@
 
 > blooming insights does the thing every blog tells you not to — it instructs the model to "Return ONLY a JSON array … wrapped in a ```json fenced block" in plain prose — and survives it because `parseAgentJson` strips the fence first, three type guards prove the shape, and `synthesize()` retries on clean context. The fence-regex-first ordering is not arbitrary: it is a direct fix for courteous models wrapping JSON in markdown.
 
-**See also:** → 01-anatomy.md · → 03-prompts-as-code.md · → 07-output-mode-mismatch.md · → 09-chain-of-thought.md
 
 ---
 
@@ -212,7 +211,7 @@ The fence is asked for in prose, stripped first in code; the typed value is manu
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -284,55 +283,6 @@ The model's adherence to a format request is probabilistic; the contract's adher
 
 ---
 
-## Tradeoffs
-
-### Prompt-instructed JSON (this codebase) vs. native tool/JSON mode
-
-| Dimension | This codebase (prompt-instructed + funnel) | Native tool / JSON mode |
-|---|---|---|
-| Validity guarantee | Manufactured in code; repair + floor | Token-level; malformed impossible |
-| Provider coupling | None — any text model | High — per-provider feature surface |
-| Testability with fakes | Full — pure functions, injected anthropic | Lower — needs the live structured mode |
-| Cost on failure | Extra `synthesize()` call (2048 tokens) | None (cannot fail to parse) |
-| Drift on model upgrade | Must re-check default formatting | Immune (decode is constrained) |
-| Correctness guarantee | Shape only | Shape only |
-
-**What we gave up.** A token-level validity guarantee. Some fraction of calls fail extract-or-validate and pay the repair cost; a native mode makes malformed output structurally impossible. The codebase accepts that cost to keep the output contract portable and unit-testable.
-
-**What the alternative would have cost.** Coupling the output contract to one provider's structured-output feature — different shapes and limits per vendor, harder to exercise in the test suite without the live API. The id-omission instruction (`recommendation.md` L82) would become an `additionalProperties: false` schema constraint, which is cleaner, but the whole funnel would need the live API to test. Native tool-use is already accepted for *input*; the output side is held back on purpose.
-
-**The breakpoint.** Prompt-instructed JSON is right while the parse-failure rate stays low enough that `synthesize()` retries are rare. The moment a *measured* failure rate climbs past a few percent — making the doubled-cost repair a real line item — or a model upgrade changes default formatting often enough to need re-checking, moving the final artifact onto native tool-use JSON becomes worth the provider coupling. The retrieval side already proves native tool-use works here; the output side is a deliberate hold, not an inability.
-
----
-
-## Tech reference (industry pairing)
-
-### Prompt-instructed fenced JSON (`## Output` + `parseAgentJson`)
-
-- **Codebase uses:** the prompts request a ```json fence in prose (`monitoring.md` L71); `parseAgentJson` (`validate.ts` L3–13) strips the fence first, then bare-parses, then substring-scans.
-- **Why it's here:** portability and testability — works against any text model and is exercisable with fakes; the fence-first ordering handles the courteous-markdown-wrapping failure mode.
-- **Leading today (2026):** native structured outputs (OpenAI `response_format`, Anthropic tool-use JSON) lead for *new* projects; fence-extraction is the portable baseline.
-- **Why it leads:** constrained decoding eliminates the parse failure mode where the provider supports it.
-- **Runner-up:** LangChain `JsonOutputParser` / `instructor` — same parse-validate-retry shape, more framework.
-
-### Anthropic tool-use JSON mode (the road not taken for output)
-
-- **Codebase uses:** native tool-use is used for **input** (every MCP call is a schema'd `tool_use`, `base.ts` L101), but **not** for the final artifact.
-- **Why it's here (as the runner-up):** it would make the final JSON structurally valid by forcing the model to terminate via a typed tool call — `additionalProperties: false` would enforce the id-omission that `recommendation.md` L82 does in prose.
-- **Leading today (2026):** Anthropic tool-use and OpenAI function-calling/structured-outputs lead adoption for typed output.
-- **Why it leads:** the typed contract is enforced at the API boundary, not in app code.
-- **Runner-up to *it*:** OpenAI `response_format: { type: 'json_schema', strict: true }` — same guarantee, different vendor.
-
-### Hand-written `v is T` type guards
-
-- **Codebase uses:** `validate.ts` L17–53 — one predicate per shape; the recommendation guard validates the id-less shape.
-- **Why it's here:** converts `parseAgentJson`'s `unknown` into a typed value with a runtime shape proof, no dependency.
-- **Leading today (2026):** Zod leads runtime validation in TypeScript — one schema generates validator and type.
-- **Why it leads:** single source of truth, composable, structured error reporting the guards lack.
-- **Runner-up:** Valibot (smaller bundle), io-ts (functional).
-
----
-
 ## Project exercises
 
 ### Promote the final artifact to native tool-use JSON
@@ -352,19 +302,6 @@ The model's adherence to a format request is probabilistic; the contract's adher
 - **Files to touch:** `test/mcp/validate.test.ts` (extend `parseAgentJson` cases).
 - **Done when:** the test passes against the current parser and fails if the fence regex is removed or reordered after the bare parse.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-blooming insights instructs JSON in the prompt text — `monitoring.md` L69–97, `diagnostic.md` L59–103, `recommendation.md` L47–91 — the approach blog folklore warns against, including schema-shaping in prose ("Do NOT include an id field", `recommendation.md` L82). It survives by treating the model's output as an untrusted body: `parseAgentJson` (`validate.ts` L3–13) strips the markdown fence *first* (the literal fix for courteous models wrapping JSON in code blocks), the three `v is T` guards (`validate.ts` L17–53) prove shape field-by-field, and `synthesize()` (`diagnostic.ts` L82–121) retries on clean context before a model-independent floor. The cost is owning the parser, paying for repair retries, and getting shape-not-correctness; the benefit is portability and full testability with fakes — a defensible, reversible choice the codebase makes deliberately while reserving native tool-use for input.
-
-**Key points:**
-- The prompts request fenced JSON in prose; the contract (extract + validate + repair) is what guarantees a typed result.
-- `parseAgentJson` tries the fence regex *first* — a direct fix for models that wrap JSON in markdown as a courtesy.
-- `recommendation.md` L82 ("Do NOT include an id") is schema-shaping in prose; the guard validates the id-less shape and the code assigns the UUID after.
-- `synthesize()` is a clean-context, tool-less retry that breaks the loop's "keep querying" momentum; monitoring skips it and floors to `[]`.
-- Native tool/JSON mode is the runner-up — already used for *input* — held back on *output* for portability and testability, flippable when measured failure rate justifies the coupling.
 
 ---
 
@@ -439,5 +376,10 @@ A reviewer says: "Switch the final diagnosis to Anthropic tool-use JSON mode and
 
 In `parseAgentJson`, what are the three extraction strategies in order, and what happens if all three fail? (Answer: (1) fenced-code regex `/```(?:json)?\s*([\s\S]*?)```/i`, (2) bare `JSON.parse`, (3) first-bracket-to-last-bracket substring scan; if none yields valid JSON it throws `'no parseable json in agent output'` — `lib/mcp/validate.ts` L3–13.)
 
+## See also
+
+→ 01-anatomy.md · → 03-prompts-as-code.md · → 07-output-mode-mismatch.md · → 09-chain-of-thought.md
+
 ---
 Updated: 2026-05-29 — Corrected the `## Output` section ranges (monitoring L69–97, diagnostic L59–103, recommendation L47–91) and the dependent in-section refs (fence asks → monitoring L71 / diagnostic L61 / recommendation L49; "Do NOT include an id" → recommendation L82; diagnostic empty-case shape L94–101). No placeholder injection table exists in this file (it lives in 01-anatomy.md), so `{categories}` was added there instead.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Sampling controls how randomly the model picks the next token; blooming insights sets *none* of them — it accepts Claude's default temperature everywhere and tunes only `max_tokens`, including a deliberate `16` on the intent classifier to force a one-word answer.
 
-**See also:** → 01-what-an-llm-is.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
 
 ---
 
@@ -164,7 +163,7 @@ The randomness knobs live entirely on the Provider side and are never overridden
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Partially addressed — `max_tokens` only.** No `temperature`, `top_p`, or `top_k` is set on any `anthropic.messages.create` call; Claude's defaults apply everywhere. The only per-call decoding tuning is `max_tokens`.
 
@@ -219,54 +218,6 @@ The classifier (`intent.ts`) sits in the top row: a query has one intent, and ra
 
 ---
 
-## Tradeoffs
-
-### Default temperature everywhere vs. per-task tuning
-
-| Dimension | This codebase (defaults + max_tokens) | Per-task temperature tuning |
-|---|---|---|
-| Setup cost | Zero — set nothing | One `temperature` field per call class |
-| Classifier reliability | Good (sharp prompt + 16-token cap), not guaranteed | Deterministic on a given input |
-| Synthesis reproducibility | Varies run-to-run | Stable, eval-friendly |
-| Agent prose quality | Natural (default randomness) | Same if left default; worse if forced to 0 |
-| Control / auditability | None — provider-chosen | Explicit, version-stable |
-
-**What we gave up.** Determinism on the two calls that have a single correct output. The classifier can flip a borderline query; the synthesis pass cannot be reproduced byte-for-byte. Both are *small* because the prompt and the parse/validate boundary absorb most of the variance — but "small and silent" is exactly the kind of nondeterminism that confounds debugging when it does surface.
-
-**What the alternative would have cost.** Almost nothing for the deterministic calls — one `temperature: 0` field each. The only real risk is forcing `temperature: 0` on the *agent exploration* turns, which can make multi-step reasoning more repetitive and occasionally more brittle (greedy decoding can get stuck). The correct move is selective: pin the classifier and synthesis, leave the agents at default.
-
-**The breakpoint.** Defaults are fine until determinism becomes a *requirement* rather than a nicety — the first time someone builds an eval harness (→ Phase 3) that needs a reproducible baseline, or the first time a flaky classification causes a user-visible wrong routing. At that point, `temperature: 0` on the classifier and synthesis stops being optional.
-
----
-
-## Tech reference (industry pairing)
-
-### temperature
-
-- **Codebase uses:** nothing — default applies on every call (`lib/agents/base.ts` L92–L100 and all `create` sites set no `temperature`).
-- **Why it's here (absent):** the analytical agents tolerate mild variety because their output is parsed and validated; the team controlled `max_tokens` (length) but not temperature (randomness).
-- **Leading today:** `temperature: 0` is the de-facto standard for classification and structured extraction across providers (2026).
-- **Why it leads:** for single-correct-answer tasks, greedy decoding removes a source of error for free.
-- **Runner-up:** low non-zero temperature (e.g. 0.2) — near-deterministic but avoids the rare degenerate loops pure greedy decoding can hit.
-
-### top-p (nucleus sampling)
-
-- **Codebase uses:** nothing — default.
-- **Why it's here (absent):** no call needs finer-grained diversity control than the default provides.
-- **Leading today:** top-p is the standard diversity knob for open-ended generation (2026), often paired with a moderate temperature.
-- **Why it leads:** it adapts the eligible-token set to the distribution's shape, avoiding both the rigidity of top-k and the tail risk of raw temperature sampling.
-- **Runner-up:** top-k — simpler, fixed-size cutoff; less adaptive.
-
-### `max_tokens` (length cap)
-
-- **Codebase uses:** `4096` / `2048` / `16` across agent / synthesis / classifier calls.
-- **Why it's here:** it bounds output length — cost and shape — and the `16` enforces the one-word classifier contract.
-- **Leading today:** universal across providers (2026); not a differentiator.
-- **Why it leads:** bounds the most expensive output component with a single integer (→ 06-token-economics.md).
-- **Runner-up:** stop sequences — content-based termination instead of count-based.
-
----
-
 ## Project exercises
 
 ### Pin temperature 0 on the classifier and both synthesis calls, then measure determinism
@@ -286,19 +237,6 @@ The classifier (`intent.ts`) sits in the top row: a query has one intent, and ra
 - **Files to touch:** `lib/agents/intent.ts` (`classifyIntent`), `test/agents/intent.test.ts`.
 - **Done when:** the classifier returns a single word for inputs that previously produced two, and `parseIntent` still maps it correctly.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-Sampling parameters — temperature, top-p, top-k — control how randomly the model selects the next token from its output distribution; the right setting is task-specific. blooming insights sets none of them: Claude's default temperature applies on every `anthropic.messages.create` call, and the only per-call decoding tuning is `max_tokens` (`4096` agent, `2048` synthesis, `16` classifier). Default temperature is defensible for the JSON-extraction agents, whose output is parsed and validated downstream, but slightly suboptimal for the two calls with a single correct answer — the intent classifier and the synthesis pass — both of which would ideally use `temperature: 0`.
-
-**Key points:**
-- Temperature trades determinism for diversity; top-p/top-k restrict the eligible token set.
-- This codebase sets only `max_tokens`; `temperature`/`top_p`/`top_k` are left at provider defaults.
-- `max_tokens: 16` on the classifier (`lib/agents/intent.ts` L20) bounds the answer to one word but does not make it deterministic.
-- Default temperature is fine for analytical agents (output is parsed/validated) and a small gap for the classifier and synthesis (single correct answer).
-- The fix is selective: `temperature: 0` for classification and synthesis, default for exploration.
 
 ---
 
@@ -374,5 +312,10 @@ A colleague proposes `temperature: 0` on *every* call including the agent loop i
 
 How many sampling-randomness parameters does any `anthropic.messages.create` call in this codebase set? (Answer: zero — only `max_tokens` is set; `temperature`/`top_p`/`top_k` are all left at Claude defaults.)
 
+## See also
+
+→ 01-what-an-llm-is.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted synthesis-call ranges (diagnostic L97–L116 / `max_tokens` L99, recommendation L96–L122); the no-temperature finding and `base.ts`/`intent.ts` refs verified unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

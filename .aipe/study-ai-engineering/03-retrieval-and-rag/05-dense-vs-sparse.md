@@ -5,7 +5,6 @@
 
 > Dense retrieval matches on *meaning* (embedding cosine) and sparse retrieval matches on *exact terms* (keyword/BM25 over a structured field); each fails where the other wins, and blooming insights' EQL queries are pure structured/keyword retrieval — the sparse end of the spectrum, with no dense side at all.
 
-**See also:** → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
 
 ---
 
@@ -145,7 +144,7 @@ The two columns are mirror images; blooming insights lives entirely in the left 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (dense side).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach — pure structured/keyword (sparse-like) querying — and has no embedding/dense retrieval at all.
 
@@ -187,47 +186,6 @@ Neither axis dominates; they are complementary because their failure modes do no
 
 ---
 
-## Tradeoffs
-
-### Sparse-only (current, EQL) vs. dense-only vs. hybrid
-
-| Dimension | Sparse only (EQL, current) | Dense only (embeddings) | Hybrid |
-|---|---|---|---|
-| Exact event/ID/filter | Exact | Blurs neighbors | Exact (sparse leg) |
-| Synonym / paraphrase | Misses | Matches | Matches (dense leg) |
-| Explainability | High (readable filter) | Low (opaque vector) | Medium |
-| Infrastructure | None beyond the query engine | Embedding + vector store | Both + fusion |
-| Right for analytics aggregates | Yes — exact by nature | No — wrong "close" answer | Overkill |
-| Right for free-text past work | No — vocabulary mismatch | Yes | Best |
-
-**What we gave up (by being sparse-only).** Nothing for the analytics use case — EQL's exactness is exactly right for counts, rates, and funnels, where a "similar" event is simply the wrong event. The only thing forgone is meaning-based retrieval over *free text*, which the product does not currently do; there is no free-text corpus to retrieve.
-
-**What the alternative would have cost.** Adding dense retrieval to the analytics path would be actively harmful: an embedding's "close" event is the wrong event for an exact aggregate, and you would pay embedding + vector-store cost to introduce errors. Dense earns its place only on a fuzzy corpus (past investigation narratives), not on structured analytics.
-
-**The breakpoint.** Sparse-only is correct as long as every retrieval is an exact analytics question. It needs a dense complement the moment the product retrieves over *natural-language* content — "find past investigations similar to this one" — where vocabulary mismatch (synonyms, paraphrase) makes exact-term matching miss, and that is precisely the deferred-RAG threshold in `11-rag.md`.
-
----
-
-## Tech reference (industry pairing)
-
-### sparse / lexical retrieval
-
-- **Codebase uses:** EQL via `execute_analytics_eql` (`lib/mcp/tools.ts` L11/L16) and `execute_analytics` — exact structured querying, the sparse end fully present.
-- **Why it's here:** analytics questions have exact answers retrievable only by exact-term/field filtering; a "similar" event is the wrong event.
-- **Leading today:** BM25 (via Elasticsearch/OpenSearch) leads lexical retrieval; SPLADE leads learned-sparse (2026).
-- **Why it leads:** BM25's rarity weighting nails exact and rare-term queries that dense underweights; learned-sparse adds semantics while staying invertible.
-- **Runner-up:** plain TF-IDF — simpler than BM25, still effective for small lexical corpora.
-
-### dense / semantic retrieval
-
-- **Codebase uses:** nothing — no embeddings or cosine retrieval.
-- **Why it's here (absent):** there is no free-text corpus whose meaning must be matched; analytics is exact.
-- **Leading today:** embedding retrieval over a vector index (text-embedding-3 / Voyage + Qdrant/pgvector) leads semantic search (2026).
-- **Why it leads:** matches synonyms and paraphrase that lexical search misses entirely.
-- **Runner-up:** DPR-style dual-encoder retrieval — the research lineage, now generalized by hosted embedding models.
-
----
-
 ## Project exercises
 
 ### Add a dense retrieval path for past investigations (alongside sparse EQL)
@@ -247,19 +205,6 @@ Neither axis dominates; they are complementary because their failure modes do no
 - **Files to touch:** new `scripts/dense-vs-sparse.ts` (the harness), `lib/mcp/retrieval.ts` (both retrievers), `test/mcp/retrieval.test.ts`.
 - **Done when:** the table shows an exact-event-name query where sparse wins and dense drifts, and a paraphrase query where dense wins and sparse returns nothing.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Retrieval has two axes: sparse (exact terms — keyword, BM25, EQL) and dense (meaning — embedding cosine), and they fail on opposite inputs, so the method must match the query's nature. blooming insights is pure sparse: every retrieval is an `execute_analytics_eql` call asking an exact, structured analytics question, which is the correct tool because aggregates have exact answers and a "similar" event is the wrong event. The dense side has nothing to add to analytics and is reserved for a genuinely fuzzy feature — semantic search over past investigations — which is the deferred-RAG decision elsewhere in this section.
-
-**Key points:**
-- Sparse matches exact terms (IDs, enums, filters); dense matches meaning (synonyms, paraphrase).
-- Their failure modes are mirror images, which is why hybrid exists.
-- EQL is pure sparse/structured retrieval — and it is correct for exact analytics.
-- Dense retrieval would *hurt* exact aggregates (a "close" event is the wrong event).
-- The dense axis earns its place only on a free-text corpus, not on structured analytics.
 
 ---
 
@@ -334,3 +279,8 @@ A colleague says "embeddings are strictly more powerful than keyword search, rep
 ### Quick check — code reference test
 
 What kind of retrieval does blooming insights do, and which tool is the evidence? (Answer: pure sparse/structured retrieval — exact-term querying via `execute_analytics_eql` (`lib/mcp/tools.ts` L11 monitoring, L16 diagnostic) and `execute_analytics`; there is no dense/embedding retrieval, and sparse is the correct tool for exact analytics aggregates.)
+
+## See also
+
+→ 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

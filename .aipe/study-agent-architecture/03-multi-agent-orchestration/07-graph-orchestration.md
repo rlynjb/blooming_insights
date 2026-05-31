@@ -5,7 +5,6 @@
 
 > Control flow expressed as an explicit state machine — nodes, edges, conditional transitions, checkpointed state. blooming insights' orchestration is imperative route code, NOT a checkpointed agent-state graph. The UI ProcessStepper is a UI state machine, not an agent-orchestration runtime. The topology that earns its overhead when you need debuggability, human-in-the-loop pause/resume, or branching control flow the route's `if`-ladder can't express.
 
-**See also:** → `./03-sequential-pipeline.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
 
 ---
 
@@ -310,7 +309,7 @@ Graph orchestration — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented as an agent-orchestration graph runtime.**
 
@@ -396,104 +395,6 @@ It also breaks when the engine's checkpointing model doesn't match the work shap
 - `./08-shared-state-and-message-passing.md` → state in graphs is the shared-state pattern, by default
 - `./02-supervisor-worker.md` → graphs can express supervisor-worker as a hub-and-spoke graph with conditional edges
 - `../06-orchestration-system-design-templates/` → the "graph-based investigation workflow" refactor template
-
----
-
-## Tradeoffs
-
-The decision was: **imperative route code — no graph runtime.** The alternative is to adopt LangGraph (or equivalent) and express orchestration as nodes + edges + state.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Imperative route (chosen)   │ Graph runtime (alternative) │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build cost       │ ~50 lines route.ts          │ graph definition + engine   │
-│                  │                             │ wiring + checkpoint store   │
-│ Runtime cost     │ none extra                  │ engine overhead per node    │
-│                  │                             │ transition; checkpoint writes│
-│ Debuggability    │ read route.ts + replay      │ inspect graph state at any  │
-│                  │ trajectory                  │ checkpoint                  │
-│ Resumability     │ none — failures lose the    │ first-class — resume from   │
-│                  │ run                         │ last checkpoint             │
-│ Human-in-the-loop│ manual (sessionStorage +    │ first-class (human nodes,   │
-│                  │ cross-request)              │ thread_ids)                 │
-│ Branching        │ if-ladder in code (opaque   │ conditional edges (queryable)│
-│                  │ at >5 branches)             │                             │
-│ Visualization    │ none — read the code        │ auto-rendered graph diagram │
-│ Onboarding       │ engineer reads route.ts +   │ engineer reads graph def +  │
-│                  │ each agent class            │ understands engine API       │
-│ Framework        │ none — vanilla TS           │ LangGraph (Python primarily)│
-│ availability     │                             │ or LangGraph.js (less mature)│
-│ Stops being      │ when orchestration grows    │ stops being right when      │
-│ right when…      │ past ~5 conditional         │ orchestration is small and  │
-│                  │ branches OR resumability    │ stable and imperative is    │
-│                  │ becomes a hard requirement  │ readable                    │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up first-class resumability. Today, if the recommendation stage errors after the diagnostic stage succeeded, we lose both — the user has to re-run the whole investigation. A graph runtime with checkpointing would let us retry just the failed node.
-
-We gave up declarative debugging. The orchestration's branching today is in `route.ts` L199–L249 — to understand "when does the QueryAgent run vs the DiagnosticAgent" you read the if-ladder. With a graph definition, the answer is a labeled edge in a drawable graph.
-
-We gave up first-class human-in-the-loop. The "user gates step 3" UX works, but it's manually implemented via sessionStorage + cross-request handoff. With a graph runtime, it would be a `human_review` node with first-class pause semantics; the UI would resume by sending the user's response back with the thread_id.
-
-### What the alternative would have cost
-
-If we'd built on LangGraph from day one, the up-front cost would have been substantial: LangGraph's primary SDK is Python (the TS port is less mature in 2026), so we'd either go cross-runtime (Python service for orchestration, Next.js for UI) or accept the rough edges in LangGraph.js. Either way, the codebase shape would have a `graph.ts` defining nodes and edges, a checkpoint store (likely SQLite or Redis), and an engine wrapper in `route.ts` that streams graph events to the client.
-
-Per-run cost: each node transition writes to the checkpoint store (~5–10ms of disk/network); the engine adds a small overhead per node (~10–50ms). At our run volume this is negligible. The bigger cost is *operational* — running LangGraph means understanding its execution model, its persistence layer, its retry semantics, its versioning story. It's a real framework with a real learning curve.
-
-The win: a 5-node graph with the conditional edges we'd actually want (confidence-based human review, retry-on-low-confidence) would be ~100 lines of declarative code with first-class debugging and resumability. The imperative equivalent today (route.ts + sessionStorage + parseDiagnosis + filterByStep) is more code, not less.
-
-### The breakpoint
-
-This stays the right call until the orchestration grows past ~5 conditional branches, OR resumability becomes a hard requirement (e.g. a future "save and resume investigation later" feature), OR the team grows past ~3 engineers and onboarding cost on the imperative orchestration becomes meaningful. At those breakpoints, a graph runtime's declarative shape and first-class checkpointing earn their overhead.
-
-### What wasn't actually a tradeoff
-
-Building our own graph runtime was not a real alternative. Persistent agent state, checkpoint semantics, conditional edge evaluation, human-in-the-loop pause/resume — these are well-trodden ground; rolling our own would be re-inventing LangGraph poorly. If the breakpoint hits, the right move is adopting a framework, not building one.
-
-Treating the UI ProcessStepper as the "graph runtime" was also not a real option. The ProcessStepper is client-side state for *which view to render*; it doesn't own agent context, doesn't checkpoint server-side state, doesn't know how to resume a paused server-side run. Conflating UI step state with agent orchestration state is a category error that some teams make — naming the distinction here is the discipline.
-
----
-
-## Tech reference
-
-### LangGraph (Python primary, LangGraph.js secondary)
-
-- **Codebase uses:** not used.
-- **Why it's here:** LangGraph is the canonical framework for expressing agent orchestration as a state graph with checkpointing and human-in-the-loop pauses.
-- **Leading today:** LangGraph — innovation-leading for graph-style multi-agent orchestration, 2026.
-- **Why it leads:** explicit `StateGraph`, conditional edges, built-in checkpoint savers (SQLite, Postgres, Redis), `interrupt_before`/`interrupt_after` for human-in-the-loop, first-class subgraphs for nested orchestration.
-- **Runner-up:** OpenAI Agents SDK graph mode — simpler model, less ceremony, no built-in checkpointing yet (2026), but easier interop with OpenAI tools.
-
-### XState (the frontend state-machine ancestor)
-
-- **Codebase uses:** not used in this codebase; the comparison is conceptual.
-- **Why it's here:** XState is the React-ecosystem state machine library that taught the frontend community to think of multi-step UIs as declarative graphs. The graph orchestration pattern for agents is the same idea, one layer up.
-- **Leading today:** XState — adoption-leading for React state machines, 2026.
-- **Why it leads:** declarative state machines + visualizer + first-class typing; the model devs reach for when imperative state grows past `useReducer`.
-- **Runner-up:** Robot (smaller, simpler), Zustand with finite-state-machine middleware (more ad-hoc, less ceremony).
-
-### LangGraph checkpointers (SQLite / Redis / Postgres)
-
-- **Codebase uses:** not used.
-- **Why it's here:** the checkpointer is the piece that makes resumability work — it persists graph state at each node transition.
-- **Leading today:** SqliteSaver for local + PostgresSaver for production — adoption-leading for LangGraph state persistence, 2026.
-- **Why it leads:** drop-in serializers, thread_id-based isolation, time-travel debugging (load any historical checkpoint).
-- **Runner-up:** RedisSaver — faster for high-volume runs, less durable than Postgres.
-
----
-
-## Summary
-
-Graph orchestration expresses agent control flow as an explicit state machine — named nodes, named edges, conditional transitions, checkpointed state — making orchestration into queryable, drawable, resumable data. blooming insights does NOT use graph orchestration: the route file (`app/api/agent/route.ts` L199–L249) is imperative TypeScript, the UI ProcessStepper is a UI state machine (not an agent runtime), and the cross-request "human-in-the-loop" gate is manually implemented via `sessionStorage`. The constraint that made imperative right is that orchestration is small (3 product flows, ~50 lines) and stable; the cost is no first-class checkpointing, no first-class human-in-the-loop, no declarative debugging. The breakpoint: orchestration grows past ~5 conditional branches, OR resumability becomes a hard requirement, OR team size makes opaque imperative orchestration an onboarding tax — at which point LangGraph (or equivalent) earns its overhead.
-
-- Graph orchestration is nodes (work) + edges (transitions) + state (context) — make orchestration into data so you can inspect, debug, pause, and replay it.
-- Checkpointing is the load-bearing feature — it makes resumability first-class instead of manually implemented.
-- Human-in-the-loop pauses are a node type, not a hack; the UI resumes by passing a thread_id back.
-- blooming insights uses imperative route code; the UI ProcessStepper is NOT a graph runtime, just step rendering.
-- Worth it past ~5 conditional branches or when resumability matters; not worth it for a 50-line route file with 3 stages.
 
 ---
 
@@ -663,5 +564,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./03-sequential-pipeline.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

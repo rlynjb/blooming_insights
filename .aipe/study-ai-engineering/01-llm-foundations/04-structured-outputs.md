@@ -5,7 +5,6 @@
 
 > The model is asked to emit JSON in a markdown fence; `parseAgentJson` extracts it through three escalating strategies, a `v is T` type guard proves the shape, and a dedicated tool-less `synthesize()` call is the clean-context retry — together a contract that turns a prose string into a validated `Diagnosis`, `Anomaly[]`, or `Recommendation[]`.
 
-**See also:** → 01-what-an-llm-is.md · → 05-streaming.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
 
 ---
 
@@ -222,7 +221,7 @@ The model emits prose; the Service layer manufactures the type through extract �
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -278,57 +277,6 @@ The model's adherence to a format request is probabilistic; the contract's adher
 
 ---
 
-## Tradeoffs
-
-### Prose-extraction contract vs. native JSON mode (for the final artifact)
-
-| Dimension | This codebase (extract + validate + repair) | Native JSON / tool-use mode |
-|---|---|---|
-| Validity guarantee | Manufactured in code; repair + fallback | Token-level; malformed impossible |
-| Provider coupling | None — any text model works | High — per-provider feature |
-| Testability with fakes | Full — pure functions, injected anthropic | Lower — needs the live structured mode |
-| Cost on failure | Extra `synthesize()` call (2048 tokens) | None (cannot fail to parse) |
-| Correctness guarantee | Shape only | Shape only |
-| Handles prose-wrapped output | Yes (stages a/b/c) | N/A (no prose) |
-
-**What we gave up.** A token-level validity guarantee for the final artifact. With prose-extraction, some fraction of calls fail stages 1–2 and pay the repair cost; a native mode makes malformed output structurally impossible. The codebase accepts the repair cost to keep the output contract portable and unit-testable.
-
-**What the alternative would have cost.** Coupling the final-artifact contract to one provider's structured-output feature, with different shapes and limits per vendor, and a contract that is harder to exercise in the 157-test suite without the live API. Notably the codebase already uses native tool-use for *input* (data retrieval) — so the choice was specifically to keep the *output* side in portable application code.
-
-**The breakpoint.** Prose-extraction is right while the parse-failure rate stays low enough that `synthesize()` retries are rare. When a measured failure rate climbs past a few percent — making the doubled-cost repair a real line item — moving the final artifact onto native tool-use JSON mode becomes worth the provider coupling. The retrieval side already proves native tool-use is acceptable here; the output side is held back deliberately, not by inability.
-
-**Not actually a tradeoff:** id-assignment-after-validation. Validating the id-less shape and assigning UUIDs in code (`recommendation.ts` L76) costs nothing and removes a class of model-controlled-identity bugs.
-
----
-
-## Tech reference (industry pairing)
-
-### markdown-fence JSON extraction (`parseAgentJson`)
-
-- **Codebase uses:** `lib/mcp/validate.ts` L3–L13 — fence regex, then bare parse, then first-bracket-to-last-bracket scan.
-- **Why it's here:** the synthesis instructions ask for a ```json fence; the parser recovers the cases where the model forgets the fence or wraps it in prose.
-- **Leading today:** native structured outputs (OpenAI response_format, Anthropic tool-use JSON) lead for *new* projects (2026); fence-extraction remains the portable, provider-agnostic baseline.
-- **Why it leads:** constrained decoding eliminates the parse failure mode entirely where the provider supports it.
-- **Runner-up:** LangChain `JsonOutputParser` / `instructor` — same parse-validate-retry shape, more framework.
-
-### type guards (`isDiagnosis`, `isAnomalyArray`, `isRecommendationArray`)
-
-- **Codebase uses:** `lib/mcp/validate.ts` L17–L57 — hand-written `v is T` predicates, one per shape.
-- **Why it's here:** to convert `parseAgentJson`'s `unknown` into a typed value with a runtime shape proof, validating the id-less recommendation shape (and accepting either `estimatedImpact` shape) specifically.
-- **Leading today:** Zod leads adoption for runtime validation in TypeScript (2026) — one schema generates validator and type.
-- **Why it leads:** single source of truth for shape, composable, with structured error reporting the hand-written guards lack.
-- **Runner-up:** Valibot (smaller), io-ts (functional).
-
-### clean-context retry (`synthesize()`)
-
-- **Codebase uses:** `lib/agents/diagnostic.ts` L87–L126, `lib/agents/recommendation.ts` L82–L132 — a fresh, tool-less `create` that re-derives the artifact from evidence text.
-- **Why it's here:** to break the model's exploration momentum that a same-conversation retry would inherit.
-- **Leading today:** `instructor`-style validation-retry loops lead for Python (2026); a clean-context re-prompt is the language-agnostic equivalent.
-- **Why it leads:** retrying with the validation error or a clean context recovers most format failures without constrained decoding.
-- **Runner-up:** JSON-repair libraries (e.g. `jsonrepair`) — fix malformed JSON mechanically instead of re-prompting; cheaper but cannot recover missing fields.
-
----
-
 ## Project exercises
 
 ### Promote the final artifact to native tool-use JSON
@@ -348,19 +296,6 @@ The model's adherence to a format request is probabilistic; the contract's adher
 - **Files to touch:** `lib/mcp/validate.ts`, `lib/mcp/types.ts` (derive types from schemas), `test/mcp/validate.test.ts`.
 - **Done when:** all existing validation tests pass against the Zod-backed guards, and a malformed object yields a field-level error path instead of a bare `false`.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-A structured-output contract is parse + validate + repair, not just a JSON request. blooming insights extracts the model's JSON from prose with `parseAgentJson` (fenced → bare → substring scan, `lib/mcp/validate.ts`), proves the shape with `v is T` guards that validate the id-less recommendation shape and let the system assign ids, and repairs failures with a clean-context tool-less `synthesize()` call before dropping to a model-independent `FALLBACK`. Crucially, the codebase uses native tool-use for the structured *input* (data retrieval) but keeps the final-artifact contract in portable, testable application code — a deliberate split between trusting the provider and trusting its own parser.
-
-**Key points:**
-- The contract has three stages: extract (`parseAgentJson`), validate (type guards), repair (`synthesize()` → `FALLBACK`).
-- `parseAgentJson` handles fenced, bare, and prose-buried JSON in escalating order.
-- Type guards prove shape field-by-field; the recommendation guard validates the id-less shape and the system assigns UUIDs after.
-- `synthesize()` is a clean-context retry — no tools, no loop history — which breaks the model's exploration momentum.
-- Native tool-use is used for *input*; the final *output* artifact is parsed from prose for portability and testability — a defensible, reversible choice.
 
 ---
 
@@ -434,6 +369,11 @@ A reviewer says: "Use Anthropic's tool-use JSON mode for the final diagnosis and
 
 In `parseAgentJson`, what are the three extraction strategies in order, and what happens if all three fail? (Answer: (1) fenced-code regex, (2) bare `JSON.parse`, (3) first-bracket-to-last-bracket substring scan; if none yields valid JSON it throws `'no parseable json in agent output'` — `lib/mcp/validate.ts` L3–L13.)
 
+## See also
+
+→ 01-what-an-llm-is.md · → 05-streaming.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
+
 ---
 Updated: 2026-05-28 — Refreshed the output contract for grown types (Insight/Diagnosis/Recommendation optional fields, `EstimatedImpact` union), the loosened `isRecommendationArray` `impactOk` check, post-validation derivation via `deriveInsightFields`/`diagnosisConfidence`, and re-derived all validate.ts/diagnostic.ts/recommendation.ts line refs.
 Updated: 2026-05-29 — Synthesis-instruction append ref drifted to L96–L98 (was L95–L98); corrected the three remaining occurrences (the In-this-codebase line already read L96–L98).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

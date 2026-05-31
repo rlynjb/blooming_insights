@@ -5,7 +5,6 @@
 
 > Code that depends on a thin interface it owns — not on the vendor SDK it happens to use — can be tested with a plain object fake and swapped to a different backend without touching callers.
 
-**See also:** → 01-request-flow.md · → 04-caching-and-rate-limiting.md · → 06-multi-agent-orchestration.md
 
 ---
 
@@ -249,7 +248,7 @@ The two interface boundaries are the seam. Everything above the seam is testable
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### lib/mcp/transport.ts
 
@@ -355,66 +354,6 @@ A second failure mode: the interface hides capability. `SdkTransport.callTool` c
 - How `McpClient`'s cache and rate-limiter sit between the interface seam and the caller — they are only possible because the transport is injectable (`04-caching-and-rate-limiting.md`).
 - How the four agents each receive the same `McpCaller` interface but build different system prompts and tool schemas (`06-multi-agent-orchestration.md`).
 - TypeScript structural typing: understand why `McpClient` satisfies `McpCaller` without `implements McpCaller` — search for "duck typing" and "structural vs nominal type systems."
-
----
-
-## Tradeoffs
-
-| Dimension              | Thin interface + adapter (this codebase)      | Call the SDK directly everywhere          |
-|------------------------|-----------------------------------------------|-------------------------------------------|
-| **Test setup**         | Pass a plain-object fake; no network          | Must mock the SDK module or have live keys|
-| **Test speed**         | ~0.5 s for 125 tests offline                  | Seconds per test waiting on network       |
-| **Files to maintain**  | Extra: `transport.ts` interface + `SdkTransport`; fakes in tests | Fewer files; SDK is used inline     |
-| **SDK swap**           | Change one file (`SdkTransport`)              | Change every call site                    |
-| **Type safety**        | `callTool` returns `unknown`; callers cast    | SDK's full typed return available inline  |
-| **Interface drift**    | Interface lags new SDK features until updated | SDK's full surface always available       |
-
-**What this approach gave up:** one extra file per abstraction layer; an interface that must be kept in sync when the SDK adds methods; `unknown` return types instead of SDK-typed responses.
-
-**What calling the SDK directly costs:** agent and client tests become integration tests requiring live credentials; flaky CI when the network is slow; no way to trigger rate-limit retry paths deterministically; changing the SDK client means updating every call site.
-
-**The breakpoint:** when the slice of the SDK surface the app actually uses grows beyond 3–4 methods, the interface maintenance cost rises sharply. At 10+ methods, consider a generated adapter or accept the coupling.
-
----
-
-## Tech reference (industry pairing)
-
-### @modelcontextprotocol/sdk client
-
-- The `Client` class is wrapped by `SdkTransport`, never imported by `McpClient` or agents.
-- `client.callTool({ name, arguments })` — note `arguments` (not `args`) is the SDK's parameter key; `SdkTransport.callTool` bridges the naming difference.
-- `client.listTools()` returns a typed object; `SdkTransport` returns it as `Promise<unknown>` to keep the interface simple.
-- Connection and authentication are handled upstream (in `auth.ts`/`connect.ts`); `SdkTransport` receives an already-connected `Client`.
-- The SDK is a compile-time and runtime dependency only in files that construct `SdkTransport` — the rest of the codebase is SDK-free.
-
-### Vitest (injection-based testing)
-
-- `vi.fn()` creates a tracked mock function; `buildFakeAnthropic` uses it to build scripted Anthropic responses (`base.test.ts` L23`).
-- `vi.useFakeTimers()` / `vi.advanceTimersByTime()` let `client.test.ts` test time-dependent behaviour (TTL expiry, rate-limit intervals) without real sleeps.
-- No `vi.mock('module')` calls anywhere in the agent or MCP tests — the injection approach makes module mocking unnecessary.
-- `expect(create).toHaveBeenCalledTimes(n)` verifies how many Anthropic API turns the loop consumed — only possible because `create` is a `vi.fn()`.
-- Tests are in `describe` blocks per class/function; each `it` constructs its own fake, avoiding shared state between cases.
-
-### TypeScript structural typing
-
-- TypeScript checks compatibility by shape, not by name. An object `{ callTool: async fn, listTools: async fn }` satisfies `McpTransport` without `implements McpTransport`.
-- `McpClient` satisfies `McpCaller` because its `callTool` signature is a superset of `McpCaller.callTool` — `McpClient` accepts an extra optional `opts` parameter.
-- The `as unknown as Anthropic` double cast (`base.test.ts` L128) is a TypeScript pattern for injecting a narrow fake of a complex type when the narrow slice is all the code under test actually uses.
-- `implements McpTransport` on `SdkTransport` is documentation; the compiler would also accept a structurally-matching class without the keyword.
-- TypeScript's structural typing is the mechanism that makes the pattern lightweight: no registration, no decorator, no DI container — just the right shape.
-
----
-
-## Summary
-
-**Part 1 recap:** `McpClient` depends on `McpTransport` (a two-method interface it owns) rather than on the MCP SDK's `Client` class. `SdkTransport` is the one file that knows about the SDK. `runAgentLoop` takes both `anthropic` and `mcp` as injected parameters. Tests pass plain-object fakes for both, enabling 125 offline tests in ~0.5 s.
-
-- This is the `D` in SOLID applied at the SDK boundary: own the interface, wrap the vendor.
-- TypeScript structural typing is the mechanism — no DI framework or decorator needed.
-- The seam is the same thing as passing a data-fetcher as a prop to `<UserList />` — same idea, same motivation, backend spelling.
-- Tag `2. Request-response flow` — the seam sits directly in the path of every tool call from agent → MCP server; understanding it is prerequisite to following the request flow end-to-end.
-- Tag `5. Failure handling` — because the transport is injectable, error scenarios (transport throws, rate-limit payload returned) are injected via fakes in `client.test.ts` L89–L198; the seam is what makes failure-path testing deterministic.
-- This is primarily a `4. State ownership` / architecture boundary: the service layer owns its interface; the provider layer owns the SDK coupling.
 
 ---
 
@@ -528,5 +467,10 @@ A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is 
 - Name one thing `fakeTransport` tracks that lets tests verify caching behaviour.
 - In `runAgentLoop`, what is the parameter type of `mcp` and why is it not `McpClient`?
 
+## See also
+
+→ 01-request-flow.md · → 04-caching-and-rate-limiting.md · → 06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; added a note on the capturing-fetch error seam (`HttpErrorHolder`/`makeCapturingFetch`) and `McpToolError`
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

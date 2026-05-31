@@ -5,7 +5,6 @@
 
 > Every agent failure mode in blooming insights has a coded recovery: the forced-final tool-less turn caps the loop, a dedicated `synthesize()` rescues a loop that yields no valid JSON, `FALLBACK` is the last-resort diagnosis, the MCP client retries rate-limits with exponential backoff and never caches errors, the route's pre-stream setup is wrapped so a config throw returns the real error, and on the client a revoked alpha token triggers a one-time auto-reconnect. The budget IS the loop protection.
 
-**See also:** → 01-agents-vs-chains.md · → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -252,7 +251,7 @@ A reader who sees only this diagram should grasp: the client reconnects once on 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -353,54 +352,6 @@ The transport recovery still has an honest gap: there is no circuit breaker — 
 
 ---
 
-## Tradeoffs
-
-### Comparison: layered fallbacks + backoff retry vs alternatives
-
-| Dimension | This codebase | No fallback (trust the loop's JSON) | Backoff + jitter + circuit breaker |
-|---|---|---|---|
-| Unparseable output | 3-tier recovery → safe default | `tryParse` fails → run breaks | Same as this (orthogonal) |
-| Non-termination | Budget withholds tools → forced stop | Runs to route timeout | Same as this (orthogonal) |
-| Rate-limit recovery | Exponential backoff, parsed-hint, ≤20s cap | None | + jitter, fast-fail |
-| Backend hard-down | Pays full retry budget every call | Fails immediately | Circuit opens → fast-fail |
-| Setup complexity | Low — `??` chains + a `while` loop | Lowest | Higher — breaker state + jitter |
-
-**What we gave up.** Fast-fail under sustained outage. With no circuit breaker, every call to a hard-down Bloomreach pays the full bounded-retry budget (up to 3 retries, each capped at `retryCeilingMs = 20_000`) before surfacing the error — across a multi-call investigation that compounds toward the route's `maxDuration` ceiling. We accept this because Bloomreach hard-down is rare relative to transient rate-limits, and the backoff-with-hint retry handles the common case (a single 429, where the server states its ~10s window) cleanly; a circuit breaker is justified only once sustained outages become frequent enough to matter.
-
-**What the alternative would have cost.** Trusting the loop's final-turn JSON (dropping `synthesize` and `FALLBACK`) would remove two API calls' worth of cost on the failure path — but any run where the forced-final turn emits prose would break: `tryParse` returns `null`, and with nothing below it the route would either throw or emit a malformed diagnosis. The fallback tiers cost one extra clean-context call *only* when the loop's JSON fails, and zero when it succeeds; that is cheap insurance against a stream-breaking failure.
-
-**The breakpoint.** The current recovery is right while failures are transient and isolated (a stray 429, an occasional prose response). It stops being right when failures become correlated or sustained — a Bloomreach outage, a model regression that fails `tryParse` on most runs — at which point the fixed retry burns budget pointlessly and the indistinguishable `FALLBACK` masks the outage. Then add a circuit breaker (fast-fail after N failures) and tag fallbacks with their cause so an outage is observable rather than hidden.
-
----
-
-## Tech reference (industry pairing)
-
-### Forced-final turn (loop protection)
-
-- **Codebase uses:** `forceFinal` withholds `params.tools` on the budget-spent / last turn (`base.ts` L91, L101).
-- **Why it's here:** It is the only reliable way to make a model stop querying — remove its ability to call tools.
-- **Leading today:** Hard iteration/tool-call budgets are the adoption-leading agent loop-protection in 2026.
-- **Why it leads:** Every serious agent runtime (LangGraph, Anthropic Agent SDK) enforces a max-iterations cap; the default without one is run-to-limit.
-- **Runner-up:** A "done" tool the model must call to terminate (passing the result as the tool argument) — guarantees valid JSON at the cost of one extra hop.
-
-### Fallback chain (graceful degradation)
-
-- **Codebase uses:** `tryParse ?? synthesize() ?? FALLBACK` (`diagnostic.ts` L74–L75); `?? []` for recommendation/monitoring.
-- **Why it's here:** The route must always get a typed value to stream, never an exception.
-- **Leading today:** Layered fallbacks with a safe default are the adoption-leading degradation pattern in 2026.
-- **Why it leads:** Each tier handles a distinct failure; the bottom tier guarantees no crash reaches the user.
-- **Runner-up:** Constrained decoding (Outlines, OpenAI structured outputs) — forces valid JSON at the token level, removing the need for the parse-fallback tiers (not available at this codebase's Anthropic vintage).
-
-### Bounded retry (transport recovery)
-
-- **Codebase uses:** `while (isRateLimited && retries < maxRetries)` with exponential backoff off `retryDelayMs`, preferring a parsed server-stated window, capped at `retryCeilingMs` (`client.ts` L122–L132).
-- **Why it's here:** A single 429 under the ~1 req/s limit is recoverable by waiting out the stated window and re-calling.
-- **Leading today:** `p-retry`-style bounded retry is adoption-leading; exponential backoff + jitter is the production standard.
-- **Why it leads:** Bounds the retry count and gives the server time to recover.
-- **Runner-up:** `cockatiel` / `opossum` — full resilience toolkits adding circuit breaker, timeout, and fallback (the absent breaker).
-
----
-
 ## Project exercises
 
 ### Tag FALLBACK diagnoses with their cause
@@ -420,20 +371,6 @@ The transport recovery still has an honest gap: there is no circuit breaker — 
 - **Files to touch:** `lib/mcp/client.ts` (`callTool` L97–L146, `liveCall` L148–L163, add breaker state); `test/mcp/client.test.ts` (open/half-open/closed transitions).
 - **Done when:** After N consecutive errors the next call fast-fails without hitting the transport, and a success after the cooldown closes the circuit — proven by unit tests with a fake transport.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Every agent failure in blooming insights has a coded recovery. Non-termination is prevented structurally: the `forceFinal` turn withholds tools (`base.ts` L91, L101) so the model must stop — the per-agent `maxToolCalls` budget is simultaneously the latency bound and the loop protection. Unparseable output falls through a three-tier cascade: the loop's forced-final JSON, then a clean-context `synthesize()` retry (`diagnostic.ts` L87–L126), then a safe `FALLBACK`/`[]` that never throws. Monitoring degrades an unparseable scan to `[]` (treating it as "no anomalies"). Underneath, `McpClient` retries rate-limits with exponential backoff (preferring the server-stated window, capped at `retryCeilingMs`) and never caches error results (`client.ts` L122–L139). The route wraps pre-stream setup so a config throw returns the real error (L156–165), and the feed auto-reconnects once on a revoked alpha token (`app/page.tsx` L386–410). The honest gap — no circuit breaker — is named, not hidden.
-
-Key points:
-- The budget IS the loop protection: `forceFinal` (`base.ts` L91) removes the model's ability to keep querying.
-- The output cascade is three safe tiers — `tryParse ?? synthesize ?? FALLBACK` — bottoming out at a typed value, never an exception.
-- `synthesize()` is a clean-context retry; a fresh single-turn call breaks the loop's "exploration momentum."
-- Transport recovery: exponential-backoff rate-limit retry (parsed-hint preferred, ≤`retryCeilingMs`) and never caching errors (no poison).
-- Two more guards: the route's pre-stream setup `try/catch`, and the client's one-time auto-reconnect on a revoked alpha token.
-- Honest absences: no circuit breaker and no backoff jitter; and a `FALLBACK` from total failure looks identical to one from inconclusive data (the confidence-downgrade only partly mitigates this).
 
 ---
 
@@ -515,5 +452,10 @@ A reviewer says: "Drop the `synthesize()` call and the `FALLBACK` — if the loo
 
 When `McpClient.callTool` gets an error result, does it write it to the cache, and why? (Answer: no — `lib/mcp/client.ts` L137–L139 returns the error result without caching, so a transient failure cannot poison the next 60s of calls.)
 
+## See also
+
+→ 01-agents-vs-chains.md · → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — Corrected the transport claim: retry is now exponential backoff (parsed server-window preferred, capped at `retryCeilingMs = 20_000`), not fixed-delay; added the route's pre-stream setup `try/catch` and the feed's one-time token-revocation auto-reconnect; refreshed all `client.ts`/`diagnostic.ts`/`monitoring.ts` line refs.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

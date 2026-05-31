@@ -5,7 +5,6 @@
 
 > The baseline single-agent shape — reason, call a tool, read the result, repeat. blooming insights runs this one loop (`runAgentLoop`) under four different prompts; everything fancier is an escalation away from it.
 
-**See also:** → 01-chains-vs-agents.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
 
 ---
 
@@ -233,7 +232,7 @@ runAgentLoop — the baseline reused four times
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **The loop itself**
 **File:** `lib/agents/base.ts`
@@ -293,90 +292,6 @@ When the task has a knowable path up front (a fixed 4-step pipeline), ReAct re-d
 - `04-reflexion-self-critique.md` → escalate when the output's failure mode is recognizable; trade 2x tokens for one recovery pass
 - `06-routing.md` → ReAct is one of N possible loops; routing picks which loop runs for which input
 - `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` → the mechanics this file relies on (Thought–Action–Observation, the typed `tool_use` block, the message history shape)
-
----
-
-## Tradeoffs
-
-The decision here was *to keep all four agents on one shared ReAct loop with per-job budgets*, rather than building a per-agent custom shape or escalating to a planner / critic. The alternative most teams reach for is "each agent gets its own bespoke control flow" (a planner for diagnostic, a critic for recommendation, etc.).
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Shared ReAct (chosen)       │ Per-agent bespoke shapes    │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ one loop, parameterised     │ 4 distinct control flows    │
-│                  │ 4 times                     │ to author and maintain      │
-│ Latency / cost   │ 1 model call per turn,      │ planner adds an expensive   │
-│                  │ bounded by maxToolCalls     │ up-front call; critic adds  │
-│                  │                             │ a retry pass                │
-│ Debugging        │ one trace shape; replay     │ 4 trace shapes; per-agent   │
-│                  │ tool calls in order         │ debugging rituals           │
-│ Complexity       │ knobs = (prompt, tools,     │ each agent grows its own    │
-│                  │ budget, synthesisInstr)     │ control surface             │
-│ Failure blast    │ a loop bug fixes all 4 at   │ a loop bug fixes one; the   │
-│                  │ once                        │ others might re-introduce it│
-│ Predictability   │ same shape, same bounded    │ each agent's worst-case is  │
-│                  │ worst-case across all 4     │ separate to reason about    │
-│ Adaptability     │ extending requires a new    │ each agent already has its  │
-│                  │ knob (e.g. plan phase)      │ own machinery to extend     │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up per-agent customization of the control flow. The diagnostic agent can't, today, run a "plan first, then execute" phase without changing `runAgentLoop` itself — the loop has no plan slot. Same for a critic re-read: the loop has no post-loop hook (`diagnostic.ts` L75 calls a separate `synthesize()` *outside* the loop precisely because the loop has no notion of "try again differently").
-
-We also pay the tighter budgets uniformly. `maxToolCalls: 4` for recommendation is fine because recommendations don't need a long investigation, but the *cost of testing whether 6 would be better* is changing a constant in one file — easy. The flip side is uniform predictability: no caller can accidentally double its budget without it showing in the diff.
-
-### What the alternative would have cost
-
-If we had built bespoke control flows per agent, the up-front cost would be ~4x the loop code (each agent reimplements the for-loop, the forced-final logic, the tool-result feeding). And every loop bug — like the messages.length growth blowing context, or the budget arithmetic being off by one — would have to be fixed four times. The biggest hidden cost is the *trace shape*: the streaming events the route emits (`tool_call_start`, `tool_call_end`, `reasoning_step`) work because every agent emits them from the same loop. Four loops means four trace shapes, and the UI's investigation feed would have to branch on agent.
-
-### The breakpoint
-
-Shared ReAct stays the right call as long as the four agents' loops are *structurally identical* and only differ in (prompt, tool subset, budget, synthesis instruction). The day one of them needs a genuinely different shape — a plan phase, a critic round, a fan-out to sub-agents — that agent breaks out of `runAgentLoop` and `runAgentLoop` becomes "the three-agent loop." That's the right time to fork; before that, forking is premature.
-
-### What wasn't actually a tradeoff
-
-A no-loop "single call with all tools" was not a real alternative. Each investigation needs the model to *observe* a tool result before picking the next tool — the period-over-period comparison in `monitoring.md` L26–L29 literally needs the count from query #1 to know whether to switch to a populated window in query #2. One call with all tools and a "do everything" prompt can't observe between calls. The loop isn't a complexity choice; it's the only shape that supports observation-driven tool sequences.
-
----
-
-## Tech reference (industry pairing)
-
-### Anthropic Messages API (`tool_use` / `tool_result` blocks)
-
-- **Codebase uses:** `@anthropic-ai/sdk`'s `anthropic.messages.create({ tools, messages })` (`lib/agents/base.ts` L102). Model: `claude-sonnet-4-6` (L9). Forced-final omits the `tools` field entirely (L101).
-- **Why it's here:** the typed `tool_use` block is what makes the ReAct loop a first-class control-flow primitive instead of "parse free text and hope it's a tool name." Without typed blocks, every loop step would need a regex.
-- **Leading today:** Anthropic tool use — innovation-leading for agent loops, 2026.
-- **Why it leads:** the content-block model (text + tool_use + tool_result) treats the loop as a conversation shape, not a parsing problem; the SDK handles serialization both ways.
-- **Runner-up:** OpenAI function calling / Responses API — equivalent loop shape, larger installed base, slightly different message shape (assistant→tool→assistant vs Anthropic's user→assistant→user-with-tool_result).
-
-### MCP (Model Context Protocol) as the tool surface
-
-- **Codebase uses:** `lib/mcp/connect.ts` → `mcp.callTool(name, args)` called from `runAgentLoop` at `lib/agents/base.ts` L144. Per-agent tool subsets at `lib/mcp/tools.ts` L5–L40.
-- **Why it's here:** every `tool_use` block the model emits is dispatched through one MCP client interface — the loop doesn't know which Bloomreach tool exists; it just calls `mcp.callTool(name, args)`. Adding a tool is a server-side change, not a loop change.
-- **Leading today:** MCP — innovation-leading for agent–tool integration, 2026.
-- **Why it leads:** standardizes the tool surface across models (any Anthropic/OpenAI/Gemini agent can speak to the same server), and lets the same tool definition serve multiple agents (each agent picks its subset via `filterToolSchemas`).
-- **Runner-up:** direct per-agent SDKs (the Bloomreach REST API called directly) — fewer hops, no protocol overhead, but every new agent re-implements auth and rate handling.
-
-### Next.js streaming Response (the loop's wrapper)
-
-- **Codebase uses:** `app/api/agent/route.ts` L168–L267 — a `ReadableStream` writes NDJSON events as the loop progresses, surfaced to the client via `onText`/`onToolCall`/`onToolResult` hooks (`base.ts` L55–L57).
-- **Why it's here:** the loop is bounded but not fast (~1 req/s MCP spacing × 6 calls ≈ 6–10s/agent). Streaming makes the loop *visible* — the user sees each tool call land, instead of a blank screen for 30s.
-- **Leading today:** Next.js App Router `Response(ReadableStream)` — adoption-leading for streamed APIs, 2026.
-- **Why it leads:** native to the runtime, edge-compatible, no extra dependency; NDJSON is the simplest streaming shape that survives proxies.
-- **Runner-up:** Server-Sent Events (SSE) — same idea, slightly heavier framing; tRPC subscriptions if the rest of the stack uses tRPC.
-
----
-
-## Summary
-
-ReAct is the baseline single-agent loop: the model emits a tool call, the runtime executes it, the result is fed back, the model decides the next call or stops. In this codebase, `runAgentLoop` (`lib/agents/base.ts` L48–L176) is that loop, and four agents share it by parameterizing the prompt, tool subset, budget, and synthesis instruction. The constraint that made it right is that all four agents have structurally identical control flow — only the inputs differ, so one loop with knobs beats four bespoke ones. The cost is uniformity: any per-agent shape change (a plan phase, a critic round) means the agent leaves the shared loop.
-
-- One loop, four callers — the per-agent differences are (prompt, tool subset, `maxToolCalls`, `synthesisInstruction`); the body is the same.
-- The model writes the chain at runtime; the runtime owns the ceiling (`maxTurns`, `maxToolCalls`, and the forced-final turn at `base.ts` L90).
-- The forced-final turn (`base.ts` L101: omit `tools` + append `synthesisInstruction`) is the *guaranteed terminal* — without it ReAct can hang.
-- ReAct is the bottom of the escalation ladder: only escalate to plan-and-execute, reflexion, ToT, or multi-agent when a measured failure justifies the cost.
-- Worth it as long as the four agents stay structurally identical; promote to a custom shape the day one needs a plan phase or a critic round the loop can't express.
 
 ---
 
@@ -490,6 +405,11 @@ Without opening any files:
 
 Open and verify. ✓ File + function + the two budgets matter; line numbers drifting is fine.
 
+## See also
+
+→ 01-chains-vs-agents.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
+
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

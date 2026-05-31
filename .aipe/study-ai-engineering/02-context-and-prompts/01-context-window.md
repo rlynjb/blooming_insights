@@ -5,7 +5,6 @@
 
 > The context window is one fixed-size array every part of a request shares — system prompt, message history, tool results, and the room reserved for the answer all compete for the same slots; blooming insights keeps the request inside it by *character* budgeting at every inflow (`truncate`/`MAX_TOOL_RESULT_CHARS = 16_000`, route `TRUNC = 4000`, `schemaSummary` caps) and by a forced tool-less final turn that stops the transcript growing so the model has room to synthesize.
 
-**See also:** → 02-lost-in-the-middle.md · → 03-prompt-chaining.md · → ../01-llm-foundations/02-tokenization.md · → ../04-agents-and-tool-use/02-tool-calling.md
 
 ---
 
@@ -181,7 +180,7 @@ Inflow is capped in the Service layer; the answer's room is reserved by withhold
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -231,49 +230,6 @@ The window is zero-sum between input and output. Every character you let into th
 
 ---
 
-## Tradeoffs
-
-### Character budgets + forced-final turn vs. token-aware window management
-
-| Dimension | This codebase (char budgets) | Token-aware management |
-|---|---|---|
-| Measurement cost | Zero — `s.length` | A tokenizer pass per string, or read `res.usage` after the call |
-| Accuracy of the bound | Loose; off by content type (JSON vs prose) | Exact against the real window unit |
-| Output-room guarantee | Indirect — forced-final turn + `max_tokens` | Could compute exact remaining room before the final call |
-| Truncation quality | Byte offset; can cut mid-JSON | Can cut at a token / structure boundary |
-| Window-edge safety | Slop swamps margin near the limit | Tight, reliable margin |
-| Dependencies | None | Tokenizer lib or usage parsing |
-
-**What we gave up.** Knowing how full the window actually got. With character budgets, "did that call run near the window edge?" is unanswerable — the codebase trusts that capped inflow stays inside, which holds today but has no meter behind it. It also gave up adaptive truncation: a 16,000-char cap on dense id-heavy JSON consumes more window than the same cap on prose, and nothing adjusts.
-
-**What the alternative would have cost.** A tokenizer dependency and a tokenizer pass over every tool result and the schema prefix — real latency on large payloads, plus keeping the tokenizer version matched to the model. Reading `res.usage` is far cheaper but only measures *after* the call, so it cannot pre-bound truncation; it can only confirm the bound was safe in hindsight.
-
-**The breakpoint.** Character budgeting is correct while the bounded transcript stays well inside the window. It breaks the moment a six-call run with full 16,000-char results plus the schema prefix sits within ~20% of the window edge — there the char-to-token slop exceeds the remaining margin and a "safe" result can crowd out the answer. That event — any call landing near the window edge — is the trigger to count tokens for real (`res.usage`) and switch to summarization compaction for the oldest turns.
-
-**Not actually a tradeoff:** the forced-final turn. Withholding tools on the last turn costs nothing and reserves answer room regardless of how the inflow was measured; it would stay in a token-aware design unchanged.
-
----
-
-## Tech reference (industry pairing)
-
-### context window (the model's fixed sequence length)
-
-- **Codebase uses:** the window is never measured; it is defended indirectly by character caps on every inflow (`truncate`, `schemaSummary` caps) and the forced-final turn that stops the transcript growing.
-- **Why it's here:** the window is a hard transformer limit shared by input and output; the codebase protects it without counting it because `s.length` is free and adequate at current payload sizes.
-- **Leading today:** large-window models (Claude / Gemini at 200k–1M+ tokens) lead adoption (2026); the practice that leads alongside them is *compaction* — summarize old turns rather than just truncate.
-- **Why it leads:** a bigger window plus compaction lets a run carry more evidence without overflow, which is exactly the multi-tool-call shape this codebase has.
-- **Runner-up:** retrieval-over-window — store the corpus externally and pull only what each turn needs into context (the RAG path, → ../03-retrieval-and-rag/).
-
-### `max_tokens` (output-room reservation)
-
-- **Codebase uses:** `4096` agent (`lib/agents/base.ts` L74), `2048` synthesis (`diagnostic.ts` L99 / `recommendation.ts` L98), `16` classifier (`lib/agents/intent.ts` L20).
-- **Why it's here:** it is the one token-denominated control the code sets directly, and it reserves the output slots so a packed input cannot starve the answer.
-- **Leading today:** every major provider exposes an output cap (2026); it is universal, not differentiated.
-- **Why it leads:** it bounds the most variable cost component with one integer and guarantees the answer has reserved room.
-- **Runner-up:** stop sequences — bound output by content rather than by count.
-
----
-
 ## Project exercises
 
 ### Add `res.usage` window-fullness logging to the agent loop
@@ -293,19 +249,6 @@ The window is zero-sum between input and output. Every character you let into th
 - **Files to touch:** `lib/agents/base.ts` (`truncate`, `MAX_TOOL_RESULT_CHARS` → a token budget), `lib/agents/monitoring.ts` (`schemaSummary` caps), new `lib/mcp/tokens.ts`, `test/agents/base.test.ts`.
 - **Done when:** a 60KB JSON tool result is truncated to a configured token budget at a valid boundary and the schema prefix respects a token cap, both verified against the tokenizer.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-The context window is one fixed-size array shared by the system prompt, every turn, every tool result, and the room the answer needs — input and output are zero-sum. blooming insights keeps a six-call investigation inside it by bounding every inflow in characters: `truncate` caps each tool result at `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts`), `schemaSummary` caps the schema prefix to ~20 events × 10 props × 30 customer props, and the route's separate `TRUNC = 4000` bounds only the UI stream. It then reserves the answer's room with the forced tool-less final turn (`forceFinal` at base.ts L91, tools withheld at L101) so the transcript stops growing, plus `max_tokens` on the output. The bound is coarse (characters, not tokens) but free, and correct enough until a run approaches the window edge.
-
-**Key points:**
-- The window is shared and finite; input and output compete for the same slots.
-- Every inflow is bounded by character count at the door: `16_000` tool results, `20/10/30` schema caps, `4000` UI stream (a separate budget).
-- `16_000` defends the model's window; `4000` defends the UI wire — two budgets, two purposes.
-- The forced tool-less final turn (base.ts L91/L101) stops the transcript growing so the model has room to synthesize.
-- The bound has no meter — nothing reads `res.usage`; it breaks at the window edge where char-to-token slop exceeds the margin.
 
 ---
 
@@ -380,5 +323,10 @@ A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` so the diagnostic
 
 Which line withholds the tool schemas so the model cannot grow the transcript on its final turn, and what condition gates it? (Answer: `lib/agents/base.ts` L101 — `if (!forceFinal) params.tools = toolSchemas`, gated by `forceFinal` set at L91.)
 
+## See also
+
+→ 02-lost-in-the-middle.md · → 03-prompt-chaining.md · → ../01-llm-foundations/02-tokenization.md · → ../04-agents-and-tool-use/02-tool-calling.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`TRUNC = 4000` now L99–L103, applied at L192) and the diagnostic synthesis `max_tokens` (now L99); the character-budget/forced-final-turn mechanics and `base.ts`/`monitoring.ts` refs verified unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > `McpClient.liveCall` enforces a fixed minimum interval between outbound calls — set to 1100 ms in `connectMcp` to satisfy Bloomreach's ~1 req/s/user limit — but this is serial spacing for ONE user's call chain, not a real request queue with backpressure or load-shedding when many users share the limit. (The routes do wrap the pre-stream setup — `getOrCreateSessionId` + `connectMcp` — in a try/catch that returns the real error JSON instead of a bare 500.)
 
-**See also:** → 05-retry-circuit-breaker.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
 
 ---
 
@@ -189,7 +188,7 @@ A reader who sees only this diagram should grasp: one serial caller is correctly
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 Partially implemented — fixed-interval spacing is built; queueing, backpressure, and load-shedding are not.
 
@@ -247,52 +246,6 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 
 ---
 
-## Tradeoffs
-
-| Dimension | This codebase (fixed spacing) | Add bounded queue + backpressure | Add shared distributed limiter |
-|---|---|---|---|
-| Single serial caller | correct — strict 1100ms gap | correct (queue depth 1) | correct but over-built |
-| Concurrent callers, one process | uncoordinated contention, no fairness | ordered + bounded + fair | ordered + bounded + fair |
-| Concurrent instances (serverless) | uncoordinated — 2+ req/s possible | still per-process | correct — shared per-user limit |
-| Burst behavior | everyone waits, unbounded latency | reject/block when full → fail fast | fail fast + cross-instance |
-| Setup complexity | done — one field + one sleep | medium — a queue library | high — Redis, key naming, TTLs |
-
-**What we gave up.** Per-instance spacing is a best-effort courtesy to Bloomreach, not a hard guarantee under concurrency. blooming insights gave up multi-tenant correctness and burst control: two concurrent users get two independent spacers, and a burst makes everyone wait without bound rather than shedding excess. For a single-user, one-run-at-a-time analyst tool, that was the right trade — the deployment shape is exactly the one serial spacing handles correctly, and the cost of the gap is zero until a second concurrent caller appears.
-
-**What the alternative would have cost.** A bounded queue (`p-queue`) adds a dependency and a depth-and-policy decision (what do we do when full?). A distributed limiter (Redis sliding window) adds an operational dependency — a Redis instance, connection management, per-user key naming, TTL synchronization — disproportionate to a single-user demo. Both solve a contention problem the current deployment does not have.
-
-**The breakpoint.** Fixed spacing is correct and sufficient for one serial caller. It breaks the moment two call chains run concurrently against the same per-user Bloomreach limit — whether two users in one process (contention with no fairness/bound) or one user across two serverless instances (no cross-instance coordination, 2 req/s possible). At that point a concurrency-bounded queue is the minimum fix, and a shared distributed limiter is required for the serverless case.
-
----
-
-## Tech reference (industry pairing)
-
-### fixed-interval spacing (timestamp + sleep)
-
-- **Codebase uses:** `liveCall`'s `lastCallAt` + `sleep(minIntervalMs - elapsed)` (`lib/mcp/client.ts` L148–L163), `minIntervalMs: 1100` (`lib/mcp/connect.ts` L91–L96).
-- **Why it's here:** zero dependencies, provably correct for one serial caller against a ~1 req/s limit.
-- **Leading today:** `p-throttle` (adoption-leading minimal throttle, 2026); `Bottleneck` `minTime` (innovation-leading with reservoir/clustering, 2026).
-- **Why it leads:** `p-throttle` is a drop-in for the spacing logic; `Bottleneck` adds the queue and clustering the bare field lacks.
-- **Runner-up:** a hand-rolled timestamp field — exactly what `McpClient` does.
-
-### concurrency-bounded queue + backpressure
-
-- **Codebase uses:** nothing — concurrent callers contend on one `lastCallAt` with no queue or bound.
-- **Why it's here:** the named gap; the multi-caller case the spacing does not handle.
-- **Leading today:** `p-queue` (adoption-leading concurrency queue, 2026); `Bottleneck` with reservoir + `highWater` rejection (innovation-leading, 2026).
-- **Why it leads:** `p-queue` orders callers and caps in-flight work; `Bottleneck`'s `highWater` is explicit load-shedding.
-- **Runner-up:** an `async-sema` semaphore for a bare concurrency cap without ordering.
-
-### distributed / cross-instance limiting
-
-- **Codebase uses:** nothing — `lastCallAt` is per `McpClient` instance (`lib/mcp/connect.ts` L91–L96).
-- **Why it's here:** serverless cold starts and concurrent users each get an independent spacer.
-- **Leading today:** Upstash Rate Limit (`@upstash/ratelimit`) (adoption-leading serverless limiter, 2026); Redis `SET NX PX` sliding windows (innovation-leading self-hosted, 2026).
-- **Why it leads:** state lives in a shared store all instances read/write atomically, so the per-user limit holds across the fleet.
-- **Runner-up:** `Bottleneck`'s Redis clustering mode.
-
----
-
 ## Project exercises
 
 ### Concurrency-bounded queue with backpressure
@@ -312,19 +265,6 @@ Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp
 - **Files to touch:** `lib/mcp/connect.ts` (construct the shared limiter at L91 instead of the per-instance `minIntervalMs`), `lib/mcp/client.ts` (consult the shared limiter in `liveCall` L148).
 - **Done when:** two `McpClient` instances for the same user, sharing the limiter, collectively respect the ~1 req/s ceiling — verified with a fake shared store in a test.
 - **Estimated effort:** 1–2 days.
-
----
-
-## Summary
-
-blooming insights enforces a fixed minimum interval between outbound MCP calls in `McpClient.liveCall` (`lib/mcp/client.ts` L148–L163) — set to 1100 ms in `connectMcp` (`lib/mcp/connect.ts` L91–L96) to stay under Bloomreach's ~1 req/s/user limit with headroom. This is strict client-side spacing for a single serial caller, and it is provably correct for the one-user, one-run-at-a-time deployment shape. What it lacks is the multi-caller machinery: a request queue to order concurrent callers, a depth bound, a backpressure/load-shedding policy under burst, and cross-instance coordination (each `connectMcp` builds an independent per-instance spacer). The buildable target is a concurrency-bounded queue with backpressure, and a shared distributed limiter for the serverless concurrent-user case.
-
-**Key points:**
-- Rate limiting splits into spacing (one caller) and backpressure (many callers sharing a limit); the second is the hard part.
-- `liveCall` spaces one serial caller at 1100 ms via a timestamp + sleep (`lib/mcp/client.ts` L149–L155) — a strict throttle, no bursts.
-- The interval is set in `connectMcp` (`lib/mcp/connect.ts` L91–L96) for Bloomreach's ~1 req/s/user ceiling, fitting inside the 300s route budget.
-- There is no queue, no depth bound, and no load-shedding — under burst, waiters pile up unbounded.
-- `lastCallAt` is per-instance, so concurrent users (or serverless instances) are uncoordinated; a shared limiter is the fix.
 
 ---
 
@@ -400,5 +340,10 @@ A teammate wants to replace the fixed delay with a token bucket to "handle burst
 
 What value is `minIntervalMs` set to for the live Bloomreach connection, and on which line? (Answer: 1100 ms, `lib/mcp/connect.ts` L92, in the construction at L91–L96.)
 
+## See also
+
+→ 05-retry-circuit-breaker.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
+
 ---
 Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived liveCall refs (client.ts L148–L163, lastCallAt L81) and connectMcp construction (connect.ts L91–L96, comment L81–L88); added the pre-stream setup try/catch note (both routes return real error JSON, not a bare 500).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

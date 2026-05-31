@@ -5,7 +5,6 @@
 
 > Separate the planning model from the execution model — one expensive call decides the route, many cheap calls walk it. blooming insights does NOT use this pattern as a runtime *phase*; the monitoring prompt bakes a static "suggested query plan" into the system prompt, which is a degenerate plan-in-prompt, not plan-and-execute proper.
 
-**See also:** → 02-react.md · → 04-reflexion-self-critique.md · → 06-routing.md · → agents-vs-chains: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
 
 ---
 
@@ -202,7 +201,7 @@ The three positions you can take
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (Case B with nuance).** No agent has a separate planner call. The closest thing is the *static* "Suggested query plan" section in monitoring's system prompt.
 
@@ -271,85 +270,6 @@ When the plan can't anticipate divergences, you end up re-planning constantly an
 - `04-reflexion-self-critique.md` → the other common escalation: instead of planning the route, critique the result
 - `06-routing.md` → routing is one-shot decomposition (which agent) where plan-and-execute is N-step decomposition (which sequence of tools)
 - `../../study-prompt-engineering/03-prompts-as-code.md` → how a static plan in a prompt earns its keep when the steps are stable
-
----
-
-## Tradeoffs
-
-The decision here was *to put the monitoring plan in the prompt and run all four agents as pure ReAct*, rather than building a runtime planner. The alternative most teams reach for is "plan-and-execute for every multi-step task."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Plan in prompt + ReAct       │ Runtime plan-and-execute    │
-│                  │ (chosen)                    │ (alternative)               │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Per-run cost     │ 1 model call per agent +     │ 1 planner + N executor      │
-│                  │ tool calls                   │ calls per agent             │
-│ Latency          │ ~6–10s/agent under MCP rate  │ +planner latency (~1–3s)    │
-│                  │ limit                        │ before any tool fires        │
-│ Build time       │ author one prompt section    │ author planner prompt,      │
-│                  │ + ReAct loop                 │ executor prompt, plan schema│
-│                  │                              │ validator, re-plan trigger  │
-│ Adaptability     │ model adapts WITHIN the plan │ planner sees task once;     │
-│                  │ via observation              │ executor walks blindly      │
-│ Per-run plan     │ none — same prompt always    │ tailored per task            │
-│ tailoring        │                              │                             │
-│ Debugging        │ replay 1 trace; one budget   │ replay plan + execution     │
-│                  │ to reason about              │ separately; two surfaces    │
-│ Failure mode     │ model deviates from prompt's │ plan goes stale mid-run →   │
-│                  │ suggested order              │ wrong steps walked          │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up per-workspace plan tailoring for monitoring. Every workspace gets the same 5-query plan in the prompt, even ones where (say) the workspace has no `view_item` events — the agent runs the funnel query, gets zeros, and has to interpret that. A runtime planner would have read the workspace schema and skipped the funnel query for that workspace. The cost we accepted is one tool call wasted on a structurally empty query, in exchange for not running the planner ourselves.
-
-We also gave up adaptive *step order* for monitoring. The prompt's plan says "volume first, then 180d window, then funnel, then traffic" — the agent mostly follows that, but it can't, say, escalate to a deeper investigation of one metric mid-scan because the loop has no concept of revising the plan. (For deeper investigation, the *whole* run becomes a diagnostic, handled by a different agent — that's the chain layer's job per `01-chains-vs-agents.md`.)
-
-### What the alternative would have cost
-
-If we had built a runtime planner for monitoring, every scan would pay an extra model call (1–3s, more tokens at the higher Opus pricing for the planner) just to produce a list the prompt already encodes. And every divergence — a workspace with sparse data, a missing event type, a category the user wants prioritized — would need either pre-planning enrichment (read the schema, decide what to include) or post-planning re-planning. Both add complexity that the static prompt avoids by simply being explicit about how to handle each case (the prompt's "CRITICAL: verify your windows actually contain data" at L31–L37 is the static answer to "what if the data is sparse").
-
-The diagnostic agent's case is more pointed: a runtime planner would have written a plan like `[check time series, check segments, check campaigns]` — three perfectly reasonable steps that almost never survive the data. Real diagnostics need the second query to depend on what the first returned. ReAct's per-turn re-decision is exactly the shape that fits.
-
-### The breakpoint
-
-Plan-in-prompt stays the right call as long as the monitoring task's steps are stable across workspaces. The day workspaces diverge enough that the prompt can't enumerate their cases (e.g. multi-vertical workspaces where the right metrics differ by vertical, or workspaces where the user supplies custom KPIs the prompt can't know), the prompt's enumeration breaks and a runtime planner that reads the workspace + KPIs becomes the cheaper answer. Until then, the prompt is the planner.
-
-### What wasn't actually a tradeoff
-
-A "no plan at all, pure exploratory ReAct" was not a real alternative for monitoring. Without the suggested-query plan in the prompt, the agent burns its 6-call budget on metrics that don't matter (`select count event session_start by user_agent` or worse) and produces no actionable anomalies. The monitoring task's value is the *coverage* — it has to check each of (volume, revenue, conversion, traffic) — and only an enumerated plan reliably produces that coverage. So "no plan" isn't on the table; the question is only where to put the plan (prompt vs runtime call).
-
----
-
-## Tech reference (industry pairing)
-
-### Prompt-embedded plan (static plan)
-
-- **Codebase uses:** `lib/agents/prompts/monitoring.md` L39–L47 — a literal "Suggested query plan (~5 calls, global)" section listing the EQL queries the agent should run, baked into the system prompt the `MonitoringAgent` (`lib/agents/monitoring.ts` L83–L86) hands to `runAgentLoop`.
-- **Why it's here:** monitoring's steps are stable across workspaces, so the cheapest place to put the plan is the prompt — zero extra model calls, full transparency in version control.
-- **Leading today:** prompt-embedded plans — adoption-leading for tasks with stable structure, 2026.
-- **Why it leads:** for any agent task where the path is knowable, the prompt is the cheapest and most debuggable place to encode it; you read the plan in the prompt instead of replaying a planner trajectory.
-- **Runner-up:** runtime plan-and-execute via LangGraph / LangChain `PlanAndExecute` — earns its overhead when the plan must be per-task; this codebase doesn't need that yet.
-
-### LangGraph (the runtime plan-and-execute runner this repo does NOT use)
-
-- **Codebase uses:** N/A — not a dependency.
-- **Why it's here as a reference:** LangGraph is the closest industry-standard runtime for plan-and-execute orchestration. Naming what we don't use is the discipline.
-- **Leading today:** LangGraph — innovation-leading for multi-step orchestration, 2026.
-- **Why it leads:** treats the agent loop as an explicit state graph (nodes = LLM calls or tool calls, edges = transitions, checkpointed state), which lets plan-then-execute, re-plan triggers, and human-in-the-loop pauses all be first-class.
-- **Runner-up:** CrewAI / AutoGen — agent-team flavor with built-in planner-worker shapes; trades the graph's inspectability for higher-level abstractions.
-
----
-
-## Summary
-
-Plan-and-execute is the pattern where an expensive model writes the step list once and a cheaper model walks it — earning its overhead when the path is knowable up front and the per-step context can stay small. In this codebase, the diagnostic, recommendation, and query agents are pure ReAct (no plan phase), and the monitoring agent runs ReAct against a *static* plan baked into its system prompt at `lib/agents/prompts/monitoring.md` L39–L47 — a plan-in-prompt, not a plan-and-execute phase. The constraint that made this right is task shape: monitoring's steps are stable across workspaces, so the prompt is the cheapest place for the plan; diagnostic's steps depend on prior queries' data, so a static plan would go stale. The cost is per-workspace tailoring — every workspace gets the same monitoring plan even when it would benefit from a tailored one.
-
-- No runtime planner call exists in this repo; closest analog is the prompt section at `monitoring.md` L39–L47.
-- The trade collapses to "where does the plan live" — your code, your prompt, or a runtime call — and the cheapest place that still works is the right one.
-- ReAct wins where each step's choice depends on the prior step's data (diagnostic, recommendation, query); plan-and-execute wins where the steps are knowable but the executor can stay cheap.
-- The most common failure of runtime plan-and-execute is plan staleness — the plan was written before the data was seen, the data surprises, the plan goes wrong.
-- Worth it as a runtime phase only when the per-run plan must differ in ways a prompt can't enumerate; until then, write the plan in the prompt.
 
 ---
 
@@ -474,5 +394,10 @@ Without opening any files:
 
 Open and verify. ✓ File + section name + the "one model call per turn" answer matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-react.md · → 04-reflexion-self-critique.md · → 06-routing.md · → agents-vs-chains: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

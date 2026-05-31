@@ -5,7 +5,6 @@
 
 > When the retriever is a tool the model calls inside a loop — and the model decides which query to run next based on what the last one returned — RAG stops being a pipeline step and becomes a control flow. blooming insights is the live-API form of this: every `execute_analytics_eql` call is the agent retrieving on-the-fly, and the next query depends on the last result.
 
-**See also:** → 02-self-corrective-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/02-react.md` · → why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
 
 ---
 
@@ -212,7 +211,7 @@ blooming insights: agentic retrieval over a live API
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **The loop**
 **File:** `lib/agents/base.ts`
@@ -276,89 +275,6 @@ The agentic loop breaks in three places. **No stop rule** → the model loops un
 - Retrieval routing (`03-retrieval-routing.md`) → multiple retrievers and the model picks
 - ReAct mechanics (`../01-reasoning-patterns/02-react.md`) → the loop shape this sits on
 - Why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md` → the live-tool vs vector-index decision walked end-to-end
-
----
-
-## Tradeoffs
-
-The decision was *which retriever fills the slot* — a live tool call (chosen) or a pre-built embedding index (the textbook answer for RAG).
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Live-tool agentic RAG       │ Embedding-index agentic RAG │
-│                  │ (chosen)                    │ (alternative)               │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Freshness        │ always current              │ stale until re-embedded     │
-│ Exactness        │ exact aggregates (counts,$) │ fuzzy nearest-neighbor      │
-│ Per-call latency │ ~1.1s spaced + HTTP RTT     │ ~10ms vector lookup         │
-│ Build time       │ zero — the API exists       │ chunker + embedder + index  │
-│                  │                             │ + incremental indexing      │
-│ Ops burden       │ none beyond the API itself  │ keep the index in sync with │
-│                  │                             │ a source that changes       │
-│ Per-query cost   │ Bloomreach quota (~1 req/s) │ embedder cost + storage     │
-│ Debuggability    │ replay tool calls, see the  │ harder: was the chunk in    │
-│                  │ exact EQL the model ran     │ top-k? was it relevant?     │
-│ Trajectory shape │ N model + N HTTP rounds      │ N model + N vector lookups  │
-│ Failure blast    │ rate-limit error visible    │ silent stale read → wrong   │
-│                  │ and retryable               │ answer downstream           │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up per-retrieval speed. A vector lookup is milliseconds; an EQL round trip is a second or more, plus the 1100 ms spacing gate in `lib/mcp/connect.ts` L92. Over a 6-call diagnostic, that's most of the wall-clock budget — the route's 300s `maxDuration` exists because the retrieval *is* the latency.
-
-We also gave up the ability to retrieve from data we don't have a live API for. If the codebase ever needed to search free-text narratives (past investigations, past chat logs), the live tool covers none of that surface — an embedding index would have to be added beside it (cross-ref: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`).
-
-### What the alternative would have cost
-
-If we had built an embedding index of analytics data, the day-one cost would have been the chunker + embedder + vector store + incremental indexing pipeline (essentially everything in `study-ai-engineering`'s `03-retrieval-and-rag/` files 01–10). The ongoing cost would have been *correctness*: an embedded snapshot of "42,000 purchases" is a fuzzy nearest-neighbor point, not the number — the agent would answer with a vibe, not a count, and worse, every downstream turn would inherit the lossy read. The fix would have been to re-embed constantly, which means paying both for retrieval *and* for a freshness pipeline that does the live read anyway.
-
-### The breakpoint
-
-This stays the right call until a feature's retrieval can't be expressed as a single API query — when the retriever needs to do "find narratives semantically similar to this anomaly" or "find past investigations that mentioned similar evidence." That's free-text search over content this codebase doesn't have a queryable API for, and it's the day an embedding index earns its place beside the live tool.
-
-### What wasn't actually a tradeoff
-
-"Just stuff the whole workspace into the context window" was not a real alternative. A Bloomreach workspace has years of events, millions of rows — orders of magnitude beyond any context window. Even if it fit, the lost-in-the-middle problem would dominate, and you'd be paying full-input price on every turn to re-send data the model can read directly. The retrieval loop isn't a compromise; it's what makes the question answerable at all.
-
----
-
-## Tech reference
-
-### Anthropic Messages API (tool use)
-
-- **Codebase uses:** `anthropic.messages.create({ tools, messages })` in `runAgentLoop` (`lib/agents/base.ts` L102); the loop reads `res.content` for `tool_use` blocks (L116) and emits `tool_result` blocks (L161) on the next turn.
-- **Why it's here:** the tool_use round-trip IS the agentic-RAG loop. Every retrieval is a `tool_use` block; every observation is a `tool_result` block.
-- **Leading today:** Anthropic tool use — innovation-leading for agentic loops, 2026.
-- **Why it leads:** native structured tool calls make the loop a first-class API shape instead of a parsing exercise; the model emits typed call blocks the loop dispatches without prompt-engineering its way out of free text.
-- **Runner-up:** OpenAI function calling / Responses API — same loop shape, larger installed base.
-
-### MCP (Model Context Protocol)
-
-- **Codebase uses:** `lib/mcp/client.ts` wraps the MCP transport; `lib/mcp/tools.ts` declares the tool schemas (`execute_analytics_eql` and friends) the agents hand to Claude.
-- **Why it's here:** MCP standardizes how the agent talks to the retriever. The tool is defined once in MCP-shape and reused across all four agents.
-- **Leading today:** MCP — adoption-leading for cross-agent tool definitions, 2026.
-- **Why it leads:** decouples the tool from the agent — a tool defined once is usable across agents and across clients (Claude Desktop, IDE plugins, server agents) without re-integration.
-- **Runner-up:** per-agent direct tool definitions — simpler for a one-off agent, doesn't compose across agents or clients.
-
-### Bloomreach Analytics EQL
-
-- **Codebase uses:** the EQL string the model emits as the `eql` argument to `execute_analytics_eql`; recipes in `lib/agents/categories.ts` (the monitoring checklist) and prompt-level guidance in `lib/agents/prompts/*.md`.
-- **Why it's here:** EQL is the live retriever's query language. It IS the API the agentic-RAG loop calls; the model generates EQL the way an agentic-RAG-over-SQL system would generate SQL.
-- **Leading today:** EQL — domain-specific for Bloomreach Engagement; not a general retrieval standard.
-- **Why it leads:** native to Bloomreach, expresses aggregates and windows directly — the model can ask exact analytics questions in one query that would take many lookups against a vector index.
-- **Runner-up:** raw event export + SQL — more general, requires building the warehouse and the EQL→SQL semantics yourself.
-
----
-
-## Summary
-
-Agentic RAG is the shape where retrieval becomes a tool the model calls inside a loop — the model writes the query sequence at runtime instead of your code writing one query at build time. blooming insights is this shape, with one specific choice that matters: the retriever is a live API (`execute_analytics_eql` against Bloomreach via MCP) rather than an embedding index. The agent loop (`runAgentLoop`, `lib/agents/base.ts` L48–L176) drives reason → tool_use → observe → repeat until the model stops naturally (no tool_use block, L121) or the budget caps it (L90–L101). The cost is per-call latency (~1.1s spaced HTTP round trip per retrieval); the win is exact, always-current, schema-correct results no embedding could match for analytics.
-
-- Agentic RAG = ReAct loop whose primary tool is a retriever; the model writes the query plan at runtime.
-- The retriever is an interface — a vector index, a SQL query, a web search, or a live API call all fill the slot.
-- blooming insights fills the slot with a live MCP tool, so there is no vector store, no chunker, no embedding pipeline.
-- The loop has caps (`maxTurns`, `maxToolCalls`) — without them, "model decides" means "model loops forever."
-- The right shape only as long as the data is a queryable API; free-text narrative search would push back toward embeddings.
 
 ---
 
@@ -464,5 +380,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-self-corrective-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/02-react.md` · → why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

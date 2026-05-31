@@ -5,7 +5,6 @@
 
 > When an LLM returns a JSON object wrapped in free-form text, you need a fallback ladder — fenced-block regex, bare parse, substring scan — followed by a type guard that confirms shape before you trust the value.
 
-**See also:** → ../01-system-design/06-multi-agent-orchestration.md · → 05-severity-sort.md
 
 ---
 
@@ -300,7 +299,7 @@ The diagram in the next section is the primary recap.
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/mcp/validate.ts`
 **Function / class:** `parseAgentJson` + `isAnomalyArray` + `isDiagnosis` + `isRecommendationArray`
@@ -380,56 +379,6 @@ The guards are hand-written. Each new field on `Anomaly`, `Diagnosis`, or `Recom
 - **Tool/function-calling JSON mode** — Anthropic's tool-use API and OpenAI's function-calling API both let you declare a JSON schema; the model is constrained to emit conforming JSON. No extraction ladder needed.
 - **Zod** — a TypeScript-first schema validation library. Define the schema once; get parsing, coercion, and a type-narrowed result. Replaces the hand-written guards and adds coercion (e.g. string → number).
 - **Constrained decoding** — grammar-guided sampling (e.g. Outlines, llama.cpp GBNF grammars) forces the model's token choices to produce valid JSON at generation time, eliminating the problem entirely for self-hosted models.
-
----
-
-## Tradeoffs
-
-| Dimension | This implementation (regex + scan + hand guards) | Alternative: Zod + SDK structured output |
-|---|---|---|
-| Complexity | Three code paths; each guard hand-maintained per type | One Zod schema per type; SDK handles extraction |
-| Reliability | Substring scan fails on stray `{}`; guards lag type changes | Zod parses or throws cleanly; schema is the single source of truth |
-| Dependency footprint | Zero new dependencies | Zod (tiny) or SDK structured-output feature (already a dep) |
-| Model freedom | Works with any prompt style, any model, streaming text | Requires function/tool-call mode; older models or non-Anthropic providers may not support it |
-
-**Gave up:** The scan is fragile when prose contains stray brackets. Guards are hand-maintained — a field added to the TypeScript type is invisible to the guard until a developer also updates it. There is no compile-time enforcement of guard completeness.
-
-**Alternative cost:** Zod adds a dependency (though it's small and widely used). The Anthropic tool-use mode requires restructuring the agent prompt and call site — you declare a tool schema, call the model differently, and parse a tool-call response rather than text. That's a larger refactor than dropping in a parse function.
-
-**Breakpoint:** This implementation is fine when the shapes are small, stable, and few (three types: `Anomaly`, `Diagnosis`, `Recommendation`). When shapes grow, nest deeply, or change frequently, hand-written guards become a maintenance liability and Zod or structured output is the right call.
-
----
-
-## Tech reference (industry pairing)
-
-### JSON.parse + regex extraction
-
-- **Leader — Anthropic tool-use mode:** The SDK's tool-use API returns structured JSON in a typed `tool_use` content block. No regex needed. Declared via a `tools` array with an input schema.
-- **Runner-up — OpenAI function calling / `response_format: { type: "json_object" }`:** Same idea; the model is constrained to emit JSON. Works across GPT-3.5+.
-- **Standard library — `JSON.parse` in a try/catch:** Language-native. Works in every JavaScript/TypeScript environment. The fallback when you cannot constrain the model.
-- **Regex fenced-block extraction:** A common pattern in LLM output parsers (LangChain's `JsonOutputParser`, LlamaIndex's `PydanticOutputParser`) — they all implement some variant of the fenced-block → bare-parse → substring-scan ladder.
-- **Constrained decoding — Outlines / llama.cpp GBNF:** For self-hosted models, you can compile a JSON grammar into the sampler so the model physically cannot produce invalid JSON. Eliminates extraction entirely.
-
-### Structural type guards
-
-- **Leader — Zod:** Schema-first validation. `z.array(AnomalySchema).parse(v)` returns a typed value or throws a `ZodError` with field-level detail. The schema is the TypeScript type's single source of truth.
-- **Runner-up — io-ts / Effect Schema:** Functional, composable schemas. Stronger than Zod for algebraic types but more verbose.
-- **Standard pattern — `is` predicates:** Language-native TypeScript. Zero dependency. No field-level error messages. Suitable for stable, small shapes.
-- **`instanceof` checks:** Work only for class instances, not plain objects. Not applicable here — agent output is always a plain object deserialized from JSON.
-- **JSON Schema + Ajv:** JSON Schema is language-agnostic and widely supported. `Ajv` compiles a schema to a validator function. Useful when the schema needs to be shared across languages or stored externally.
-
----
-
-## Summary
-
-`parseAgentJson` extracts a JSON value from text a language model wrote. It uses a three-step fallback ladder: (1) pull the content of a fenced code block with a regex, (2) `JSON.parse` the candidate, (3) scan for the outermost bracket pair and slice. After extraction, the value is `unknown` — three `is` type guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) confirm shape before the caller uses the value in a typed context.
-
-- The fenced-block regex handles the most common agent output format: a markdown code block.
-- The bare-parse handles well-formed JSON emitted without a fence.
-- The substring scan handles JSON buried mid-sentence, without fence markers.
-- All three extraction paths return `unknown`; narrowing to a typed value requires an `is` predicate.
-- The design is liberal at the boundary (accept any parseable encoding) and strict at the gate (admit only exact shapes).
-- The main weakness is the substring scan's fragility when prose contains stray brackets and the hand-maintenance burden on the type guards.
 
 ---
 
@@ -556,5 +505,10 @@ A teammate argues: "We should replace `parseAgentJson` with Zod's `z.array(Anoma
 - An `is` predicate returns `boolean`. What does the `: v is Anomaly[]` annotation add over just returning `boolean`?
 - `isRecommendationArray` accepts `estimatedImpact` in two shapes. Name both. (Cite `lib/mcp/validate.ts` L46–L48.)
 
+## See also
+
+→ ../01-system-design/06-multi-agent-orchestration.md · → 05-severity-sort.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; noted that `isRecommendationArray` now accepts `estimatedImpact` as either a string or a `{ range, ... }` object (the `impactOk` union check)
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

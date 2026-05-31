@@ -5,7 +5,6 @@
 
 > A rank table converts a string enum into integers so `Array.prototype.sort` can order anomalies by severity, and `new Set` collapses three overlapping tool arrays into one deduplicated union in a single spread.
 
-**See also:** → 04-json-from-prose.md · → ../01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -251,7 +250,7 @@ The primary recap: both operations together.
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/agents/monitoring.ts`
 **Function / class:** `SEV_RANK` constant + `MonitoringAgent.scan`
@@ -314,58 +313,6 @@ GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/tools.ts#L
 - Stable sort guarantees: why V8's Timsort is stable, and what changed in Chrome 70 / Node 11 when it became spec-mandated.
 - Multi-key sort: how to chain comparators `(SEV_RANK[b.s] - SEV_RANK[a.s]) || (b.timestamp - a.timestamp)` for a secondary sort within the same severity.
 - `Map`-based grouping: how `Map<Severity, Anomaly[]>` can replace both the sort and a downstream `filter` when you need all anomalies of each severity in separate buckets.
-
----
-
-## Tradeoffs
-
-| Dimension | Rank-table comparator | Alternative: sort by stored numeric field | Alternative: `indexOf` comparator |
-|---|---|---|---|
-| Complexity | O(n log n) sort; O(1) lookup per compare | O(n log n); no extra table | O(n log n) sort; O(k) per compare |
-| Coupling | Rank table must stay in sync with the enum | Rank embedded in the data model | Order array must stay in sync with enum |
-| Type safety | `Record<Severity, number>` enforces completeness | TypeScript field type enforces presence | `indexOf` returns -1 for unknown values |
-| Mutability | Rank table is a separate const; easy to reorder | Changing rank means a data migration | Reorder by editing the order array |
-
-**Gave up: nothing keeps the rank table in sync automatically.** If a new `Severity` member is added to the type union and a developer forgets to add it to `SEV_RANK`, `tsc` catches it immediately because `Record<Severity, number>` requires all keys. The coupling is real but compile-time-checked, which makes it acceptable.
-
-**Alternative cost: storing rank on the Anomaly itself.** You could add `rank: number` to the `Anomaly` type and have the model emit it, or compute it during `parseAgentJson`. Then the comparator is just `(a, b) => b.rank - a.rank`. The cost: the model must produce a correct integer; that integer must be validated; the schema gets wider. The rank table is computed locally and verified statically, so it is more trustworthy than model-emitted data.
-
-**Alternative cost: `indexOf`.** `severityOrder.indexOf(b.severity)` is O(k) per compare where k is the array length (4 here, so O(1) in practice). The issue: `indexOf` returns -1 for unknown values, and `-1 - 2 = -3` (negative), which would sort unknown values before `"warning"`. That is a worse silent failure mode than NaN.
-
-**Breakpoint.** This is irrelevant at this scale. The anomaly array is capped at 10 after the sort; even before the cap, the model returns at most a handful. O(n log n) at n ≤ 30 is a handful of comparisons. The rank table lookup is a single property access. The `Set` union over ~35 tool strings iterates once. None of this is a performance consideration — the value is correctness and clarity, not speed.
-
----
-
-## Tech reference (industry pairing)
-
-### Array.sort comparator
-
-- **Spec:** `Array.prototype.sort` accepts an optional `compareFn(a, b)`: returns negative → a before b, positive → b before a, zero → implementation-defined (stable since ES2019).
-- **Stability:** V8's Timsort (used in Node.js and browsers) has been stable since Chrome 70 / Node 11; the ES2019 spec mandated stable sort for all conforming engines.
-- **NaN behavior:** if `compareFn` returns NaN for any pair, the sort treats that pair as equal (0), producing undefined relative order for those elements.
-- **Non-destructive copy:** `[...parsed].sort(...)` spreads into a new array before sorting. `sort` mutates in place; the spread avoids mutating the `parsed` reference, which may be used elsewhere.
-- **Ordinal mapping pattern:** a plain object literal used as a lookup table (`Record<K, number>`) is the idiomatic JS pattern for converting a string enum to a sortable integer; it is O(1) per lookup.
-
-### Set-based union
-
-- **Constructor:** `new Set(iterable)` iterates the argument in insertion order, adding each value if not already present. For strings and other primitives, equality is `===`.
-- **Dedup guarantee:** each unique primitive string appears exactly once. Insertion order is preserved for first occurrence.
-- **Spread back to array:** `[...set]` uses the Set iterator protocol; the resulting array is in insertion order. Combined with `as const`, TypeScript narrows the type to a readonly tuple of the unique strings.
-- **Reference types:** for objects, two structurally identical objects are not equal by `===`. Set dedup only works for primitives (strings, numbers, symbols) and identical references.
-- **Union of N arrays:** `new Set([...a, ...b, ...c])` generalizes to any number of source arrays. The cost is O(total elements) for the Set construction, which is O(n) where n is the sum of all array lengths.
-
----
-
-## Summary
-
-`SEV_RANK` maps the string enum `Severity` to integers so `Array.prototype.sort` can use a numeric comparator — `SEV_RANK[b.severity] - SEV_RANK[a.severity]` — to sort anomalies most-severe-first. `.slice(0, 10)` caps the result. `queryTools` uses `new Set([...monitoringTools, ...diagnosticTools, ...recommendationTools])` to merge three overlapping tool arrays into a deduplicated union in one expression.
-
-- A rank table is an injection from a categorical enum into the integers, borrowing ℕ's total order for use in a comparator.
-- `b - a` in a comparator produces descending order; `a - b` produces ascending.
-- `Record<Severity, number>` enforces at compile time that every enum member has a rank entry.
-- JS sort has been stable since ES2019; equal-rank anomalies preserve their input order.
-- `Set` deduplicates by `===`; it works correctly for primitive strings, not for object references.
-- The Set union pattern scales to any number of source arrays and runs in O(n) time.
 
 ---
 
@@ -445,8 +392,13 @@ Scenario B: `monitoringTools` and `diagnosticTools` both contain `"execute_analy
 - What TypeScript type on `SEV_RANK` ensures every `Severity` member has an entry?
 - What does `.slice(0, 10)` return if the sorted array has only 3 elements?
 
+## See also
+
+→ 04-json-from-prose.md · → ../01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers (sort + slice moved L92 → L102; `SEV_RANK` and `queryTools` refs unchanged)
 
 ---
 Updated: 2026-05-29 — sort + slice moved L102 → L119; `SEV_RANK` now L51 (was cited L50); `scan` method L69 (was L68); `queryTools` refs unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

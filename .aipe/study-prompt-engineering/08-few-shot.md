@@ -5,7 +5,6 @@
 
 > blooming insights is example-driven for *format* — the EQL reminders, the worked query plan, and the JSON output blocks are syntax exemplars that shape what the model emits — but its actual classifier (`classifyIntent`) is *zero-shot*: query.md lists the three intent label definitions, not labeled input→output examples. Format-shaping few-shot: yes. Classifier few-shot: no.
 
-**See also:** → 01-anatomy.md · → 02-structured-outputs.md · → 09-chain-of-thought.md · → 04-token-budgeting.md
 
 ---
 
@@ -198,7 +197,7 @@ The codebase demonstrates shapes pervasively and the actual classification decis
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — partial.** Format-shaping few-shot is present; classifier few-shot is absent.
 
@@ -271,54 +270,6 @@ An instruction is parsed; an example is imitated. The model's strongest behavior
 
 ---
 
-## Tradeoffs
-
-### Zero-shot classifier vs. few-shot classifier
-
-| Dimension | This codebase (zero-shot `classifyIntent`) | Few-shot classifier |
-|---|---|---|
-| Token cost per call | Minimal — definitions only | +k examples in every call's prefix |
-| Boundary-case accuracy | Unanchored — decided from definitions | Anchored — model imitates labeled edges |
-| Maintenance | One definition string | A curated, drift-prone example set |
-| Calibration to your data | None — generic | Examples encode your real query distribution |
-| Latency | Lowest (16 output tokens) | Same output, larger input |
-
-**What we gave up.** A calibration anchor for boundary cases. With no examples, the classifier maps "is my refund rate climbing?" onto a label from definitions alone, with nothing demonstrating where monitoring ends and diagnostic begins. Accuracy on the clean cases is fine; the ambiguous middle is unanchored.
-
-**What the alternative would have cost.** Tokens on every call and a maintenance burden. Each example sits in the classifier's prefix on every classification, and an example set drifts — real query phrasings change, and a stale exemplar quietly mis-calibrates the model. The codebase chose definitions to keep the classifier cheap and stateless; defensible while the three categories are distinct enough.
-
-**The breakpoint.** Zero-shot is right while measured classification accuracy on real queries stays high. The moment a held-out eval shows boundary-case misses above tolerance — refund/return queries landing on the wrong agent, say — adding 3–5 diverse labeled examples becomes worth the per-call tokens. The trigger is a *measured* accuracy gap, not a hunch; this is where few-shot meets eval-driven iteration (→ 05-eval-driven-iteration.md).
-
----
-
-## Tech reference (industry pairing)
-
-### Format exemplars (worked EQL lines + JSON output block)
-
-- **Codebase uses:** `monitoring.md` L49–L54 / L73–L85, `diagnostic.md` L27–L37 / L63–L85 — worked query shapes and a filled output instance.
-- **Why it's here:** to pin the *shape* of queries and output; the model imitates a demonstrated form more reliably than a described rule.
-- **Leading today:** format exemplars remain the adoption-leading way to constrain output shape in 2026, alongside native structured-output modes that make the format request unnecessary.
-- **Why it leads:** demonstration beats description for structure, at low token cost when examples are few.
-- **Runner-up:** native JSON/tool mode (Anthropic tool-use, OpenAI response_format) — removes the need for an output exemplar by constraining decoding (→ 02-structured-outputs.md).
-
-### Zero-shot classification (`classifyIntent`)
-
-- **Codebase uses:** `lib/agents/intent.ts` L17–L31 — label definitions, no examples, one-word output.
-- **Why it's here:** three distinct categories on a capable model with `max_tokens: 16`; definitions are cheaper than examples per call.
-- **Leading today:** zero-shot leads for coarse, distinct-category classification in 2026; few-shot and dynamic (retrieved) few-shot lead when categories blur or accuracy must be tuned.
-- **Why it leads:** capable models classify distinct categories from definitions without the per-call token cost of examples.
-- **Runner-up:** few-shot with 3–5 curated examples — higher boundary-case accuracy at the cost of prefix tokens and example maintenance.
-
-### dynamic / retrieved few-shot (NOT used here)
-
-- **Codebase uses:** nothing — the prompts carry a fixed set, none retrieved per call.
-- **Why it's here:** named as the frontier — retrieving the k most similar past queries as examples per classification adapts the exemplars to the input.
-- **Leading today:** retrieval-augmented few-shot leads for high-accuracy classifiers in 2026.
-- **Why it leads:** examples matched to the input out-perform a fixed set on the long tail.
-- **Runner-up:** a fixed curated set (the static-few-shot baseline) — simpler, no retrieval index.
-
----
-
 ## Project exercises
 
 ### Add few-shot exemplars to the intent classifier and measure accuracy
@@ -338,19 +289,6 @@ An instruction is parsed; an example is imitated. The model's strongest behavior
 - **Files to touch:** `lib/agents/prompts/monitoring.md` (the output block), `test/agents/monitoring.test.ts` (assert the agent still parses both shapes).
 - **Done when:** monitoring runs still parse via `isAnomalyArray`, and a manual check shows the model varying metric names rather than echoing `purchase_revenue`.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-Examples constrain output more reliably than instructions because the model imitates a demonstrated shape better than it parses a described rule. blooming insights uses format exemplars pervasively — the EQL reminder one-liners (`monitoring.md` L49–L54, `diagnostic.md` L27–L37, with a negative example at L35), the five-step worked query plan (`monitoring.md` L39–L47), and the filled JSON output blocks that double as the request side of the structured-output contract (`monitoring.md` L73–L85, recommendation's id-less shape at L49–L74 / L82). But its one true classifier, `classifyIntent` (`intent.ts` L17–L31), is zero-shot — label definitions, no labeled query→label pairs, mirrored in query.md's Framing (L15–L21). The split is honest: format wants demonstration, the classifier's distinct categories survive on definitions, and whether examples would help the classifier is a measurable open question.
-
-**Key points:**
-- A demonstrated shape constrains output more reliably than a described rule — the model pattern-completes.
-- Format exemplars (EQL lines, query plan, JSON block) are used pervasively to pin output shape.
-- The JSON output block IS a one-shot of the output form — the request side of the structured-output contract.
-- `classifyIntent` is zero-shot: label definitions, no examples; the one true classification decision is demonstrated nowhere.
-- 3–5 diverse examples beat 20 mediocre ones, at a per-call token cost — so the discipline is "few, diverse, exactly-formatted."
 
 ---
 
@@ -425,6 +363,11 @@ A reviewer says: "Add examples to the classifier — few-shot always beats zero-
 
 Is `classifyIntent` few-shot or zero-shot, and what does its system prompt contain? (Answer: zero-shot — its system prompt at `intent.ts` L21–L23 contains label *definitions* for monitoring/diagnostic/recommendation and "Reply with ONLY the one word," with no labeled query→label examples.)
 
+## See also
+
+→ 01-anatomy.md · → 02-structured-outputs.md · → 09-chain-of-thought.md · → 04-token-budgeting.md
+
 ---
 Updated: 2026-05-29 — Resynced monitoring.md exemplar refs after the `{categories}` shift: EQL reminders L43–48→L49–54, Suggested query plan L33–41→L39–47 (with inner step annotations L35–41→L41–47), output exemplar L54–64→L73–85 (verified against the live JSON block, which sits lower than the +6 estimate due to the expanded field-rules).
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md EQL reminders L26–34→L27–37 and negative-example L33→L35, diagnostic.md output exemplar L48–66→L63–85, recommendation.md output exemplar L49–59→L49–74 and id-ban L64→L82.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > blooming insights caches at two layers it controls — a 60s exact-match `Map` over MCP tool results keyed `name:JSON.stringify(args)`, and a coarse whole-investigation replay cache — but does NOT cache the one thing that dominates the bill: the long static system prompts re-sent to Claude on every turn.
 
-**See also:** → 02-llm-cost-optimization.md · → 04-rate-limiting-backpressure.md · → 05-retry-circuit-breaker.md · → ../04-agents-and-tool-use/README.md
 
 ---
 
@@ -207,7 +206,7 @@ A reader who sees only this diagram should grasp: two caches are built and prote
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 This is partially implemented — two of the three layers exist.
 
@@ -269,52 +268,6 @@ Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If
 
 ---
 
-## Tradeoffs
-
-| Dimension | This codebase (L0 + L1 only) | Add L2 prompt cache | Add L2.5 semantic cache |
-|---|---|---|---|
-| Cost removed | network round-trips, full re-runs | repeated input tokens (the bill driver) | near-duplicate model calls |
-| Setup complexity | zero — two `Map`s | low — one request-field change + a stable-prefix split | high — embedding model, vector store, threshold tuning |
-| Hit precision | exact (L1), per-id (L0) | exact prefix match | fuzzy — risks serving a wrong-but-close answer |
-| Survives cold start | no (in-memory) | yes (provider-side, ~5 min) | depends on store |
-| Failure mode | cold-start misses; unbounded growth | invalidates if prefix not byte-stable | false hits below a bad threshold |
-
-**What we gave up.** By caching only L0 and L1, blooming insights leaves the input-token cost untouched. A diagnostic run re-sends its full system prompt 6–7 times; with `cache_control` the 2nd through 7th calls would read the prefix at ~10% price. For a demo-stage app that mostly replays from L0 (zero Claude calls), this gap is nearly free — the cost only materializes on live runs. That is why skipping L2 was right *for now*: the L0 replay cache means the common path never reaches Claude at all.
-
-**What the alternative would have cost.** Implementing L2 well requires splitting each system prompt into a byte-stable cached prefix and a per-run variable suffix, then verifying the prefix never changes (a timestamp slipping into the prefix silently zeroes the hit rate). That is real work for a payoff that only shows up on live, non-replayed runs. The semantic cache costs far more — an embedding model, a vector index, threshold tuning, and the risk of serving a confidently-wrong neighbor.
-
-**The breakpoint.** L0 + L1 is sufficient while most traffic is replayed demos and live runs are rare. The moment live `?live=1` runs become the common path — real users investigating fresh anomalies daily — the repeated system-prompt cost compounds and L2 prompt caching becomes the highest-ROI change in the codebase. The trigger is "live runs per day × agents per run × turns per agent" crossing into the hundreds of full-price prefix re-sends.
-
----
-
-## Tech reference (industry pairing)
-
-### in-memory Map (cache-aside, exact-match)
-
-- **Codebase uses:** `Map<string, {result, expiresAt}>` in `McpClient` (`lib/mcp/client.ts` L80) and `Map<string, AgentEvent[]>` in `lib/state/investigations.ts` L11.
-- **Why it's here:** zero dependencies, exact-match keying on serialized tool args, instant hit path for repeated EQL within a run.
-- **Leading today:** `lru-cache` (npm) for bounded in-process caches (adoption-leading, 2026); Redis/Upstash for cross-instance (innovation-leading for serverless, 2026).
-- **Why it leads:** `lru-cache` adds size-based eviction the raw `Map` lacks; Redis survives cold starts and coordinates across serverless instances.
-- **Runner-up:** `node-cache` — built-in TTL expiry callbacks, drop-in for the manual `expiresAt` check.
-
-### Anthropic prompt caching (`cache_control`)
-
-- **Codebase uses:** nothing — no `cache_control` field is set on any `anthropic.messages.create` call.
-- **Why it's here:** it is the named gap; the static system prefix at `lib/agents/base.ts` L98 is the obvious candidate.
-- **Leading today:** Anthropic ephemeral prompt caching (adoption-leading for Claude apps, 2026); OpenAI automatic prompt caching (innovation-leading — no opt-in field, 2026).
-- **Why it leads:** Anthropic's explicit `cache_control` gives precise control over the cached span; OpenAI's automatic caching removes the byte-stability footgun entirely.
-- **Runner-up:** self-hosted KV-cache reuse (vLLM `--enable-prefix-caching`) for teams running open models.
-
-### semantic caching
-
-- **Codebase uses:** nothing — the L1 cache is strictly exact-match on `JSON.stringify(args)`.
-- **Why it's here:** the `?q=` free-form query path (`app/api/agent/route.ts` L115, L211) is the candidate surface where near-duplicate questions recur.
-- **Leading today:** GPTCache (adoption-leading open-source semantic cache, 2026); managed semantic caches in LangChain / Vercel AI SDK (innovation-leading, 2026).
-- **Why it leads:** GPTCache bundles embedding + vector store + threshold logic; managed caches remove the operational surface.
-- **Runner-up:** a hand-rolled embedding + cosine-threshold lookup over a small `Map` for low query volume.
-
----
-
 ## Project exercises
 
 ### Add `cache_control` to the static system-prompt prefix
@@ -334,19 +287,6 @@ Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If
 - **Files to touch:** `lib/mcp/client.ts` (the `cache` field L80 and `callTool` read/write at L105–L110, L143–L144).
 - **Done when:** the existing `test/mcp/client.test.ts` suite still passes and a new test proves the cache evicts the least-recently-used entry past the cap.
 - **Estimated effort:** <1hr.
-
----
-
-## Summary
-
-blooming insights caches at two layers it owns: an exact-match `Map` over MCP tool results (`lib/mcp/client.ts`, 60s TTL, keyed on `name:JSON.stringify(args)`, no-cache-on-error) and a coarse whole-investigation replay cache (`lib/state/investigations.ts`) that lets a finished investigation stream from disk with zero Claude calls. Both attack latency and rate-limit pressure. The layer it skips — Anthropic prompt caching via `cache_control` on the repeated static system prefix — is the one that attacks cost, and is the primary buildable target. A semantic cache is a deeper gap, blocked on the absence of any embedding infrastructure.
-
-**Key points:**
-- There are three cache layers — whole-response (L0), tool-result (L1), prompt-prefix (L2) — and they each remove a *different* cost.
-- L1 keys on `name:JSON.stringify(args)` and never caches an error result (`lib/mcp/client.ts` L137–L139), so a transient failure cannot poison the cache.
-- L0 replay (`lib/state/investigations.ts`) collapses a full multi-agent run to a file read — the reason the demo runs without an API key.
-- The static system prompt is re-sent at full input price every turn; `cache_control` would cut turns 2–N to ~10% — the unbuilt cost lever.
-- Exact-match caching misses semantically identical queries; a semantic cache needs embeddings the codebase does not have.
 
 ---
 
@@ -427,5 +367,10 @@ A teammate says "remove the L0 investigation replay cache — it makes the demo 
 
 What is the default TTL of the L1 tool cache, and on which line is it set? (Answer: `60_000` ms, `lib/mcp/client.ts` L103.)
 
+## See also
+
+→ 02-llm-cost-optimization.md · → 04-rate-limiting-backpressure.md · → 05-retry-circuit-breaker.md · → ../04-agents-and-tool-use/README.md
+
 ---
 Updated: 2026-05-28 — Re-derived drifted refs after the client.ts/route.ts rewrites: cache key L102 / ttl L103 / read L105–L110 / no-cache-on-error L137–L139 / write L143–L144 (callTool L97–L146, field L80); replay branch route.ts L127–L141, REPLAY_DELAY_MS L105, saveInvestigation L254. L2 prompt-cache gap unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

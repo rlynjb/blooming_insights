@@ -5,7 +5,6 @@
 
 > The substrate every reasoning pattern runs on — the model emits structured tool calls, your loop executes them, the result feeds the next turn. blooming insights runs it through MCP: one connection to Bloomreach's loomi MCP server, one tool list, sliced per agent so each one only sees the affordances its job needs.
 
-**See also:** → `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md` · → `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
 
 ---
 
@@ -265,7 +264,7 @@ The full substrate — what every reasoning pattern stands on
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **The loop seam (where MCP is called):**
 **File:** `lib/agents/base.ts`
@@ -341,96 +340,6 @@ MCP earns its layer when there are *multiple* tool servers or *multiple* agents 
 - Tool calling mechanics (`../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md`) → the brain/hands split, in this codebase
 - Tool routing (`../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`) → how to pick which tool/agent for an incoming query
 - Capability gating (`../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`) → scope before spend; complements per-agent tool slicing
-
----
-
-## Tradeoffs
-
-The decision here was *to use MCP as the tool substrate* rather than defining tool schemas directly in each agent or running a custom tool gateway between Claude and Bloomreach.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ MCP (chosen)                │ Direct tool defs (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ adopt SDK, wire OAuth, write│ ~27 tool defs × 4 agents,    │
-│                  │ McpClient (~200 lines)      │ ~1200 lines, drift-prone     │
-│ Token cost/turn  │ full tool schemas (~13 per   │ same (no win — model still   │
-│                  │ agent) in the window         │ needs schemas in window)     │
-│ Latency          │ +1 HTTP round trip per call  │ in-process call, no round    │
-│                  │                              │ trip                          │
-│ Auth surface     │ one place: BloomreachAuth    │ duplicated per agent          │
-│                  │ Provider (PKCE+DCR)          │                              │
-│ Rate-limit logic │ one place: McpClient L122    │ per-agent or none (and pay   │
-│                  │                              │ the 429 storm)                │
-│ Cache scope      │ one 60s TTL across all       │ per-agent (each cache cold   │
-│                  │ agents (cross-agent reuse)   │ on first call)                │
-│ Vendor lock-in   │ MCP spec is open; loomi MCP │ direct = locked to whatever   │
-│                  │ is the host (swappable)      │ shape you coded              │
-│ Discovery        │ runtime listTools()          │ compile-time, drift-prone    │
-│ Debugging        │ tagged McpToolError + the    │ per-agent error shapes       │
-│                  │ trace records every call     │                              │
-│ Hire-ability     │ MCP is the emerging standard│ "we made up our own" — extra │
-│                  │ in 2026 — recognisable       │ ramp for any new contributor │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up in-process call latency. Every `mcp.callTool` is at minimum a transport round trip — the proactive 1.1s spacing alone serializes calls. For a 6-call investigation, the spacing floor is ~6.6s of wait baked in, before the actual tool execution time. We pay that as the price of staying inside the Bloomreach rate-limit window.
-
-We gave up direct introspection of tool implementations. The model emits a call, we dispatch it, the server runs it — we can't step into the tool's code. Debugging a wrong result means inspecting the trace (`/debug` and the cached investigation events), not setting a breakpoint in the tool.
-
-We gave up the option to inline tool defs. Adopting MCP commits us to the protocol shape: we can't easily add a "tool" that's actually a local function unless we wrap it as an MCP tool. That's mostly fine — every current tool is server-hosted — but a future "local debug tool" would have to either fork the substrate or be wrapped.
-
-### What the alternative would have cost
-
-If we had defined tool schemas directly per agent, we'd be maintaining ~27 schemas × 4 agents × the inevitable drift. Every new Bloomreach tool would mean a coordinated edit across files. The OAuth flow would be re-implemented (or, more likely, replaced with a less-secure API key model). The ~1.1s spacing would either not exist (rate-limit storms) or live in four places (drift in retry behaviour). The 60s cache would either not exist (cold lookups every turn) or be per-agent (cross-agent reuse impossible). We'd be ahead on lines of code in the very short run and behind on every metric that matters by week two.
-
-### The breakpoint
-
-MCP stays the right call until either (a) the tool host adds a feature MCP can't represent (e.g., bidirectional streaming for live data), or (b) the system grows a need for a tool gateway in front of multiple model providers — at which point you'd add the gateway *as an MCP client of its own*, keeping MCP between the host and the gateway and putting a routing layer above for the providers.
-
-### What wasn't actually a tradeoff
-
-An in-process emulation of the Bloomreach API (where we'd implement EQL execution locally) wasn't a real alternative — the data, the catalog, the campaigns all live in Bloomreach's systems. Hitting their HTTP API directly without MCP was technically possible but would mean re-implementing the OAuth + rate-limit story manually. MCP is the protocol Bloomreach exposes; using it is the cheapest path to the data, not a stylistic choice.
-
----
-
-## Tech reference (industry pairing)
-
-### Model Context Protocol (`@modelcontextprotocol/sdk`)
-
-- **Codebase uses:** `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`, wrapped by `SdkTransport` in `lib/mcp/transport.ts`. The transport is plumbed through `BloomreachAuthProvider` in `lib/mcp/connect.ts`.
-- **Why it's here:** MCP is the protocol Bloomreach's loomi connect server speaks; the SDK gives us a compliant client without re-implementing the JSON-RPC + transport details.
-- **Leading today:** Model Context Protocol — innovation-leading for LLM tool integration, 2026. Backed by Anthropic, adopted by multiple model providers and tool hosts.
-- **Why it leads:** open spec, transport-agnostic (HTTP, stdio, others), first-class auth provider hook, runtime tool discovery — the same instincts HTTP brought to web servers.
-- **Runner-up:** OpenAI Responses API tools — comparable shape, but tied to OpenAI's hosting model; no equivalent open server spec.
-
-### Anthropic `tool_use` content blocks
-
-- **Codebase uses:** `Anthropic.Messages.ToolUseBlock` and `ToolResultBlockParam` in `runAgentLoop` (`base.ts` L116, L161–L167).
-- **Why it's here:** the typed content-block shape is the contract between "what the model emits" and "what the loop dispatches." It's also what makes the streamed reasoning trace possible — the loop can hook every block.
-- **Leading today:** Anthropic Messages API tool use — innovation-leading for agent loops, 2026.
-- **Why it leads:** first-class block types, `is_error` flag for failed results, the round trip is a typed shape your code can pattern-match on.
-- **Runner-up:** OpenAI function calling / Responses API — same logical shape, larger installed base, slightly different content-block layout.
-
-### OAuth 2.1 (PKCE + Dynamic Client Registration)
-
-- **Codebase uses:** `BloomreachAuthProvider` in `lib/mcp/connect.ts`, implementing `OAuthClientProvider` — PKCE for the code exchange, DCR for the client registration without manual app setup.
-- **Why it's here:** Bloomreach's MCP host requires OAuth; PKCE is the modern shape (no client secret needed), DCR lets the host register a client per session without admin pre-registration.
-- **Leading today:** OAuth 2.1 with PKCE — adoption-leading for delegated auth, 2026.
-- **Why it leads:** the security model fits server-to-server-with-a-user-session well; the spec is mature and SDK support is wide.
-- **Runner-up:** API keys with rotation — simpler to build, weaker on revocation and per-user scoping.
-
----
-
-## Summary
-
-Tool calling is the substrate every reasoning pattern stands on: the model emits structured tool calls, the loop executes them, the result feeds the next turn. blooming insights runs that substrate through MCP — one connection to Bloomreach's loomi MCP server (`lib/mcp/connect.ts`), one discovery (`listTools()` in `route.ts` L203), one client (`McpClient` in `lib/mcp/client.ts`) that owns auth (OAuth PKCE+DCR), proactive spacing (1.1s), rate-limit retry with parsed hints, a 60s TTL cache, and no-cache-on-error. Each agent gets a per-agent slice of the tool list via `filterToolSchemas(tool-schemas.ts L15)` — monitoring sees monitoring-shaped tools, recommendation sees recommendation-shaped tools, drift impossible because the source is one server. The constraint that made this right is a multi-host, multi-agent surface: 27 tools, 4 agents, one rate-limited remote host. The cost is the protocol layer: an extra round trip per call and the 1.1s spacing floor.
-
-- The model writes the call; the loop dispatches it; the result becomes the next observation.
-- MCP standardises the dispatch: one server, many compliant clients; one client, many compliant agents.
-- Per-agent tool slicing happens at the boundary (`filterToolSchemas`), not in each agent.
-- Cross-cutting concerns (auth, spacing, retry, cache) live once in `McpClient`, never in agent code.
-- Worth it because the tool host is non-trivial (OAuth + rate limits + 27 tools); not worth it for a single inlinable function.
 
 ---
 
@@ -563,5 +472,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md` · → `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

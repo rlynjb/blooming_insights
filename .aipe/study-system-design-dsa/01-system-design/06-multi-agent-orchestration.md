@@ -5,7 +5,6 @@
 
 > One shared `runAgentLoop` function drives a multi-turn Claude conversation for each specialist agent, executing MCP tool calls between turns and forcing a final tool-less synthesis turn to guarantee parseable JSON output.
 
-**See also:** → 05-streaming-ndjson.md · → 03-provider-abstraction.md · → ../02-dsa/04-json-from-prose.md
 
 ---
 
@@ -366,7 +365,7 @@ Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 | File | Function | Lines | Role |
 |------|----------|-------|------|
@@ -483,75 +482,6 @@ The loop runs in exploration mode. `synthesize()` runs in synthesis mode. Keepin
 - **LangGraph** — a graph-based agent orchestration library where nodes are agents or functions, edges are conditional transitions, and state flows through a typed schema. Adds branching, cycles, and checkpointing that the sequential `await` chain here cannot express.
 - **Anthropic Agent SDK** — Anthropic's higher-level agent SDK adds built-in tool-use loops, memory primitives, and observability hooks. The `runAgentLoop` in this codebase is a hand-rolled version of what the SDK provides.
 - **Structured outputs / function-calling JSON modes** — OpenAI and some other providers support constrained decoding that forces the model to emit valid JSON at the token level, eliminating the need for `tryParse ?? synthesize ?? FALLBACK`. Claude's `tool_use` JSON mode is a partial equivalent.
-
----
-
-## Tradeoffs
-
-### Comparison
-
-| Dimension | This codebase | One mega-agent | No budget | Trust loop's final turn |
-|-----------|--------------|----------------|-----------|------------------------|
-| Specialist focus | Each agent sees only its tool subset + prompt | All tools always visible; prompt bloat | Same as this codebase | Same as this codebase |
-| Latency ceiling | Bounded by `maxToolCalls` + 1 synthesis call | Bounded by same budget (same tools available) | Unbounded; hits route timeout | Same as budget path, but synthesis unreliable |
-| Structured output reliability | 3-tier: loop final turn → synthesize() → FALLBACK | Same 3-tier applicable | Loop never forces final text; returns `finalText: ''` | `finalText` often prose or partial JSON; `tryParse` fails; no safety net |
-| Testability | Each agent tested independently with fake MCP | Single surface to test but larger | Same | Same |
-| Token cost per investigation | 3 agents × up to 6 tool calls + 3 synthesis calls | 1 agent × same total calls (no savings) | Runs until timeout; wastes tokens | 1 extra call per agent (synthesis) avoided but unreliable |
-
-**What this approach gave up.** Each diagnostic or recommendation agent that fails `tryParse` pays an extra synthesis call: one additional `anthropic.messages.create` with up to 2048 tokens. In a run where the loop's `forceFinal` turn produces valid JSON, `synthesize()` is never called and the cost is zero. In the worst case (loop fails, synthesize succeeds) you pay ~2× tokens for that agent. That is the price of reliability.
-
-**What the alternatives cost.** Without a budget, the loop runs until the `maxDuration = 300` cap kills the request. The client receives a partial NDJSON stream — some tool-call events but no `diagnosis` or `done` event — and the UI hangs. Without `synthesize()`, any run where the `forceFinal` turn produces prose instead of JSON silently degrades to `FALLBACK`, which means the recommendation step (step 3) receives a hollow handed-over diagnosis and returns `[]`. The user sees "Insufficient data" even though the agent ran 6 successful queries and has evidence.
-
-**The breakpoint.** The sequential `await` orchestration in the route is fine for a 2-step diagnose→recommend chain. It becomes a liability when chains get deep (>3 steps) or need to branch — for example, running two diagnostic hypotheses in parallel or conditionally skipping the recommendation step if the diagnosis confidence is `low`. At that point the route's `if/await/if/await` structure becomes a hand-rolled state machine and should be replaced with a proper agent graph (LangGraph or equivalent).
-
----
-
-## Tech reference (industry pairing)
-
-### @anthropic-ai/sdk tool use (claude-sonnet-4-6)
-
-The Anthropic Messages API supports tool use via the `tools` parameter (an array of JSON Schema tool definitions) and `tool_use`/`tool_result` block types in the message content. `claude-sonnet-4-6` is the model used in this codebase (`AGENT_MODEL` in `lib/agents/base.ts` L9).
-
-- **Tool definitions:** passed as `toolSchemas` in `runAgentLoop`; omitted on `forceFinal` turns to prevent further tool calls
-- **`tool_use` blocks:** the model's request to call a tool — `{ type: 'tool_use', id, name, input }`
-- **`tool_result` blocks:** the response fed back — `{ type: 'tool_result', tool_use_id, content, is_error? }`
-- **`stop_reason: 'tool_use'`:** indicates the model is waiting for tool results; `stop_reason: 'end_turn'` indicates a natural end — the loop checks for `tool_use` blocks in `res.content` instead of `stop_reason` directly
-- **`max_tokens`:** capped at 4096 for agent turns, 2048 for synthesis calls; controls cost per turn
-
-### The agentic loop pattern
-
-The ReAct pattern (Reason + Act) alternates reasoning steps with tool-call steps until a stopping condition. Industry implementations include LangChain's `AgentExecutor`, LangGraph's graph-based runner, the Anthropic Agent SDK, and hand-rolled loops like `runAgentLoop` here.
-
-- **LangGraph** is the current leader for production multi-agent graphs with branching, checkpointing, and human-in-the-loop nodes; replaces the sequential `await` chain when the graph gets complex
-- **Anthropic Agent SDK** provides a higher-level loop with built-in observability and tool execution; `runAgentLoop` is a hand-rolled equivalent
-- **LangChain `AgentExecutor`** is the original Python reference implementation; similar mechanics but less typed than the Anthropic SDK approach
-- **`maxIterations` / `maxToolCalls`** budget: every serious production implementation enforces a hard cap; the default behavior without one is to run to the token or time limit
-- **Structured output via tool_use:** using a "done" tool that accepts a typed JSON argument is an alternative to the `synthesisInstruction` approach — the model must call the done-tool to terminate, passing its result as the tool argument; guarantees valid JSON without a separate synthesis call at the cost of one extra hop
-
-### Structured-output synthesis pass
-
-The `synthesize()` method is an instance of the "extract from evidence" pattern used in production RAG and agentic pipelines: gather raw evidence in one pass, then format/extract in a second, clean-context pass.
-
-- **Two-pass extraction** is a standard RAG pattern: retrieve in pass 1, synthesize in pass 2; the synthesis call here is the same shape applied to tool-call results instead of retrieved documents
-- **JSON repair / retry loops** are an alternative — attempt to parse, repair malformed JSON with a second call, retry; more fragile than a clean-context synthesis pass and harder to test
-- **Constrained decoding (Outlines, SGLang, OpenAI structured outputs):** forces valid JSON at the token level; eliminates the need for `tryParse ?? synthesize ?? FALLBACK` entirely; not yet available in the Anthropic API at the time of this codebase
-- **Tool-as-output schema:** wrapping the desired JSON shape as a tool definition forces the model to emit valid arguments when it calls the tool; a common pattern in OpenAI function-calling workflows
-- **Pydantic + instructor library:** a Python-side approach that wraps the model call in a validation loop, retrying with the validation error message if the model's output does not parse; runner-up to constrained decoding
-
----
-
-## Summary
-
-`runAgentLoop` is a shared `while` loop that drives a multi-turn Claude conversation: ask the model, execute any tool calls, feed results back, repeat until no more tool calls or budget exhausted. On the forced-final turn, tools are withheld and a `synthesisInstruction` is appended to the system prompt, compelling the model to emit its structured answer. If the loop's final text still does not parse, a dedicated tool-less `synthesize()` call receives the gathered evidence and requests only the JSON. The diagnostic agent then derives a `confidence` from its hypotheses (downgraded to `medium` if any tool call errored); the recommendation agent emits richer per-recommendation fields (effort, time-to-set-up, prerequisites, success metric, dollar-range impact). Four specialist agents (monitoring, diagnostic, recommendation, query) each call `runAgentLoop` with their own prompt and tool subset. The investigation is now **two requests**: step 2 (`step=diagnose`) runs only the diagnostic agent, step 3 (`step=recommend`) runs only the recommendation agent with the diagnosis handed over from step 2 via `sessionStorage`. Each step streams its agent's reasoning as NDJSON.
-
-Key takeaways:
-- `forceFinal` (L91 of `base.ts`) is the mechanism that converts an exploration loop into a synthesis step — it is the equivalent of removing the "next page" parameter so the loop must stop (`2. Request-response flow`)
-- without `maxToolCalls`, the loop runs to the `maxDuration = 300` route limit; the client receives a truncated stream and no `done` event (`5. Failure handling`)
-- the fallback chain `tryParse ?? synthesize() ?? FALLBACK` is a three-tier reliability guarantee; each tier handles a different failure mode; the `FALLBACK` ensures the route always emits a valid `diagnosis` event (`5. Failure handling`)
-- cost and latency compound per agent; splitting into two requests (`step=diagnose`, `step=recommend`) keeps each one under the `maxDuration = 300` ceiling (`6. Scale concerns`)
-- the `synthesize()` call is justified by the failure mode it prevents — a hollow `FALLBACK` diagnosis that produces zero recommendations — not by speculative quality improvements (`6. Scale concerns`)
-- four agents share one loop because the loop is domain-agnostic; domain logic lives in the prompts, tool subsets, and validators, not in the loop itself (`2. Request-response flow`)
-- `MonitoringAgent.scan(hooks, categories)` is gated upstream: the briefing route passes `runnableCategories(schemaCapabilities(schema))` so the agent only checks categories the live schema supports; the runnable set becomes the per-category checklist injected into the prompt, and `runAgentLoop` is untouched (`2. Request-response flow`)
 
 ---
 
@@ -702,8 +632,13 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 - How is a diagnosis's `confidence` set? (Answer: `diagnosisConfidence(diag)` from supported/tested hypotheses, `derive.ts` L54–L63, downgraded high→medium if any tool call errored, `diagnostic.ts` L80–L82)
 - Which line in `base.ts` feeds tool results back to the model as the next user turn? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`)
 
+## See also
+
+→ 05-streaming-ndjson.md · → 03-provider-abstraction.md · → ../02-dsa/04-json-from-prose.md
+
 ---
 Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.
 
 ---
 Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `scan(hooks?, categories: AnomalyCategory[] = [])` and described the per-category checklist injection; added a "schema gate" sub-section with an ASCII diagram showing schema → capabilities → runnable categories → scan(hooks, runnable), noting the gate is upstream of the unchanged `runAgentLoop`; corrected the `scan` line range (L68–L103 → L69–L120) and the `DiagnosticAgent` `maxToolCalls` ref (L61 → L62); verified `runAgentLoop` (L48–L176) and `DiagnosticAgent.investigate` (L45–L83) against current code.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

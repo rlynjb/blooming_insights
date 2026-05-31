@@ -5,7 +5,6 @@
 
 > `useInvestigation` is one client hook that runs a `fetch` reader loop over `/api/agent` exactly once per mount even under StrictMode's double-invoke, stashes each step's result in `sessionStorage` so re-visits hydrate without re-running the agents, and carries the step-2 diagnosis forward to step 3 — because Vercel's per-instance memory cannot.
 
-**See also:** → 05-streaming-ndjson.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
 
 ---
 
@@ -210,7 +209,7 @@ The diagram stands alone: four `sessionStorage` keys (`bi:insight:`, `bi:inv:dia
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/hooks/useInvestigation.ts`
 **Function / class:** `useInvestigation` — the whole hook
@@ -296,66 +295,6 @@ Every row where "Stateful?" is no needs an explicit carrier. The hook picks the 
 
 ---
 
-## Tradeoffs
-
-### Comparison: started-guard + sessionStorage handoff vs. alternatives
-
-| Dimension | This codebase | Alternative A: AbortController cancel-on-cleanup | Alternative B: React Query + URL/server session |
-|---|---|---|---|
-| StrictMode correctness | Correct — guard runs once, no cancel | Correct only if the fetch is re-runnable; a stream is not | Correct — library handles dedupe |
-| Survives client route change | Yes — `sessionStorage` rehydrates | No — state dropped, re-fetch needed | Yes — query cache persists in memory |
-| Survives new tab / deep-link | No — `sessionStorage` is per-tab | No | Yes if backed by URL or server session |
-| Cross-instance (Vercel) handoff | Yes — browser carries `&insight=`/`&diagnosis=` | No carrier | Depends — needs server session, not client cache |
-| Setup complexity | Low — one ref, four keys, hand-written | Low — but wrong for streams | High — library + server session plumbing |
-| Invalidation / staleness | None — no TTL, tab-lifetime only | N/A (always re-fetches) | Built-in (`staleTime`, `invalidateQueries`) |
-
-**What we gave up.** Cache invalidation and new-tab durability. The stash has no version or TTL, so a recomputed briefing leaves a stale diagnosis cached until the tab closes; and middle-clicking a card opens a tab with empty `sessionStorage`, breaking the subject card and the cross-instance lookup.
-
-**What the alternative costs.** React Query gives invalidation and dedupe for free but does not by itself solve the cross-instance handoff — the diagnosis would still need a carrier the server can read (URL or a server-side session keyed by id), which adds either URL bloat or a stateful backend (Redis/KV). The `AbortController` cleanup pattern is the React-docs default but is simply wrong here: cancelling a one-shot NDJSON stream on StrictMode cleanup is exactly the bug that produced the empty-logs symptom.
-
-**The breakpoint.** This design is correct and sufficient for a single-tab, demo/live flow where the user clicks through feed → diagnose → recommend in one session. It breaks the moment the product needs: shareable deep-links to an investigation, multi-tab investigations, or stash invalidation after a data refresh. At that point the diagnosis handoff must move to a URL param or a server-side session store (Vercel KV / Redis) keyed by `id`, and the per-step stash should gain a version key.
-
----
-
-## Tech reference (industry pairing)
-
-### React effect idempotency under StrictMode
-
-- **React 18 StrictMode** — double-invokes effects (and their cleanups) in development to surface non-idempotent effects. The `startedRef` latch is the "make it run-once" answer; the React docs' default answer is "make it cancellable." For a one-shot stream, run-once is the correct branch.
-- **`useRef` as a run-once latch** — a mutable container that survives re-renders and the StrictMode remount (same fiber) without triggering a render. Standard pattern for "did this effect already do its irreversible work?"
-- **`AbortController` / `signal`** — the cancellable-fetch primitive. Correct for re-runnable queries; deliberately *not* used here because aborting the stream is the bug, not the fix.
-- **TanStack Query (`@tanstack/react-query`)** — would replace the manual stash with a managed cache (`queryKey`, `staleTime`) and handle StrictMode dedupe internally. The library answer to this whole hook, minus the cross-instance handoff.
-
-### client-side state handoff
-
-- **`sessionStorage`** — per-tab, per-origin string store, ~5 MB, cleared when the tab closes. The carrier for `bi:insight:`, `bi:inv:*`, and `bi:diag:` here. Per-tab isolation is exactly why new-tab opens break.
-- **`localStorage`** — same API, but persists across tabs and sessions. The hook uses it only for the `bi:mode` live/demo flag (L157), not for handoff data, because investigation results should not outlive the tab.
-- **URL search params (`&insight=`, `&diagnosis=`, `&step=`)** — the carrier across the network boundary. The only handoff the *server* can read; `sessionStorage` is invisible to the server, so the hook re-encodes it into the query string for live mode.
-- **Server-side session store (Vercel KV, Redis, Upstash)** — the production fix for cross-instance and deep-link durability: store the anomaly/diagnosis server-side keyed by `id`, hand only the `id` across boundaries. Replaces the `&insight=`/`&diagnosis=` payloads with a lookup.
-
-### NDJSON streaming consumption
-
-- **`fetch` + `ReadableStream.getReader()`** — the stream transport (see `05-streaming-ndjson.md`). Chosen over `EventSource` because `EventSource` cannot send the auth/route context this flow needs and is GET-only with no header control.
-- **`TextDecoder({ stream: true })` + `split('\n')` + `pop()`** — the line-buffering mechanics, documented in full in `../02-dsa/03-ndjson-line-buffering.md`.
-
----
-
-## Summary
-
-**Part 1 — recap.** `useInvestigation` is one client hook that solves three "the backend won't remember this" problems with three client-owned carriers. A `useRef` started-guard makes the effect's `fetch` reader run exactly once per mount even under React StrictMode's double-invoke, and the effect deliberately registers no cleanup — cancelling a one-shot NDJSON stream on StrictMode cleanup was the bug that left the logs empty. Each step's full result is stashed in `sessionStorage` under `bi:inv:diagnose:<id>` / `bi:inv:recommend:<id>` so a re-visit or back-navigation hydrates in 0 ms without re-running a 40-second agent. The step-2 diagnosis is handed to step 3 via `bi:diag:<id>` (and re-encoded as `&diagnosis=` in live mode so the server's recommendation agent receives it). The feed stashes every insight as `bi:insight:<id>` and the hook sends it as `&insight=`, because on Vercel the feed request and the investigation request can land on different instances with no shared memory.
-
-**Part 2 — key points.**
-
-- The run-once latch is a `useRef` (no re-render, survives StrictMode remount), checked-and-set in two lines at the top of the effect — `lib/hooks/useInvestigation.ts` L47–L48.
-- The effect returns no cleanup function on purpose; `setState`-after-unmount is a safe no-op in React 18+ — rationale at L32–L36.
-- Four `sessionStorage` keys are the durable tier: `bi:insight:<id>` (feed→investigation), `bi:inv:<step>:<id>` (per-step memo), `bi:diag:<id>` (step 2→3 diagnosis).
-- The server reads none of `sessionStorage` directly — the hook re-encodes the carried state into `&insight=` / `&diagnosis=` query params (L160–L164), the only channel the server can read.
-- `resolveAnomaly` preferring `?insight=` over in-memory `getAnomaly` is what makes the cross-instance handoff load-bearing, not cosmetic.
-- Breaks on new-tab / deep-link (per-tab `sessionStorage`) and has no stash invalidation — a server-side session store keyed by `id` is the production fix.
-- **Checklist step: 4. State ownership** — the client owns the durable investigation state because no single server instance can; **2. Request/response flow** — the carried state rides the query string across both `/api/agent` requests.
-
----
-
 ## Interview defense
 
 ### What they are really asking
@@ -434,3 +373,8 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 - Which key is read by `InvestigationSubject`? (`bi:insight:<id>` — `components/investigation/InvestigationSubject.tsx` L17.)
 - In live mode, how does the step-3 recommendation agent receive the step-2 diagnosis? (The hook appends `&diagnosis=<encoded>` — `lib/hooks/useInvestigation.ts` L162–L164 — which the server parses in its recommend branch.)
 - Does the effect register a cleanup function? (No — by design; L32–L36.)
+
+## See also
+
+→ 05-streaming-ndjson.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

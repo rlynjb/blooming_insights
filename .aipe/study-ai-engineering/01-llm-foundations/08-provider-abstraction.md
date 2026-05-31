@@ -5,7 +5,6 @@
 
 > The agent system injects both its MCP caller (`McpCaller` / `McpTransport`) and its Anthropic client through function parameters so tests can pass fakes and run with no network — but this is a *testability* seam, not multi-LLM-provider switching: there is one provider (Anthropic), no factory, and no way to swap Claude for another model.
 
-**See also:** → 01-what-an-llm-is.md · → 04-structured-outputs.md · → 06-token-economics.md · → 05-streaming.md
 
 ---
 
@@ -175,7 +174,7 @@ The agent layer depends on interfaces and receives implementations from above. T
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Partially addressed — a test seam, not provider portability.** The MCP caller and the Anthropic client are injected by parameter so tests pass fakes and run with no network; but the `anthropic` parameter is the concrete SDK type, there is no vendor-neutral provider interface, and no factory — a single Anthropic provider with no swap path.
 
@@ -229,49 +228,6 @@ These are two independent properties that happen to share a mechanism (injection
 
 ---
 
-## Tradeoffs
-
-### Concrete-client injection (test seam) vs. vendor-neutral provider interface
-
-| Dimension | This codebase (inject concrete client) | Vendor-neutral interface + factory |
-|---|---|---|
-| Testability (fakes, no network) | Full | Full |
-| Swap providers in production | No — requires a refactor | Yes — change the factory input |
-| Code coupling to Anthropic shapes | High (messages/tools/tool_use) | Low (hidden behind the interface) |
-| Implementation effort | Done | Translation layer per provider |
-| Risk of leaky abstraction | N/A | Real — vendors differ on tool-call semantics |
-| Right when | One provider, want fast tests | Multi-provider is a requirement |
-
-**What we gave up.** Provider portability. The codebase cannot run on a non-Anthropic model without a refactor, and the model choice is a source constant, not config. For a single-provider product this is not a real loss — it is scope correctly deferred — but it does mean "swap to OpenAI" is a project, not a flag.
-
-**What the alternative would have cost.** A vendor-neutral interface plus per-provider translation layers (message shapes, tool-call formats, streaming and usage parsing) — real work, and a leaky-abstraction risk because vendors differ on tool-call semantics and structured-output features (→ 04-structured-outputs.md). Building it before a second provider is actually needed is speculative generality: abstraction maintained for a swap that may never happen.
-
-**The breakpoint.** The concrete-client seam is right while there is exactly one provider and the only goal is fast, networkless tests — which is the current state and is served perfectly. It stops being right the moment multi-provider becomes a *requirement*: a cost arbitrage between vendors, a reliability fallback when one provider is down, or a customer who mandates a specific model. At that point the neutral interface and factory stop being speculative and become necessary, and the existing injection point is the foundation to build them on.
-
-**Not actually a tradeoff:** the structural `McpCaller` interface. Defining the agent's dependency as a minimal structural type costs nothing and makes both the production client and a hand-written fake satisfy it without ceremony — pure testability upside.
-
----
-
-## Tech reference (industry pairing)
-
-### dependency injection via narrow interfaces (`McpCaller`, `McpTransport`)
-
-- **Codebase uses:** `McpCaller` (`lib/agents/base.ts` L16–L22), `McpTransport` (`lib/mcp/transport.ts` L7–L10) — minimal structural interfaces the consumers depend on; implementations injected by parameter.
-- **Why it's here:** to let tests pass fakes and run with no network or API key, isolating the loop's logic.
-- **Leading today:** constructor/parameter injection against interfaces is the universal testability pattern (2026); structural typing makes it ceremony-free in TypeScript.
-- **Why it leads:** isolates the unit under test from slow, networked, non-deterministic collaborators with no framework.
-- **Runner-up:** module mocking (`vi.mock`, `jest.mock`) — works without an interface but couples tests to module internals and is harder to reason about.
-
-### vendor-neutral LLM provider interface (the absent capability)
-
-- **Codebase uses:** nothing — the injected `anthropic` is the concrete SDK type; no `LLMProvider`, no factory.
-- **Why it's here (absent):** one provider, no requirement to switch; portability was correctly deferred.
-- **Leading today:** LiteLLM and the Vercel AI SDK provider adapters lead for multi-provider abstraction (2026); LangChain's `BaseChatModel` is the framework-heavy option.
-- **Why it leads:** one interface over many vendors, with translation of message and tool-call shapes handled for you.
-- **Runner-up:** a hand-rolled `LLMProvider` interface + per-vendor adapters — full control, full maintenance.
-
----
-
 ## Project exercises
 
 ### Introduce a vendor-neutral `LLMProvider` behind the injected parameter
@@ -291,19 +247,6 @@ These are two independent properties that happen to share a mechanism (injection
 - **Files to touch:** new `lib/agents/providers/openai.ts`, `lib/agents/provider.ts` (`createProvider`), `app/api/agent/route.ts` (read the config), config/env wiring.
 - **Done when:** a single config value switches a diagnostic investigation between Claude and an OpenAI model, both producing a valid `Diagnosis`.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-blooming insights injects its MCP caller (`McpCaller` / `McpTransport`) and its Anthropic client (`runAgentLoop`'s `anthropic` parameter) so the agent loop depends on interfaces and constructs nothing — which lets the test suite pass fakes and run with no network or API key. This is a *testability* seam, built deliberately and well. It is *not* multi-provider portability: the `anthropic` parameter is the concrete SDK type, `AGENT_MODEL` is a hard-coded constant, and there is no vendor-neutral interface or factory. Swapping Claude for another model is a Case B capability — buildable on the existing injection point, but not present.
-
-**Key points:**
-- Inject dependencies behind a narrow interface → testability for free; vendor-neutrality requires the interface to *also* be vendor-neutral.
-- `McpCaller` (`lib/agents/base.ts` L16–L22) is satisfied structurally by the real client and by test fakes alike.
-- The `anthropic` parameter is the *concrete* SDK type, so the loop is coupled to Anthropic message/tool shapes.
-- Testability (present) and portability (absent) are independent properties that share the injection mechanism.
-- A second provider is a refactor, not a config change — the seam is the foundation, not the finished feature.
 
 ---
 
@@ -378,6 +321,11 @@ A colleague says: "We already inject the client, so we're provider-agnostic — 
 
 Is the `anthropic` parameter of `runAgentLoop` a vendor-neutral interface or a concrete SDK type, and what does that imply about provider-swapping? (Answer: the concrete `Anthropic` SDK type — `lib/agents/base.ts` L48–L49; swapping providers requires a vendor-neutral interface and translation layers that do not exist, so it is a refactor, not a config change.)
 
+## See also
+
+→ 01-what-an-llm-is.md · → 04-structured-outputs.md · → 06-token-economics.md · → 05-streaming.md
+
 ---
 Updated: 2026-05-28 — Documented the transport's `HttpErrorHolder`/`makeCapturingFetch` error-body capture and `client.ts`'s `McpToolError` (both error-detail plumbing behind the unchanged narrow interface); re-derived transport.ts (`McpTransport` L7–10, `SdkTransport` L41–74) and the route's `new Anthropic` location (now L207, inside the stream).
 Updated: 2026-05-29 — Test count 157→169 (both occurrences).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

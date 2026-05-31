@@ -5,7 +5,6 @@
 
 > GraphRAG retrieves by *traversing relationships* between entities — events relate to properties, insights share a metric — rather than only by vector similarity, so it answers "what is connected to this?" questions a flat embedding index cannot; blooming insights has no graph index, but the Bloomreach schema (events → properties → catalogs) is graph-shaped and `bootstrapSchema` already walks it, so this is study material grounded in a real analog.
 
-**See also:** → 11-rag.md · → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 10-incremental-indexing.md
 
 ---
 
@@ -150,7 +149,7 @@ Vector similarity finds the start; graph edges find the connected — the schema
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (graph retrieval).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, with neither a flat embedding index nor a graph index — so there is no edge-traversal retrieval anywhere.
 
@@ -197,47 +196,6 @@ Like all of this section, GraphRAG is Case B and subject to the same threshold r
 
 ---
 
-## Tradeoffs
-
-### Graph traversal vs. flat vector retrieval vs. live tools (current)
-
-| Dimension | Graph traversal | Flat vector index | Live tool call (current) |
-|---|---|---|---|
-| Answers "connected to" | Yes (edges) | No (similarity only) | No |
-| Answers "similar to" | Via vector entry | Yes | No |
-| Multi-hop reasoning | Yes | No | No |
-| Build cost | Entity/edge extraction (or given) | Embed + index | None |
-| Maintenance | Node/edge upserts (10) | Vector upserts (10) | None |
-| Right when | Relationship/connection questions | Similarity questions | Exact live questions |
-
-**What we gave up (by not having it).** Relationship retrieval — blooming insights cannot answer "what other insights touch this metric or scope?" by traversal; it has no graph to walk. For exact analytics that is fine (those are not relationship questions). The gap is real only for a connection-shaped feature like "related insights," which the codebase does not yet have.
-
-**What the alternative would have cost.** A graph index for the *analytics* data would be over-engineering — analytics questions are exact aggregates, not connection queries, so there are no edges to traverse that EQL does not already express. Even for insights, a *general* knowledge-graph pipeline (entity extraction, relation inference) would be far more machinery than needed, because the relevant edges (`metric`, `scope`) are already exact structured fields — no extraction required.
-
-**The breakpoint.** Flat/live retrieval is correct while questions are "similar to" or exact. A graph retriever becomes warranted the moment a feature asks "what is *connected* to this" — specifically "related insights" over shared `metric`/`scope`. Because those edges are exact fields (`lib/mcp/types.ts` L7–L17), that graph is cheap to build (no embeddings, no extraction), making it the lowest-cost threshold-crossing feature in this whole section.
-
----
-
-## Tech reference (industry pairing)
-
-### knowledge-graph retrieval
-
-- **Codebase uses:** the analog — `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks the graph-shaped Bloomreach schema; `parseWorkspaceSchema` (L91–L99) assembles event→property edges. No graph *query*.
-- **Why it's here (absent as retrieval):** the schema graph is built but used as a flat summary, not traversed for retrieval.
-- **Leading today:** Neo4j (property graph) and Microsoft GraphRAG lead knowledge-graph retrieval (2026).
-- **Why it leads:** native edge traversal and multi-hop queries that similarity retrieval cannot express.
-- **Runner-up:** an in-memory adjacency-list graph (a `Map<nodeId, Edge[]>`) — enough when edges are exact structured fields, as `metric`/`scope` are.
-
-### hybrid vector + graph retrieval
-
-- **Codebase uses:** nothing — no vector entry, no graph traversal.
-- **Why it's here (absent):** neither retriever exists; retrieval is live exact querying.
-- **Leading today:** vector-entry-then-graph-expand (LlamaIndex/LangChain graph retrievers, Neo4j vector index) leads GraphRAG (2026).
-- **Why it leads:** similarity finds where to start, edges find what is connected — covers both relation types.
-- **Runner-up:** pure structured-edge graph (no vectors) — the right minimal choice when edges are exact fields, as for "related insights."
-
----
-
 ## Project exercises
 
 ### Build a "related insights" graph over shared metric and scope
@@ -257,19 +215,6 @@ Like all of this section, GraphRAG is Case B and subject to the same threshold r
 - **Files to touch:** `lib/mcp/retrieval.ts` (hybrid `relatedByQuery`), `lib/state/insight-graph.ts` (traversal), `lib/mcp/embeddings.ts` + `lib/mcp/vector-store.ts` (vector entry), `test/mcp/retrieval.test.ts`.
 - **Done when:** a free-text query lands on the nearest insight by similarity and then surfaces metric/scope-connected insights that share no wording with the query, bounded by a hop limit.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-GraphRAG retrieves by traversing relationships between entities — shared attributes, links, multi-hop chains — answering "what is connected to this?" questions that flat vector similarity, which only knows "similar to," cannot. blooming insights has no graph retriever, but its data is genuinely graph-shaped: the Bloomreach schema (events → properties → catalogs) is a graph that `bootstrapSchema` already walks, and the `Insight` type's `metric`/`scope` fields are edges waiting to be drawn. The standout consequence: a "related insights" feature over shared metric/scope is a *pure structured-edge graph* needing no embeddings at all, making it the cheapest threshold-crossing retrieval feature in this section.
-
-**Key points:**
-- Vector similarity captures "same meaning"; graph traversal captures "connected" — different relations.
-- The Bloomreach schema is graph-shaped and `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) already walks it.
-- `Insight.metric` and `Insight.scope` are edges — "related insights" is a graph query over exact fields.
-- Production GraphRAG uses vector similarity for the entry node and edges for expansion.
-- "Related insights" needs no embeddings — the edges are exact structured fields, the cheapest graph win.
 
 ---
 
@@ -344,5 +289,10 @@ A colleague wants to build "related insights" with an embedding index ("just emb
 
 What graph-shaped data does blooming insights already build and walk, and what edges would a "related insights" graph use? (Answer: `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks the graph-shaped Bloomreach schema and `parseWorkspaceSchema` assembles event→property edges (L91–L99); a "related insights" graph would use the exact structured `metric` and `scope` fields on the `Insight` type (`lib/mcp/types.ts` L7–L17) as edges — no embeddings required.)
 
+## See also
+
+→ 11-rag.md · → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 10-incremental-indexing.md
+
 ---
 Updated: 2026-05-28 — corrected one stale ref: `bootstrapSchema` moved to `lib/mcp/schema.ts` L170–L192 (was L152–L176). Case-B rationale (graph-shaped schema, no graph query yet) unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

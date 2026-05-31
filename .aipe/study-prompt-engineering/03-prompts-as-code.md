@@ -5,7 +5,6 @@
 
 > blooming insights treats prompts as source — four `.md` files loaded with `readFileSync`, version-controlled, git-diffable, reviewed in PRs like any other code. What it does *not* yet do is pair a prompt version with the model that ran it (model IDs live in `base.ts` L9 and `intent.ts` L14, separate from the prompts) or log which prompt version produced which output — so the "worked on Sonnet, breaks on the next Sonnet" failure can't be traced.
 
-**See also:** → 01-anatomy.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md
 
 ---
 
@@ -164,7 +163,7 @@ The authoring half is solid; the model ID is decoupled; the observability half i
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — partial. The authoring half is implemented; the observability half is not.**
 
@@ -228,55 +227,6 @@ The progression is: make it a file (review), then make it observable (trace). A 
 
 ---
 
-## Tradeoffs
-
-### Prompts-as-files (authoring only) vs. full prompt observability tooling
-
-| Dimension | This codebase (files + git, no obs) | Full obs (PromptLayer/LangSmith-style) |
-|---|---|---|
-| Diff / review | Yes — PR diff on the `.md` | Yes (plus run-level diffing) |
-| Runtime immutability | Yes — import-time read | Varies (often live-editable) |
-| Regression bisect to a line | Manual (git vs deploy time) | Automatic (version logged per run) |
-| Model-version pairing | None — `base.ts` L9 decoupled | Tracked per run |
-| Operational weight | Zero deps, zero infra | Extra service + instrumentation |
-| Time to incident root cause | Slow (correlate by hand) | Fast (filter by prompt/model version) |
-
-**What we gave up.** Traceability. With outputs persisted but no prompt SHA or model ID alongside them (`route.ts` L254), root-causing "diagnoses got worse" means correlating git history against deploy timestamps manually. Full observability tooling would make it a filter query.
-
-**What the alternative would have cost.** An extra service (or self-hosted store), instrumentation on every agent call, and a dependency the rest of the stack doesn't need. For an early-stage app with four prompts, files-plus-git is the right amount of process; the obs tooling would be premature weight.
-
-**The breakpoint.** Files-plus-git is right while the team can hold the prompt↔model pairing in its head and regressions are rare. It stops being right at the first model upgrade that silently regresses output, or when the prompt count grows past what one person can reason about — at that point the cost of *not* co-logging `{promptSha, model}` (an untraceable regression) exceeds the cost of adding it.
-
----
-
-## Tech reference (industry pairing)
-
-### Prompts as repo files (`readFileSync` of `.md`)
-
-- **Codebase uses:** `lib/agents/*.ts` L12–14 read `lib/agents/prompts/*.md` at import; the prompts live under `lib/` and ship with the build.
-- **Why it's here:** zero-dependency way to make prompts diffable, reviewable, and runtime-immutable — the authoring half of prompts-as-code.
-- **Leading today (2026):** prompts-as-files-in-repo is the baseline; prompt-management platforms (PromptLayer, LangSmith, Humanloop) lead for teams needing the observability half.
-- **Why it leads:** the platforms add version↔run↔output logging and A/B/eval wiring that files alone can't.
-- **Runner-up:** prompts as typed objects in code (per-prompt module exporting template + variables + model) — keeps everything in-language and lets the model pairing live next to the prompt.
-
-### Model ID as a code constant
-
-- **Codebase uses:** `base.ts` L9 `AGENT_MODEL`, `intent.ts` L14 `CLASSIFIER_MODEL` — string constants, separate from the prompts.
-- **Why it's here:** one place to swap the model; simple and explicit.
-- **Leading today (2026):** colocating model + prompt + decoding params as one versioned config leads, because the three are tuned together.
-- **Why it leads:** a prompt is tuned to a model; versioning them as a unit prevents the silent-decoupling regression.
-- **Runner-up:** front-matter in the `.md` carrying the intended model — keeps the pairing visible in the prompt file itself.
-
-### Output persistence without provenance (`saveInvestigation`)
-
-- **Codebase uses:** `route.ts` L254 persists the `AgentEvent[]` of outputs for cache-replay; no prompt SHA or model ID attached.
-- **Why it's here:** the immediate need was replay (serve a precomputed investigation without re-running), not regression tracing.
-- **Leading today (2026):** run records that carry `{ promptVersion, model, params, inputHash, output }` lead for any team doing eval-driven iteration.
-- **Why it leads:** provenance is what turns a saved output into a debuggable, evaluatable record.
-- **Runner-up:** structured logs (one line per run with the provenance fields) shipped to any log store — lighter than a full platform.
-
----
-
 ## Project exercises
 
 ### Co-log prompt SHA and model ID with every investigation
@@ -296,19 +246,6 @@ The progression is: make it a file (review), then make it observable (trace). A 
 - **Files to touch:** the four `lib/agents/prompts/*.md` (front-matter), the four agent `.ts` files (parse + assert at load), `lib/agents/base.ts` / `lib/agents/intent.ts` (export the expected model).
 - **Done when:** bumping `AGENT_MODEL` without updating the prompts' declared model throws at load, and a matching pair loads cleanly.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights treats prompts as code in the authoring sense: four `.md` files under `lib/agents/prompts/`, loaded as source with `readFileSync` (`monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13), version-controlled, diffed and reviewed in PRs, and runtime-immutable because the read happens at import. The observability half is absent: model IDs live separately (`base.ts` L9, `intent.ts` L14), unpaired with the prompts, and `saveInvestigation` (`route.ts` L254) persists outputs with no prompt SHA or model ID attached. That gap is exactly what makes a one-line model bump a potential silent regression — the prompts are tuned to a specific model, and nothing records or enforces which prompt version was validated against which model.
-
-**Key points:**
-- Prompts are repo files loaded as source — diffable, reviewable, runtime-immutable (read at import).
-- `.md` keeps the instruction legible as prose, the way the model reads it and the way a reviewer reads it.
-- Model IDs are code constants in different files (`base.ts` L9, `intent.ts` L14), not paired with the prompts.
-- Persisted investigations (`route.ts` L254) carry outputs only — no prompt SHA, model ID, or version tag.
-- The missing pairing is the precise reason a model upgrade can silently regress prompts tuned to the prior model.
 
 ---
 
@@ -382,5 +319,10 @@ A reviewer says: "We don't need prompt observability — git history is enough."
 
 Where does the model ID that runs the three agents live, and is it stored anywhere alongside the prompt or the output? (Answer: `AGENT_MODEL = 'claude-sonnet-4-6'` at `lib/agents/base.ts` L9; it is *not* paired with the prompt files and *not* persisted by `saveInvestigation` at `app/api/agent/route.ts` L254 — the observability gap.)
 
+## See also
+
+→ 01-anatomy.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md
+
 ---
 Updated: 2026-05-29 — Documented the `{categories}` runtime checklist injection as a prompts-as-code interpolation pattern (`monitoring.ts` L69–86: `scan` now takes a `categories` param at L69, builds a checklist, and `.replace('{categories}', checklist)` at L86 — same versioned-`.md`-plus-runtime-interpolation as `{schema}`/`{project_id}`). Also corrected stale code refs: `monitoring.ts` L12→L13 and `saveInvestigation` `route.ts` L162→L254 (with the stream body L169–256 and `collected` declared L171).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

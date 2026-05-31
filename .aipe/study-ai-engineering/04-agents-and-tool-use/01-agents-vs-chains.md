@@ -5,7 +5,6 @@
 
 > blooming insights uses both shapes deliberately: a deterministic CHAIN sequences the agents at the top (diagnostic→recommendation, run as two separate `/api/agent` calls — `step=diagnose` then `step=recommend` — with the diagnosis handed between them), and inside each node an AGENT loop lets the model decide which tools to call and how many — chain at the top, bounded agent at each node.
 
-**See also:** → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
 
 ---
 
@@ -180,7 +179,7 @@ A reader who sees only this diagram should grasp: the route is fixed, the nodes 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.** Both topologies coexist; this is the defining architectural choice of the codebase.
 
@@ -253,55 +252,6 @@ A 2-step chain of agents is the comfortable case. It breaks when the chain needs
 
 ---
 
-## Tradeoffs
-
-### Comparison: chain-of-bounded-agents vs the obvious alternatives
-
-| Dimension | This codebase (chain of agents) | One mega-agent (all tools, one loop) | Pure chain (fixed queries, no agent) |
-|---|---|---|---|
-| Control-flow ownership | Code at top, model at node | Model owns everything | Code owns everything |
-| Adaptivity | Query path adapts per anomaly | Adapts, but tool sprawl | None — same queries every run |
-| Predictability of order | High — route is fixed | Low — model picks step order too | Total — every step is code |
-| Testability | Each node tested with fake MCP | One large surface, harder to isolate | Trivial — deterministic |
-| Runaway risk | Bounded per node (`maxToolCalls`) | Single budget for the whole task | Zero |
-| Token cost | 2 nodes × bounded budget + synth | 1 loop, same total calls, no savings | Cheapest (no exploration) |
-
-**What we gave up.** The chain cannot react to a node's output by changing the *next node*. If the diagnosis comes back hollow, the route still calls `propose` — it does not skip recommendation or loop back to re-diagnose. We accept running a recommendation step against a `FALLBACK` diagnosis (which returns `[]`) rather than building branch logic that is not yet justified. We also gave up cross-node memory: the only thing node 2 knows about node 1 is the `diagnosis` argument; there is no shared scratchpad.
-
-**What the alternative would have cost.** A single mega-agent with all of `monitoringTools ∪ diagnosticTools ∪ recommendationTools` in one loop would collapse the route to one call — but the model would see ~40 tools and a bloated system prompt, increasing the odds it reaches for the wrong tool (the exact failure 04-tool-routing.md prevents), and a single budget would have to cover monitor + diagnose + recommend, making per-phase tuning impossible. A pure chain (always run the same N queries, no model in the loop) would be the cheapest and most testable, but it cannot ask the follow-up query an anomaly demands — it would over-fetch every dimension on every run or miss the relevant one.
-
-**The breakpoint.** This design stops being right the moment the chain needs a third decision point that depends on a node's output — e.g., a confidence-gated re-investigation or a parallel two-hypothesis split. Concretely: when the route accumulates more than one `if (diagnosis.x)` branch around an `await`, replace the `if/await` spine with a graph runner. Until then, two `await`s are strictly simpler and equally correct.
-
----
-
-## Tech reference (industry pairing)
-
-### @anthropic-ai/sdk Messages API (the agent substrate)
-
-- **Codebase uses:** `anthropic.messages.create(params)` inside `runAgentLoop` (`base.ts` L102); the model's `tool_use` blocks are the "next step" signal that makes a node an agent.
-- **Why it's here:** It is the only API that turns model output into control flow — the presence or absence of a `tool_use` block at L116/L121 decides whether the loop continues.
-- **Leading today:** Anthropic Messages API and OpenAI Responses/Chat Completions are the two adoption-leading agent substrates in 2026.
-- **Why it leads:** First-class tool-use blocks, large context windows, and strong instruction-following make hand-rolled loops viable without a framework.
-- **Runner-up:** Google Gemini function calling — capable, growing adoption, less mature tool-loop ergonomics.
-
-### Sequential `await` (the chain mechanism)
-
-- **Codebase uses:** Two `await` calls in `route.ts` (L153, L158) with the diagnosis threaded between them — the entire orchestration layer.
-- **Why it's here:** A 2-step linear pipeline needs nothing more; a framework would add dependency weight for zero capability.
-- **Leading today:** Plain `async/await` is the adoption-leading orchestration for linear LLM chains in 2026; LangGraph is the innovation-leading choice for graphs.
-- **Why it leads:** Linear chains do not need a runtime; `await` is readable, typed, and trivially testable.
-- **Runner-up:** LangChain Expression Language (LCEL) `|` pipes — declarative, but unnecessary abstraction for two steps.
-
-### LangGraph (the future graph runner)
-
-- **Codebase uses:** Not used — named as the migration target when the chain needs to branch.
-- **Why it's here:** It is the standard answer to "my `if/await` spine became a state machine."
-- **Leading today:** LangGraph is the adoption-leading agent-graph runtime in 2026.
-- **Why it leads:** Typed state, conditional edges, checkpointing, and human-in-the-loop nodes that sequential `await` cannot express.
-- **Runner-up:** OpenAI Swarm / Agents SDK — lighter, handoff-oriented, less mature checkpointing.
-
----
-
 ## Project exercises
 
 ### Add a confidence gate that converts the chain into a small branch
@@ -321,19 +271,6 @@ A 2-step chain of agents is the comfortable case. It breaks when the chain needs
 - **Files to touch:** new `lib/agents/pipeline.ts`; `app/api/agent/route.ts` (replace L231–L249); `test/agents/pipeline.test.ts`.
 - **Done when:** The route's behavior is byte-identical in the NDJSON stream, and adding a node is a one-line array edit with a passing unit test using fake agents.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-blooming insights runs a deterministic chain of bounded agents. The route (`route.ts` L231–L249) fixes the order — diagnose then recommend — splitting it across two `step`-gated calls with a typed handoff (the diagnosis stashed and re-parsed via `parseDiagnosis`). Each node (`runAgentLoop`, `base.ts` L48–L176) is an agent: the model chooses which tools to call and signals termination by emitting no `tool_use` block (L121), bounded by `maxTurns` and `maxToolCalls`. Inside an agent, the loop-then-`synthesize` pair (`diagnostic.ts` L74–L75) is a 2-step micro-chain. The architecture is the same idea at three scales: fixed spine, adaptive node, fixed fallback.
-
-Key points:
-- A chain is code-owned control flow; an agent is model-owned control flow; blooming insights uses both, layered.
-- The line that makes a node an agent is `base.ts` L121 — the model ends the loop by choosing not to call a tool.
-- The route is a chain because the order never changes; the node is an agent because the query path changes per anomaly.
-- `synthesize()` chained after `runAgentLoop` is a micro-chain inside an agent — the pattern recurses.
-- The chain breaks down when a node's output must change the *next node* (branching/parallelism); that is the LangGraph breakpoint.
 
 ---
 
@@ -418,8 +355,13 @@ A reviewer says: "Collapse the route into a single agent with all tools — fewe
 
 Which line in `lib/agents/base.ts` is the single point where the *model*, not your code, decides the agent loop is finished? (Answer: L121 — `if (toolUses.length === 0) return { finalText, toolCalls }`.)
 
+## See also
+
+→ 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+
 ---
 Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`?step=recommend` split (separate calls, sessionStorage diagnosis handoff via `parseDiagnosis`), added the derived `confidence` step, and refreshed all route/diagnostic line refs.
 
 ---
 Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [])` signature (monitoring.ts L69) and per-category checklist; the briefing route gates the list to `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204/223) before the agent runs, so the monitoring node is schema-gated. Cross-ref 07-capability-gating.md.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

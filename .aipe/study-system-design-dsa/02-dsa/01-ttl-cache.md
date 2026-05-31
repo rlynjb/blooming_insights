@@ -5,7 +5,6 @@
 
 > A Map-backed lookup table where each entry carries an absolute expiry timestamp; reads return the stored value when it is still fresh and fall through to the live source when it is stale or absent.
 
-**See also:** → 02-rate-limit-and-retry.md · → ../01-system-design/04-caching-and-rate-limiting.md
 
 ---
 
@@ -223,7 +222,7 @@ The Map is the single shared store for the `McpClient` instance. Every `callTool
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/mcp/client.ts`
 **Function / class:** `McpClient.callTool`
@@ -308,60 +307,6 @@ Three failure modes are inherent to this design:
 - **LRU eviction** — a Least Recently Used cache adds a size cap; when the Map would exceed N entries, the entry accessed furthest in the past is evicted. The `lru-cache` npm package implements this. Combine with TTL to bound both size and freshness.
 - **Redis as shared cache** — moves the Map to a network-accessible key-value store. All instances share one cache. TTL is a native Redis feature (`SET key value EX 60`). Adds network latency on every cache read.
 - **Stale-while-revalidate** — instead of blocking on a miss, serve the stale entry immediately and trigger a background refetch. React Query's default. Trades consistency for perceived speed.
-
----
-
-## Tradeoffs
-
-| Dimension | This implementation (TTL Map) | LRU + TTL | No cache |
-|---|---|---|---|
-| Read latency (hit) | O(1), ~0 ms | O(1), ~0 ms | N/A |
-| Read latency (miss) | O(1) + live call (~1.1 s+) | O(1) + live call | live call always |
-| Write cost | O(1) Map.set | O(1) + LRU bookkeeping | none |
-| Space complexity | O(distinct keys), unbounded | O(N) where N = LRU cap | O(1) |
-| Error safety | errors not cached | errors not cached | errors never persist |
-| Cross-instance sharing | none (per-process) | none (unless Redis) | n/a |
-| Staleness window | up to `ttl` ms | up to `ttl` ms | always fresh |
-| Invalidation control | time only (no manual eviction) | time + size cap | none needed |
-
-**What was given up.** The Map has no size cap. Every unique `(name, args)` combination adds a permanent entry for the life of the process. In a session with a bounded call space this is fine. In a long-running server with a large argument space it becomes a memory leak.
-
-**Alternative cost.** LRU adds bookkeeping: a doubly-linked list or equivalent structure to track access order. Every read and write touches the list in addition to the Map. The overhead is constant-factor but non-zero. Running with no cache at all pays the full 1.1 s+ rate-limit penalty on every call — every identical repeat is a fresh network round-trip.
-
-**Breakpoint.** The current design is correct for session-scoped use where the number of distinct tool-call argument combinations is small and bounded. It needs LRU (to cap size) or Redis (to share state) when: (a) distinct keys grow large relative to available memory, (b) the app scales horizontally, or (c) cache coherence across deploys is required.
-
----
-
-## Tech reference (industry pairing)
-
-### JavaScript Map (cache store)
-
-- **Role:** keyed in-memory store; O(1) average get/set; preserves insertion order (unused here).
-- **Leader:** native `Map` — no dependency, zero overhead; used directly in `McpClient`.
-- **Runner-up:** `lru-cache` (npm) — wraps a Map with a size cap and optional per-entry TTL; drop-in for the `cache` field when unbounded growth becomes a problem.
-- **Key API surface:** `map.get(key)`, `map.set(key, value)`, `map.has(key)`, `map.delete(key)`.
-- **What it does not do:** no TTL natively, no max-size, no LRU eviction — the application code in `callTool` supplies all of these.
-
-### cache-aside + TTL
-
-- **Role:** the architectural pattern; the application is the cache-population agent, not a middleware layer; TTL is the expiry mechanism.
-- **Leader:** React Query — `staleTime` + `cacheTime` implement cache-aside with stale-while-revalidate; the `queryKey` is the cache key equivalent.
-- **Runner-up:** SWR (Vercel) — same pattern, `dedupingInterval` is the TTL equivalent for in-flight deduplication.
-- **Contrast with cache-through:** in cache-through the cache layer intercepts writes and keeps itself up to date; cache-aside requires the application to write explicitly after a live call succeeds.
-- **Industry use:** Redis `SET key value EX 60` is cache-aside + TTL at the network level; the semantics are identical to `cache.set(key, {result, expiresAt: now+60_000})` — only the store and the expiry mechanism differ (server-side timer vs. inline check).
-
----
-
-## Summary
-
-`McpClient` implements cache-aside with TTL: a `Map<string, {result, expiresAt}>` keyed on `name + ':' + JSON.stringify(args)`. On every `callTool` invocation the code builds the key, checks whether a non-expired entry exists, and returns it immediately if so. On a miss it calls the transport, retries on rate-limit errors, and writes the result to the Map with `expiresAt = Date.now() + ttl` — but only when the result is not an error. The TTL defaults to 60 000 ms. `skipCache` bypasses the read check but still performs a write on success, which intentionally refreshes the entry for all subsequent callers.
-
-- The cache key is a deterministic string; argument order matters because `JSON.stringify` is order-sensitive — `{a:1,b:2}` and `{b:2,a:1}` produce different keys and different cache slots.
-- Expiry is checked inline at read time, not via a background timer; expired entries stay in the Map until overwritten.
-- Error results (`isError === true`) are never written to the cache; this is the poisoned-cache guard.
-- The Map is per-process and per-instance; horizontal scaling means no shared cache state.
-- Space complexity is O(distinct keys) with no upper bound; this is the main tradeoff against LRU.
-- The pattern is identical to React Query's `staleTime` behaviour, with hard expiry instead of stale-while-revalidate.
 
 ---
 
@@ -472,6 +417,11 @@ Your tech lead says: "Expired entries stay in the Map forever — this leaks mem
 - Name one scenario where two logically identical calls produce different cache keys.
 - What is the space complexity of the current implementation?
 
+## See also
+
+→ 02-rate-limit-and-retry.md · → ../01-system-design/04-caching-and-rate-limiting.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

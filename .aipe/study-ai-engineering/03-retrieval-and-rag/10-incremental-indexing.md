@@ -5,7 +5,6 @@
 
 > A retrieval index is built once but the source keeps changing, so you need to add, update, and delete vectors *in place* rather than re-embedding the whole corpus on every change — an upsert keyed by document id, driven by change-detection; blooming insights has no index, but its append-keyed investigation store is the same "write by key, update in place" shape, so this is study material grounded in a real analog.
 
-**See also:** → 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
 
 ---
 
@@ -129,7 +128,7 @@ Cost flows with the number of changes, not the corpus size — the upsert/delete
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (incremental embedding indexing).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to maintain — and a live tool call needs no indexing at all, which is part of the no-RAG rationale (`11-rag.md`): there is no index to keep current because every query reads the source live.
 
@@ -171,47 +170,6 @@ The principle is universal to any derived-from-source structure: maintain it inc
 
 ---
 
-## Tradeoffs
-
-### Incremental upsert/delete vs. full rebuild vs. live retrieval (current)
-
-| Dimension | Incremental (upsert/delete) | Full rebuild | Live tool call (current) |
-|---|---|---|---|
-| Cost per change | O(changes) | O(N) | N/A — no index |
-| Index availability during update | Live | Stale/offline | Always live |
-| Delete handling | Explicit delete by id | Implicit (gone after rebuild) | N/A |
-| Bookkeeping | Content hash + ids | None | None |
-| ANN structure quality | Degrades, needs compaction | Optimal after rebuild | N/A |
-| Right when | Corpus changes often | Rare changes / model swap | Source is a live API |
-
-**What we gave up (by not having it).** Nothing — live retrieval has no index to maintain, so there is no incremental-update cost at all. That is a genuine advantage of the live-tool approach (`11-rag.md`): you never re-embed, never upsert, never compact, because there is no derived structure to keep in sync with the source.
-
-**What the alternative would have cost.** An embedding index buys semantic search at the price of perpetual maintenance: change-detection, per-document upserts, a delete path, and periodic ANN compaction. For data that is already a live API, that is ongoing operational cost to keep a copy in sync with a source you could just read directly.
-
-**The breakpoint.** Live-only (no index) is correct while every query reads the source live. Incremental indexing becomes necessary only when a feature needs an embedding index over content that *isn't* a live API (past investigation narratives) *and* that corpus changes — at which point full rebuilds are too expensive and per-document upsert/delete keyed by id (extending `saveInvestigation`'s pattern) is the required approach.
-
----
-
-## Tech reference (industry pairing)
-
-### keyed upsert / delete
-
-- **Codebase uses:** the analog — `saveInvestigation` `mem.set(insightId, events)` and JSON merge `all[insightId] = events` (`lib/state/investigations.ts`); keyed read `getCachedInvestigation`. No vectors.
-- **Why it's here (absent for vectors):** there is no embedding index; investigations are upserted by key but never embedded.
-- **Leading today:** vector-DB native `upsert`/`delete` by id (Pinecone, Qdrant, Weaviate) leads incremental indexing (2026).
-- **Why it leads:** per-document mutation keeps the index live and costs scale with change, not corpus size.
-- **Runner-up:** Elasticsearch incremental segment updates — the search-engine lineage of the same idea.
-
-### change-data-capture / change-detection
-
-- **Codebase uses:** nothing for re-indexing; investigations are overwritten wholesale by key with no hash compare.
-- **Why it's here (absent):** no derived index needs selective updates.
-- **Leading today:** CDC pipelines (Debezium, source-change events) driving re-embed-on-change lead production RAG maintenance (2026).
-- **Why it leads:** updates the index from the authoritative change stream — no polling, minimal re-embedding.
-- **Runner-up:** content-hash polling — compare a stored hash on a schedule; simpler, higher latency than event-driven.
-
----
-
 ## Project exercises
 
 ### Build incremental upsert/delete for the embedding index
@@ -231,19 +189,6 @@ The principle is universal to any derived-from-source structure: maintain it inc
 - **Files to touch:** `lib/state/embedding-index.ts` (compaction + drift check), new `scripts/index-compact.ts`, `test/state/embedding-index.test.ts`.
 - **Done when:** a recall regression on the eval set after many upserts triggers a rebuild that restores recall, with incremental updates remaining the default.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-A retrieval index is built once but its source keeps changing, so it must be maintained by per-document upsert (add/update) and delete keyed by id, gated by change-detection so cost scales with what changed rather than with corpus size — a full rebuild is correct semantics but O(N) wrong economics. blooming insights has no index, but `saveInvestigation`'s `mem.set(insightId, events)` is exactly the keyed in-place upsert the pattern needs, missing only change-detection and a delete path. Live tool retrieval needs no index at all, which is part of why the codebase deferred RAG — there is nothing to keep in sync.
-
-**Key points:**
-- Maintain the index in place — upsert and delete by document id, not full rebuilds.
-- Change-detection (content hash) skips the unchanged, so cost scales with the change.
-- The delete path is the most commonly forgotten — omit it and deleted docs become ghost results.
-- `saveInvestigation`'s `mem.set` by key is the codebase's existing keyed-upsert shape.
-- Incremental indexes drift; a periodic compaction/rebuild is still occasionally needed.
 
 ---
 
@@ -317,3 +262,8 @@ A colleague proposes a nightly full re-embed of the whole corpus "for simplicity
 ### Quick check — code reference test
 
 What keyed in-place update does blooming insights already perform, and what two things would an incremental embedding index add to it? (Answer: `saveInvestigation` upserts one investigation by key — `mem.set(insightId, events)` and the JSON merge `all[insightId] = events` in `lib/state/investigations.ts`; an incremental embedding index would add change-detection — a content hash to skip unchanged documents — and a delete path to evict vectors for removed documents.)
+
+## See also
+
+→ 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > The user's raw question is rarely the best retrieval query; query rewriting reshapes it (expand, decompose, or — in HyDE — embed a *hypothetical answer* instead of the question) so it lands closer to the documents that hold the answer; blooming insights does query *understanding* (classify intent, translate to EQL) but not retrieval-query rewriting, so this is study material grounded in a real analog.
 
-**See also:** → 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
 
 ---
 
@@ -133,7 +132,7 @@ The current path produces an exact EQL query; the proposed path reshapes a fuzzy
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (retrieval-query rewriting).** blooming insights retrieves live via exact EQL — where the query is translated, not rewritten-for-recall — and has no embedding retrieval whose query would need expansion or HyDE.
 
@@ -180,55 +179,6 @@ The free-form `?q=` is only `.trim()`'d (route) and passed straight to the model
 
 ---
 
-## Tradeoffs
-
-### Query rewriting (expand/decompose/HyDE) vs. raw query vs. classify-only (current)
-
-| Dimension | Rewriting (rewrite then retrieve) | Raw query | Classify + EQL (current) |
-|---|---|---|---|
-| Closes vocabulary gap | Yes | No | N/A (exact query) |
-| Handles compound questions | Yes (decompose) | No | Routes to one intent |
-| Cost | +1 cheap gen per lever | Zero | +1 cheap gen (classify) |
-| Latency | Higher (pre-retrieval gen) | Lowest | Low (16-token classify) |
-| Right for fuzzy retrieval | Yes | No | N/A |
-| Right for exact EQL | Overhead | N/A | Yes |
-
-**What we gave up (by not having it).** Nothing today — EQL is exact, so there is no vocabulary-gap recall problem for rewriting to solve. The latent value appears only with fuzzy retrieval over free text (past investigations), where a user's question phrased in their words would embed far from an old investigation phrased in different words, and HyDE/expansion would recover the recall.
-
-**What the alternative would have cost.** Adding query rewriting to the EQL path would be pure overhead and risk: an extra generation per query for no recall gain (the query is already exact), plus a new failure mode (a rewrite that mistranslates the schema). Rewriting belongs to fuzzy retrieval, not exact querying.
-
-**The breakpoint.** Classify-and-translate-to-EQL is correct while retrieval is exact. Query rewriting (especially HyDE) earns its place the moment fuzzy retrieval over free text exists *and* user vocabulary diverges from document vocabulary — measured as a recall gap between raw-query and rewritten-query retrieval on real questions.
-
----
-
-## Tech reference (industry pairing)
-
-### query classification / understanding
-
-- **Codebase uses:** `classifyIntent` (`lib/agents/intent.ts` L17–L31) — haiku, 16-token one-word intent; `parseIntent` (L6–L12) substring heuristic first.
-- **Why it's here:** route the free-form `?q=` to the right agent and translate it to EQL — the present query-understanding.
-- **Leading today:** small/cheap LLM classifiers lead query intent routing (2026).
-- **Why it leads:** a 16-token classification is fast and pennies; far cheaper than running the wrong full agent.
-- **Runner-up:** embedding-based intent matching (nearest exemplar) — no generation, but needs an embedder.
-
-### query rewriting / expansion
-
-- **Codebase uses:** nothing — EQL translation is exact, not recall-oriented rewriting.
-- **Why it's here (absent):** exact queries have no vocabulary-gap recall problem.
-- **Leading today:** LLM-generated query expansion and multi-query retrieval lead RAG query rewriting (2026).
-- **Why it leads:** a cheap generation closes the user-vs-document vocabulary gap before retrieval.
-- **Runner-up:** classic pseudo-relevance feedback — expand from top retrieved terms, no LLM needed.
-
-### HyDE (Hypothetical Document Embeddings)
-
-- **Codebase uses:** nothing.
-- **Why it's here (absent):** no embedding retrieval whose query would benefit.
-- **Leading today:** HyDE is a standard recall-boost when question/answer vocabulary diverges (2026).
-- **Why it leads:** embedding a hypothetical answer lands near real answers, which questions do not.
-- **Runner-up:** step-back prompting — rewrite to a broader question to retrieve foundational context first.
-
----
-
 ## Project exercises
 
 ### Add HyDE-based retrieval for past-investigation search
@@ -248,19 +198,6 @@ The free-form `?q=` is only `.trim()`'d (route) and passed straight to the model
 - **Files to touch:** `lib/mcp/retrieval.ts` (`decomposeAndRetrieve`), `lib/agents/intent.ts` (the split prompt), `lib/mcp/retrieval.ts` (`rrfFuse` from `06`), `test/mcp/retrieval.test.ts`.
 - **Done when:** a two-part question retrieves clean candidates for each part and fuses them, outperforming a single retrieval of the raw compound query.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-The user's literal question is rarely the best retrieval query: expansion closes the vocabulary gap, decomposition splits compound questions, and HyDE embeds a *hypothetical answer* so the query lands near real answer documents instead of near other questions. blooming insights does the sibling discipline — query *understanding*: `classifyIntent` labels the free-form question and the agent translates it into exact EQL — but not retrieval-query rewriting, because EQL is exact and has no vocabulary-gap recall problem. The rewriting levers earn their place only with fuzzy retrieval over free text, where HyDE and expansion measurably lift recall.
-
-**Key points:**
-- Retrieval quality is capped by the query handed to it — fix the input before retrieving.
-- HyDE embeds a hypothetical answer because answers, not questions, look like answer documents.
-- Decomposition mirrors the codebase's intent split, applied to retrieval queries and fused with RRF.
-- The codebase does query understanding (classify + translate to EQL); EQL is exact, so no rewriting is needed.
-- Query rewriting is not input sanitization — a HyDE generator inherits any prompt injection.
 
 ---
 
@@ -334,3 +271,8 @@ A colleague wants to add HyDE to the EQL analytics path "to improve every query.
 ### Quick check — code reference test
 
 What query-understanding does blooming insights do today, and why is retrieval-query rewriting (HyDE/expansion) not needed for it? (Answer: `classifyIntent` (`lib/agents/intent.ts` L17–L31) classifies the free-form `?q=` and the agent translates it into exact EQL; because EQL uses known schema names there is no user-vs-document vocabulary gap, so the expand/HyDE recall levers have nothing to fix.)
+
+## See also
+
+→ 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

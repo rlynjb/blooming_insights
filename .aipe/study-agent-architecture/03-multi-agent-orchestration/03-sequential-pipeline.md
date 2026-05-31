@@ -5,7 +5,6 @@
 
 > The primary topology in blooming insights: monitoring → diagnostic → recommendation, with the typed `Diagnosis` handed step-to-step as a structured message. The user gates the transition between stages. Each stage is a ReAct loop with its own tool subset and budget — but the order between them is fixed and owned by code.
 
-**See also:** → `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 
@@ -270,7 +269,7 @@ Sequential pipeline — the full picture in this codebase
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — the pipeline is the primary topology.**
 
@@ -353,101 +352,6 @@ It also breaks when latency becomes the constraint — a pipeline's latency is t
 - `./08-shared-state-and-message-passing.md` → the typed `Diagnosis` is the message-passing version of inter-stage communication
 - `./07-graph-orchestration.md` → pipelines expressed as state graphs with checkpointing and conditional edges
 - `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` → the cross-request handoff via `sessionStorage` from a system-design perspective
-
----
-
-## Tradeoffs
-
-The decision was: **sequential pipeline with code-owned order and typed inter-stage messages.** The alternative most teams reach for is one mega-agent with all tools and a long prompt covering all responsibilities.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Sequential pipeline (chosen)│ Mega-agent (alternative)    │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ 3 prompts, 3 tool subsets,  │ 1 prompt covering           │
-│                  │ 1 shared loop primitive     │ everything                  │
-│ Latency          │ sum of stages (sequential)  │ shorter wall-clock per run, │
-│                  │                             │ but more iterations needed  │
-│                  │                             │ to cover the work           │
-│ Token cost / run │ pays for 3 focused loops    │ one loop with longer prompt │
-│                  │                             │ and more turns              │
-│ Prompt focus     │ each stage's prompt covers  │ one prompt covers all       │
-│                  │ exactly its job             │ responsibilities; drifts    │
-│ Tool budget      │ per-stage cap (6/6/4) —     │ shared budget — early stages│
-│ contention       │ no contention               │ starve late ones            │
-│ Output schema    │ typed Diagnosis between     │ free-form; output drifts    │
-│                  │ stages                      │ between detect/diag/rec     │
-│ Debugging        │ stage-localized — bug is in │ entire mega-trajectory to   │
-│                  │ one prompt or one budget    │ replay                      │
-│ Stage swappability│ swap one agent's prompt or │ rewrite the whole prompt    │
-│                  │ tools without touching      │                             │
-│                  │ others                      │                             │
-│ Runtime flex     │ order is fixed              │ model can adapt within one  │
-│                  │                             │ run (cost: drifting outputs)│
-│ Failure blast    │ a bad stage fails alone     │ a bad turn cascades through │
-│                  │                             │ the rest of the loop        │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up runtime adaptability in stage order — `route.ts` L224–L249 hardcodes monitoring → diagnostic → recommendation. The route can't decide to skip the recommendation step if the diagnosis is obvious, or re-run diagnosis with a deeper budget if it was inconclusive. (The user can — the split-step UX lets them not click "see recommendations" — but the *system* can't decide that on its own.)
-
-We also gave up wall-clock latency. The pipeline is sequential; total time = monitoring + diagnostic + recommendation. The diagnostic stage typically takes 5–15 seconds (multiple EQL queries under the ~1 req/s MCP limit); the recommendation stage adds another 3–8 seconds. A fan-out shape would parallelize some of this, at the cost of losing the data dependency (the recommendation truly needs the diagnosis).
-
-### What the alternative would have cost
-
-If we had used one mega-agent with all 20+ tools and a long prompt, the up-front cost would have been a 4–6x larger system prompt covering three responsibilities. The model would have spent budget on "which job am I doing this turn?" decisions instead of doing the work. Output schemas would drift run-to-run — sometimes the mega-agent would return a diagnosis, sometimes recommendations, sometimes both interleaved, sometimes neither. Per-stage caps (6/6/4) wouldn't be expressible because there are no stages.
-
-Concretely: the recommendation step's average ~7s execution would become "somewhere between 0s and 30s depending on whether the mega-agent decided to propose actions this run." That variance breaks the user-gated UX — the user clicks "see recommendations" and gets nothing because the mega-agent already used its budget on detection.
-
-### The breakpoint
-
-This stays the right call until a *stage's output* has to change which *stages* run next — e.g. "if the diagnosis confidence is low, re-run diagnosis with a deeper budget instead of going to recommendation." That branching isn't expressible as a linear pipeline; it's a state graph. At that point you'd move to `./07-graph-orchestration.md`'s shape, keeping the typed inter-stage messages but expressing transitions as graph edges.
-
-### What wasn't actually a tradeoff
-
-Parallel fan-out was not a real alternative for the diagnostic → recommendation transition. The recommendation agent's `propose(anomaly, diagnosis, hooks)` signature literally requires the diagnosis — there's no way to start the recommendation stage before the diagnostic stage completes. The data dependency is real, not a preference.
-
-Skipping the typed `Diagnosis` schema and using free-form prose between stages was also not a real alternative: the cross-request handoff needs to round-trip through a URL query param (`?diagnosis=...`), and `parseDiagnosis()` validates the shape. Without the type, you'd have either no validation or a much messier handoff.
-
----
-
-## Tech reference
-
-### TypeScript interfaces as inter-agent contracts
-
-- **Codebase uses:** `interface Diagnosis` in `lib/mcp/types.ts` L95–L104 — the inter-stage message between diagnostic and recommendation; `parseDiagnosis()` in `app/api/agent/route.ts` L86–L97 validates the shape at request boundaries.
-- **Why it's here:** the type *is* the pipeline contract — both stages reference the same `Diagnosis` type, so a schema change forces both stages to update.
-- **Leading today:** TypeScript interfaces (or Zod schemas) as inter-agent contracts — adoption-leading for typed multi-agent designs in TS, 2026.
-- **Why it leads:** structural typing makes the contract enforceable at compile time without runtime overhead; Zod adds runtime validation when the contract crosses an untrusted boundary (URL param, sessionStorage).
-- **Runner-up:** JSON Schema + Zod — runtime-validated schemas that double as docs; preferred when the contract crosses an HTTP boundary.
-
-### sessionStorage as a step-to-step message bus
-
-- **Codebase uses:** `sessionStorage.setItem('bi:diag:<id>', JSON.stringify({ diagnosis }))` in `lib/hooks/useInvestigation.ts` L138 — persists the diagnosis between step-2 and step-3 HTTP requests.
-- **Why it's here:** it's the carrier that lets the pipeline split across user-gated requests without losing the typed message.
-- **Leading today:** `sessionStorage` for per-tab persisted state — adoption-leading for browser-scoped step state, 2026.
-- **Why it leads:** synchronous read/write, per-tab scope (multi-tab safety), cleared on tab close (no leak between sessions); zero infrastructure cost.
-- **Runner-up:** server-side session store (Redis, signed cookies) — needed when the message is too large for a URL param or has to survive a tab close.
-
-### Anthropic Messages API tool_use loops (per-stage agents)
-
-- **Codebase uses:** `runAgentLoop` in `lib/agents/base.ts` L48–L176, called by each of the four agents with its own `system`, `toolSchemas`, and `maxToolCalls`.
-- **Why it's here:** the per-stage isolation is implemented by *injecting different tool subsets and prompts into the same loop primitive* — one function, four configurations.
-- **Leading today:** Anthropic tool use — innovation-leading for typed agent loops, 2026.
-- **Why it leads:** `tool_use`/`tool_result` content blocks let each stage's loop emit structured calls; the same loop function serves all four stages without per-stage forking.
-- **Runner-up:** OpenAI Responses API — equivalent shape, larger installed base.
-
----
-
-## Summary
-
-A sequential pipeline is a `.then()` chain where each function is an agent — agents wired together in a fixed order, with each stage's typed output handed to the next stage's typed input. blooming insights' primary pipeline is monitoring → diagnostic → recommendation, with the inter-stage message being a `Diagnosis` object (`lib/mcp/types.ts` L95–L104) and the order owned by code (`app/api/agent/route.ts` L224–L249). The constraint that made this right is the real data dependency between stages — recommendation literally needs the diagnosis as an input. The cost is sequential latency (no parallelism between stages) and a fixed order (no runtime adaptation). The split-step UX uses the same pipeline with `sessionStorage` as the cross-request carrier, gated by the user clicking "see recommendations."
-
-- The pipeline's order is fixed because the data flow is sequential — the recommendation agent's signature literally takes the diagnosis as an argument.
-- Each stage has its own prompt, its own tool subset (`lib/mcp/tools.ts`), and its own budget (`maxToolCalls` 6/6/4) — agents are *focused* by separation, not by prompt cleverness.
-- The inter-stage message is a typed `Diagnosis` object; the same message survives in-process (function arg) and cross-request (`sessionStorage` + URL param).
-- The combined run (capture/demo) and the split-step run (production UX) share one pipeline — only the carrier of the message changes.
-- Worth it while the data dependency is sequential and the order is knowable; promote to graph orchestration the day a stage's output has to change which stages run next.
 
 ---
 
@@ -584,6 +488,11 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
+
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

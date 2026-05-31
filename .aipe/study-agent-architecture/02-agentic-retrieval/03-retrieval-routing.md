@@ -5,7 +5,6 @@
 
 > When you have more than one knowledge source — a vector index, a SQL warehouse, a web search, a live API — a router picks which source to retrieve from before retrieving. blooming insights has *one* source (Bloomreach via MCP), so source-level routing doesn't apply; the adjacent pattern that *does* live here is the coverage gate (`lib/agents/categories.ts`), which routes the monitoring agent toward the subset of anomaly categories the workspace's schema can actually support — a pre-retrieval *capability* route.
 
-**See also:** → 01-agentic-rag.md · → 02-self-corrective-rag.md · → `../01-reasoning-patterns/06-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
 
 ---
 
@@ -260,7 +259,7 @@ Canonical retrieval routing (multi-source) — and where this codebase sits
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case B — source-level retrieval routing is not implemented.** The honest sentence: there's only one knowledge source (Bloomreach via MCP), so there is no source-routing layer; if a vector store or web tool ships beside it, a router would slot in front of the agentic-RAG loop's tool-pick step.
 
@@ -331,92 +330,6 @@ The router can mis-classify. A heuristic router built on rules will misroute the
 - Self-corrective RAG (`02-self-corrective-rag.md`) → the grader at the other side of retrieval
 - Routing pattern in general (`../01-reasoning-patterns/06-routing.md`) → routing as a single-agent reasoning shape
 - Capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` → the broader pattern the coverage gate instantiates
-
----
-
-## Tradeoffs
-
-The decision here was *whether to add a second knowledge source.* This codebase did not (Phase A, one source); the alternative is multi-source with a router (Phase B). The coverage gate is orthogonal to this choice — it exists in both phases.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ One source (chosen — now)   │ Multi-source + router       │
-│                  │                             │ (alternative)               │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ zero — one MCP transport    │ second retriever stack +    │
-│                  │                             │ router + dispatch wiring    │
-│ Per-query layers │ capability gate → retrieve  │ capability gate → SOURCE    │
-│                  │                             │ ROUTER → retrieve            │
-│ Routing cost     │ none                        │ heuristic: ~0; LLM fallback:│
-│                  │                             │ +1 model RTT on hard queries│
-│ Question surface │ what EQL can express        │ EQL + vector + web + …      │
-│ Ops burden       │ one source to monitor       │ N sources + router metrics  │
-│ Failure modes    │ "EQL can't answer this"     │ misroute, source down,      │
-│                  │ → answer is "not in scope"  │ router miss, fanout cost    │
-│ Cost of "wrong"  │ contained: no answer found  │ silent: routed to wrong     │
-│ source pick      │                             │ source, wrong answer        │
-│ Cost of capacity │ EQL cap = analytics surface │ unbounded (add another      │
-│                  │                             │ source any time)            │
-│ Debuggability    │ one source, one trajectory  │ trajectory + route decision │
-│                  │                             │ per query                   │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up coverage of any question shape that isn't expressible as EQL. Anything that requires free-text similarity (find investigations similar to this one), real-world freshness (what did press say about the company today), or content from outside the workspace (industry benchmarks) — none of those have a retriever today and nothing in the loop would route to one if it existed.
-
-We also gave up the routing layer's flexibility. If a new source ships, it has to be added everywhere the agents bind to MCP — there's no single "dispatch table" the new retriever slots into. The cost of the second source is the source itself plus the router we didn't build.
-
-### What the alternative would have cost
-
-If we had built source routing day one, we would have shipped a router with no second source to route to — a no-op layer adding latency and code without buying anything. The router only earns its place once there are at least two sources whose competences don't overlap; building it eagerly is over-engineering for capacity we don't need.
-
-### The breakpoint
-
-Add the router the moment a second source ships. The specific signals: (a) a feature lands that can't be expressed in EQL (semantic search over narratives, web-fetched comparisons, anything outside the live analytics surface), AND (b) you build a retriever for it. That's the day "which source for this question" becomes a real decision and the heuristic-first / LLM-fallback shape earns its overhead.
-
-### What wasn't actually a tradeoff
-
-"Just use the vector store for everything once we add it" is not a real alternative. A vector store is good at paraphrase and bad at exact aggregates; routing analytics questions to it would silently return paraphrased prose instead of exact counts. The retriever-strength asymmetry is the whole reason routing exists — if one retriever covered everything, you'd just use it. Multi-source isn't a power move; it's a response to retrievers having non-overlapping competence.
-
----
-
-## Tech reference
-
-### MCP (Model Context Protocol)
-
-- **Codebase uses:** `lib/mcp/client.ts` and `lib/mcp/transport.ts` wrap the single MCP transport; all retrieval goes through it.
-- **Why it's here:** MCP is the source layer. Routing would sit *above* MCP (which retriever to call); MCP itself doesn't route — it transports.
-- **Leading today:** MCP — adoption-leading for standardized tool/data integrations in agents, 2026.
-- **Why it leads:** decouples the tool from the agent; a second MCP transport (a different source) drops in beside this one without touching the agent code, leaving only the router to build above.
-- **Runner-up:** direct per-source SDK integrations — no protocol overhead, more glue code per source.
-
-### LangChain / LlamaIndex routing utilities (the named pattern)
-
-- **Codebase uses:** none — the codebase has one source and uses no routing library.
-- **Why it's here:** these are where retrieval routing got its production-grade naming (`RouterChain`, `RouterQueryEngine`) and worked examples.
-- **Leading today:** LangChain's routing primitives — adoption-leading for orchestrated multi-retriever apps, 2026.
-- **Why it leads:** the routing layer ships with the framework; the cost of adopting routing is one component, not a custom dispatch table.
-- **Runner-up:** custom heuristic + LLM fallback built per-app — less coupling to a framework, more code to maintain.
-
-### Capability gating (the adjacent pattern)
-
-- **Codebase uses:** `lib/agents/categories.ts` — `schemaCapabilities` (L121–L127), `coverageFor` (L131–L136), `runnableCategories` (L158–L160); consumed in `app/api/briefing/route.ts` L200–L204.
-- **Why it's here:** it's the routing the codebase actually has — a pre-retrieval gate that prunes the agent's question space against the workspace's schema before the loop spends its budget.
-- **Leading today:** schema-driven capability checks — adoption-leading for production agent systems with variable data shapes, 2026.
-- **Why it leads:** pushes the "this isn't answerable" decision *above* the agent loop, where it's cheaper and visible in the UI (ghost tiles in the briefing grid), instead of letting the agent waste tool calls discovering it.
-- **Runner-up:** letting the agent discover unavailability mid-loop — simpler to build, burns budget, harder to surface in the UI.
-
----
-
-## Summary
-
-Retrieval routing dispatches a query to the right knowledge source before retrieval happens — the heuristic-first / LLM-fallback shape catches the high-volume rules at zero LLM cost and falls through to a model classifier for the ambiguous queries. blooming insights has one source (Bloomreach via MCP), so source-level routing doesn't apply yet; the adjacent pattern that *is* here is the coverage gate in `lib/agents/categories.ts`, which routes the monitoring agent toward the subset of anomaly categories the workspace's schema supports — a pre-retrieval capability route that runs once per investigation in `briefing/route.ts` L200–L204. The router pattern earns its place the day a second knowledge source ships (vector over narratives, web search, anything EQL can't express); until then, dispatching to one source is a no-op and the capability gate is the routing decision worth making.
-
-- Retrieval routing = `if/else` over data sources, decided before retrieve.
-- Production shape is heuristic-first (regex/rules, ~95% of queries) with LLM fallback (the ambiguous ~5%).
-- This codebase has *one* source and so no source router; it has *capability* routing via the coverage gate.
-- The coverage gate prunes the question space upstream so the agent doesn't burn budget on unanswerable categories.
-- Source routing earns its place when a second retriever ships (something EQL can't express + a stack to retrieve it).
 
 ---
 
@@ -537,5 +450,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 01-agentic-rag.md · → 02-self-corrective-rag.md · → `../01-reasoning-patterns/06-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

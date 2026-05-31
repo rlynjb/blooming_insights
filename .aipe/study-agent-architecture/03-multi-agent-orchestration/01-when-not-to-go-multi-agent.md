@@ -5,7 +5,6 @@
 
 > The architectural-opinion file: blooming insights IS multi-agent but deliberately MINIMAL — a deterministic pipeline + a router + single-purpose agents — and AVOIDS an autonomous LLM supervisor and its 2–5x coordination tax. The escalation gate names when the next step earns its overhead.
 
-**See also:** → `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
 
 ---
 
@@ -258,7 +257,7 @@ The escalation gate — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 This is the boundary file for SECTION C. It does not have a single line range; it names a *decision* taken across the codebase. The artifacts are:
 
@@ -331,93 +330,6 @@ The gate becomes wrong when the codebase grows a *family* of stage orderings tha
 - `./09-coordination-failure-modes.md` → the failures the deterministic shape *prevents*, not just controls
 - `../01-reasoning-patterns/01-chains-vs-agents.md` → the chain/agent boundary at the per-loop level
 - `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` → the mechanics of the boundary at the per-call level
-
----
-
-## Tradeoffs
-
-The decision was: **decompose into specialists, but keep orchestration deterministic.** The alternative most teams reach for is autonomous LLM coordination — a supervisor agent that decides which worker runs next. Both are "multi-agent." Only one is autonomous.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Deterministic (chosen)      │ LLM supervisor (alternative)│
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build time       │ ~50 lines of route code     │ supervisor prompt + its own │
-│                  │                             │ loop + handoff protocol     │
-│ Latency / run    │ stage order is free         │ +1 model call per ordering  │
-│                  │ (no LLM)                    │ decision (~1–3s under MCP   │
-│                  │                             │ rate limit)                 │
-│ Token cost / run │ pays for the 3 worker loops│ pays for workers + super-   │
-│                  │ only                        │ visor turns (often 2–5x)    │
-│ Predictability   │ same order every run        │ order can drift run-to-run  │
-│ Debugging        │ order bug → grep route.ts;  │ order bug → replay super-   │
-│                  │ work bug → replay one loop  │ visor reasoning + worker(s) │
-│ Failure surface  │ 2 suspects (route, worker)  │ 3 suspects (supervisor,     │
-│                  │                             │ workers, synthesis)         │
-│ Runtime flex     │ none in ordering            │ ordering adapts run-to-run  │
-│ Onboarding       │ any engineer reads an       │ engineer must understand    │
-│                  │ if-ladder                   │ the supervisor prompt + the │
-│                  │                             │ handoff protocol            │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up runtime flexibility in stage ordering. The route can't decide to skip the diagnostic stage for a "trivial" anomaly or run it twice for a confusing one — `route.ts` L224–L249 is fixed. If a new analyst flow needed a conditional fourth stage, that's a code change.
-
-We also gave up "smart" short-circuiting. Every full investigation runs both diagnostic and recommendation, even when the diagnosis is obvious. A supervisor might short-circuit. We pay the fixed two-stage cost regardless — but, critically, the user *opts into* recommendation by clicking the step (`step === 'recommend'`), so the system already has a human-in-the-loop short-circuit at the right layer.
-
-### What the alternative would have cost
-
-If we had built an LLM supervisor, the up-front cost would have been a whole extra reasoning layer: a supervisor prompt, its own `runAgentLoop`, and a handoff protocol between supervisor and workers. Every investigation would pay an extra model call just to be told something the route already knows. Debugging would get worse: a wrong recommendation could now be the supervisor mis-ordering, the diagnostic mis-investigating, OR the recommendation mis-proposing — three suspects instead of two.
-
-At the codebase's current ~1 req/s MCP rate limit, the supervisor's reasoning turns would also *take* throughput from the worker turns — the supervisor isn't free latency on top of the workers; it competes for the same shared budget.
-
-### The breakpoint
-
-This stays the right call until the stage order needs to depend on what a stage *found* — e.g. "if the diagnosis is inconclusive, run a deep-dive specialist instead of recommendation" or "if the anomaly is in segment X, route to a segment-X specialist instead of the generic recommendation agent." The day a stage's output has to change which stage runs next, the `if`-ladder can't express it cleanly and the supervisor earns its overhead.
-
-### What wasn't actually a tradeoff
-
-A single mega-agent with all 20+ tools was not a real alternative. Cramming detect + diagnose + recommend into one prompt with one tool budget would blur the per-stage tool subsets (`lib/mcp/tools.ts`) and the per-stage caps that bound latency under the ~1 req/s MCP limit. The split into stages wasn't a compromise — it was what made the budgets per-job and the prompts focused.
-
----
-
-## Tech reference
-
-### The Anthropic "Building Effective Agents" framing (the discipline)
-
-- **Codebase uses:** the discipline, not a library — the architecture in `app/api/agent/route.ts` + `lib/agents/*.ts` is the workflow-first instinct applied: deterministic orchestration + decomposed workers + ReAct only inside each worker.
-- **Why it's here:** it's the framing that distinguishes "multiple agents" from "agentic coordination" — blooming insights is the former by design.
-- **Leading today:** Anthropic's escalation order (one call → tools → workflow → autonomous agent) — innovation-leading for agent architecture discipline, 2026.
-- **Why it leads:** it gave the industry a vocabulary for *not* using autonomous agents without sounding behind the curve; it reframes "workflow" as the senior choice, not the conservative one.
-- **Runner-up:** OpenAI's Agents SDK docs (2025) — name a similar "start simple, add only when measured" gate, with handoffs as the upgrade path.
-
-### Per-agent tool subsets (`lib/mcp/tools.ts`)
-
-- **Codebase uses:** per-agent `tools` allow-lists — diagnostic gets analytics + segments tools, recommendation gets feature-spec tools, query gets a broader read-only subset. The single shared `runAgentLoop` (`base.ts`) receives only the subset for its calling agent.
-- **Why it's here:** it's the mechanical reason decomposition was structurally necessary — one prompt with 20 tools confuses the model; four prompts with 4–8 tools each are sharp.
-- **Leading today:** per-agent tool subsets — adoption-leading for multi-agent designs in production, 2026.
-- **Why it leads:** every multi-agent framework (LangGraph, OpenAI Agents SDK, CrewAI) makes per-agent tools first-class because the alternative (shared global tool set) measurably degrades selection accuracy as the tool count grows.
-- **Runner-up:** dynamic tool retrieval (RAG over a tool catalog) — picks tools per turn by relevance; the answer at very large tool counts (50+) where even a per-agent subset is too large.
-
-### Haiku as classifier vs Sonnet as worker (model-tier routing)
-
-- **Codebase uses:** Haiku 4.5 (`claude-haiku-4-5-20251001`) for intent classification (`lib/agents/intent.ts` L14); Sonnet 4.6 (`claude-sonnet-4-6`) for every agent loop (`lib/agents/base.ts` L9).
-- **Why it's here:** the per-call application of the same gate — Haiku for the cheap deterministic-ish job (label a query as `recall|segment|funnel|comparison|aggregation`), Sonnet only where loop reasoning earns it.
-- **Leading today:** mixed-tier model routing — innovation-leading for cost-aware agent design, 2026.
-- **Why it leads:** the price gap between Haiku and Sonnet is large enough that misallocating one to the wrong job moves the cost-per-run line meaningfully; "use the cheap model where it works" is now standard advice in every provider's docs.
-- **Runner-up:** single-model-for-everything (Sonnet everywhere) — simpler, ~3–5x more expensive at the same workload.
-
----
-
-## Summary
-
-The escalation gate is the discipline of *not* going multi-agent by reflex: start with a single-agent ReAct baseline, measure its real failures, and only escalate to a multi-agent topology when the failure is *structural* (one loop can't do the job) — and even then, pick the specific topology that addresses the specific failure, not "multi-agent" as a vibe. blooming insights is multi-agent (four agents, decomposed by responsibility) but deliberately minimal: the route file (`app/api/agent/route.ts` L199–L249) is the supervisor, written in code, because the stage order (monitoring → diagnostic → recommendation) is knowable up front. The constraint that made this right is that the failure forcing decomposition was tool-subset contention and prompt bloat — not unknowable ordering. The cost is fixed stage order; the day a stage's output has to change which stage runs next, the `if`-ladder earns a promotion to a supervisor agent.
-
-- Single-agent baseline first, measure failures, decompose only when the failure is structural — propositional failures (wrong prompt, wrong tool description) are fixed at the prompt layer, not by adding agents.
-- blooming insights is multi-agent, not autonomously coordinated — the four agents are real, the route's `if`-ladder is the supervisor, no LLM decides the stage order.
-- The two-suspect debugging surface (route OR worker) is the win: a third suspect (supervisor) is the cost the deterministic shape avoids.
-- Haiku for classification, Sonnet for loops — the same gate applied at the per-call level: don't pay for capability the job doesn't need.
-- Worth it while the stage order is knowable; promote to a supervisor only when a stage's output has to change which stage runs next.
 
 ---
 
@@ -552,5 +464,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

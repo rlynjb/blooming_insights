@@ -5,7 +5,6 @@
 
 > blooming insights treats Claude as one thing — a function that maps a prompt to a string of tokens — and never trusts that string: every agent output is parsed through `parseAgentJson`, validated by a type guard, and degraded to a hard-coded `FALLBACK` if it does not conform.
 
-**See also:** → 02-tokenization.md · → 04-structured-outputs.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
 
 ---
 
@@ -184,7 +183,7 @@ The model never hands the system a `Diagnosis`. It hands the system a string, an
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -238,46 +237,6 @@ When the backend is deterministic, validation catches bugs. When the backend is 
 
 ---
 
-## Tradeoffs
-
-### Parse-and-validate prose vs. trusting the model vs. native JSON mode
-
-| Dimension | This codebase (parse + validate + fallback) | Trust raw output | Native constrained JSON mode |
-|---|---|---|---|
-| Reliability on malformed output | High — three tiers, never throws | None — first bad output 500s | High — malformed is impossible by construction |
-| Vendor lock-in | None — works on any text model | None | High — feature varies per provider |
-| Code complexity | Moderate — parser + guards + fallback | Minimal | Low — SDK enforces |
-| Correctness guarantee | Shape only | None | Shape only |
-| Cost of a bad generation | One graceful fallback | One crashed request | N/A (cannot occur) |
-
-**What we gave up.** A token-level guarantee that the output is valid JSON. Native constrained decoding makes `parseAgentJson` redundant for the parse step. By extracting from prose instead, blooming insights accepts that some fraction of calls produce output that fails the parse and must be retried via `synthesize()` or dropped to `FALLBACK` — extra latency and tokens on the unlucky calls.
-
-**What the alternative would have cost.** Native JSON modes are per-provider features with different shapes and limits; adopting one couples the agent layer to a specific vendor's API surface. The prose-extraction approach is provider-agnostic — it works against any model that returns text — which matters given the testability seam the codebase already invests in (see → 08-provider-abstraction.md).
-
-**The breakpoint.** Parse-and-validate is the right call while the malformed-output rate stays low enough that `synthesize()` retries are rare. When a measured parse-failure rate climbs past a few percent of calls, the extra latency and token cost of the second-tier retry start to matter, and moving the *final* structured artifact onto native tool-use JSON mode becomes worth the vendor coupling.
-
----
-
-## Tech reference (industry pairing)
-
-### @anthropic-ai/sdk (claude-sonnet-4-6)
-
-- **Codebase uses:** `anthropic.messages.create(params)` at `lib/agents/base.ts` L102 as the sole model call; `AGENT_MODEL = 'claude-sonnet-4-6'` at L9.
-- **Why it's here:** the Messages API is the next-token function the whole agent system is built on; `res.content` text blocks are the untyped return value the Service layer validates.
-- **Leading today:** OpenAI's GPT-4-class models lead in raw adoption (2026); Anthropic's Claude leads in agentic tool-use reliability and is the innovation leader for long-horizon agent workloads.
-- **Why it leads:** strong instruction-following on JSON-shaped tasks and a mature tool-use loop make it well-suited to the "emit a structured artifact from gathered evidence" pattern this codebase runs.
-- **Runner-up:** OpenAI's Chat Completions / Responses API — equivalent next-token interface, broader ecosystem, different tool-use ergonomics.
-
-### Type guards (TypeScript `v is T` predicates)
-
-- **Codebase uses:** `isDiagnosis`, `isAnomalyArray`, `isRecommendationArray` in `lib/mcp/validate.ts` to prove the shape of `parseAgentJson` output before it crosses into typed code.
-- **Why it's here:** TypeScript types are erased at runtime, so a runtime predicate is the only way to make `unknown` (the model output) into a `Diagnosis` safely.
-- **Leading today:** Zod is the adoption leader for runtime schema validation in TypeScript (2026); it generates both the validator and the static type from one schema.
-- **Why it leads:** a single source of truth for shape, with rich error messages and composability the hand-written guards here lack.
-- **Runner-up:** Valibot (smaller bundle, same idea) and io-ts (functional, older).
-
----
-
 ## Project exercises
 
 ### Make `FALLBACK` observable
@@ -297,19 +256,6 @@ When the backend is deterministic, validation catches bugs. When the backend is 
 - **Files to touch:** `lib/mcp/validate.ts` (`parseAgentJson`), `test/mcp/validate.test.ts` (new fixtures).
 - **Done when:** a fixture with prose + two fenced JSON objects parses to the intended object, and the existing tests still pass.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-An LLM is a function that maps a token sequence to a sampled token, looped until a stop condition; its return value is a `string`, never a typed object. blooming insights internalizes this completely: `anthropic.messages.create` (`lib/agents/base.ts` L102) yields text blocks that are joined into `finalText`, and that string is treated as `unknown` until `parseAgentJson` parses it and a type guard proves its shape. When proof fails, the system degrades — `synthesize()` retries, and a hand-written `FALLBACK` guarantees `investigate` always returns a valid `Diagnosis`. The trust boundary between probabilistic provider and typed service is the system's central contract.
-
-**Key points:**
-- An LLM call returns a `string`, not your domain type — the type is manufactured downstream by parse + validate.
-- `parseAgentJson` + a `v is T` type guard is the parse-and-validate boundary every model output crosses (`lib/mcp/validate.ts`).
-- `FALLBACK` is model-independent by design so the bottom tier of the chain can never itself fail (`lib/agents/diagnostic.ts` L16–L20).
-- Validation proves shape, not correctness — a hallucinated diagnosis passes every guard.
-- Treating the model like a flaky third-party `fetch` is what makes a bad generation degrade one investigation instead of crashing the system.
 
 ---
 
@@ -384,6 +330,11 @@ A colleague says: "Anthropic supports tool-use JSON mode now; rip out `parseAgen
 
 What is the exact return type of `runAgentLoop`, and which field of it is the untrusted model output? (Answer: `AgentRunResult = { finalText: string; toolCalls: ToolCall[] }` — `lib/agents/base.ts` L24–L27; `finalText` is the untrusted string.)
 
+## See also
+
+→ 02-tokenization.md · → 04-structured-outputs.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted `diagnostic.ts`/`monitoring.ts` line refs (chain L74–L75, `tryParseDiagnosis` L22–L29, `FALLBACK` L16–L20, monitoring degradation L95–L101) and noted the post-derived `diag.confidence`; `base.ts`/`runAgentLoop` refs verified unchanged.
 Updated: 2026-05-29 — Monitoring degradation path moved: `parseAgentJson` + degrade guard now L113–L118 (was L95–L101), `parsed: unknown` declaration now L112 (was L85).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

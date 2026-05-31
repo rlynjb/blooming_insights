@@ -5,7 +5,6 @@
 
 > An embedding is a snapshot of a document at the moment it was embedded; when the source changes, the vector is stale and retrieval returns yesterday's answer — so an index needs a freshness policy (TTL, change-detection, or a `embedding_stale_at` marker); blooming insights has no embeddings, but its 60-second TTL cache is the exact freshness/staleness mechanism, and `embedding_stale_at` ↔ cache expiry is a direct parallel.
 
-**See also:** → 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
 
 ---
 
@@ -133,7 +132,7 @@ This diagram spans the State layer (the index as a cache) and shows the direct p
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (embedding staleness).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to go stale — and notably, *live retrieval has no staleness problem at all*, which is a core reason for the no-RAG decision (`11-rag.md`): a fresh tool call always returns current data, where an embedding index would lag.
 
@@ -176,47 +175,6 @@ The first three rows are the same problem the codebase solved for `McpClient`. T
 
 ---
 
-## Tradeoffs
-
-### Live retrieval (current, no staleness) vs. TTL re-embed vs. change-detection re-embed
-
-| Dimension | Live tool call (current) | Embedding + TTL | Embedding + change-detection |
-|---|---|---|---|
-| Staleness | None — always fresh | Bounded by TTL | Near-zero (re-embed on change) |
-| Per-query cost | Live call (rate-limited) | Cheap cosine | Cheap cosine |
-| Re-embed cost | N/A | Re-embeds unchanged too | Re-embeds only changed |
-| Bookkeeping | None | `embedding_stale_at` per vector | + content hash per vector |
-| Failure handling | no-cache-on-error (exists) | needs no-poison rule | needs no-poison rule |
-| Right when | Data is a fresh live API | Source changes slowly, simplicity wins | Source changes often, cost matters |
-
-**What we gave up (by not having embeddings).** Nothing — and this is the point. Live tool retrieval has *zero* staleness because every call returns current data. An embedding index would *introduce* the staleness problem the live path does not have, which is a real argument in the no-RAG decision (`11-rag.md`): you would be adding a freshness-management burden to gain semantic search the analytics path does not need.
-
-**What the alternative would have cost.** An embedding index buys semantic retrieval at the price of a freshness policy — `embedding_stale_at`, change-detection, no-poison-on-error, and full re-index on model swap. For data that is already a fresh live API (Bloomreach analytics), that is paying a maintenance cost to make fresh data go stale.
-
-**The breakpoint.** Live-only (no staleness) is correct while every query can be answered by a fresh tool call. An embedding index — and therefore a freshness policy — becomes necessary only when a feature needs semantic retrieval over content that is *not* a live API (past investigation narratives), at which point `embedding_stale_at` and re-embedding-on-change are mandatory, modeled on the `McpClient` cache that already exists.
-
----
-
-## Tech reference (industry pairing)
-
-### TTL / freshness marker on vectors
-
-- **Codebase uses:** the analog — `expiresAt` (`lib/mcp/client.ts` L65) + read check (L40) on tool-result cache entries; no vectors.
-- **Why it's here (absent for vectors):** there is no embedding index; the live tool call is always fresh.
-- **Leading today:** content-hash change-detection plus event-driven re-embed leads index freshness (2026).
-- **Why it leads:** re-embeds only genuinely changed documents — minimal cost, near-zero staleness.
-- **Runner-up:** plain TTL re-embed — simpler, bounds staleness to a window, re-embeds the unchanged.
-
-### no-poison-on-error for re-embedding
-
-- **Codebase uses:** the analog — no-cache-on-error (`lib/mcp/client.ts` L58–L60); not for vectors.
-- **Why it's here (absent for vectors):** no re-embed step exists to fail.
-- **Leading today:** keep-last-good-on-failure is standard for derived-value caches and indexes (2026).
-- **Why it leads:** a failed recompute must never replace a good value with a bad/empty one.
-- **Runner-up:** retry-with-backoff on the re-embed call before giving up (the `McpClient` retry pattern applied to embeds).
-
----
-
 ## Project exercises
 
 ### Add an `embedding_stale_at` freshness policy modeled on the TTL cache
@@ -236,19 +194,6 @@ The first three rows are the same problem the codebase solved for `McpClient`. T
 - **Files to touch:** `lib/state/embedding-index.ts` (model-version tag + bulk invalidation), `lib/mcp/embeddings.ts`, `test/state/embedding-index.test.ts`.
 - **Done when:** changing the configured embedding model forces a full re-embed and queries never mix old-model and new-model vectors.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-An embedding is a cached snapshot of a document's meaning at embed-time, so it goes stale exactly like any cache when its source changes — but nothing expires it automatically, so a changed document silently returns its old vector forever, producing a confidently wrong answer with no error. blooming insights has no embeddings, but it has already solved this problem for tool results: `McpClient`'s 60-second `expiresAt` TTL and no-cache-on-error rule are the precise freshness mechanism, and `embedding_stale_at` ↔ `expiresAt` is a direct parallel. Live tool retrieval has *zero* staleness, which is itself an argument in the no-RAG decision — an embedding index would introduce the freshness burden the live path does not have.
-
-**Key points:**
-- An embedding index is a cache of derived values; it inherits cache invalidation, the hard problem.
-- `embedding_stale_at` is the literal analog of `McpClient`'s `expiresAt` (`lib/mcp/client.ts` L65).
-- Staleness is silent — cosine returns a number, retrieval succeeds, the answer is just wrong.
-- A model swap invalidates the *entire* index at once; cross-model cosines are meaningless.
-- Live retrieval has no staleness — adding embeddings adds the freshness burden the live path avoids.
 
 ---
 
@@ -321,3 +266,8 @@ A colleague says "embeddings don't go stale, they're just math." Argue why an em
 ### Quick check — code reference test
 
 What freshness/staleness mechanism does blooming insights already implement, and what is the embedding analog of `expiresAt`? (Answer: the 60-second TTL cache in `McpClient` — `expiresAt = Date.now() + 60_000` written at `lib/mcp/client.ts` L65, checked at L40, with error results never cached at L58–L60; the embedding analog of `expiresAt` is `embedding_stale_at`, and no-cache-on-error is the analog of keeping the last-good vector on a failed re-embed.)
+
+## See also
+
+→ 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

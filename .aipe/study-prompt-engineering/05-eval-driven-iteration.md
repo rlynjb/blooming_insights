@@ -5,7 +5,6 @@
 
 > The senior-vs-junior line in prompt work is this: a junior edits a prompt, eyeballs one output, and ships; a senior runs the edited prompt against a fixed set of labeled cases and ships only if the score holds AND no critical case regressed. blooming insights has no golden set and no harness — but its prompts are visibly iterated-by-incident: the "CRITICAL: verify your windows actually contain data" and "Never report a change derived from an empty window" blocks are regression fixes encoded as prose, an informal regression suite with no runner behind it.
 
-**See also:** → 02-structured-outputs.md · → 03-prompts-as-code.md · → 10-self-critique.md · → 13-forbidden-patterns.md
 
 ---
 
@@ -200,7 +199,7 @@ A reader who sees only this should grasp: the dataset is fixed and growing, the 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** There is no eval set, no eval runner, and no LLM-judge anywhere in blooming insights; the 169 Vitest tests under `test/` are unit tests that inject fake Anthropic/MCP clients and assert output *shape* (e.g. `test/agents/diagnostic.test.ts` checks that a fenced-JSON fake yields a typed `Diagnosis` and that garbage falls to `FALLBACK`) — they never score answer quality, so a hallucinated-but-well-formed output passes all of them.
 
@@ -245,55 +244,6 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ---
 
-## Tradeoffs
-
-### Eval harness vs. iterate-by-vibes (current state)
-
-| Dimension | This codebase (no harness, iterate by memory) | Eval harness over a golden set |
-|---|---|---|
-| Catches silent regressions | No — relies on the editor remembering every edge case | Yes — per-case diff surfaces them |
-| Cost per prompt edit | Near zero (run one case by hand) | Real (50 model calls + judge calls) |
-| Confidence to change a prompt | Low — every edit is a gamble on memory | High — gated on a number |
-| Onboarding a new editor | Dangerous — the edge cases live in one head | Safe — the dataset IS the institutional memory |
-| Survives a model upgrade | Blind — no way to compare old vs new | Re-run and diff |
-| Time to first signal | Immediate | Days to build the set + runner |
-
-**What we gave up.** A safety net. Today a prompt edit is gated only by whether the editor remembers the empty-window case, the < 500-events case, the historical-data case, and the `customers matching` case — all four of which are real, all four currently enforced only by prose in the prompt and recall in the head. The first edit that forgets one ships a regression invisibly.
-
-**What the alternative would have cost.** Building the dataset (the expensive, irreplaceable part), wiring a runner that uses the real `DiagnosticAgent`/`QueryAgent` path with a deterministic injected `McpCaller`, and the per-edit cost of 50-ish real model calls plus judge calls. For a four-prompt system iterated by one person, that is real upfront work — which is exactly why it has not been built, and exactly why it becomes mandatory the moment a second person edits the prompts or the prompts change weekly.
-
-**The breakpoint.** Iterate-by-vibes survives while one person owns all four prompts and remembers every CRITICAL block. It breaks the first time (a) a second engineer edits a prompt, or (b) a model upgrade silently changes behavior on an edge case, or (c) the team ships a prompt edit that regresses the historical-data path and a merchant reports a confidently-wrong briefing. Any one of those events is the signal to build `evals/`.
-
----
-
-## Tech reference (industry pairing)
-
-### the eval dataset (golden set / regression set)
-
-- **Codebase uses:** nothing formal; the de-facto cases live as prose in `monitoring.md` (L23, L31–37), `diagnostic.md` (L33, L38–50), `recommendation.md` (L64).
-- **Why it's here:** each CRITICAL/Never/Do-NOT block is a real production miss someone fixed once; the prompt is where the fix was written down for lack of a dataset.
-- **Leading today:** a versioned dataset of input→grader cases checked into the repo (2026), the practice Hamel Husain advocates — read your outputs, label them, accrete cases.
-- **Why it leads:** the dataset is the only artifact that lets you change a prompt without gambling on memory; it outlives prompts and survives model upgrades.
-- **Runner-up:** trace-derived datasets — harvesting real production transcripts into eval cases (the richest source, but needs scrubbing and labeling).
-
-### the eval runner
-
-- **Codebase uses:** nothing; would reuse the injection seam in `lib/agents/base.ts` (L48–L62) that the 169 unit tests already use to pass fakes.
-- **Why it's here:** the seam exists because the unit tests need it; an eval runner is the same seam with a real model and deterministic tool results instead of a fake model.
-- **Leading today:** lightweight in-repo runners and frameworks like promptfoo / OpenAI Evals / Inspect (2026) that run a dataset through a real call path and produce a per-case results table.
-- **Why it leads:** running the REAL prompt+model+parser path is the only way the score reflects production; a mocked path measures fiction.
-- **Runner-up:** notebook-driven ad-hoc evals — fast to start, hard to keep green or to gate CI on.
-
-### LLM-as-judge (scorer for prose)
-
-- **Codebase uses:** nothing; the query agent's prose output (`query.md` L49) has no field to assert on, so it is the natural place a judge would be added.
-- **Why it's here:** structured outputs score with field assertions, but free prose needs a rubric-based grader.
-- **Leading today:** LLM-as-judge with a rubric, validated against human labels before trust (2026) — Hamel's required step.
-- **Why it leads:** it is the only scalable scorer for open-ended text; the validation-against-humans step is what separates it from vibes.
-- **Runner-up:** reference-based metrics (exact match, ROUGE/BLEU, embedding similarity) — cheap and deterministic, but weak for analytical prose where many phrasings are equally correct.
-
----
-
 ## Project exercises
 
 ### Build a golden set + runner under `evals/`
@@ -313,20 +263,6 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 - **Files to touch:** new `evals/judge.ts`, new `evals/cases/query/*.json` (with human labels), `evals/run.ts` (wire the judge for query cases).
 - **Done when:** the judge scores a held-out set of query answers, and you report its agreement rate with your 15 hand labels before any score from it is used to gate a prompt change.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Eval-driven iteration replaces "I changed the prompt and the one output looked fine" with "I changed the prompt and the score on a fixed dataset held while no critical case regressed." The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the raw material (its CRITICAL/Never/Do-NOT blocks are regression fixes written as prose) and the wiring (the `runAgentLoop` injection seam used by 169 unit tests) but no harness, so it iterates by memory. The killer failure mode it is exposed to is a "better" prompt that lifts the average while regressing an untracked edge case — which is why the gate is two conditions, not one.
-
-**Key points:**
-- The 169 Vitest tests check output *shape* with injected fakes; they are not evals — a hallucinated-but-well-formed answer passes all of them.
-- The prompts' CRITICAL/Never/Do-NOT blocks (`monitoring.md` L29/L31–37, `diagnostic.md` L35/L38–50) are an informal regression suite living in prose with no runner.
-- The dataset is the expensive, irreplaceable asset; the prompt is cheap and disposable (Hamel Husain).
-- The eval gate is two conditions: aggregate improved AND no critical case regressed — averages alone ship silent regressions.
-- LLM-as-judge is necessary for prose but worthless until validated against human labels.
-- The buildable target is `evals/` reusing the existing injection seam: a 20–50 case golden set + runner over the real agent path.
 
 ---
 
@@ -402,6 +338,11 @@ A reviewer says: "We have 169 green tests, we don't need evals." State the disti
 
 Which seam in `lib/agents/base.ts` would an eval runner reuse to feed deterministic tool results to the real agent, and how does its use differ from the unit tests'? (Answer: the injected `anthropic` client and `McpCaller` parameters of `runAgentLoop` — `lib/agents/base.ts` L48–L62, interface L16–L22. Unit tests inject a fake model AND a fake MCP; an eval runner keeps the REAL Anthropic client for real model behavior but injects a deterministic `McpCaller` that replays the case's canned results.)
 
+## See also
+
+→ 02-structured-outputs.md · → 03-prompts-as-code.md · → 10-self-critique.md · → 13-forbidden-patterns.md
+
 ---
 Updated: 2026-05-29 — Updated the Vitest test count from 125 to 169 across all 11 body references (the suite grew this session).
 Updated: 2026-05-29 — Resynced stale prompt-line refs (the {categories} shift + earlier prompt revisions): monitoring.md CRITICAL block L25–31→L31–37, small-baseline caution L23→L29; diagnostic.md historical-data block L36–42→L38–50, "customers matching" ban L33→L35; recommendation.md id-ban L64→L82; query.md prose L36→L49.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

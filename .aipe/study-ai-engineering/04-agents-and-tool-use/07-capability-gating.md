@@ -5,7 +5,6 @@
 
 > Before the monitoring agent runs, blooming insights classifies a fixed 10-category anomaly checklist against the live workspace schema and hands the agent only the categories the data can actually support — so a rate-limited agent never spends a query on data the workspace doesn't emit, and the UI shows honest "no data source" tiles for the rest.
 
-**See also:** → 04-tool-routing.md · → 01-agents-vs-chains.md · → ../06-production-serving/02-llm-cost-optimization.md · → ../06-production-serving/04-rate-limiting-backpressure.md · → ../../study-system-design-dsa/01-system-design/08-schema-gated-coverage.md · → ../../study-system-design-dsa/02-dsa/07-coverage-gate.md
 
 ---
 
@@ -145,7 +144,7 @@ A reader who sees only this diagram should grasp: one cheap schema classificatio
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -217,55 +216,6 @@ The gate matches dependencies by **exact string**. `requires: ['purchase']` test
 
 ---
 
-## Tradeoffs
-
-### Comparison: gate-then-scan vs alternatives
-
-| Dimension | Gate-then-scan (this codebase) | Run all, discard empties | Ask the agent to self-select |
-|---|---|---|---|
-| Budget on unsupported categories | None — filtered before run | Full — every category queried | Variable — agent may still try |
-| Cost of the check | One in-memory `Set` pass | Zero up front, wasted calls later | A reasoning turn spent deciding |
-| Adapts to a varying schema | Yes — gate reads the live schema | Yes, but after paying | Yes, but unreliably |
-| UI honesty about gaps | Explicit ghost tiles + note | Gaps look like "no result" | No first-class verdict |
-| Reliability | Deterministic | Deterministic but wasteful | Probabilistic (model may misjudge) |
-| Failure mode | Misnamed event → ghost (visible) | Misnamed event → silent empty | Model hallucinates availability |
-
-**What we gave up.** Adaptivity to needs the registry doesn't capture. The `requires`/`enriches` lists are static and hand-authored, so a category whose real data dependency isn't declared can be mis-gated, and an exact-name mismatch reads as "unavailable." We accept this because the workspace schema and the registry are both controlled, and a deterministic, debuggable gate beats a flexible-but-fuzzy one for a budget-protection mechanism.
-
-**What the alternative would have cost.** Running all ten categories and discarding the empties is simpler to wire — no gate — but spends scarce ~1 req/s calls on guaranteed-empty queries, and under the 300-second ceiling those wasted calls can be the difference between finishing and timing out. Asking the agent to self-select which categories to run spends a reasoning turn on a decision a `Set.has` answers, and trusts the model to judge availability it can't actually see until it queries.
-
-**The breakpoint.** Gate-then-scan is right while the schema check is cheap relative to the work it guards and the registry is small enough to hand-author. It needs reworking when the registry grows large (hundreds of categories recomputed per request → cache the report), when exact-name matching's miss rate on real schemas climbs (→ add a normalization layer), or when "runnable" needs to become a ranking under budget rather than a binary include/exclude (→ weighted gating).
-
----
-
-## Tech reference (industry pairing)
-
-### Schema-driven capability gating
-
-- **Codebase uses:** `lib/agents/categories.ts` (`schemaCapabilities` → `coverageFor` → `runnableCategories`), run in `app/api/briefing/route.ts` L202–L204 to scope `agent.scan` and drive the coverage grid.
-- **Why it's here:** Workspaces have varying schemas and the MCP budget is scarce; running only the supported categories beats wasting rate-limited calls on absent data.
-- **Leading today:** Capability detection + graceful degradation is the adoption-leading pattern in 2026 for agents over heterogeneous data sources — detect what the environment supports, then scope the work.
-- **Why it leads:** Deterministic, cheap, and it produces the UI's availability state for free.
-- **Runner-up:** Letting the agent self-select via a planning turn — more flexible, but spends a model call on a decision a membership test answers and trusts the model to judge availability it can't observe.
-
-### JavaScript Set (the capability store)
-
-- **Codebase uses:** native `Set<string>` built by `schemaCapabilities`; tested with `set.has(dep)` inside `coverageFor` (`categories.ts` L116–L136).
-- **Why it's here:** O(1) membership turns a nested, variable schema into one structure the gate can query thirty times for free.
-- **Leading today:** Native `Set` is the adoption-leading membership structure for this in JS/TS — no dependency, exact-match.
-- **Why it leads:** Zero overhead, intent-revealing (`has`, not key→value).
-- **Runner-up:** A trie or normalized lookup if fuzzy/prefix matching becomes necessary — more setup, only worth it once exact-match misses real schemas.
-
-### Anthropic "Building effective agents" — the routing/gating instinct
-
-- **Codebase uses:** the gate as a deterministic pre-step that narrows the agent's task before the loop, alongside `04-tool-routing.md`'s tool-subset and intent routers.
-- **Why it's here:** narrowing the decision space before the model acts is cheaper and more reliable than prompting the model to narrow itself.
-- **Leading today:** "constrain the agent's surface by construction" is adoption-leading guidance for production agents in 2026.
-- **Why it leads:** removes whole classes of wrong/wasteful actions structurally rather than hoping the prompt discourages them.
-- **Runner-up:** prompt-only scoping ("only check categories with data") — relies on instruction-following the model can't fulfill, since it can't see the schema until it queries.
-
----
-
 ## Project exercises
 
 ### Cache the coverage report instead of recomputing per request
@@ -285,19 +235,6 @@ The gate matches dependencies by **exact string**. `requires: ['purchase']` test
 - **Files to touch:** `lib/agents/categories.ts` (`schemaCapabilities` + `coverageFor`); `test/agents/categories.test.ts` (a fixture workspace with a pluralized/cased event name that should still resolve to `full`).
 - **Done when:** A workspace whose event is named `Purchases` classifies the `purchase`-dependent categories as `full`/`limited`, not `unavailable`, and the existing exact-match tests still pass.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights gates the monitoring agent's work against the live workspace schema before the agent spends any budget. `schemaCapabilities` (`categories.ts` L116) flattens the schema into a capability `Set`; `coverageFor` (L131) classifies each of the ten `CATEGORIES` as full/limited/unavailable by testing its `requires`/`enriches` deps; `coverageReport` (L144) returns the full verdict and `runnableCategories` (L158) the runnable subset. The briefing route runs this after schema bootstrap (L202–L204), streams the verdict to the coverage grid, and hands only the runnable categories to `agent.scan` (L223), which builds them into the prompt as a checklist (`monitoring.ts` L69–L86). The agent never queries a category the schema can't support; the UI shows honest ghost tiles for the rest.
-
-Key points:
-- Scope before spend: a free in-memory schema check runs before the rate-limited agent, so every spent call is on a category that can produce a result.
-- One computation, two consumers: `coverageReport` is both the agent's scope (via `runnableCategories`) and the grid's data.
-- Three verdicts map to three tile states; unsupported categories are shown as ghosts, never faked or silently dropped.
-- The gate is upstream of `runAgentLoop` — it changes *what* the agent is asked to check, not *how* the loop runs (distinct from `04-tool-routing.md`'s by-role tool narrowing).
-- Brittle edges: exact-string dep matching (no alias layer) and static hand-authored `requires` lists; membership proves *declared*, not *populated* (the agent's volume check is the separate later guard).
 
 ---
 
@@ -374,5 +311,10 @@ A reviewer says: "Delete the gate — just run all ten categories and ignore the
 
 What two outputs does the gate produce from a single `coverageReport`, and who consumes each? (Answer: `runnableCategories` → the monitoring agent's checklist via `agent.scan` at `briefing/route.ts` L223; the full `coverageReport` → the `CoverageGrid` via per-category `coverage_item` events at L209–L212. One computation, two consumers.)
 
+## See also
+
+→ 04-tool-routing.md · → 01-agents-vs-chains.md · → ../06-production-serving/02-llm-cost-optimization.md · → ../06-production-serving/04-rate-limiting-backpressure.md · → ../../study-system-design-dsa/01-system-design/08-schema-gated-coverage.md · → ../../study-system-design-dsa/02-dsa/07-coverage-gate.md
+
 ---
 Updated: 2026-05-29 — created (the anomaly-coverage schema gate: scope the monitoring agent's category checklist against the live schema before spending the rate-limited budget)
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

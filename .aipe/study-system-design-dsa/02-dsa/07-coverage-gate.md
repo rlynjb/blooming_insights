@@ -5,7 +5,6 @@
 
 > Classify each item in a fixed registry as fully / partially / not supported by testing its declared dependencies for membership in a set of capabilities derived from the live schema.
 
-**See also:** → ../01-system-design/08-schema-gated-coverage.md · → 05-severity-sort.md
 
 ---
 
@@ -176,7 +175,7 @@ The set is the pivot: it collapses a nested, variable schema into a flat structu
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/agents/categories.ts`
 **Function / class:** `schemaCapabilities`, `coverageFor`, `missingFor`, `coverageReport`, `runnableCategories` (over the `CATEGORIES` registry / `AnomalyCategory` interface)
@@ -271,65 +270,6 @@ The two-tier dependency split (`requires` vs `enriches`) is the second idea: not
 
 ---
 
-## Tradeoffs
-
-| Dimension | Flatten-to-Set gate (this) | Re-traverse schema per dep | Hard-coded category list |
-|---|---|---|---|
-| Set build | O(events + props + catalogs), once | none | none |
-| Per-category test | O(deps) `has()` lookups | O(deps × schema) nested search | O(1) — but wrong when schema varies |
-| Total for 10 categories | O(schema) + O(Σ deps) | O(10 × deps × schema) | O(1) |
-| Correctness across workspaces | adapts to live schema | adapts (slower) | breaks on any workspace missing a field |
-| Three-valued output | yes (full/limited/unavailable) | possible | no |
-| Memory | O(capability tokens) | O(1) | O(1) |
-| Coupling | exact string tokens | exact string tokens | none (but unsafe) |
-
-**What was given up.** The set costs memory proportional to the schema's surface (every event + every property + every catalog becomes a string). For a workspace with hundreds of properties that's a few hundred short strings — negligible here, but it is not free, and it is rebuilt every briefing rather than cached.
-
-**Alternative cost.** Re-traversing the nested schema for each dependency avoids the set allocation but multiplies the per-category cost by the schema size, and you write the nested-search logic by hand for three shapes (event, event.property, catalog) instead of one `has()`. A hard-coded category list is O(1) and zero-allocation but is simply incorrect the moment a workspace's schema differs from the one you coded against — which is the entire reason the gate exists.
-
-**Breakpoint.** Flatten-to-Set is right while the registry and schema are small and the classification runs per request. It needs a reverse index or caching when either the registry grows large (hundreds of categories) or the same schema is gated repeatedly within one request, at which point rebuilding the set each time becomes the waste the gate was meant to avoid.
-
----
-
-## Tech reference (industry pairing)
-
-### JavaScript Set (membership store)
-
-- **Role:** the flattened capability store; O(1) average `has`/`add`; the single structure the whole gate tests against.
-- **Leader:** native `Set` — no dependency, exact-match membership, used directly in `schemaCapabilities`.
-- **Runner-up:** a plain object used as a map (`{[token]: true}`) — works, but `Set` states the intent (membership, not key→value) and has cleaner `has`.
-- **Key API surface:** `set.add(token)`, `set.has(token)`, spread `[...set]`.
-- **What it does not do:** no fuzzy / prefix matching, no aliasing — exact string equality only; the dependency tokens must match the schema's naming exactly.
-
-### Array.prototype.every (the gate predicate)
-
-- **Role:** the all-deps-present test; short-circuits on the first absent dep, which makes `requires.every(has)` the hard gate.
-- **Leader:** native `every` — built-in, short-circuiting, reads as the spec ("every required dep is available").
-- **Runner-up:** `requires.filter(d => !has(d)).length === 0` — equivalent result but builds an intermediate array and does not short-circuit; `missingFor` uses exactly this `filter` form precisely *because* it wants the full list of absentees, not a boolean.
-- **Contrast:** `every` answers "are all present?" (boolean, short-circuit); `filter` answers "which are absent?" (list, full scan) — the gate uses the first, the ghost-tile copy uses the second.
-
-### feature detection / capability gating (the pattern)
-
-- **Role:** decide at runtime what a variable backend supports rather than assuming; degrade instead of erroring.
-- **Leader:** runtime feature detection (`'IntersectionObserver' in window`, `caniuse`-driven progressive enhancement) — the front-end form of the same idea.
-- **Runner-up:** dependency/constraint resolution (a package manager checking `required ⊆ installed`) — the same `subset?` test over version ranges.
-- **Industry use:** GraphQL introspection gating UI to the fields a schema actually exposes is structurally identical — flatten the schema's capabilities, test each feature's needs against it.
-
----
-
-## Summary
-
-`lib/agents/categories.ts` gates a fixed 10-category registry against a live workspace schema. `schemaCapabilities` flattens the schema once into a `Set<string>` of event names, `event.property` tokens, and `catalog:<name>` tokens. `coverageFor` then classifies each category by membership: missing any hard `requires` dep → `unavailable`; hard deps present but a soft `enriches` dep missing → `limited`; all present → `full`. `coverageReport` maps this (plus `missingFor`, the absent-deps list) over all 10 categories in registry order for the UI grid, and `runnableCategories` filters to the non-`unavailable` subset handed to the monitoring agent. The classification is pure, network-free, and short-circuiting.
-
-- Flatten once, test many: one O(schema) pass turns nested schema into O(1) `has()` lookups.
-- Two-tier deps map to three states: `requires` gate existence (unavailable), `enriches` gate quality (limited).
-- `every` short-circuits and gives the boolean gate; `filter` (in `missingFor`) gives the absent-deps list for ghost-tile copy.
-- Registry order is preserved so the grid is stable across briefings.
-- Membership proves a field is *declared*, not *populated* — the agent's volume check is a separate later guard.
-- Matching is exact-string: a naming mismatch reads as missing data, with no aliasing.
-
----
-
 ## Interview defense
 
 **What they are really asking.** Whether you reach for a set to turn a repeated nested lookup into O(1), whether you understand why the dependency split is two-tier, and whether you know the gap between "declared" and "populated."
@@ -411,3 +351,8 @@ Your teammate says: "Drop `enriches` — just have `requires`, and a category is
 - Which function uses `every` and which uses `filter`, and why the difference?
 - Does a `full` classification guarantee the category will fire an anomaly? Why or why not?
 - What does `runnableCategories` exclude, and which consumer receives its output?
+
+## See also
+
+→ ../01-system-design/08-schema-gated-coverage.md · → 05-severity-sort.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

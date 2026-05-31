@@ -5,7 +5,6 @@
 
 > Once you have an eval set, you need a way to turn an output into a score; the methods form a ladder from cheap-and-strict (exact-match) to expensive-and-nuanced (human review), and the right rung depends on the surface — blooming insights' anomaly classification fits exact-match/F1, its diagnosis and recommendation prose fit rubric or LLM-as-judge.
 
-**See also:** → 01-eval-set-types.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../01-llm-foundations/07-heuristic-before-llm.md
 
 ---
 
@@ -196,7 +195,7 @@ One harness, many methods. The cheap rungs stay local and free; only diagnosis/r
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights has no eval harness and no scoring code — there is no `evals/runner.ts`, no exact-match scorer, no F1 computation over monitoring output, no rubric, and no LLM-as-judge. The closest existing code is *shape* validation (`lib/mcp/validate.ts` L17–L53), which is a pass/fail on structure, not a quality score.
 
@@ -243,55 +242,6 @@ The method tracks the *entropy* of the correct-answer space. A single enum has n
 
 ---
 
-## Tradeoffs
-
-### Climbing the ladder per surface vs. one method for everything
-
-| Dimension | Method-per-surface (this guide) | Exact-match everything | LLM-judge everything |
-|---|---|---|---|
-| Cost per run | Mostly free (lower rungs), judge only for nuance | Free | A model call per case |
-| Latency | Low | Lowest | High (a judge call each) |
-| False failures on prose | None — prose uses rubric/judge | Constant — wording shifts fail | None |
-| Wasted compute on labels | None — labels use exact-match | None | High — judging an enum |
-| Bias introduced | Only on judged surfaces | None | Everywhere, even on labels |
-| Sensitivity to real regressions | High — right tool per surface | Low on prose (always fails) | High but noisy/biased |
-
-**What we gave up (by not having any of this).** Today there is no scoring at all, so there is no method to choose — but the latent cost is that whoever builds evals first will be tempted to pick one method for everything. Exact-match-everything is the seductive wrong choice (it is free and deterministic) and it makes diagnosis evals useless; LLM-judge-everything is the other wrong choice (it feels rigorous) and it burns money judging enums while importing bias.
-
-**What the alternative would have cost.** A single-method harness is cheaper to build and a maintenance trap: the day you add a prose surface to an exact-match harness, your eval starts lying (false failures), and the day you add a label surface to a judge harness, you pay model calls to grade `===`. The per-surface dispatch costs a little routing code up front and is correct at every surface.
-
-**The breakpoint.** A single method (exact-match) is defensible *only* while the only thing being evaluated is classification — intent and severity. The instant you eval diagnosis or recommendation prose, you must climb to rubric/judge, because exact-match on prose produces false failures that train the team to ignore the score. Conversely, the instant a judge is added, severity-weighting and human calibration become mandatory or the number is decorative.
-
----
-
-## Tech reference (industry pairing)
-
-### exact-match / classification metrics
-
-- **Codebase uses:** nothing for evals — `classifyIntent` (`lib/agents/intent.ts` L17–L31) and `Severity` (`lib/mcp/types.ts` L3) produce exact-match-scoreable enums, but no scorer exists.
-- **Why it's here (absent):** classification surfaces exist; no harness scores them.
-- **Leading today:** scikit-learn-style accuracy / precision / recall / F1 are the standard classification metrics (2026).
-- **Why it leads:** deterministic, free, universally understood; the only correct method for label output.
-- **Runner-up:** confusion-matrix reporting — same data, more diagnostic detail on *which* labels confuse.
-
-### rubric grading
-
-- **Codebase uses:** nothing — `Diagnosis` (`lib/mcp/types.ts` L64–L73) is rubric-shaped but ungraded.
-- **Why it's here (absent):** structured prose output exists with no quality decomposition.
-- **Leading today:** explicit weighted criteria checklists, partly code-checkable, are the standard for structured-prose eval (2026).
-- **Why it leads:** forces you to define "good" as concrete sub-questions; more objective and debuggable than a holistic score.
-- **Runner-up:** holistic single-score rubrics — faster to write, less diagnostic when they fail.
-
-### LLM-as-judge / pairwise
-
-- **Codebase uses:** nothing — no judge model is wired for evaluation.
-- **Why it's here (absent):** subjective surfaces (recommendation quality) exist with no nuanced scorer.
-- **Leading today:** LLM-as-judge (absolute, e.g. G-Eval) and pairwise preference (Chatbot-Arena-style) are the standard for free-form prose and A/B (2026).
-- **Why it leads:** approximates human preference at a fraction of the cost; pairwise is robust to scale drift.
-- **Runner-up:** reward models / fine-tuned scorers — more consistent, far more setup.
-
----
-
 ## Project exercises
 
 ### Build `evals/runner.ts` pointable at the live agents
@@ -311,19 +261,6 @@ The method tracks the *entropy* of the correct-answer space. A single enum has n
 - **Files to touch:** `evals/runner.ts` (compare mode), `evals/scorers/pairwise.ts`, reads two variants of `lib/agents/prompts/diagnostic.md`.
 - **Done when:** running compare mode over the golden set prints a win-rate for v2 over v1 with order randomized per case.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-Once you have an eval set, you score it with a method matched to the output's variability: exact-match for a label, fuzzy/F1 for a set, a rubric for structured prose, an LLM-judge for nuance, pairwise for comparisons, human for ground truth. The methods form a ladder from cheap-and-strict to expensive-and-nuanced, and you climb only as high as the output forces you to — the same discipline as picking `toBe` over `toMatch`. In blooming insights, `classifyIntent` and anomaly severity are exact-match, `MonitoringAgent.scan`'s array output is F1, and `DiagnosticAgent`/`RecommendationAgent` prose is rubric-then-judge. None of this exists yet; it lives in a new `evals/runner.ts` plus per-method scorers.
-
-**Key points:**
-- Method choice tracks output entropy: low entropy → exact-match, high entropy → rubric/judge.
-- Exact-match on prose produces false failures; LLM-judge on labels wastes money and adds bias.
-- F1 hides which errors you made — report precision and recall separately, weight by severity.
-- Pairwise (relative) is more reliable than absolute scoring for A/B decisions.
-- Human review authors the references and calibrates the cheaper methods; it is not the per-run scorer.
 
 ---
 
@@ -396,5 +333,10 @@ A colleague proposes one LLM-as-judge scorer for every surface "so the harness i
 
 What does `classifyIntent` (`lib/agents/intent.ts` L17–L31) return, and which scoring method fits it and why? (Answer: one of three enum words — it caps `max_tokens` at 16 to force a single-word answer — so exact-match (`===`) is the correct method: the output space is a single label with zero correct variation, so no tolerance is needed and a judge would only add cost and bias.)
 
+## See also
+
+→ 01-eval-set-types.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../01-llm-foundations/07-heuristic-before-llm.md
+
 ---
 Updated: 2026-05-28 — Test count 125→157; re-derived `MonitoringAgent.scan` (monitoring.ts L68–L103) and `Diagnosis` (types.ts L64–L73) refs. `classifyIntent` (intent.ts L17–L31), `propose` (recommendation.ts L36–L77), and Severity (types.ts L3) unchanged. Still Case B.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

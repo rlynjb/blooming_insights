@@ -5,7 +5,6 @@
 
 > Two models for how agents communicate — a shared blackboard everyone reads/writes, or typed messages handed agent-to-agent. blooming insights firmly uses MESSAGE PASSING: the typed `Diagnosis` is handed step→step (function arg or `sessionStorage`), and each agent's context is scoped to what it's handed. Scoped context = cheaper and less noise, but you must decide what to pass.
 
-**See also:** → `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md`
 
 ---
 
@@ -362,7 +361,7 @@ Shared state vs message passing — full picture
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — blooming insights firmly uses message passing.**
 
@@ -469,105 +468,6 @@ It also breaks when the agents genuinely benefit from inspecting each other's *p
 - `./07-graph-orchestration.md` → state graphs typically use shared state (with curated schemas)
 - `./09-coordination-failure-modes.md` → "context bloat" is the failure mode this avoids
 - `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` → the cross-request carrier (`sessionStorage` + URL param) from a system-design perspective
-
----
-
-## Tradeoffs
-
-The decision was: **message passing with a typed Diagnosis as the inter-agent message.** The alternative is a shared workspace state.
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Message passing (chosen)    │ Shared state (alternative)  │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Build cost       │ schema design (Diagnosis    │ state schema + reducer       │
-│                  │ type) + carrier (route +    │ functions or a graph engine  │
-│                  │ sessionStorage)             │                              │
-│ Context window   │ small (each agent sees only │ grows with the run — every   │
-│ per agent        │ what's handed)              │ agent's window includes the  │
-│                  │                             │ whole shared state           │
-│ Token cost / run │ low — focused contexts      │ higher — every turn carries  │
-│                  │                             │ everyone else's prior work   │
-│ Type safety      │ TypeScript checks every     │ depends on the state schema's│
-│                  │ call site of the message    │ enforcement; weaker without  │
-│                  │                             │ a graph runtime              │
-│ Debug shape      │ stage-localized — agent's   │ have to figure out which     │
-│                  │ scratchpad stays in its loop│ writer left which content    │
-│ Failure blast    │ a bad message is caught at  │ a bad write poisons every    │
-│ radius           │ parseDiagnosis (trust       │ reader silently              │
-│                  │ boundary)                   │                              │
-│ Onboarding       │ engineer reads the schema   │ engineer reads the state     │
-│                  │ to know the contract        │ schema + every reader/writer │
-│ Schema migration │ visible PR (TypeScript flags│ ad-hoc field additions easy  │
-│ cost             │ every call site)            │ to hide                      │
-│ Cross-request    │ trivial — serialize the     │ requires server-side state   │
-│ handoff          │ typed message               │ store                        │
-│ Stops being      │ when schema growth          │ stops being right when       │
-│ right when…      │ outpaces the agents' needs  │ context bloat starts hurting │
-│                  │ and you're adding fields    │ tool selection and reasoning │
-│                  │ every PR                    │                              │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up free-form access to other agents' context. The recommendation agent can't ask "what intermediate hypothesis did the diagnostic agent consider but reject?" unless that information is in `Diagnosis.hypothesesConsidered[]`. Today it is; the schema was designed knowing the recommendation agent would want it. But this required up-front schema design — we had to think about what the recommendation agent needs before we wrote the schema.
-
-We also gave up the ability to add fields ad-hoc. Every new field in `Diagnosis` is a visible PR with TypeScript fan-out — every place that constructs or reads the diagnosis has to acknowledge the change. That's a feature (no silent context drift) and a friction (you can't quickly add "this one extra field" without a real change).
-
-### What the alternative would have cost
-
-If we'd used a shared workspace state, the up-front cost would have been a `WorkspaceState` type with all the per-agent fields, plus reducer-style update functions for each agent to write to it (or a graph engine's state schema). Per-run cost: each agent's context window would carry more of the run's history — the recommendation agent would see the diagnostic agent's full `messages[]` (~30k tokens of tool calls and reasoning), not just the curated `Diagnosis` (~1-2k tokens). At Anthropic's pricing (Sonnet ~$3/MTok input), that's roughly 10x more tokens for recommendation's prompt — meaningful at scale.
-
-The hidden cost: debugging. With message passing, "the recommendation went wrong" is investigated by reading the `Diagnosis` and the recommendation agent's loop trajectory — two places. With shared state, "the recommendation went wrong" is investigated by figuring out *what part of the shared state the recommendation agent latched onto* — could be any field any agent wrote. The shared-state debug surface scales with the number of fields.
-
-### The breakpoint
-
-This stays the right call until the schema grows so large that it's effectively a typed shared state — at which point you might as well adopt a graph runtime with a proper state schema and move to the "shared state with curation" model. Concrete trigger: if `Diagnosis` grows past ~15 fields, or if a third agent (e.g. a hypothetical `SummarizationAgent`) needs to read the diagnostic agent's intermediate reasoning, message passing starts to feel forced.
-
-### What wasn't actually a tradeoff
-
-Free-form text strings between agents (no schema, just prose) was not a real alternative. Prose-based handoffs lose type safety, are slow to validate at request boundaries, and make the recommendation agent's prompt brittle ("the previous agent's findings are: [paragraph]" requires the recommendation agent to re-parse what the diagnosis was). The typed `Diagnosis` is what makes `parseDiagnosis()` cheap (a JSON parse + 3 type checks) and what lets the recommendation prompt reference `diagnosis.conclusion` directly.
-
-A "single mega-prompt with all agents collapsed into one" was also not a real alternative — that's the single-agent baseline `./01-when-not-to-go-multi-agent.md` already rejected. The decomposition into agents is settled; message passing is how the agents communicate inside that decomposition.
-
----
-
-## Tech reference
-
-### TypeScript interfaces (the contract)
-
-- **Codebase uses:** `interface Diagnosis` in `lib/mcp/types.ts` L95–L104; `interface Recommendation` in `lib/mcp/types.ts` L116+.
-- **Why it's here:** the interface IS the inter-agent contract — both agents reference the same type, so a schema change forces both to update.
-- **Leading today:** TypeScript interfaces (or Zod schemas) as inter-agent contracts — adoption-leading for typed multi-agent designs in TS, 2026.
-- **Why it leads:** structural typing makes the contract enforceable at compile time; Zod adds runtime validation when the contract crosses an untrusted boundary.
-- **Runner-up:** JSON Schema + Zod — runtime-validated schemas that double as docs; preferred when the contract crosses HTTP.
-
-### sessionStorage (the cross-request carrier)
-
-- **Codebase uses:** `sessionStorage.setItem('bi:diag:<id>', JSON.stringify({ diagnosis }))` in `lib/hooks/useInvestigation.ts` L138.
-- **Why it's here:** the carrier that lets the typed message survive a user-gated cross-request handoff without server-side state infrastructure.
-- **Leading today:** `sessionStorage` for per-tab persisted state — adoption-leading for browser-scoped step state, 2026.
-- **Why it leads:** synchronous read/write, per-tab scope (multi-tab safety), cleared on tab close (no leak between sessions); zero infrastructure cost.
-- **Runner-up:** server-side session store (Redis, signed cookies) — needed when the message is too large for a URL param or has to survive a tab close.
-
-### parseDiagnosis as a trust-boundary validator
-
-- **Codebase uses:** `parseDiagnosis()` in `app/api/agent/route.ts` L86–L97 — validates that the URL-passed diagnosis has the right shape before resuming the pipeline.
-- **Why it's here:** the cross-request carrier passes the message through a URL query param (client-controlled), so the server has to validate the shape — same pattern as any client-supplied input.
-- **Leading today:** runtime schema validation at trust boundaries — adoption-leading for typed APIs, 2026.
-- **Why it leads:** the boundary between trusted (server-internal) and untrusted (client-supplied) is where type assertions must become runtime checks; structural validators are the standard.
-- **Runner-up:** Zod / valibot — more expressive schema validators with better error messages; `parseDiagnosis` is a hand-rolled minimal version for this single message.
-
----
-
-## Summary
-
-Inter-agent communication has two models: shared state (a blackboard everyone reads/writes) and message passing (typed messages handed agent-to-agent). blooming insights uses message passing: the typed `Diagnosis` (`lib/mcp/types.ts` L95–L104) is handed from diagnostic agent to recommendation agent as a function argument (in-process, `app/api/agent/route.ts` L247) or as a `sessionStorage` write + URL query param + `parseDiagnosis` validation (cross-request, `lib/hooks/useInvestigation.ts` L138 + `route.ts` L86). Each agent's context is scoped to exactly what's handed in plus its own per-stage prompt and tool subset (`lib/mcp/tools.ts`). The constraint that made this right is curated context = cheaper LLM bills + smaller windows + type-safe contracts + stage-localized debugging. The cost is up-front schema design — you have to decide what to pass. The breakpoint: when the schema grows past ~15 fields or a third agent needs another agent's intermediate reasoning, adopt a graph runtime's curated shared state instead.
-
-- blooming insights uses message passing, not shared state — the typed `Diagnosis` is the message, function args and `sessionStorage` are the carriers.
-- Each agent sees only what's handed to it; scratchpad/history/tool calls stay scoped to the agent's own loop.
-- The schema (TypeScript `interface Diagnosis` + runtime `parseDiagnosis` at the trust boundary) is the inter-agent contract.
-- Per-agent tool subsets (`lib/mcp/tools.ts`) scope capabilities too — recommendation literally cannot call analytics tools.
-- Worth it while the schema fits the agents' needs; promote to a graph runtime's state schema if `Diagnosis` grows past ~15 fields.
 
 ---
 
@@ -728,5 +628,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

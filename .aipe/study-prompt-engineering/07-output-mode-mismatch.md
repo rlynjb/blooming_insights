@@ -5,7 +5,6 @@
 
 > blooming insights runs three JSON agents and one prose agent — the query agent deliberately opts out of JSON ("No JSON shape is required", `query.md` L49) while the other three demand it. Each prompt declares its mode, the validators enforce it at the boundary, and the bug to watch for is a prompt whose declared mode doesn't match the consumer that handles its output: the `parseAgentJson`/`synthesize()` path assumes JSON, and query is the one path that must not touch it.
 
-**See also:** → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
 
 ---
 
@@ -165,7 +164,7 @@ Mode is declared per prompt and enforced per consumer; three agents share the JS
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A — implemented.**
 
@@ -229,54 +228,6 @@ A mode contract is two-ended. Declaring it only biases the producer; enforcing i
 
 ---
 
-## Tradeoffs
-
-### Per-prompt mode declaration + boundary enforcement (this codebase) vs. one uniform mode
-
-| Dimension | This codebase (mixed JSON + prose, per-agent) | Force all agents to JSON |
-|---|---|---|
-| Fit to the job | High — prose for human answers, JSON for artifacts | Low — wraps a human answer in a needless schema |
-| Mismatch surface | Real — two paths, must keep declaration↔consumer aligned | None — one mode, one consumer |
-| Enforcement | Per-mode (validate+reject vs accept+default) | Uniform validator |
-| UX for free-form Q&A | Natural prose to show the user | JSON the UI must unwrap into prose anyway |
-| Failure visibility | Silent degrade on mismatch | Uniform reject |
-
-**What we gave up.** A single uniform consumer. Mixing modes means two enforcement paths and a real (if small) mismatch surface to police — the price of letting the query agent speak prose. A JSON-everywhere system would have one consumer and no mismatch class.
-
-**What the alternative would have cost.** Wrong fit for the query agent. Forcing a free-form human answer through a JSON schema means the model emits `{ "answer": "..." }` and the UI immediately unwraps it back into prose — ceremony with no benefit, and a schema that constrains an inherently unstructured output. The prose mode exists because the query agent's *consumer is a human reader*, not a validator.
-
-**The breakpoint.** Mixed modes are right while one agent's output is genuinely for human reading (prose) and others' are for machine handoff (JSON). It stops being worth the mismatch surface only if every agent's output becomes machine-consumed — at which point one uniform JSON mode removes the prose path and the mismatch class with it. The query agent's human-facing output keeps that from being the case here.
-
----
-
-## Tech reference (industry pairing)
-
-### Per-prompt output-mode declaration
-
-- **Codebase uses:** each `## Output` declares its mode — fenced JSON (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49) or prose (`query.md` L49).
-- **Why it's here:** biasing the model toward the right format at the source, per agent, so the consumer's assumption is usually met.
-- **Leading today (2026):** explicit format declaration in the prompt is standard, increasingly paired with native structured-output modes for the JSON case.
-- **Why it leads:** declaring the mode reduces (doesn't eliminate) wrong-format output before the consumer has to reject it.
-- **Runner-up:** a system-level `response_format` / tool-call constraint that makes the JSON mode structural rather than instructed.
-
-### Boundary enforcement (validate-and-reject vs accept-and-default)
-
-- **Codebase uses:** JSON consumers reject wrong-shape output to a floor (`monitoring.ts` L91 `return []`); the prose consumer accepts any text and defaults on empty (`query.ts` L47).
-- **Why it's here:** enforcement is what turns a declared mode into a guaranteed one; the two modes need different disciplines because prose has no shape.
-- **Leading today (2026):** validate-at-the-boundary (type guards / schema validation) is standard for JSON; prose outputs increasingly get a separate quality/grounding check.
-- **Why it leads:** rejecting malformed structured output at the boundary keeps bad data out of the rest of the system.
-- **Runner-up:** a single validation layer keyed on a declared mode tag, selecting the consumer automatically.
-
-### Mode declared in `## Output` and the synthesis nudge
-
-- **Codebase uses:** the mode appears in both `## Output` and the `synthesisInstruction` (JSON: `diagnostic.ts` L62–66; prose: `query.ts` L42–44).
-- **Why it's here:** the forced-final turn appends the nudge last (→ 01-anatomy.md), so the nudge must restate the same mode or the model gets conflicting final instructions.
-- **Leading today (2026):** restating the critical format instruction at the end of the prompt is standard recency-exploiting practice.
-- **Why it leads:** the last instruction the model reads dominates; restating the mode there is robust.
-- **Runner-up:** a single mode constant interpolated into both sites so they can't drift.
-
----
-
 ## Project exercises
 
 ### Add a mode-consistency test across all four agents
@@ -296,19 +247,6 @@ A mode contract is two-ended. Declaring it only biases the producer; enforcing i
 - **Files to touch:** `lib/agents/query.ts` (L47 — add the check), `test/agents/query.test.ts`.
 - **Done when:** an empty-or-evasive prose answer triggers the explicit "unable to find data" path rather than returning a vacuous string, and a real numeric answer passes unchanged.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-blooming insights mixes output modes deliberately: three agents declare fenced JSON (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49) consumed by `parseAgentJson` + a type guard that rejects wrong-shape output to a safe floor, and the query agent declares prose ("No JSON shape is required — just the answer text", `query.md` L49) consumed by `finalText.trim()` (`query.ts` L47) with no parsing at all. The mode is a two-ended contract: the prompt declares it (in both `## Output` and the synthesis nudge), the consumer enforces it, and the two ends must agree. A mismatch never throws — feed prose to the JSON consumer and it floors to `[]`; feed JSON to the prose consumer and the user sees raw JSON — so you catch it in review by reading the declared mode, the synthesis nudge, and the consumer side by side, not by waiting for an exception.
-
-**Key points:**
-- Three JSON agents + one prose agent; the query agent opts out of JSON on purpose (`query.md` L49) because its consumer is a human reader.
-- Mode is declared in the prompt and enforced at the consuming boundary — declare to bias the model, enforce to guarantee.
-- The two modes have *separate* consumer code (`parseAgentJson`+guard vs `.trim()`), so they can't accidentally share enforcement.
-- Both mismatch directions are silent — `[]` or raw-JSON-to-user — never an exception, which is what makes the bug insidious.
-- The mode is stated twice (`## Output` and the `synthesisInstruction`); both must name the same mode, or the final turn gets conflicting instructions.
 
 ---
 
@@ -384,6 +322,11 @@ A reviewer says: "Make all four agents return JSON so there's one consumer and n
 
 Which agent consumes its `finalText` without calling `parseAgentJson`, and what is the exact consuming expression? (Answer: the query agent — `finalText.trim() || 'I was unable to find enough data to answer that question.'` at `lib/agents/query.ts` L47; it declares prose mode at `query.md` L49 and never touches the JSON parse path.)
 
+## See also
+
+→ 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
+
 ---
 Updated: 2026-05-29 — Corrected the monitoring.md JSON-output fence reference L52→L71 (the `## Output` "Return ONLY a JSON array" line moved down after the `{categories}` section) across all 7 citations.
 Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an earlier prompt-file revision): diagnostic.md output fence L46→L61, recommendation.md output fence L46→L49, query.md prose-output L36→L49, across all prose + diagram citations.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

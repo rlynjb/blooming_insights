@@ -5,7 +5,6 @@
 
 > Reranking is a precise but slow second-stage scorer (a cross-encoder) that re-orders the top-N candidates a fast first-stage retriever returned — you retrieve broadly for recall, then rerank narrowly for precision, putting the best document first where the model actually reads it; blooming insights does no retrieval ranking, so this is study material and a buildable target.
 
-**See also:** → 06-hybrid-retrieval-rrf.md · → 01-embeddings.md · → ../02-context-and-prompts/02-lost-in-the-middle.md · → 11-rag.md
 
 ---
 
@@ -134,7 +133,7 @@ Stage 1 gets the right docs in; stage 2 orders them right; placement puts the wi
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via single-path sparse EQL with no candidate ranking step — there is no first-stage retriever returning a candidate set and no reranker reordering one.
 
@@ -176,46 +175,6 @@ The pattern generalizes any time an accurate scorer is too slow to run over ever
 
 ---
 
-## Tradeoffs
-
-### Retrieve-then-rerank vs. retrieve-only vs. rerank-everything
-
-| Dimension | Retrieve + rerank | Retrieve only (cosine order) | Rerank everything |
-|---|---|---|---|
-| Top-k precision | High (cross-encoder order) | Medium (coarse bi-encoder order) | Highest |
-| Cost | 1 retrieval + N rerank inferences | 1 retrieval | Infeasible (per-doc over corpus) |
-| Latency | Retrieval + N model passes | Retrieval only | Prohibitive |
-| Recall | Stage-1 dependent | Stage-1 dependent | N/A |
-| Right when | Top-k order matters and prompt budget is tight | Coarse order is good enough | Never (corpus too large) |
-
-**What we gave up (by not having it).** Nothing today — there is no retrieved candidate set to reorder. When retrieval over past investigations exists, skipping reranking means trusting the bi-encoder's coarse order: the genuinely-best match may sit at position 5 and get truncated, or land in the prompt's dead zone. For a small candidate set the loss is modest; it grows with set size.
-
-**What the alternative would have cost.** Adding a cross-encoder reranker costs N extra inferences per query (one per candidate) and a model dependency. Reranking *everything* (skipping stage 1) is infeasible — you cannot run a cross-encoder over a whole corpus per query. The two-stage split exists precisely to make the accurate scorer affordable.
-
-**The breakpoint.** Retrieve-only (trust cosine order) is fine when the candidate set is tiny and the order barely matters. Reranking earns its place when you retrieve many candidates (top-20+) but can only fit a few in the prompt, *and* the difference between the best and the merely-good candidate is decision-relevant — at which point the cross-encoder's precision and correct placement pay for themselves.
-
----
-
-## Tech reference (industry pairing)
-
-### cross-encoder reranker
-
-- **Codebase uses:** nothing — no candidate set, no reranker.
-- **Why it's here (absent):** there is no first-stage retrieval producing candidates to reorder.
-- **Leading today:** Cohere Rerank and Voyage rerank lead hosted reranking; `BAAI/bge-reranker` leads open cross-encoders (2026).
-- **Why it leads:** joint query+document scoring captures fine relevance a bi-encoder misses, with a one-call rerank API.
-- **Runner-up:** an open cross-encoder (`ms-marco-MiniLM`) self-hosted — zero per-call cost when data must stay on-box.
-
-### LLM-as-reranker
-
-- **Codebase uses:** nothing — though the agent loop already runs a chat model that could score candidates.
-- **Why it's here (absent):** no candidates to score; reranking is not part of the analytics path.
-- **Leading today:** prompting a capable chat model to rank candidates is common when a dedicated reranker is unavailable (2026).
-- **Why it leads:** no extra model dependency; reuses the LLM already in the pipeline.
-- **Runner-up:** dedicated rerankers — cheaper and faster per call than a full chat model for the same precision.
-
----
-
 ## Project exercises
 
 ### Add a cross-encoder rerank stage over retrieved past investigations
@@ -235,19 +194,6 @@ The pattern generalizes any time an accurate scorer is too slow to run over ever
 - **Files to touch:** new `scripts/rerank-eval.ts`, `lib/mcp/retrieval.ts` (toggle rerank), `test/mcp/retrieval.test.ts`.
 - **Done when:** the report shows a precision@3 improvement from reranking and the added latency, with a recommendation on whether the gain justifies the cost at current scale.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-Reranking is the precise, slow second stage of a two-stage retrieval pipeline: a fast first-stage retriever (bi-encoder cosine / BM25 / hybrid) gets the right documents *into* a short candidate list for recall, then a cross-encoder re-scores those candidates jointly with the query for precision, surfacing the genuinely-best one. The reordered list then drives prompt *placement* — the best evidence goes to a high-attention position so the model does not skim past it (lost in the middle). blooming insights does no retrieval ranking; its only "rank then top-k" shape is severity-sorting output anomalies, which is not a query-relevance reranker. Reranking earns its place once retrieval over past investigations exists.
-
-**Key points:**
-- Stage 1 is a fast bi-encoder (separate encoding, recall); stage 2 is a slow cross-encoder (joint encoding, precision).
-- Retrieve broad, rerank narrow, keep what fits — run the accurate scorer only on the short list.
-- A reranker cannot fix bad recall; it only reorders what it is given.
-- Reranked order is wasted unless the winner is *placed* at a high-attention prompt position.
-- The codebase's severity-sort + `slice(0,10)` ranks results by a field, not candidates by query relevance.
 
 ---
 
@@ -321,3 +267,8 @@ A colleague says "reranking is overkill, just trust the cosine order." Argue the
 ### Quick check — code reference test
 
 Does blooming insights rerank retrieved candidates by query relevance, and what is the closest existing "rank then top-k" code? (Answer: no — there is no retrieval reranker; the closest shape is `MonitoringAgent.scan` sorting *output* anomalies by `SEV_RANK` then `.slice(0, 10)` (`lib/agents/monitoring.ts` L50, L92), which ranks results by a fixed field, not candidates by joint query relevance.)
+
+## See also
+
+→ 06-hybrid-retrieval-rrf.md · → 01-embeddings.md · → ../02-context-and-prompts/02-lost-in-the-middle.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > An agent runs many turns per task, and many tasks repeat sub-steps. blooming insights caches at two of the three useful scopes — a 60s exact-match `Map` over MCP tool results keyed on `name:JSON.stringify(args)` (intra-run memoization), and a whole-investigation replay used by the demo — and deliberately skips the third (cross-run semantic cache), because a stale hit would poison the agent's whole trajectory, not just one response.
 
-**See also:** → 02-fan-out-backpressure.md · → 03-per-tool-circuit-breaking.md · → single-call caching: `../../study-ai-engineering/06-production-serving/01-llm-caching.md`
 
 ---
 
@@ -263,7 +262,7 @@ blooming insights: cross-turn caching, three scopes labelled by what's in/out
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Case A (partial) — the two scopes that are built.**
 
@@ -339,94 +338,6 @@ The intra-run cache breaks if args aren't deterministic — a tool that takes a 
 - Single-call caching: `../../study-ai-engineering/06-production-serving/01-llm-caching.md` → the layer this file extends (per-call cache, prompt-prefix cache)
 - Fan-out backpressure: `02-fan-out-backpressure.md` → concurrency control, the next layer of serving cost
 - Per-tool circuit breaking: `03-per-tool-circuit-breaking.md` → what to do when the tool the cache fronts is sick
-
----
-
-## Tradeoffs
-
-The decision was *how many scopes to cache at and where to stop.* This codebase took intra-run + whole-run replay (two scopes) and explicitly skipped cross-run semantic; the alternative would have been adding the semantic layer for higher hit rate.
-
-┌──────────────────┬──────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Intra + whole-run (chosen)   │ + cross-run semantic        │
-│                  │                              │ (alternative)               │
-├──────────────────┼──────────────────────────────┼─────────────────────────────┤
-│ Hit rate         │ medium — repeat sub-steps    │ high — repeats across runs  │
-│                  │ within one run                │ too                         │
-│ Blast radius of  │ one trajectory               │ every trajectory that hits  │
-│ a stale read     │ (TTL-bounded)                │ the cached key (unbounded)  │
-│ Detectability    │ trivial — TTL is 60s          │ silent — model reasons      │
-│ of staleness     │ and run ends in seconds      │ forward, no error surface   │
-│ Build cost       │ ~30 lines of `Map` logic     │ embedder + vector store +   │
-│                  │ in `client.ts`               │ freshness gates + bypass    │
-│                  │                              │ rules + similarity tuning   │
-│ Ops cost         │ none beyond the Map           │ vector store, embeddings    │
-│                  │                              │ ops, gates to maintain      │
-│ Failure mode     │ "we re-ran a query we        │ "the model answered from a  │
-│                  │ already knew the answer to"  │ snapshot 2 hours stale and  │
-│                  │ — cheap correctness loss     │ we don't know which runs"   │
-│ Correctness      │ data is always fresh; cache  │ data might be stale and the │
-│ guarantee        │ only saves identical work    │ model can't tell             │
-│ When it earns its│ always — TTL + scope make it │ only when underlying data   │
-│ place            │ strictly net-positive        │ is provably slow-moving     │
-└──────────────────┴──────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up hit rate at the cross-run scope. Two users asking nearly identical questions, or one user doing two similar investigations in a day, each pay the full retrieval cost. The bill scales linearly with distinct trajectories rather than flattening with semantic overlap.
-
-We also gave up the prompt-prefix cache (a separate, smaller gap covered in the ai-eng caching file). The static system prompts re-tokenized on every turn are the largest single line item by token count, and `cache_control` on the request would have addressed it — that's a real gap, but it sits at the *per-turn* layer rather than the cross-turn layer this file owns.
-
-### What the alternative would have cost
-
-If we had built the cross-run semantic cache, we would have paid the engineering cost of an embedder (probably a small OpenAI or local model), a vector store for the keys, a similarity threshold to tune (too high → no hits; too low → wrong hits), AND a freshness-gating layer that decides whether a hit is still valid (which is exactly the layer that's easy to get wrong). The day-one cost is moderate; the *correctness* cost is the part that's easy to ignore in a design doc and impossible to ignore in a production incident. A stale cross-run hit on a moving-data question would produce a confidently-wrong diagnosis that points the user at the wrong cause, and the only signal is "the answer doesn't match reality" — there's no exception, no error log, no metric that catches it.
-
-### The breakpoint
-
-This stays the right call until cross-run hit rate becomes worth the freshness work. The specific signal: the same sub-questions are observed across many investigations (operational dashboards repeatedly asking the same period-over-period queries), *and* the source data has a slow-enough refresh cycle that "an hour ago" is provably still right (a daily-batch aggregate, not a live event stream). Either alone isn't enough; both together flips the cost-benefit. Until then, intra-run + whole-run replay is the right floor and adding cross-run is buying a sharper failure surface for marginal savings.
-
-### What wasn't actually a tradeoff
-
-"Just cache nothing and re-run everything" was not a real alternative. The intra-run cache is strictly net-positive — the data hasn't moved within 60 seconds of the prior call (or it has, and the agent re-asking from the cache is no more wrong than asking the network at that same moment), and the saved tool-call slot lets the 6-call budget go farther. Skipping intra-run caching wouldn't have made the system more correct; it would have made it slower and given the agent less budget for actual work.
-
----
-
-## Tech reference
-
-### In-memory `Map` cache (the intra-run engine)
-
-- **Codebase uses:** `private cache = new Map<string, { result: unknown; expiresAt: number }>()` on `McpClient` (`lib/mcp/client.ts` L80); read at L106–L110, write at L143–L144, TTL default at L103.
-- **Why it's here:** plain `Map` is the right scope when the cache lifetime matches the object's lifetime — `McpClient` is constructed per investigation, so the cache dies when the investigation ends. No eviction policy is needed beyond TTL.
-- **Leading today:** in-memory `Map` with TTL — adoption-leading for single-process intra-run caches, 2026.
-- **Why it leads:** zero dependencies, zero ops; correct for the lifetime-matches-scope case.
-- **Runner-up:** Redis with TTL — necessary when the cache has to survive across processes, overkill when it doesn't.
-
-### Anthropic prompt caching (the layer NOT used)
-
-- **Codebase uses:** the `cache_control` field on Anthropic message blocks — not set anywhere in this codebase. The static system prompts (`lib/agents/prompts/*.md`) are re-sent every turn at full token cost.
-- **Why it's here:** named as the per-turn cache scope absent from this implementation; covered in detail in `../../study-ai-engineering/06-production-serving/01-llm-caching.md`.
-- **Leading today:** Anthropic `cache_control` — innovation-leading for prompt-prefix caching, 2026.
-- **Why it leads:** provider-side KV-cache reuse keyed on a hashed prefix; the application opts in by marking which content blocks are stable, the provider handles the cache.
-- **Runner-up:** OpenAI automatic prefix caching — same mechanic, less opt-in control.
-
-### Semantic cache (the layer skipped on purpose)
-
-- **Codebase uses:** none.
-- **Why it's here:** named as the scope this codebase deliberately skipped, with the blast-radius argument for why.
-- **Leading today:** GPTCache and provider-specific semantic-cache layers — adoption-leading for high-volume agent products with slow-moving data, 2026.
-- **Why it leads:** flattens cost when the same questions recur across users/sessions.
-- **Runner-up:** exact-string cross-run cache — safer (no semantic match), but lower hit rate because exact repeats are rare.
-
----
-
-## Summary
-
-Agent caching nests at three scopes — per-turn (provider prefix), intra-run (memoize repeated tool calls within one task), and cross-run (semantic match across tasks) — plus a whole-run replay variant. blooming insights builds two: a 60-second TTL `Map` over MCP tool results keyed on `name:JSON.stringify(args)` (intra-run, `lib/mcp/client.ts` L97–L146) and a whole-investigation replay used by the demo (`app/api/agent/route.ts` L125–L141). It deliberately skips the cross-run semantic cache because a stale hit poisons the whole trajectory — the model reasons forward from the stale value and every downstream turn inherits the error — which makes the failure silent and the freshness gates needed to prevent it complex to build correctly for moving analytics data. The provider prompt-prefix cache is a separate gap covered in the ai-eng caching file.
-
-- Three scopes, three blast radii — intra-run is the sweet spot, cross-run semantic widens both hit rate and failure surface.
-- Intra-run cache is strictly net-positive when the args are deterministic and the TTL is shorter than the data's freshness.
-- A whole-run replay is a coarser cache (the entire trajectory is the value) — perfect for demos, wrong for live investigations.
-- The cross-run semantic cache wasn't skipped for laziness; the stale-hit failure is silent and trajectory-wide.
-- The principle: cache wider only when freshness is provably bounded against the value's use.
 
 ---
 
@@ -538,5 +449,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ 02-fan-out-backpressure.md · → 03-per-tool-circuit-breaking.md · → single-call caching: `../../study-ai-engineering/06-production-serving/01-llm-caching.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

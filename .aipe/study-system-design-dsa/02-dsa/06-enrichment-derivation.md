@@ -5,7 +5,6 @@
 
 > `lib/insights/derive.ts` turns evidence the monitoring agent already computed into business-owner fields — find the first `{current, prior}` pair by linear scan, pick the funnel leak with a `reduce` min-by-key, bucket diagnosis confidence by hypotheses-tested counts, and normalize a string-or-object impact — all pure functions, all O(n) over a handful of items.
 
-**See also:** → 05-severity-sort.md · → 04-json-from-prose.md · → ../01-system-design/01-request-flow.md
 
 ---
 
@@ -167,7 +166,7 @@ The diagram stands alone: four inputs, four pure operations (scan, argmin-reduce
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **File:** `lib/insights/derive.ts`
 **Function / class:** the whole module — `impactRange`, `impactAssumption`, `findCurrentPrior`, `deriveInsightFields`, `hypothesesTested`, `diagnosisConfidence`
@@ -347,71 +346,6 @@ Contrast — if all three had non-empty reasoning, `tested = 3 = total`, and Ste
 
 ---
 
-## Tradeoffs
-
-### Comparison: derive-at-presentation vs. alternatives
-
-| Dimension | This codebase (derive on read) | Alternative A: agent emits the fields | Alternative B: store derived fields on write |
-|---|---|---|---|
-| I/O / round-trips | Zero — pure function over held data | One prompt round-trip per field | Zero on read, but a write step to compute+persist |
-| Staleness vs. inputs | Never stale — recomputed from current input | Can drift if agent computes inconsistently | Can go stale if inputs change after write |
-| Cost of a new display field | A new pure function | A prompt change + schema change + retest | A migration + recompute of stored rows |
-| Determinism | Total — same input, same output | LLM may vary | Total at write time, frozen after |
-| Where the logic lives | One module, unit-testable | Inside a prompt (hard to test) | A write-path job |
-| Compute location | Read/render time, every time | Generation time, once | Write time, once |
-
-**What we gave up.** Caching of the derived result — every render recomputes `leakKey` and `diagnosisConfidence`. At `n ≤ 4` funnel stages and single-digit hypotheses this is free; if these moved to a 10k-row table they would need memoization or precomputation.
-
-**What the alternative costs.** Having the *agent* emit these fields couples the LLM's output schema to the UI's display needs and risks the model computing `revenueImpact` arithmetic inconsistently (LLMs are unreliable at exact arithmetic — `Math.round(current - prior)` in code is exact). Storing derived fields on write adds a persistence step and reintroduces staleness — the stored leak stage can disagree with the stored funnel after an update.
-
-**The breakpoint.** Derive-on-read is correct while `n` is tiny and the functions are pure and cheap — true here (≤4 funnel stages, single-digit evidence and hypotheses). It breaks when a derivation becomes expensive (large array, heavy compute) or runs on a hot render path; at that point wrap it in `useMemo`/a memoized selector, or precompute it once where the data is built (which `lib/state/insights.ts` L25 already does for `deriveInsightFields` — derived once at insight-build time, not per render).
-
----
-
-## Tech reference (industry pairing)
-
-### linear scan / find-first
-
-- **`Array.prototype.find`** — returns the first element matching a predicate, or `undefined`. The stdlib form of `findCurrentPrior`; the hand-written `for` loop is used only to make the `typeof` narrowing of `current`/`prior` explicit to TypeScript.
-- **`Array.prototype.some`** — the boolean cousin (does any element match). Used when you need existence, not the element.
-- **Short-circuit on first match** — O(n) worst case but stops early; for "the headline metric's pair is usually first" this is effectively O(1).
-
-### min-by-key reduce (argmin)
-
-- **`Array.prototype.reduce`** — the fold. `reduce((a,b)=> b.v<a.v ? b : a)` with no seed is `argmin` over `v`; the seedless form starts the accumulator at element 0 and throws on an empty array (hence the length guard).
-- **`d3.least(arr, accessor)`** — returns the element minimizing the accessor (argmin as a named function); **`d3.min`** returns the minimum value. `least` is the direct analog of the leak reduce.
-- **`Math.min(...arr.map(...))`** — returns the minimum *value*, losing which element produced it; wrong tool when you need the key (the stage name), right tool when you need the number.
-- **`_.minBy` (lodash)** — `minBy(arr, 'v')` returns the element with the min `v`; the lodash form of the leak reduce.
-
-### threshold bucketing
-
-- **`Array.prototype.filter().length`** — counting by predicate; `supported` and `tested` are both this. Two passes here; a single `reduce` could count both in one pass but at n ≤ ~6 it is not worth the loss of readability.
-- **Guard-clause ladder** — the `if … return` cascade in `diagnosisConfidence` is the standard way to express ordered thresholds; the first matching branch wins, so order encodes priority (agent-set → high → medium → low).
-- **Nullish coalescing (`??`)** — `d.hypothesesConsidered ?? []` defends against an absent array so `.filter`/`.length` never throw.
-
-### union type normalization
-
-- **`typeof` narrowing** — collapses `string | object` to a single shape; TypeScript narrows the union inside each branch, so `e.range` is only reachable when `e` is the object arm.
-- **Optional chaining + `||` fallback** — `e.assumption?.trim() || null` returns `null` for absent, empty, or whitespace-only assumptions in one expression.
-- **Discriminated unions** — the principled alternative to `typeof` when the union members are both objects with a shared tag field; not needed here because one arm is a primitive `string`.
-
----
-
-## Summary
-
-**Part 1 — recap.** `lib/insights/derive.ts` projects raw evidence the agents already computed into the business-owner fields the UI shows, with no new I/O. `findCurrentPrior` linear-scans an anomaly's evidence for the first numeric `{current, prior}` pair; `deriveInsightFields` turns that (when the metric is revenue and trending down) into a rounded `revenueImpact`. The funnel "leak point" is an `argmin` — `funnelStages.reduce((a,b)=> b.v<a.v ? b : a).k` in `components/feed/InsightCard.tsx` returns the stage name with the smallest signed % change. `diagnosisConfidence` prefers the agent's own label, else buckets to high/medium/low from counts of supported and tested hypotheses (tested = non-empty `reasoning`). `impactRange`/`impactAssumption` normalize the `string | { range, assumption }` union so callers render uniformly. All are pure functions, all `O(n)` over single-digit `n`.
-
-**Part 2 — key points.**
-
-- `findCurrentPrior` is find-first: O(n), stops on the first numeric `{current, prior}` pair, returns `null` if none — `lib/insights/derive.ts` L12–L20.
-- The leak point is min-by-key (`argmin`): `reduce((a,b)=> b.v<a.v ? b : a).k`, guarded by `funnelStages.length` because seedless `reduce([])` throws — `components/feed/InsightCard.tsx` L159–L161.
-- `diagnosisConfidence` is an ordered threshold ladder: agent-set wins, then `supported>=1 && tested===total → high`, `supported>=1 → medium`, else `low` — `derive.ts` L54–L62.
-- "Tested" is proxied by non-empty `reasoning`; an untested hypothesis is the agent's tool-call budget running out — `hypothesesTested` L42–L48.
-- `impactRange`/`impactAssumption` collapse a `string | object` union with `typeof`, so no caller branches on the type — L4–L9.
-- `deriveInsightFields` is computed once at insight-build time (`lib/state/insights.ts` L25), not per render; the others compute on read at `n` so small it is free.
-
----
-
 ## Interview defense
 
 ### What they are really asking
@@ -489,5 +423,10 @@ A reviewer says: "Move `diagnosisConfidence` into the agent prompt — let the m
 - What does `impactAssumption` return for the bare-string arm of `EstimatedImpact`? (`null` — `derive.ts` L8.)
 - Where is `deriveInsightFields` actually called, and is it per-render or once? (`lib/state/insights.ts` L25 — once, at insight-build time.)
 
+## See also
+
+→ 05-severity-sort.md · → 04-json-from-prose.md · → ../01-system-design/01-request-flow.md
+
 ---
 Updated: 2026-05-29 — funnel-leak reduce refreshed to current lines (block L155–L161, `funnelStages` map L156–L158, `leakKey` argmin L159–L161); verified `anomalyToInsight` copies `category` at `lib/state/insights.ts` L25 and `derive.ts` refs unchanged.
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

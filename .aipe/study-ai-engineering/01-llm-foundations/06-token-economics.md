@@ -5,7 +5,6 @@
 
 > Every model call costs money proportional to tokens, with output tokens ~5× the price of input; blooming insights controls cost with hard tool-call budgets, character truncation, and a cheap haiku classifier in front of expensive sonnet agents — but it has *no* cost meter: nothing logs `res.usage`, so the spend is bounded but unmeasured.
 
-**See also:** → 02-tokenization.md · → 03-sampling-parameters.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
 
 ---
 
@@ -174,7 +173,7 @@ Every lever the codebase pulls is upstream of the call (bound the spend); the on
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Partially addressed — bounds present, meter absent.** Cost is controlled by `maxToolCalls` budgets, input truncation, and haiku-vs-sonnet tiering, but nothing reads `res.usage`; there is no `ai_call_log`, per-run token total, or cost dashboard.
 
@@ -230,57 +229,6 @@ Bounding answers "can this ever cost too much?" — no, the budget caps it. Meas
 
 ---
 
-## Tradeoffs
-
-### Bounds-only cost control vs. bounds + metering
-
-| Dimension | This codebase (bounds, no meter) | Bounds + `res.usage` metering |
-|---|---|---|
-| Worst-case bill | Capped (budgets + truncation) | Capped |
-| Typical-case visibility | None | Per-call, per-agent, per-run |
-| Find the expensive call | Guesswork | Direct query |
-| Cost of adding it | N/A | Read a field already returned + a log sink |
-| Tune cost against traffic | Blind | Data-driven |
-| Synthesis-spike frequency | Unknown | Counted |
-
-**What we gave up.** All cost *visibility*. The system guarantees an investigation cannot cost more than its budgets allow, but cannot say what one actually costs, which call dominates, or how often the synthesis spike fires. Every post-launch cost optimization starts blind. This is the same observability gap noted for `FALLBACK` in → 01-what-an-llm-is.md — the bounds work, but their effect is unmeasured.
-
-**What the alternative would have cost.** Almost nothing. `res.usage` is already on every `create` response; logging it is reading a field and writing a row. The cost is the discipline of threading a usage total through `AgentRunResult` and persisting it — hours, not days. The reason it is absent is scope (a demo does not pay a real bill), not difficulty.
-
-**The breakpoint.** Bounds-only is fine while no one pays a per-token bill and runs are short. It breaks the instant the system serves real traffic at real prices: the first cost-reduction ask ("our LLM bill is too high — cut it 30%") is unanswerable without the meter, because you cannot target what you cannot see. At that point `res.usage` logging is the prerequisite, not an enhancement.
-
-**Not actually a tradeoff:** the haiku-vs-sonnet tiering. Using the cheap model for classification costs nothing in capability (it is a three-way label) and saves real tokens — a free win with no downside.
-
----
-
-## Tech reference (industry pairing)
-
-### model tiering (haiku classifier / sonnet agents)
-
-- **Codebase uses:** `CLASSIFIER_MODEL` haiku (`lib/agents/intent.ts` L14) for routing; `AGENT_MODEL` sonnet (`lib/agents/base.ts` L9) for analysis.
-- **Why it's here:** classification is trivial; paying the dear model for it is waste. Cheap model routes, capable model reasons.
-- **Leading today:** cost-aware routing (cheap model first, escalate to capable on hard inputs) is standard practice (2026); frameworks like RouteLLM formalize it.
-- **Why it leads:** most requests are easy; routing them to a small model captures the majority of the savings.
-- **Runner-up:** a single mid-tier model for everything — simpler, leaves savings on the table.
-
-### `res.usage` token logging (the absent meter)
-
-- **Codebase uses:** nothing — `res.usage` is returned at `lib/agents/base.ts` L102 and discarded.
-- **Why it's here (absent):** a demo pays no real bill, so the meter was out of scope; the bounds were prioritized.
-- **Leading today:** per-call usage logging plus a cost dashboard (Helicone, Langfuse, LangSmith) is table stakes for production LLM apps (2026).
-- **Why it leads:** the LLM bill is invisible without it; you cannot tune what you cannot measure.
-- **Runner-up:** provider-side usage dashboards — coarser (per-key, not per-run/per-agent), no app-level attribution.
-
-### Anthropic prompt caching (`cache_control`) (also absent)
-
-- **Codebase uses:** nothing — the repeated system prompt + schema summary are sent in full on every turn.
-- **Why it's here (absent):** not yet adopted; the truncation levers address input growth from *tool results* but not the repeated *static prefix*.
-- **Leading today:** prompt caching is standard for repeated-prefix workloads (2026), cutting input-token cost on cache hits.
-- **Why it leads:** an agent loop re-sends the same large system prompt every turn — an ideal cache target.
-- **Runner-up:** manual prompt trimming — smaller prefix, less reuse benefit.
-
----
-
 ## Project exercises
 
 ### Log `res.usage` per agent run
@@ -300,19 +248,6 @@ Bounding answers "can this ever cost too much?" — no, the budget caps it. Meas
 - **Files to touch:** `lib/state/investigations.ts` (extend `saveInvestigation`), a new `lib/state/ai-call-log.ts`, `app/api/agent/route.ts` (write the row), a report under `app/debug/`.
 - **Done when:** running several investigations produces queryable per-run cost records and a percentile report, including how often `synthesize()` fired.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-Every model call bills by tokens, with output ~5× input, so cost engineering means pulling three bounding levers and reading one meter. blooming insights pulls all three bounds: `maxToolCalls` budgets (6/6/4/6) cap call count via `forceFinal`, `truncate` and `schemaSummary` cap input growth, and a haiku classifier fronts the sonnet agents. The big conditional line item is the `synthesize()` sonnet call. But the meter — `res.usage` logging, an `ai_call_log`, a cost dashboard — is entirely absent: spend is bounded but unmeasured. The bounds prevent a runaway bill; the missing meter hides the typical bill.
-
-**Key points:**
-- Cost = Σ (input·p_in + output·p_out), with p_out ≈ 5·p_in over every call in a run.
-- `maxToolCalls` caps call count; truncation caps input growth; haiku-vs-sonnet tiering caps per-call model cost.
-- The `synthesize()` pass is the big conditional line item — a full sonnet call that fires only on parse failure.
-- Nothing reads `res.usage`: the system is bounded but blind, with no record of actual spend.
-- Bounding (before the call) and measuring (after the call) are independent; this codebase has the former, not the latter.
 
 ---
 
@@ -388,5 +323,10 @@ A colleague says: "We have `maxToolCalls`, so cost is handled — skip the usage
 
 Which model classifies intent, and why is it the cheap choice rather than the agent model? (Answer: `claude-haiku-4-5-20251001` — `lib/agents/intent.ts` L14; classification is a trivial three-way label, so it runs on the cheap haiku model while sonnet (`AGENT_MODEL`, `base.ts` L9) does the reasoning.)
 
+## See also
+
+→ 02-tokenization.md · → 03-sampling-parameters.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
+
 ---
 Updated: 2026-05-28 — `maxDuration` 60→300 (route.ts L20); re-derived the `synthesize()` line ranges (diagnostic L87–L126, recommendation L82–L132) and the `saveInvestigation` location (now `lib/state/investigations.ts` L30, called at route.ts L254).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

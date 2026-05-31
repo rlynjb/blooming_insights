@@ -5,7 +5,6 @@
 
 > A vector database stores embeddings and answers "give me the k nearest to this query vector" — by brute-force scan at small scale and by an approximate index (HNSW/IVF) at large scale; blooming insights stores no vectors, but its in-memory `Map` cache and module-level state are exactly the "in-memory, <1k items" tier where you do not need a vector DB at all.
 
-**See also:** → 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
 
 ---
 
@@ -144,7 +143,7 @@ The arrow down the State layer is the upgrade path; you climb it only when the t
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not by querying a vector store — there are no vectors and no nearest-neighbor index anywhere.
 
@@ -186,55 +185,6 @@ The progression mirrors every storage decision: a `Map` before a file, a file be
 
 ---
 
-## Tradeoffs
-
-### In-memory `Map` scan (current tier) vs. SQLite/pgvector vs. dedicated vector DB
-
-| Dimension | Tier 0: `Map` scan | Tier 1: SQLite/pgvector | Tier 3: vector DB |
-|---|---|---|---|
-| Setup cost | Zero — already used | Low — one extension | High — provision + operate |
-| Exactness | Exact (scans all) | Exact or indexed | Approximate (ANN) |
-| Survives restart | No | Yes | Yes |
-| Scales past 1M | No | Limited | Yes |
-| Metadata filtering | Manual | SQL `WHERE` | Native |
-| Right when | <1k vectors | <1M, already on SQL | Millions, multi-tenant |
-
-**What we gave up (by not having it).** Nothing today — there are no vectors. When the "search past investigations" feature ships, starting at Tier 0/1 (a `Map` or JSON file scanned exhaustively) gives up nothing at the expected scale (dozens to hundreds of investigations) and avoids operating a vector DB for a `for` loop's worth of data.
-
-**What the alternative would have cost.** Reaching straight for a managed vector DB to store ~100 investigation chunks costs provisioning, a network hop per query (slower than an in-memory scan), a monthly bill, and an operational dependency — all for data that fits in memory and scans in microseconds. It is the Redis-for-a-`Map` mistake the codebase already declined to make for its cache.
-
-**The breakpoint.** The in-memory/JSON tier is correct until either the vectors no longer fit in memory or the brute-force scan exceeds the request latency budget — concretely, past roughly 10⁵–10⁶ vectors, or when cold-start re-loading becomes the dominant latency. At that point an ANN index (Tier 2) or a vector DB (Tier 3) is the required upgrade.
-
----
-
-## Tech reference (industry pairing)
-
-### in-memory vector store
-
-- **Codebase uses:** the analog tier — `McpClient.cache` `Map` (`lib/mcp/client.ts` L18) and `schema.ts` module cache (L130); no vectors yet.
-- **Why it's here (absent for vectors):** the storage tier a <1k-vector index uses; the codebase already lives in it for non-vector data.
-- **Leading today:** a plain `Map`/array with brute-force cosine leads for small in-process retrieval (2026).
-- **Why it leads:** exact, zero dependencies, microseconds at small N — no reason to add infrastructure.
-- **Runner-up:** `hnswlib-node` — an in-process ANN index when N grows but you still want no external service.
-
-### embedded / SQL vector store
-
-- **Codebase uses:** nothing — investigations persist as plain JSON (`lib/state/demo-investigations.json`).
-- **Why it's here (absent):** no vectors to persist; the JSON-file pattern is the tier-1 storage shape already in use.
-- **Leading today:** pgvector (Postgres) leads by adoption; `sqlite-vec` leads for embedded/local (2026).
-- **Why it leads:** vectors live in the database you already run — one store, transactional, SQL metadata filtering.
-- **Runner-up:** Chroma — a lightweight embedded vector DB with a simple Python/JS API for prototypes.
-
-### dedicated vector database
-
-- **Codebase uses:** nothing.
-- **Why it's here (absent):** scale and operational needs do not justify a separate service.
-- **Leading today:** Pinecone leads managed adoption; Qdrant and Weaviate lead open-source/self-host (2026).
-- **Why it leads:** ANN index plus persistence, horizontal scaling, metadata filtering, and hybrid scoring in one service.
-- **Runner-up:** Milvus — high-scale, GPU-accelerated ANN for very large indexes.
-
----
-
 ## Project exercises
 
 ### Build a Tier-0 in-memory vector index for schema terms
@@ -254,19 +204,6 @@ The progression mirrors every storage decision: a `Map` before a file, a file be
 - **Files to touch:** `lib/mcp/vector-store.ts` (load/save), `lib/state/` (the JSON file), `test/mcp/vector-store.test.ts` (round-trip persistence).
 - **Done when:** vectors written once are loaded from disk on a fresh process and `nearest` returns identical results without re-embedding.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-A vector database stores embeddings and answers nearest-neighbor queries — by brute-force scan at small scale and by an approximate index (HNSW/IVF) once the scan is too slow. blooming insights stores no vectors, but it already runs the small-scale storage tier a vector index would use: an in-memory `Map` (`McpClient.cache`, the schema cache) and JSON-file persistence for investigations. That is the "in-memory/JSON, <1k items, brute-force scan" tier where a vector DB is unnecessary, and the discipline of staying there until the scan runs out is the same one the codebase already applied by choosing a `Map` over Redis for its cache.
-
-**Key points:**
-- Nearest-neighbor is a `for` loop until the loop is too slow; vector DBs replace it with an approximate index.
-- blooming insights already lives in Tier 0 — a `Map` and JSON files — the tier that needs no vector DB.
-- ANN indexes (HNSW/IVF) trade exactness for sub-linear speed; you measure the trade as recall@k.
-- In-memory indexes die on cold start, the same limitation `McpClient`'s cache has.
-- Climb the storage tiers only when the current one runs out — reaching for a vector DB first is over-engineering.
 
 ---
 
@@ -340,3 +277,8 @@ A colleague wants to provision a managed vector DB for the "search past investig
 ### Quick check — code reference test
 
 What storage tier does blooming insights already run that a small vector index would reuse, and where? (Answer: the in-memory `Map` tier — `McpClient.cache` at `lib/mcp/client.ts` L18 and the module-level schema cache at `lib/mcp/schema.ts` L130, plus JSON-file persistence in `lib/state/investigations.ts` — the "<1k items, brute-force scan" tier where no vector DB is needed.)
+
+## See also
+
+→ 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > Self-critique runs the model a second time to evaluate and revise its own output; self-consistency runs the model N times and votes. Both buy reliability with 2–5× the tokens. blooming insights does neither — its `synthesize()` is a clean-context RETRY for recovery-from-no-JSON, not a critique step — and the trap to respect is that a model grading itself shares the blind spots that produced the output.
 
-**See also:** → 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
 
 ---
 
@@ -167,7 +166,7 @@ A reader who sees only this should grasp: verification is conditional on stakes,
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** There is no self-critique, self-verification, or self-consistency anywhere in blooming insights; no output is re-read for correctness and nothing is sampled-and-voted.
 
@@ -211,55 +210,6 @@ The deep idea: reliability is buyable with inference, but the exchange rate is n
 
 ---
 
-## Tradeoffs
-
-### Verify pass vs. ship-first-output (current state)
-
-| Dimension | This codebase (ship v1, no verify) | Self-critique verify pass | Self-consistency vote |
-|---|---|---|---|
-| Catches well-formed-but-wrong | No | Sometimes (sloppy errors, not confident-wrong) | Only for unstable/borderline outputs |
-| Token cost | 1× | ~2–3× | N× |
-| Latency | 1 call | +1 call (sequential) | N calls (parallel-able) |
-| Works on prose diagnosis | n/a | Yes | No (nothing to vote on) |
-| Works on intent classifier | n/a | Overkill | Yes, cheap (Haiku) |
-| Catches confident systematic error | No | Weak (shared blind spot) | No |
-
-**What we gave up.** Any catch on well-formed-but-wrong output. Today the diagnosis streams the instant it validates (`route.ts` L153–154); the only checks are the type guards, which prove shape not truth (→ 02-structured-outputs.md). A diagnosis whose conclusion contradicts its own evidence ships as confidently as a correct one.
-
-**What the alternative would have cost.** A verify pass doubles to triples the diagnostic token spend per investigation and adds a sequential call to the 60s budget (`route.ts` L18). An N-run classifier vote multiplies the cheapest call (Haiku, `max_tokens: 16`) by N — affordable, but still extra latency on the query path. Neither is free, and neither is worth it on the happy-path outputs that are already right.
-
-**The breakpoint.** Ship-first-output is right while the failures are rare and reviewable (the streamed trace lets a human catch a bad diagnosis, → 09-chain-of-thought.md). Add the verify pass when (a) diagnoses go to a surface where no human reviews them before action, or (b) an eval (→ 05-eval-driven-iteration.md) measures a well-formed-but-wrong rate high enough that catching even some of it justifies the 2–3× cost. Add the classifier vote when a measurable fraction of queries are misrouted on borderline phrasing.
-
----
-
-## Tech reference (industry pairing)
-
-### self-critique / self-refine (verify-then-revise)
-
-- **Codebase uses:** nothing; the diagnosis ships unverified (`app/api/agent/route.ts` L153–154). The only second call, `synthesize()` (`lib/agents/diagnostic.ts` L82–121), is recovery, not critique.
-- **Why it's here:** it is not — but the insertion point is clear, between `investigate` and the `diagnosis` event.
-- **Leading today:** generate→critique→revise with an *independent* checker (different model or a validator), validated by evals (2026).
-- **Why it leads:** sequential critique catches sloppy errors cheaply; making the checker independent is what addresses the shared-blind-spot weakness.
-- **Runner-up:** Reflexion-style self-reflection loops — richer, multi-attempt, heavier.
-
-### self-consistency (sample-and-vote)
-
-- **Codebase uses:** nothing; `classifyIntent` is a single Haiku call (`lib/agents/intent.ts` L17–31).
-- **Why it's here:** it is not — but the classifier is the ideal target: discrete output, cheap model.
-- **Leading today:** N-sample majority voting on discrete/short-answer tasks (2026), used where the output space is small enough to vote on.
-- **Why it leads:** it converts a high-variance single draw into a stable consensus at predictable N× cost — and the cost is tolerable when the per-call model is cheap.
-- **Runner-up:** weighted voting / self-consistency with confidence scores — votes weighted by the model's stated confidence.
-
-### clean-context retry (the thing that is NOT critique)
-
-- **Codebase uses:** `synthesize()` — `lib/agents/diagnostic.ts` L82–121, `lib/agents/recommendation.ts` L82–127, gated by `tryParseDiagnosis(finalText) ?? synthesize() ?? FALLBACK` (L73–77).
-- **Why it's here:** to recover a parseable artifact when the loop never emitted JSON — a structured-output repair, not a quality check.
-- **Leading today:** validation-retry loops (`instructor`-style) for format recovery (2026) — the same family as `synthesize()`.
-- **Why it leads:** it recovers most format failures without constrained decoding; it is orthogonal to critique (recovery vs verification).
-- **Runner-up:** JSON-repair libraries — mechanical fix instead of a re-prompt; cannot recover missing fields and definitely cannot verify correctness.
-
----
-
 ## Project exercises
 
 ### Add a verify pass on the diagnosis before it streams
@@ -279,20 +229,6 @@ The deep idea: reliability is buyable with inference, but the exchange rate is n
 - **Files to touch:** `lib/agents/intent.ts` (vote wrapper around `classifyIntent`), `test/agents/intent.test.ts` (a case where 3-of-5 runs settle a borderline query).
 - **Done when:** a borderline query that the single call flips between `diagnostic` and `recommendation` settles on a stable majority label across runs, and the cost is N cheap Haiku calls, not N Sonnet calls.
 - **Estimated effort:** <1hr
-
----
-
-## Summary
-
-Self-critique (generate→critique→revise) and self-consistency (run N, vote) both spend 2–5× the tokens to raise reliability — one sequentially by re-reading, one in parallel by voting. They pay off only where being wrong is expensive AND the failure is catchable by a re-read or a vote; the hard ceiling is the shared blind spot, where a model approves its own confident-wrong output. blooming insights does neither: the diagnosis streams unverified (`route.ts` L153–154), the classifier is a single call (`intent.ts`), and the only second call, `synthesize()`, is a clean-context retry for recovery-from-no-JSON — it runs only on parse failure, never sees the first output, and re-derives rather than verifies.
-
-**Key points:**
-- Self-critique is sequential (generate→critique→revise, ~2–3×); self-consistency is parallel (run N, vote, N×).
-- `synthesize()` is recovery, not critique: it fires only when `tryParseDiagnosis` returns null and never reads the first output (`diagnostic.ts` L73–77, L82–121).
-- The shared blind spot is the headline caveat: a model grading itself approves its own systematic errors — make the critic independent.
-- Self-consistency needs a discrete answer to vote on: it fits the intent classifier, not the prose diagnosis.
-- The classifier is the cheap entry point (Haiku, `max_tokens: 16`); the Sonnet agents make voting expensive.
-- These raise reliability but do not prove correctness — evals (→ 05) are the actual correctness layer.
 
 ---
 
@@ -366,3 +302,8 @@ A reviewer says: "Just add a self-critique pass to every agent — the model can
 ### Quick check — code reference test
 
 What is the exact trigger condition under which `synthesize()` runs in the diagnostic agent, and why does that make it recovery rather than verification? (Answer: it runs only when `tryParseDiagnosis(finalText)` returns `null` — `lib/agents/diagnostic.ts` L73–77 — i.e. the loop produced no parseable JSON. On the successful path it never runs and never inspects the valid diagnosis, so it recovers a missing artifact rather than verifying an existing one.)
+
+## See also
+
+→ 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

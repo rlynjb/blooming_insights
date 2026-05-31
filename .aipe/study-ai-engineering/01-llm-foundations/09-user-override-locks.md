@@ -5,7 +5,6 @@
 
 > When a machine-generated value can also be edited by a human, a re-run must not silently overwrite the human's edit; the standard guard is a per-field `_overridden_at` timestamp that the regeneration step checks before writing. blooming insights is a read-only analyst — no user-editable persisted fields exist — so this is study material and a buildable target, not a present feature.
 
-**See also:** → 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
 
 ---
 
@@ -171,7 +170,7 @@ The marker on the State-layer record is the contract between the human (UI) and 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented.** blooming insights is a read-only analyst — it streams a diagnosis and recommendations for viewing and Markdown export, but there are no user-editable persisted fields, so there is no regeneration-vs-edit conflict to guard and no `_overridden_at` anywhere.
 
@@ -217,55 +216,6 @@ The marker is the minimum viable ownership encoding for the two-writer (one mach
 
 ---
 
-## Tradeoffs
-
-### `_overridden_at` marker (user-wins) vs. last-write-wins vs. full versioning
-
-| Dimension | `_overridden_at` marker | Last-write-wins (no marker) | Full version vectors / CRDT |
-|---|---|---|---|
-| Respects human edits | Yes | No — re-run clobbers them | Yes |
-| Implementation cost | One optional field + a merge check | Zero | High — vectors, merge logic |
-| Field-level granularity | With `_overridden_fields` | N/A | Native |
-| Handles many concurrent humans | No (one human assumed) | No | Yes |
-| Stale-edit handling | Policy B (needs a second timestamp) | N/A | Native |
-| Right when | One human can correct machine output | Machine output is never edited | Real-time multi-user collaboration |
-
-**What we gave up (by not having it).** Nothing today — there are no editable fields, so there is no conflict. The cost is *latent*: the day recommendations become dismissible or editable, shipping that feature *without* the marker means a re-run silently destroys user edits, which trains users to distrust the tool. The marker is cheap insurance that must be added *with* the edit feature, not after.
-
-**What the alternative would have cost.** Last-write-wins (shipping editability with no marker) costs user trust the first time a re-run erases an edit — a silent, infuriating bug. Full versioning costs implementation effort disproportionate to a single-human-corrects-machine scenario. The marker is the right-sized middle.
-
-**The breakpoint.** No lock is correct while the data is read-only (the current state). The instant a single edit/dismiss control ships, the `_overridden_at` marker becomes mandatory — that feature and that marker are the same change. If the product later gains *multiple concurrent human editors* of the same recommendation, the single-timestamp marker is no longer sufficient and full versioning (optimistic locking or CRDTs) becomes the required upgrade.
-
----
-
-## Tech reference (industry pairing)
-
-### per-field override marker (`_overridden_at`)
-
-- **Codebase uses:** nothing — `Recommendation` (`lib/mcp/types.ts` L85–L99) has no override metadata; the data is read-only.
-- **Why it's here (absent):** the analyst does not expose editable fields, so there is no regeneration-vs-edit conflict to guard.
-- **Leading today:** dirty-field tracking with a per-field timestamp/flag is the standard guard for AI-generated-but-human-editable values (2026).
-- **Why it leads:** minimal encoding of human ownership; a single optional field plus a merge check implements user-wins.
-- **Runner-up:** an `is_user_modified` boolean — simpler but loses the timestamp needed for newest-wins reconciliation.
-
-### optimistic locking (version column)
-
-- **Codebase uses:** nothing — state is an in-memory `Map` (`lib/state/insights.ts` L4–L6) with machine-only writes.
-- **Why it's here (absent):** no concurrent writers and no persistent store where a write race could occur.
-- **Leading today:** version/`updated_at` columns checked on write are the database-native concurrency guard (2026).
-- **Why it leads:** detects and rejects conflicting writes at the storage layer, independent of application logic.
-- **Runner-up:** row-level locks — stronger isolation, more contention.
-
-### CRDTs / operational transforms
-
-- **Codebase uses:** nothing.
-- **Why it's here (absent):** there is one writer-pair (machine + a single human), not real-time multi-user collaboration.
-- **Leading today:** Yjs / Automerge lead for collaborative editing (2026).
-- **Why it leads:** they merge concurrent edits from many users without a central lock.
-- **Runner-up:** OT (the Google Docs lineage) — powerful, harder to implement than CRDTs.
-
----
-
 ## Project exercises
 
 ### Add dismissible/editable recommendations with `_overridden_at` locks
@@ -285,19 +235,6 @@ The marker is the minimum viable ownership encoding for the two-writer (one mach
 - **Files to touch:** `lib/mcp/types.ts` (`_overridden_fields`, `generatedAt`), `lib/state/merge.ts` (per-field + timestamp policy), the corresponding tests.
 - **Done when:** editing only the title lets the machine still refresh `estimatedImpact` on re-run, and a sufficiently newer machine value can supersede an old human edit under the chosen policy.
 - **Estimated effort:** 1–2 days
-
----
-
-## Summary
-
-When a machine regenerates a value a human can also edit, "last write wins" defaults to the machine and silently destroys the human's edit; the standard guard is a per-field `_overridden_at` marker the regeneration step checks before writing, deferring to the human where it is set. blooming insights does not have this because it is a read-only analyst — `Recommendation` and `Diagnosis` (`lib/mcp/types.ts`) carry only machine fields, `lib/state/insights.ts` has no edit path, and the UI is view-and-export only. The lock becomes mandatory the moment editability ships; building it is the dirty-field merge from a controlled form, persisted to the data model.
-
-**Key points:**
-- Regeneration and human editing share a field, so you must encode *who owns it* — the marker is that encoding.
-- Without `_overridden_at`, a re-run cannot tell a deliberate edit from stale machine output and overwrites both.
-- blooming insights is read-only: no editable persisted fields, so no conflict and no marker today.
-- A dismissal is an override too — forget it and dismissed items resurrect on every re-run.
-- The lock and the edit feature are the same change; shipping editability without it is a silent trust-destroying bug.
 
 ---
 
@@ -371,5 +308,10 @@ A colleague wants to ship editable recommendations now and "add the override pro
 
 Does the `Recommendation` type carry any field that records a human edit, and what does its absence tell you about this concept's status in the codebase? (Answer: no — `lib/mcp/types.ts` L85–L99 has only machine-generated fields and no `_overridden_at`/`_dismissed`; its absence confirms blooming insights is a read-only analyst, so user-override locks are a buildable target, not a present feature.)
 
+## See also
+
+→ 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
+
 ---
 Updated: 2026-05-28 — Re-derived the drifted refs (`Recommendation` types.ts L85–L99, `Diagnosis` L64–L73, `insights.ts` surface L29–L57 + Map store L4–L6, investigate-page export L75–L98) and noted the new enrichment fields are agent-emitted/derived, not human-edit metadata — Case B still holds (no `_overridden_at`/`_dismissed`).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

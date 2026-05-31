@@ -5,7 +5,6 @@
 
 > The server writes one JSON object per line into an HTTP response body as events are produced, and the browser reads those lines incrementally with `fetch` + `response.body.getReader()`, updating React state with each parsed event so the UI renders before the full response is complete.
 
-**See also:** → 06-multi-agent-orchestration.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
 
 ---
 
@@ -516,7 +515,7 @@ The service layer produces. The network carries. The UI layer consumes. Nothing 
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 | File | Function / symbol | Lines |
 |---|---|---|
@@ -650,83 +649,6 @@ The stream is the buffer between them. `ReadableStream` in the browser and Node 
 
 ---
 
-## Tradeoffs
-
-| Dimension | NDJSON over fetch-stream | EventSource / SSE | WebSocket | Await whole response |
-|---|---|---|---|---|
-| Reconnect on drop | None — application decides | Automatic (can re-fire run) | Application decides | N/A |
-| Wire format | Plain JSON + newline | SSE framing (data:/id:/retry:) | Any binary or text | JSON |
-| Browser API complexity | Medium (manual loop + buffer) | Low (addEventListener) | Medium (onmessage) | Low (await res.json()) |
-| One-way vs bidirectional | One-way | One-way | Bidirectional | Request/response |
-| Partial renders | Yes | Yes | Yes | No |
-| Auth / custom headers | Full fetch API | Limited (GET, no custom headers) | Upgrade handshake | Full fetch API |
-
-**What this approach gave up:**
-- Auto-reconnect — there is no `retry:` field, no `Last-Event-ID`, no built-in recovery.
-- Standard protocol framing — `EventSource` clients, SSE proxies, and monitoring tools won't understand `application/x-ndjson`.
-- Manual line-buffering — you own `buf.split('\n')` and `lines.pop()`; bugs here produce silent parse errors.
-
-**What the alternatives cost:**
-- `EventSource` auto-reconnect re-fires the entire ~115s agent run. For a one-shot expensive computation, reconnect is a bug not a feature.
-- WebSocket requires a bidirectional upgrade handshake and persistent connection management — overkill for a one-way server→client stream.
-- `await res.json()` blocks for the full ~115s run and renders nothing until complete — the spinner-for-2-minutes problem from "Why care."
-
-**The breakpoint:**
-This approach is correct when the stream is one-way, short-lived (one investigation), and reconnect-on-drop must not re-trigger the computation. It needs replacement (SSE with `Last-Event-ID`, or a WebSocket with a resumption protocol) when streams must survive reconnects and partial-replay from cursor is required.
-
----
-
-## Tech reference (industry pairing)
-
-### Web Streams (ReadableStream + TextDecoder)
-
-The WHATWG Streams standard defines `ReadableStream`, `WritableStream`, and `TransformStream`. Used here: `new ReadableStream({ start(controller) { ... } })` on the server (Node/Edge runtime) and `res.body.getReader()` + `reader.read()` in the browser.
-
-- **ReadableStream / getReader:** Browser and Node API. `getReader()` locks the stream to one consumer. `read()` returns `{ done, value }` — `done: true` when the stream is closed.
-- **TextDecoder:** Converts `Uint8Array` byte chunks to strings. The `{ stream: true }` option buffers incomplete multi-byte sequences across calls — required for correct UTF-8 decoding of chunked data.
-- **controller.enqueue:** Pushes a chunk (here: `Uint8Array`) into the stream's internal queue. Downstream readers receive it via `read()`.
-- **controller.close:** Signals end-of-stream. The next `read()` call returns `{ done: true }`.
-- **Runner-up — EventSource:** The browser's built-in SSE API. Simpler to consume but carries auto-reconnect and SSE framing requirements. Good when reconnect is desirable and the server can emit `id:` fields.
-- **Runner-up — WebSocket:** Full-duplex socket. Correct for bidirectional real-time communication (chat, collaborative editing). Overhead and complexity exceed what a one-way stream needs.
-
-### NDJSON / JSON Lines
-
-NDJSON (Newline Delimited JSON) is a convention: one valid JSON value per line, `\n` as line separator, no surrounding array brackets. Files use `.ndjson` or `.jsonl` extension. Used in log shipping (Logstash, Fluentd), ML training datasets, streaming ETL.
-
-- **encodeEvent:** `JSON.stringify(e) + '\n'` — the complete encoding. No length prefix, no envelope.
-- **decodeEvent:** `JSON.parse(line)` — the complete decoding. Safe only after line is extracted.
-- **`Content-Type: application/x-ndjson`:** The MIME type used in this codebase (L108, the `NDJSON_HEADERS` constant). `application/x-ndjson` is informal; `application/jsonl` and `application/x-jsonlines` are also used in the wild.
-- **Line-buffering invariant:** You must never call `JSON.parse` on a partial line. The `buf.split('\n')` + `pop()` pattern maintains this invariant across chunk boundaries.
-- **Runner-up — SSE:** `text/event-stream` with `data:` field wrapping JSON. More overhead but gives `id:` and `retry:` fields for free. Common in LLM streaming APIs (OpenAI, Anthropic).
-
-### Next.js route handler streaming
-
-Next.js App Router route handlers (files named `route.ts`) can return a `Response` with a `ReadableStream` body. The Edge and Node runtimes both support this.
-
-- **`export const maxDuration = 300`** (L20): Vercel-specific export that sets the maximum function execution time in seconds (300 = Vercel Pro's max). Does not extend beyond the platform limit.
-- **`new Response(stream, { headers })`:** Standard `Response` constructor with a `ReadableStream` body. Next.js passes this through to the underlying runtime's HTTP layer.
-- **`Cache-Control: no-cache, no-transform`** (L109): Tells CDN layers not to buffer the response before forwarding — essential for streaming. Without it, a proxy might wait for the full body before sending.
-- **`Content-Type: application/x-ndjson; charset=utf-8`** (L108): Signals to the client that the body is NDJSON. Not strictly required for `fetch` (the consumer reads bytes regardless) but useful for debugging and for intermediaries.
-- **Pre-stream try/catch:** the MCP connect setup (L156–L166) and `/api/briefing` are wrapped so a setup throw returns a real error JSON (e.g. the missing-secret message) instead of a bare unhandled 500.
-- **Runner-up — `NextResponse.json`:** For non-streaming responses. Buffers the complete body before sending. Not usable here.
-
----
-
-## Summary
-
-`app/api/agent/route.ts` wraps an AI investigation pipeline in a `ReadableStream` producer that encodes each `AgentEvent` as a single NDJSON line (`JSON.stringify(e) + '\n'`) and enqueues it immediately as it is produced; the schema bootstrap now runs *inside* the stream so the first log line ("reading the workspace schema…") appears immediately. The investigation is split into two requests by a `step` query param (`diagnose` / `recommend`); each runs only its agent. `lib/hooks/useInvestigation.ts` consumes the stream with `fetch` + `getReader()` + a `TextDecoder`, accumulates bytes into a string buffer, splits on `'\n'`, keeps the trailing partial for the next chunk, and dispatches each complete line to `handle` which updates React state — `app/investigate/[id]/page.tsx` and `.../recommend/page.tsx` just call the hook. A cache-hit path replays stored events (filtered to the step via `filterByStep`) with 180ms inter-event delay so the UI animates without a live run.
-
-Key points:
-- `AgentEvent` is a discriminated union (`lib/mcp/events.ts` L4–L12); the `type` field determines the shape; `switch(e.type)` in `handle` is type-safe without narrowing boilerplate. `[checklist: 2. Request-response flow]`
-- `fetch`-stream was chosen over `EventSource` specifically because `EventSource` auto-reconnects, which would re-fire the agent run. `[checklist: 5. Failure handling]`
-- Bootstrap moved inside the `ReadableStream`: the producer emits a `reasoning_step` (L201) *before* `bootstrapSchema` (L202), so progress shows immediately instead of a silent ~1–2s wait.
-- `buf.split('\n')` + `lines.pop()` is the canonical line-buffering pattern for NDJSON over streaming `fetch`; getting this wrong causes silent parse errors that depend on TCP chunk boundaries.
-- `{ stream: true }` on `TextDecoder.decode` is required for correct UTF-8 across chunk boundaries.
-- The `startedRef` guard (`useInvestigation.ts` L43, L47–L48) prevents React StrictMode's double-invocation from firing two agent runs in development; the hook does NOT cancel on cleanup (L32–L36).
-- The cache replay path (`REPLAY_DELAY_MS = 180`, `route.ts` L105, L127–141) uses the same wire format and same consumer loop as a live run — and `filterByStep` (L66–L84) slices the combined snapshot down to the requested step. The consumer cannot distinguish replay from live.
-
----
-
 ## Interview defense
 
 ### What they are really asking
@@ -846,8 +768,13 @@ An interviewer asks: "you're manually line-buffering in the browser — isn't th
 - Why does the `startedRef` guard exist in development but matter less in production?
 - What HTTP header signals to CDN proxies that this response should not be buffered?
 
+## See also
+
+→ 06-multi-agent-orchestration.md · → ../02-dsa/03-ndjson-line-buffering.md · → 01-request-flow.md
+
 ---
 Updated: 2026-05-28 — maxDuration 300; reader loop moved to useInvestigation.ts; schema bootstrap now emitted inside the stream; documented the `step`-filtered cached replay + pre-stream try/catch.
 
 ---
 Updated: 2026-05-29 — documented the briefing route as a second NDJSON surface (local `BriefingEvent` superset L54–58, paced demo replay REPLAY_DELAY_MS=140 L23, per-category `coverage_item` tile-by-tile fill L209–212 / client accumulate app/page.tsx L333–339).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

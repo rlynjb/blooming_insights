@@ -5,7 +5,6 @@
 
 > The agent route emits one JSON event per line over a `ReadableStream`; the browser consumes it with `fetch` + `getReader()` + `TextDecoder` and a manual line-buffer loop — a deliberate "show its work" product surface, built on raw NDJSON rather than `EventSource` so a reconnect can never re-fire the agent run.
 
-**See also:** → 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
 
 ---
 
@@ -289,7 +288,7 @@ The server emits one JSON line per increment; the client buffers bytes, splits o
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -342,55 +341,6 @@ The whole choice hinges on one property: does re-issuing the `GET` re-do work? F
 
 ---
 
-## Tradeoffs
-
-### NDJSON over fetch/getReader vs. EventSource vs. buffered JSON
-
-| Dimension | This codebase (NDJSON + getReader) | EventSource (SSE) | Buffered single JSON response |
-|---|---|---|---|
-| Time to first byte rendered | Immediate (per event) | Immediate (per event) | After the whole run (30s+) |
-| Reconnect behavior | None — manual re-trigger only | Auto-reconnect → re-fires the run | N/A |
-| Re-fires expensive work on blip | No | Yes (the dealbreaker) | No |
-| Resumption | None | `Last-Event-ID` supported | N/A |
-| Client complexity | Manual line buffer + decoder | Built-in `onmessage` | Trivial (`await res.json()`) |
-| Trace is the product | Yes | Yes | No — only the verdict shows |
-
-**What we gave up.** Two things `EventSource` gives for free: automatic reconnection and resumption via `Last-Event-ID`. For a 30-second one-shot investigation neither is worth the cost — and the reconnect is actively harmful. We also took on a few lines of manual buffering the SSE client would have handled.
-
-**What the alternative would have cost.** `EventSource` would silently launch a second investigation on any network hiccup — double token cost, a second rate-limited MCP burst, and a doubled/confused trace. A buffered single JSON response would discard the entire product premise: the user would stare at a spinner for 30 seconds and then see only the final verdict, never the reasoning that justifies trusting it.
-
-**The breakpoint.** NDJSON-over-fetch is right while runs fit under the 300-second `maxDuration` and re-triggering on failure is acceptable. It stops being sufficient when runs get long enough that a dropped connection mid-stream is costly to redo — at which point resumable streaming (`Last-Event-ID`, checkpointed event offsets) becomes necessary, and the no-reconnect property has to be rebuilt deliberately rather than inherited.
-
----
-
-## Tech reference (industry pairing)
-
-### NDJSON / line-delimited JSON
-
-- **Codebase uses:** `encodeEvent` = `JSON.stringify(e) + '\n'` (`lib/mcp/events.ts` L15–L17); `Content-Type: application/x-ndjson` (`NDJSON_HEADERS`, `app/api/agent/route.ts` L107–L110).
-- **Why it's here:** append-only, self-delimiting framing that is trivial to produce server-side and split client-side.
-- **Leading today:** NDJSON leads for log/event streaming and is the de-facto LLM-streaming payload (2026), usually wrapped in SSE framing by providers.
-- **Why it leads:** one line per record makes partial reads recoverable with a single `split('\n')`.
-- **Runner-up:** SSE's `data:`-prefixed framing — same idea, more envelope.
-
-### WHATWG `ReadableStream` + `getReader()` + `TextDecoder`
-
-- **Codebase uses:** server `new ReadableStream({ start })` (`route.ts` L169); client `res.body.getReader()` + `new TextDecoder()` (`lib/hooks/useInvestigation.ts` L184–L185).
-- **Why it's here:** the standard, library-free way to produce and consume a chunked body in Next.js and the browser, with no auto-reconnect.
-- **Leading today:** the WHATWG Streams API is the universal standard (2026) for chunked I/O in browsers, Node, and edge runtimes.
-- **Why it leads:** one API across all JS runtimes; full control over framing, decoding, and termination.
-- **Runner-up:** the Vercel AI SDK (`streamText`, `useChat`) — wraps this exact pattern with React hooks; higher-level, less control.
-
-### EventSource / Server-Sent Events (the rejected option)
-
-- **Codebase uses:** nothing — deliberately avoided.
-- **Why it's here (absent):** its auto-reconnect would re-fire the non-idempotent, expensive `GET /api/agent` run.
-- **Leading today:** SSE leads for idempotent, resumable server-push feeds (notifications, live dashboards) in 2026.
-- **Why it leads:** built-in reconnect, `Last-Event-ID` resumption, and a one-line `onmessage` client — virtues for *resumable* feeds.
-- **Runner-up:** WebSockets — bidirectional, heavier; overkill for one-way push.
-
----
-
 ## Project exercises
 
 ### Render a clean "stream killed by `maxDuration`" state
@@ -410,19 +360,6 @@ The whole choice hinges on one property: does re-issuing the `GET` re-do work? F
 - **Files to touch:** new `app/api/notifications/route.ts` (`text/event-stream`), a small client using `new EventSource(...)`, referencing `app/api/agent/route.ts` L20 / L107–L110 / L267 for the contrast.
 - **Done when:** the notifications client auto-reconnects on a dropped connection without duplicating work, and a comment explains why the agent route cannot.
 - **Estimated effort:** 1–4hr
-
----
-
-## Summary
-
-The agent route streams its work as NDJSON over a `ReadableStream`: `encodeEvent` writes one `JSON + '\n'` per increment (`lib/mcp/events.ts`), a single `send` choke-point both records and enqueues each event, the schema bootstrap runs *inside* the stream so the client sees progress instantly, and agent hooks turn the model's reasoning into a live event stream. The browser consumes it in the `useInvestigation` hook with `fetch` + `getReader()` + `TextDecoder` and a line-buffer loop that holds back partial lines, guarded to run once per mount under StrictMode (`lib/hooks/useInvestigation.ts`). The codebase deliberately avoids `EventSource` because its auto-reconnect would re-fire the expensive, non-idempotent investigation. Streaming here is not a latency mask — the reasoning trace is the product.
-
-**Key points:**
-- NDJSON framing is one line per event (`JSON.stringify(e) + '\n'`); the client splits on `\n` and keeps the trailing partial line.
-- `AgentEvent` is a discriminated union; the client renders each variant via `switch (e.type)`.
-- The server's `send` records the event (for caching the full trace) and enqueues its bytes in one place.
-- `EventSource` is rejected because reconnect would re-start the investigation, doubling cost — `fetch`/`getReader` has no silent reconnect.
-- The transport choice follows from idempotency: each `GET /api/agent` *does* expensive work, so it must not auto-reconnect.
 
 ---
 
@@ -496,6 +433,11 @@ A reviewer says: "Streaming is just a fancy spinner — buffer the whole investi
 
 What `Content-Type` does the agent route return, and why does that choice rule out `EventSource` on the client? (Answer: `application/x-ndjson; charset=utf-8` — `NDJSON_HEADERS`, `app/api/agent/route.ts` L107–L110; `EventSource` requires `text/event-stream`, and more importantly its auto-reconnect would re-fire the non-idempotent run.)
 
+## See also
+
+→ 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
+
 ---
 Updated: 2026-05-28 — `maxDuration` 60→300; documented schema bootstrap moved inside the `ReadableStream` (+ try/catch error events, briefing route mirror); NDJSON consumer relocated from the investigate page to the StrictMode-safe `useInvestigation` hook; re-derived all route.ts/hook line refs.
 Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (local `BriefingEvent` superset L54–L58 that does NOT widen the shared `AgentEvent`; demo paced replay `REPLAY_DELAY_MS = 140` vs the agent route's 180; per-category `coverage_item` streaming L209–L212 that fills the grid tile-by-tile); refreshed drifted refs — briefing `maxDuration` L16→L17, and the feed's briefing reader from the stale `app/page.tsx` L311–L312 to the live reader (`getReader()` L323, loop L439–L457, `BriefingEvent` L28–L32).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

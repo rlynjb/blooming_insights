@@ -5,7 +5,6 @@
 
 > The discipline that decides what fills the model's window on the next turn — and, in a multi-agent system, which agent sees what. blooming insights does this actively: a 112KB raw schema gets compressed to a token-bounded summary, the runnable category list is injected by replacement, and every tool result is truncated before it goes back to the model.
 
-**See also:** → `02-agent-memory-tiers.md` · → `03-tool-calling-and-mcp.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/02-context-and-prompts/01-context-window.md` · → `../../study-ai-engineering/02-context-and-prompts/02-lost-in-the-middle.md`
 
 ---
 
@@ -201,7 +200,7 @@ The window for ONE monitoring turn (blooming insights)
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Schema cap (the structured-input slice):**
 **File:** `lib/agents/monitoring.ts`
@@ -272,79 +271,6 @@ Context engineering as discipline breaks down when the curation logic itself bec
 - Agent memory tiers (`02-agent-memory-tiers.md`) → memory is part of context engineering; tiers are how it scales
 - Tool calling and MCP (`03-tool-calling-and-mcp.md`) → per-agent tool subsets are a context-engineering decision
 - Lost-in-the-middle (`../../study-ai-engineering/02-context-and-prompts/02-lost-in-the-middle.md`) → why the *order* of slices matters, not just the size
-
----
-
-## Tradeoffs
-
-The decision here was *to actively curate the window at three boundaries* (schema summary, prompt injection, tool-result cap) instead of letting the API's nominal 200K limit be the bound. The alternative most teams reach for is "pass the raw inputs; the model will figure out what's relevant."
-
-┌──────────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Cost dimension   │ Active curation (chosen)    │ Pass-through (alternative)  │
-├──────────────────┼─────────────────────────────┼─────────────────────────────┤
-│ Token cost/turn  │ ~3KB prompt + 13 tools +    │ 112KB schema + 27 tools +   │
-│                  │ ≤16KB results/call          │ unbounded tool results       │
-│ Latency          │ small windows = fast turns  │ large windows = slow turns  │
-│ Reasoning quality│ load-bearing parts at edges │ load-bearing parts buried   │
-│                  │ (lost-in-the-middle dodged) │ in the middle               │
-│ Build time       │ caps + slot logic per agent │ paste everything in once    │
-│ Failure mode     │ a real signal is dropped by │ silent reasoning drift from │
-│                  │ a too-tight cap (visible)   │ noise (invisible)            │
-│ Per-agent cost   │ each agent gets a sliced    │ every agent pays for every  │
-│                  │ tool list                    │ tool definition every turn  │
-│ Hire-ability     │ "curate the slice" is the   │ "throw it all in" reads as  │
-│                  │ senior posture              │ junior posture              │
-└──────────────────┴─────────────────────────────┴─────────────────────────────┘
-
-### What we gave up
-
-We gave up the option to surface the long tail without an explicit retrieval step. A workspace event ranked #25 is invisible to the monitoring agent because `MAX_EVENTS = 20` excludes it. A tool result longer than 16KB is clipped with a marker the model has to respect. If the long tail ever becomes load-bearing — say, a category whose required event is rare — we'd need either a different summary shape or an on-demand retrieval tool, not just a bigger cap.
-
-We also gave up some across-agent flexibility. The recommendation agent literally cannot run `execute_analytics_eql` because it isn't in its tool list. That's deliberate (it shouldn't, and the cap prevents the mistake), but it means a "smart" agent that decided it needed a fresh measurement to ground its recommendation can't get one without going through the route layer.
-
-### What the alternative would have cost
-
-If we had passed the raw inputs straight through, the system prompt would be ~120KB on every turn — and every turn pays for every token of it. Across a 6-call investigation that's ~720KB of system prompt the model is re-reading on each turn (prefix caching would help, but not all of it). More importantly, the model's attention budget would be spent on the schema and the irrelevant tools instead of on the actual reasoning step, and the lost-in-the-middle effect would push the hard rules (the 6-call cap, the EQL gotchas) into the middle of a 120K block where they get recalled worst.
-
-### The breakpoint
-
-Active curation stays the right call until a workspace's signal genuinely lives in the long tail and the agent has no way to find it. At that point the right move isn't to remove the caps (then everything gets buried) but to add an on-demand retrieval tool that lets the agent pull from the un-summarised version when it needs to — converting "everything is in the window" to "anything can come into the window if the agent asks for it." That's agentic RAG (section 02 of this guide), and it's the right next escalation if monitoring quality is bottlenecked by the schema cap.
-
-### What wasn't actually a tradeoff
-
-A bigger model with a longer effective context wasn't a real alternative. The lost-in-the-middle effect persists even in long-context models (the published numbers show degradation across the entire window length, just less steep). And cost scales roughly linearly in input tokens, so "let it all in" gets expensive fast — a 200K window at provider rates is real money per call, and an agent makes many calls.
-
----
-
-## Tech reference (industry pairing)
-
-### Anthropic Messages API (system, tools, messages)
-
-- **Codebase uses:** `anthropic.messages.create({ model, max_tokens, system, messages, tools })` in `runAgentLoop` (`lib/agents/base.ts` L92–L102). System is the assembled string from `monitoring.ts` L83.
-- **Why it's here:** the API surface is the place where curated context becomes a request — `system`, `tools`, and `messages[]` are the three slots context engineering fills.
-- **Leading today:** Anthropic Messages API — innovation-leading for agent loops, 2026.
-- **Why it leads:** first-class `tool_use`/`tool_result` blocks make the loop a typed shape, and `system` separation from `messages[]` keeps prompt-prefix caching cheap.
-- **Runner-up:** OpenAI Responses API — equivalent role separation; the larger installed base.
-
-### Prompt templating via `String.prototype.replace`
-
-- **Codebase uses:** `PROMPT.replace('{schema}', ...).replace(/\{project_id\}/g, ...).replace('{categories}', ...)` in `monitoring.ts` L83–L86. Source template at `lib/agents/prompts/monitoring.md`.
-- **Why it's here:** plain string replacement is enough for this scope (3 slots, no nested logic) — it keeps the prompt readable as a `.md` file and the assembly visible in code.
-- **Leading today:** lightweight templating (Mustache-style, no template engine) — adoption-leading for prompt files, 2026.
-- **Why it leads:** prompts versioned as plain text diff cleanly in code review; slot substitution stays one line of code per slot.
-- **Runner-up:** LangChain `PromptTemplate` / `ChatPromptTemplate` — typed variables and composability, at the cost of a framework dependency.
-
----
-
-## Summary
-
-Context engineering is the discipline of deciding what fills the model's window for the next turn — and, in a multi-agent system, which agent sees what. blooming insights does this at three boundaries: it bounds the workspace schema with hard caps (`MAX_EVENTS=20`, `MAX_PROPS_PER_EVENT=10`, `MAX_CPROPS=30` in `monitoring.ts` L21–L33) before it enters the prompt, it injects the gated-and-runnable category list into the prompt by `.replace()` (`monitoring.ts` L83–L86), and it truncates every tool result to 16,000 chars at the loop boundary (`base.ts` L29/L150/L171). The constraint that forced this is the lost-in-the-middle effect plus the 6-call budget under a ~1 req/s MCP limit — a bloated window is both slower and worse-reasoning. The cost is curation logic that can mis-cap and silently hide the long tail.
-
-- The window is a slice you compute, not a bucket you dump into.
-- Three caps compound: schema (~112KB → ~2KB), tool result (≤16KB), stream payload (≤4KB).
-- Per-agent tool subsets are a context-engineering decision — the wrong tool is never in the window.
-- Prompt slots (`{schema}`, `{categories}`, `{project_id}`) are filled at run time against runtime state, then injected by replacement.
-- Worth it because bigger windows don't solve the noise problem; explicit slicing does.
 
 ---
 
@@ -464,5 +390,10 @@ Without opening any files:
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
+## See also
+
+→ `02-agent-memory-tiers.md` · → `03-tool-calling-and-mcp.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/02-context-and-prompts/01-context-window.md` · → `../../study-ai-engineering/02-context-and-prompts/02-lost-in-the-middle.md`
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

@@ -5,7 +5,6 @@
 
 > The `?q=` free-form query is only `.trim()`'d and passed straight to the model as `userPrompt: query` with no sanitization — an untrusted-input gap — but the blast radius is bounded because the app is read-only (MCP tools cannot write) and the agent outputs are validated structured shapes, so the worst case is data exfiltration via a crafted answer, not a destructive action.
 
-**See also:** → 05-retry-circuit-breaker.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
 
 ---
 
@@ -212,7 +211,7 @@ A reader who sees only this diagram should grasp: the input is unguarded, but re
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 **Not yet implemented (input guard).** blooming insights passes `?q=` to the model with only `.trim()` (`app/api/agent/route.ts` L115) — there is no sanitization, no injection detection, and no instruction-data separation before the query becomes `userPrompt: query` (`lib/agents/query.ts` L35).
 
@@ -255,52 +254,6 @@ The read-only mitigation holds only as long as no write tool is ever added. The 
 
 ---
 
-## Tradeoffs
-
-| Dimension | This codebase (read-only + validated output, no input guard) | Add input guard | Add output exfiltration filter |
-|---|---|---|---|
-| Destructive-action risk | none — no write tool exists | none (already safe) | none (already safe) |
-| Exfiltration risk | present — crafted query can over-disclose | reduced | directly addressed |
-| False-positive risk | none | medium — guard may block legit analytical queries | medium — filter may redact valid answers |
-| Setup complexity | done (architectural) | low–medium — a guard function | medium — needs a disclosure policy to enforce |
-| Durability | breaks if a write tool is added | holds independent of tool set | holds independent of tool set |
-
-**What we gave up.** By shipping `?q=` with only `.trim()`, blooming insights accepted the exfiltration risk: a crafted query can steer the model to surface schema or customer data the UI would not normally foreground. That was a defensible trade for a read-only analyst tool with bounded blast radius — the data the model can reach is the same data the legitimate feature exposes, so the marginal risk is over-disclosure, not new capability. It was *not* a defensible trade if a write tool ever joins the set.
-
-**What the alternative would have cost.** An input guard risks false positives — a legitimate analytical question ("ignore seasonal noise and tell me what changed") contains injection-shaped phrasing and could be wrongly blocked. A naive keyword filter degrades the core feature (free-form questions) for marginal safety. A robust guard (a classifier model) adds a per-request call and latency to a path that is already calling haiku to classify intent. The structural mitigations were cheaper and more durable, which is why they came first.
-
-**The breakpoint.** The current posture is acceptable while the tool set is read-only and the data is analytics the feature already exposes. It becomes unacceptable the instant either changes: a write/send tool is added (injection turns destructive), or the session gains access to data the product means to keep restricted (exfiltration turns into a breach). Either event makes the input guard non-optional.
-
----
-
-## Tech reference (industry pairing)
-
-### input guarding / injection detection
-
-- **Codebase uses:** nothing beyond `.trim()` (`app/api/agent/route.ts` L115).
-- **Why it's here:** `?q=` is the untrusted surface and the named gap.
-- **Leading today:** prompt-injection classifiers like Llama Guard and Lakera Guard (adoption-leading, 2026); Anthropic's constitutional-classifier approach (innovation-leading, 2026).
-- **Why it leads:** a dedicated classifier catches paraphrased attacks a keyword filter misses, with tunable false-positive rates.
-- **Runner-up:** heuristic phrase/pattern detection — cheap, brittle, the starting point for the exercise below.
-
-### instruction-data separation
-
-- **Codebase uses:** none — system prompt and `?q=` share one token stream (`lib/agents/base.ts` L80).
-- **Why it's here:** the absence of a privilege boundary is the root of why injection works.
-- **Leading today:** explicit delimiter conventions + "treat the delimited span as data" instructions (adoption-leading, 2026); structured/role-typed inputs in newer provider APIs (innovation-leading, 2026).
-- **Why it leads:** delimiters give the model a hint about which span is untrusted; structured inputs push the boundary into the API contract.
-- **Runner-up:** XML-tag-wrapping the user input — a common, model-cooperation-dependent convention.
-
-### blast-radius reduction (read-only + validated output)
-
-- **Codebase uses:** read-only MCP tool set (`lib/mcp/tools.ts`) and validated artifacts (`isDiagnosis`, `isRecommendationArray` in `lib/mcp/validate.ts`).
-- **Why it's here:** these are the architectural mitigations that contain the gap to exfiltration.
-- **Leading today:** least-privilege tool design + validated structured outputs (adoption-leading secure-agent pattern, 2026); capability-scoped tool tokens (innovation-leading, 2026).
-- **Why it leads:** limiting what the model can *do* is the only injection defense that does not depend on detecting the attack.
-- **Runner-up:** human-in-the-loop confirmation before any side-effecting action.
-
----
-
 ## Project exercises
 
 ### Input guard on `?q=` + document the read-only / structured-output defense
@@ -320,19 +273,6 @@ The read-only mitigation holds only as long as no write tool is ever added. The 
 - **Files to touch:** `lib/agents/base.ts` (the tool-result handling at L150, before it is pushed to `messages` at L171).
 - **Done when:** a tool result containing an instruction-shaped string does not alter the model's behavior, verified by a test injecting such a string through a fake MCP caller.
 - **Estimated effort:** 1–4hr.
-
----
-
-## Summary
-
-blooming insights passes the `?q=` free-form query to the model with only `.trim()` (`app/api/agent/route.ts` L115) and then verbatim as `userPrompt: query` (`lib/agents/query.ts` L35) — an honest, unguarded untrusted-input surface. The reason this is a contained risk rather than an emergency is architectural: every MCP tool is read-only (`lib/mcp/tools.ts`) and every agent artifact is validated into a fixed shape (`lib/mcp/validate.ts`), so no model output triggers a write or destructive action. The residual, real threat is data exfiltration — a crafted query steering the model to over-disclose schema or customer data through the answer text. The buildable target is an input guard plus an asserted, documented read-only/structured-output defense; the containment breaks the moment a write tool is added.
-
-**Key points:**
-- An LLM has no parameterized-query equivalent — system prompt and user input share one token stream with no privilege boundary.
-- `?q=` reaches the model with only `.trim()` — no input guard, no instruction-data delimiter (the honest gap).
-- Read-only tools (`lib/mcp/tools.ts`) mean injection cannot trigger a destructive action — mitigation 1.
-- Validated structured artifacts + no output-triggered write mean injection cannot ride the output into a side effect — mitigation 2.
-- The bounded residual risk is exfiltration via the answer; the containment evaporates if a write tool is ever added.
 
 ---
 
@@ -414,5 +354,10 @@ A teammate says "the input is unsanitized, this is a P0 security bug, block the 
 
 What is the only transformation applied to `?q=` before it reaches the model, and on which line? (Answer: `.trim()`, `app/api/agent/route.ts` L115.)
 
+## See also
+
+→ 05-retry-circuit-breaker.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
+
 ---
 Updated: 2026-05-28 — Re-derived the `?q=` path refs (trim L115, classifyIntent L211, answer L214, diagnosis/recommendation send L238–L239/L247–L248, saveInvestigation L254); added the `TraceContent` output-rendering note (model reasoning rendered as light markdown/JSON via React text nodes, no `dangerouslySetInnerHTML` — a safe surface).
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.

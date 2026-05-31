@@ -5,7 +5,6 @@
 
 > `McpClient.callTool` is the single choke-point for every MCP call: it serves cached results by key+TTL, spaces live calls to satisfy Bloomreach's 1 req/sec global limit, and retries bounded times on a rate-limit error — never caching failures.
 
-**See also:** → 01-request-flow.md · → 03-provider-abstraction.md · → ../02-dsa/01-ttl-cache.md · → ../02-dsa/02-rate-limit-and-retry.md
 
 ---
 
@@ -201,7 +200,7 @@ The spacing gate and the retry loop both live inside the Service layer, so Bloom
 
 ---
 
-## In this codebase
+## Implementation in codebase
 
 ### Files, functions, and line ranges
 
@@ -321,72 +320,6 @@ Every call through `McpClient` is a read of Bloomreach analytics data. The same 
 
 ---
 
-## Tradeoffs
-
-### Comparison: client-side TTL cache + fixed spacing + bounded retry vs. alternatives
-
-| Dimension | This codebase | Alternative A: no cache + real token bucket | Alternative B: shared Redis cache + distributed limiter |
-|---|---|---|---|
-| Setup complexity | Zero — one `Map` field, one timestamp field | Low — add `Bottleneck` or `p-throttle` npm package | High — Redis instance, shared key naming, TTL sync |
-| Works across serverless instances | No — per-process state only | No (token bucket also per-process) | Yes — state lives in Redis, visible to all instances |
-| Burst handling | Strict throttle — no bursts ever | Token bucket — allows short bursts up to bucket size | Depends on algorithm (sliding window = strict; leaky bucket = smooths) |
-| Cache coordination | No — each instance has its own cache | N/A | Yes — one cache entry per key across all instances |
-| Failure mode | Cold-start misses; multi-instance races | Same cold-start miss; better burst handling | Redis outage takes down caching + limiting simultaneously |
-| Correctness for 1 instance | Correct — spacing + cache fully cover the constraint | Correct | Correct but over-engineered |
-
-**Gave up:**
-- Coordination across instances. The `minIntervalMs` spacing is a best-effort courtesy to Bloomreach, not a hard guarantee when multiple instances share one user's rate limit quota.
-- Burst absorption. A token bucket would let an idle client accumulate credit and send two requests quickly after a quiet period; the fixed delay prevents this even when safe.
-
-**Alternative's cost:**
-- A real token bucket (`Bottleneck`, `p-throttle`) adds a dependency and more configuration surface for no benefit when there is only one process.
-- A distributed Redis limiter adds operational complexity (Redis deployment, connection management, key expiry) that is disproportionate to the current single-user, single-process deployment target.
-
-**Breakpoint:**
-This design is correct and sufficient for one process serving one user at ~1 req/sec. It breaks when multiple concurrent serverless instances handle the same user's requests simultaneously and share Bloomreach's global per-user rate limit. At that point a distributed limiter (Redis sliding window or Upstash rate limit) is the required fix.
-
----
-
-## Tech reference (industry pairing)
-
-### in-memory Map cache (cache-aside)
-
-- **React Query** (`@tanstack/react-query`): industry standard for cache-aside in React. `staleTime` is the TTL; `queryKey` is the cache key. On a stale miss it fetches and repopulates. Direct parallel to `McpClient`'s `cacheKey` + `expiresAt`.
-- **SWR** (`swr`): lightweight alternative to React Query. `dedupingInterval` is the TTL. Same pattern, smaller API surface.
-- **Apollo Client** (GraphQL): per-query normalized cache. More complex key structure but the same lazy-populate principle.
-- **`lru-cache`** (npm): the standard Node.js LRU cache. Adds eviction on max-size; `McpClient` omits this (the cache can grow unboundedly, though in practice the tool call set is small).
-- **`node-cache`** (npm): a drop-in in-memory TTL cache for Node. Identical to the `Map` approach but with built-in TTL expiry callbacks.
-
-### client-side rate limiting
-
-- **`Bottleneck`** (npm): industry-standard Node.js rate limiter. Supports token bucket, concurrency limits, priority queues. The production-grade version of `minIntervalMs`.
-- **`p-throttle`** (npm): simple fixed-rate throttle for promise-returning functions. Direct drop-in for `liveCall`'s spacing logic.
-- **`p-queue`** (npm): concurrency-limited queue. Useful when the constraint is max concurrent calls rather than calls-per-second.
-- **Upstash Rate Limit** (`@upstash/ratelimit`): Redis-backed distributed rate limiting. The production fix for multi-instance serverless deployments.
-- **`async-sema`** (npm): semaphore for limiting concurrency in async code. Lower-level than `Bottleneck` but useful when you need fine-grained control.
-
-### retry-with-backoff
-
-- **`p-retry`** (npm): industry standard for retrying promise-returning operations. Supports exponential backoff, jitter, custom `shouldRetry` predicates. Direct replacement for the `while (isRateLimited)` loop.
-- **`axios-retry`**: automatic retry plugin for Axios. Handles 429 and 5xx with configurable backoff.
-- **`fetch-retry`** (npm): wraps `fetch` with retry logic. Simple, zero-dependency.
-- **`cockatiel`** (npm): resilience library (retry, circuit breaker, timeout, fallback). The full toolkit when retry alone is insufficient.
-- **AWS SDK retry behavior**: exponential backoff with jitter, built into all AWS SDK v3 clients. The reference implementation for retry-with-backoff in production systems.
-
----
-
-## Summary
-
-`McpClient.callTool` is the single choke-point for every MCP call. It combines three primitives — a TTL cache, a fixed minimum-interval spacing gate, and a bounded retry loop — into one method so no caller has to think about rate limiting or caching individually.
-
-- `callTool` checks a `Map<string, {result, expiresAt}>` keyed on `name:JSON.stringify(args)` before touching the network — this is cache-aside with TTL (checklist step: **3. Caching layers**)
-- `liveCall` enforces `minIntervalMs = 1100` ms between outbound calls because Bloomreach's global rate limit is ~1 req/sec per user — this is client-side throttling (checklist step: **5. Failure handling**)
-- A `while (isRateLimited && retries < maxRetries)` loop retries on 429-equivalent responses with a `retryDelayMs` pause between attempts (checklist step: **5. Failure handling**)
-- Error results (`isError: true`) are never written to the cache, so a transient failure cannot poison subsequent calls for 60 seconds (checklist step: **5. Failure handling**)
-- The in-memory cache and per-process `lastCallAt` break under horizontal scaling — a distributed limiter and shared cache are the production fix (checklist step: **6. Scale concerns**)
-
----
-
 ## Interview defense
 
 ### What they are really asking
@@ -494,5 +427,10 @@ A colleague argues: "We should remove the in-memory cache because it makes debug
 - How many total transport calls does `maxRetries: 2` allow? (Initial call + 2 retries = 3.)
 - Does `listTools` use the cache? (Cite `lib/mcp/client.ts` L169–L171 and explain why not.)
 
+## See also
+
+→ 01-request-flow.md · → 03-provider-abstraction.md · → ../02-dsa/01-ttl-cache.md · → ../02-dsa/02-rate-limit-and-retry.md
+
 ---
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now uses a parsed retry-after window / exponential backoff (default `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
+Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
