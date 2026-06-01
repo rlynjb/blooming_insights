@@ -79,7 +79,7 @@ The spine: **UI → route → one shared agent loop → one MCP choke-point → 
 This book is the **wide opener** — it prepares you for the project-level questions that open an interview. When the interviewer stops asking about the project and drills into *one pattern* — the provider abstraction, the TTL cache, the schema-gated coverage — that's the **deep dive**, and those defenses live in the per-concept Interview-defense blocks inside:
 
 ```
-  .aipe/study-interview-defense/     ← THIS book — the whole project, wide
+  .aipe/rehearse-interview-defense/  ← THIS book — the whole project, wide
   .aipe/study-system-design-dsa/     ← per-concept deep dives (request flow,
                                         caching, streaming, the coverage gate, …)
                                         each concept file has its own Interview
@@ -95,3 +95,4 @@ Use both. This book gets you through the first fifteen minutes without rambling;
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-05-31 — Migrated to /aipe:rehearse orchestrator (v1.50): directory renamed from .aipe/study-interview-defense/ to .aipe/rehearse-interview-defense/ per spec rename study-interview-defense.md → rehearse-interview-defense.md; cross-references updated. Content unchanged.

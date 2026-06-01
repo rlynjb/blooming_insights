@@ -128,10 +128,10 @@ exists; the sheets are what you do.
   ## How this book connects to the rest of the study system
 
 ```
-  .aipe/study-hackathon-demo/      ← this book — present the project
+  .aipe/rehearse-hackathon-demo/   ← this book — present the project
                                      (run-of-show, choreography, recovery)
 
-  .aipe/study-interview-defense/   ← answer "how does it actually work?"
+  .aipe/rehearse-interview-defense/ ← answer "how does it actually work?"
                                      (the follow-up after the buzzer)
 
   .aipe/study-system-design-dsa/   ← the deepest follow-ups
@@ -161,3 +161,4 @@ expected.
 ```
 
 Read chapter 1 next.
+Updated: 2026-05-31 — Migrated to /aipe:rehearse orchestrator (v1.50): directory renamed from .aipe/study-hackathon-demo/ to .aipe/rehearse-hackathon-demo/ per spec rename study-hackathon-demo.md → rehearse-hackathon-demo.md; cross-references updated. Slot length (10 min) preserved. Content unchanged.

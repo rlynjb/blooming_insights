@@ -52,7 +52,7 @@ study-ai-engineering/           single-agent mechanics + retrieval mechanics
 study-prompt-engineering/       prompt-craft mechanics (self-critique, structured
                                  outputs, anatomy of the production prompts the agents
                                  use, the {categories} runtime interpolation)
-study-interview-defense/        the wide-opener interview book — defending the project
+rehearse-interview-defense/     the wide-opener interview book — defending the project
                                  above the concept level
 THIS GUIDE                      everything ABOVE one agent — reasoning patterns,
                                  agentic retrieval as a control loop, multi-agent
