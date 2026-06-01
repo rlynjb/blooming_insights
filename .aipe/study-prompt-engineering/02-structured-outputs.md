@@ -39,6 +39,55 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Structured outputs run as a four-layer producer→consumer pipeline and each layer has a different idea of what "the output" is. Layer A is the *prompt's `## Output` section* — the asked-for JSON shape, written in English with a fenced example. Layer B is the *model's final text* — an untrusted string that *might* be that JSON, *might* be that JSON wrapped in chatty markdown, *might* be a refusal. Layer C is the *extract+validate funnel* — `parseAgentJson` then a `v is T` guard, with a repair path (`synthesize()`) for the failure branch. Layer D is the *typed value the consumer ships* — the thing the next agent or the UI actually holds.
+
+**Axis: guarantees.** What is *promised* at each layer, and what is *enforced*? This is the right axis because the trap this whole concept defends against is conflating "I asked for JSON" (a request) with "I got JSON" (a guarantee). Control is too narrow here (the model controls Layer B no matter what); the interesting question is what each layer commits to. A asks; B promises nothing; C either guarantees a typed value or routes to a floor; D is guaranteed-typed by construction. If you can't say what each layer guarantees, you can't tell where to put the validator.
+
+**Seams.** Two seams, one load-bearing. Seam 1 (A↔B) is the seam blog folklore obsesses over — the guarantee flips from *statistical* ("the model usually emits JSON because I asked nicely") to *whatever-came-back* ("here's a string, good luck"). That seam is where the format request lives, but it's not where safety lives. The load-bearing seam is Seam 2 (B↔C): the guarantee flips from *no-shape-promised* to *typed-or-floored*. This is where `parseAgentJson` runs the fence-regex-first (because the model honored the prompt's request and wrapped its JSON in markdown — exactly what blog folklore warned would happen), where the type guard either returns a `Diagnosis` or null, where `synthesize()` retries on clean context, and where the floor (`[]` for monitoring, `FALLBACK` for diagnostic) makes the function total. Get this seam right and "the model returned garbage" stops being a 500 — it becomes an empty list.
+
+```
+  Structure pass — structured outputs
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: prompt ## Output (asked-for fenced JSON)   │
+  │  B: model finalText (untrusted string)          │
+  │  C: extract + validate + repair funnel          │
+  │  D: typed value the consumer ships              │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: what does each layer promise vs   │
+  │  enforce?                                       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): statistical request → no-promise    │
+  │            string                               │
+  │  S2 (B↔C): no-promise → typed-or-floored        │
+  │            (LOAD-BEARING — where shape becomes  │
+  │             a guarantee)                        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "is the shape guaranteed?" answered two ways
+
+  ┌─ Layer B ────────┐    seam     ┌─ Layer C ────────────┐
+  │  finalText:      │ ═════╪═════► │  parseAgentJson +    │
+  │  string, no      │  (it flips) │  type guard → typed  │
+  │  shape promise   │             │  value OR floor      │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary turns a request into a guarantee
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** The model's final text is an untrusted body you must defensively turn into a typed value through a three-stage funnel: *extract* the JSON out of whatever prose surrounds it, *validate* its shape field-by-field, *repair* via a clean-context retry when extract-or-validate fails. The prompt's job is to *ask* for the shape; the funnel's job is to *guarantee* it.
@@ -401,3 +450,4 @@ Updated: 2026-05-29 — Corrected the `## Output` section ranges (monitoring L69
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

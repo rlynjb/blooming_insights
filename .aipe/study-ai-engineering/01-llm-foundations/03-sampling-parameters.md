@@ -34,6 +34,40 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers: the per-agent call sites (where parameters could be set — classifier, agent turn, synthesis), the provider call (`anthropic.messages.create(params)`), and the sampler inside the model that consumes those parameters and reshapes the distribution. Above all three sits the prompt itself, which is the *other* way to control output stability (and the one this codebase actually uses).
+
+**Axis: control.** Who decides how the next token gets picked? This axis is the right lens because sampling parameters are the dial *the caller* turns to constrain model behavior — but blooming insights leaves that dial untouched and instead pushes determinism upstream into the prompt. Trust would flatten everything (the model is always probabilistic at this layer); cost is not the story (temperature doesn't move the bill); control is the lens that exposes the deliberate-non-decision.
+
+**Seams.** The cosmetic seam is between per-agent call sites and the provider call — params just pass through. The load-bearing seam is between the provider call and the sampler inside the model: this is where control over output variance would change hands if the caller passed `temperature` / `top_p` / `top_k`. blooming insights never passes them, so control stays with the provider's defaults — making the seam *invisible by abdication*. The interesting flip is sideways: `max_tokens: 16` on the classifier forces determinism not by reshaping the distribution but by ending the loop early — a length lever masquerading as a randomness lever.
+
+```
+  Structure pass — sampling parameters
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent call sites (could set; don't)       │
+  │  provider call (params pass through)           │
+  │  sampler inside model (reshapes distribution)  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides how the next token gets  │
+  │  picked — caller or provider defaults?         │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  call site↔provider: cosmetic (pass-through)   │
+  │  provider↔sampler: LOAD-BEARING                │
+  │    where temperature/top_p/top_k WOULD flip    │
+  │    control; here it stays with defaults        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** The model outputs a probability distribution over the whole vocabulary for the next token. Sampling parameters reshape that distribution and then pick from it. Think of it as a weighted `Array.prototype.find` over the vocabulary where the weights are the probabilities and the parameters control how aggressively you favor the top weights.
@@ -325,3 +359,4 @@ Updated: 2026-05-28 — Re-derived the drifted synthesis-call ranges (diagnostic
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

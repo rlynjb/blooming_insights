@@ -48,6 +48,52 @@ Zoom out — where request flow lives        ← we are here (every band)
 
 ---
 
+## Structure pass
+
+**Layers.** Request flow stacks six layers in a strict sequence: the **browser/UI** (the `useEffect` + state machine in `HomePage`), the **route handler** (the `GET /api/briefing` controller), the **session + connect gate** (cookie resolution + OAuth-tokenized MCP client), the **schema + coverage gate** (module-cached `WorkspaceSchema` + the 10-category classifier), the **agent loop** (`MonitoringAgent.scan` driving the Claude tool loop), and finally the **MCP transport + Bloomreach server**. Every `await` in the route is a layer boundary; cross one and you're in a different subsystem with different failure modes.
+
+**Axis: control.** Who decides what happens next at each layer? This axis is the right one because the whole point of "walking the request flow" is naming where control hands off — from the browser to the route, from the route to the connect gate, from CODE to the MODEL inside the agent loop. State and failure are real concerns, but they're downstream of control: once you know who's driving, you know where state can be mutated and where errors can originate. Failure could work as an alternate lens, but it'd flatten the agent-loop seam into "another try/catch" rather than showing the deepest flip in the whole stack.
+
+**Seams.** Three seams matter, and one is load-bearing. **Seam 1: browser → route handler.** Control flips from CLIENT (sync UI state machine) to SERVER (async pipeline with its own error shapes — 401/500/NDJSON `error` event). The 401+`needsAuth` contract is the joint that makes this seam real. **Seam 2: route handler → connect gate.** Control flips from CODE-decides (deterministic if-ladder) to PROVIDER-decides (OAuth round-trip may demand a redirect). The `{ok:false, authUrl}` sentinel is the contract. **Seam 3 (load-bearing): pipeline → agent loop.** Control flips from CODE-decides (the route's fixed schema→coverage→scan order) to MODEL-decides (Claude picks which MCP tool to call next, how many turns to take, when to emit final JSON). This is where the pipeline stops being procedural and becomes agentic — every other seam is procedural-to-procedural; this one is procedural-to-agentic.
+
+```
+Structure pass — request flow
+
+┌─ 1. LAYERS ────────────────────────────────────────────┐
+│  Browser/UI · Route handler · Session+Connect ·        │
+│  Schema+Coverage · Agent loop · MCP transport          │
+└───────────────────────────┬────────────────────────────┘
+                            │  pick the axis
+┌─ 2. AXIS ────────────────▼─────────────────────────────┐
+│  control: who decides what happens next at each layer? │
+└───────────────────────────┬────────────────────────────┘
+                            │  trace across layers, find flips
+┌─ 3. SEAMS ───────────────▼─────────────────────────────┐
+│  S1: browser → route       (CLIENT → SERVER)           │
+│  S2: route → connect       (CODE → PROVIDER OAuth)     │
+│  S3: pipeline → agent loop (CODE → MODEL) ★load-bearing│
+└───────────────────────────┬────────────────────────────┘
+                            ▼
+                    Block 4 — How it works
+```
+
+```
+S3 seam — "who decides what happens next?" answered two ways
+
+┌─ Route/pipeline ──┐    seam     ┌─ Agent loop ──────────┐
+│  CODE decides:    │ ═════╪═════►│  MODEL decides:        │
+│  schema → cover-  │  (it flips) │  which tool, how many  │
+│  age → scan order │             │  turns, when to stop   │
+└───────────────────┘             └────────────────────────┘
+        ▲                                       ▲
+        └────── same axis (control), two answers ─┘
+                → this is the procedural→agentic joint
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Move 1 — Mental model
@@ -582,3 +628,4 @@ Updated: 2026-05-29 — added Hop 5.5 coverage gate (`schemaCapabilities`/`cover
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

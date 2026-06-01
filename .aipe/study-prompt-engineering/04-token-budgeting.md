@@ -36,6 +36,56 @@
 
 ---
 
+## Structure pass
+
+**Layers.** The context window has four fill sources and you have to cap each one independently or any single one of them blows the call. Layer A is the *static prefix* — the system prompt plus the injected `{schema}`, identical on every turn of a loop. Layer B is the *growing transcript* — user prompt plus each turn's Thought/Action/Observation, accreting turn by turn. Layer C is the *output reservation* — `max_tokens`, which the provider subtracts from the window *before* generation. Layer D is the *unbounded variable* — the raw tool result that gets clipped on its way back into Layer B. Same window, four different fill sources, four different caps.
+
+**Axis: cost.** How many tokens does each layer cost per call, and how does that cost scale (per workspace? per turn? per call?)? Cost is the right axis because the failure this concept defends against is the call that "fits" in the hard window but degrades in the practical one — and degradation tracks token consumption, not turn count. State is too generic (everything is "in the window"); guarantees doesn't bite (the window is sized in tokens, not promises). Trace cost across A→D and the seams pop: the prefix is paid in full every turn (and uncached), the transcript grows quadratically without caps, the output reservation is paid up front, and Layer D is the one that gets clipped at the seam.
+
+**Seams.** Three seams; the load-bearing one is the prefix-caching seam that isn't there. Seam 1 (D↔B) — the cost flips from *unbounded* to *capped-at-16k-chars*; `truncate()` is the gate, and the bug it defends against is one chatty tool call flooding the transcript. Seam 2 (B's per-turn boundary) — cost flips from *paying for one turn* to *paying for N turns*; `maxToolCalls` (6/6/4/6) caps N. The load-bearing seam is Seam 3, which is hypothetical and aspirational: between the *cacheable prefix* and the *volatile placeholders* inside Layer A — cost would flip from *full-rate input tokens* to *fraction-rate cache reads* on turns 2-7. Today this seam doesn't exist because `{schema}` is appended *last*, behind the volatile `{anomaly}` / `{intent}` placeholders, so the cacheable prefix breaks at the first volatile token. Get this layout fixed (schema in front, `cache_control` on the boundary) and the dominant input-token line item on multi-turn runs drops sharply.
+
+```
+  Structure pass — token budgeting
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: static prefix (system + {schema})          │
+  │  B: growing transcript (turns accreted)         │
+  │  C: output reservation (max_tokens)             │
+  │  D: raw tool result (unbounded → clipped)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: tokens per layer per call; how does it  │
+  │  scale (per workspace, per turn, per call)?     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (D↔B): unbounded → capped 16k chars         │
+  │            (truncate gate)                      │
+  │  S2 (B per-turn): 1× → N× (maxToolCalls 6/6/4/6)│
+  │  S3 (within A): full-rate → cache-rate          │
+  │            (LOAD-BEARING — and NOT BUILT;       │
+  │             {schema} placed last blocks it)     │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what does the prefix cost on turn N?" answered two ways
+
+  ┌─ today ──────────┐    seam     ┌─ with cache + reorder┐
+  │  full-rate input │ ═════╪═════► │  fraction-rate cache │
+  │  tokens × every  │  (would flip│  reads × turns 2..N  │
+  │  turn (no cache) │   if built) │                      │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary is the optimization left on the table
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A context window is a fixed-size buffer, and every call fills it from four sources you control independently: the static prefix (system prompt + injected schema), the growing transcript (each Thought / Action / Observation appended turn over turn), the per-call output reservation (`max_tokens`, which is *subtracted* from the window before generation), and the unbounded variable — the tool results the model pulls in. Budgeting is deciding a cap for each source so their sum stays inside the *practical* window, not the hard one.
@@ -392,3 +442,4 @@ Updated: 2026-05-29 — Resynced monitoring refs after the `{categories}` shift:
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

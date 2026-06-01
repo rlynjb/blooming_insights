@@ -44,6 +44,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers, nested in the eval band: the per-agent under test (produces output), the judge call (a second LLM grading that output — itself a provider call with the same probabilistic properties), and the eval score that gets acted on. The judge looks like a smaller request flow inside the eval flow.
+
+**Axis: guarantees.** What does the judge's score actually guarantee — quality, or the judge's own systematic prejudices? This axis is the right lens because the file's whole frame is "an uncorrected judge produces a confident lie." The bias surface (position, length, self-preference) means the judge's *guarantee* is "I'll return a clean number" — but not necessarily a *correct* number. Cost is downstream; the upstream question is whether the score is trustworthy.
+
+**Seams.** The cosmetic seam is between the per-agent output and the judge's prompt — both are just strings. The load-bearing seam is between the judge call and the eval score: guarantees flip here from "probabilistic-with-known-biases" to "actionable number." The debiasing mechanisms (randomize order, control length, cross-family judge) sit *at* this seam — without them, the seam carries the judge's prejudices straight into shipping decisions. A useful parallel: the judge is to evals what the model is to live requests — same trust discipline, different layer.
+
+```
+  Structure pass — LLM-as-judge bias
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent under test (output)                 │
+  │  judge call (a second LLM, biased)             │
+  │  eval score (acted on)                         │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: quality measurement, or judge's   │
+  │  systematic prejudices?                        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  output↔judge prompt: cosmetic                 │
+  │  judge↔score: LOAD-BEARING                     │
+  │    probabilistic biased call → actionable num  │
+  │    debias HERE: position, length, family       │
+  │    without it: confident lie ships             │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Treat the judge as a measuring instrument with a known, reproducible *systematic error* — like a scale that always reads 200g heavy. You do not throw the scale out; you characterize the offset and subtract it. The three offsets are position, verbosity, and self-preference, and each has a mechanical correction. The goal is not a perfect judge (there is none) but a judge whose errors are controlled so they do not drive the score.
@@ -322,3 +357,4 @@ Updated: 2026-05-28 — Re-derived `Diagnosis` ref (types.ts L64–L73). `AGENT_
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -40,6 +40,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be graph orchestration setup has four layers: the **Graph definition** (nodes, edges, conditions — declared as data, not as control-flow code), the **Graph runtime** (walks the graph, fires nodes, evaluates conditional edges), the **Checkpoint store** (persists graph state across pauses and resumes), and the **Per-agent worker nodes** (the same agents this codebase already has — they don't change). In blooming insights the first three are absent; the Pipeline coordinator band holds an imperative `.then()`-chain `if`-ladder, no graph runtime, no checkpoints.
+
+**Axis: control.** Who decides which node fires next — imperative engineer-written code, a model supervisor, or an explicit data-driven graph the runtime walks? This is the right axis because the entire move graph orchestration makes is *moving the control-flow description out of code and into data the runtime can introspect*. State is a tempting alternate (checkpointing IS about state) but state-persistence is the *capability* the graph enables; the control-flow-as-data choice is what unlocks it.
+
+**Seams.** Two seams matter. Seam 1 sits between the Graph definition and the Graph runtime — control flips from declarative (DATA describing what could happen) to operational (RUNTIME firing one node at a time). This seam is what makes the graph inspectable — replay tools read the same definition the runtime walks. Seam 2 sits between the Graph runtime and the Checkpoint store — control flips from in-memory (runtime walks the graph) to persisted (state lives long enough to pause, resume, route a human into the loop). Seam 2 is the load-bearing one for *production* graph orchestration because that's where pause/resume and human-in-the-loop earn the whole topology. In blooming insights both seams are absent — the orchestration is small enough that imperative code reads fine.
+
+```
+  Structure pass — Graph orchestration (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Graph definition (nodes + edges as data)      │
+  │  Graph runtime (walks, evaluates conditions)   │
+  │  Checkpoint store (persists state)             │
+  │  Per-agent worker nodes (unchanged)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides which node fires next?   │
+  │           (code, model, or a data graph?)      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Graph definition ↔ Runtime            │
+  │          (DATA → RUNTIME) makes flow           │
+  │          inspectable                           │
+  │  Seam 2: Runtime ↔ Checkpoint store            │
+  │          (in-memory → persisted)               │
+  │          ★ load-bearing — enables pause/       │
+  │          resume + human-in-the-loop            │
+  │  In this repo: imperative if-ladder; no graph  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the node/edge/checkpoint mechanics and what would have to change to adopt them here.
+
+---
+
 ## How it works
 
 **The mental model: a multi-step-form's state machine, except each step is an agent and the state carries between agents.** Nodes own work; edges own transitions; state owns context. The engine walks the graph, runs nodes, evaluates edges, persists state.
@@ -543,3 +584,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

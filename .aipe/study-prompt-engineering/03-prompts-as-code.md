@@ -40,6 +40,54 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Prompts-as-code is best understood as a four-layer timeline, not a single artifact. Layer A is *authoring-time* — the `.md` file in the repo, the git history, the PR diff, the reviewer's comments. Layer B is *deploy/import-time* — `readFileSync` baking the prompt into the running process, making the deployed bytes equal to the committed bytes. Layer C is *request-time* — the model executes against that prompt on a specific `AGENT_MODEL` constant that lives in a *different* file from the prompt. Layer D is *post-hoc / observability-time* — the persisted record of what happened, which today is `saveInvestigation` writing outputs only, with no prompt-SHA or model-ID stamped on them.
+
+**Axis: lifecycle.** When does each piece exist, when is it pinned, when is it unrecoverable? This is the right axis because the gap this file is honest about — "we can review a prompt but can't trace a regression to one" — is a *temporal* gap. It's not about who controls (clearly the author, then code), and not about state (the prompt is immutable at runtime). It's about which layer captures which fact, and the fact missing at Layer D (which prompt SHA produced which output, on which model) is the one a future incident response will need *after* the prompts and model have already moved on.
+
+**Seams.** Three seams; the third is the load-bearing one. Seam 1 (A↔B) — lifecycle flips from *editable* to *runtime-immutable*; the import-time read is the gate, and the win is that deployed == committed. Seam 2 (B↔C) — the prompt and the model meet at request-time but were *paired by nobody*; the model ID is in `base.ts`, the prompt is in `prompts/monitoring.md`, and their pairing exists only in someone's memory. Seam 3 (C↔D) is the load-bearing one — lifecycle flips from *happening-now* to *recoverable-later*, and right now the boundary leaks: outputs persist, prompt-SHA and model-ID don't. The "worked on Sonnet, breaks on the next Sonnet" failure lives in this leak — by the time the regression is noticed, you can't recover which prompt-version × model-version pair produced the bad diagnosis from last week.
+
+```
+  Structure pass — prompts as code
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: authoring-time (.md, git, PR)              │
+  │  B: import-time (readFileSync → in-process)    │
+  │  C: request-time (prompt + AGENT_MODEL meet)   │
+  │  D: post-hoc (persisted record / trace)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each fact exist and      │
+  │  when is it pinned for the next reader?         │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): editable → runtime-immutable        │
+  │  S2 (B↔C): prompt & model paired by nobody     │
+  │  S3 (C↔D): happening-now → recoverable-later   │
+  │            (LOAD-BEARING — and currently leaks) │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "can a future reader recover what ran?" answered two ways
+
+  ┌─ Layer C ────────┐    seam     ┌─ Layer D ────────────┐
+  │  prompt + model  │ ═════╪═════► │  saved: outputs only │
+  │  in memory, in   │  (it flips) │  MISSING: prompt sha │
+  │  flight          │             │  + model id per output│
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary loses the pair → un-bisectable regression
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A prompt-as-code system has four properties: the prompt is a *file* (not a DB row or dashboard field), it is *loaded as source* by the program, it is *versioned* in the same repo as the code, and its version is *paired and logged* with the model and output for observability. blooming insights has the first three solidly and the fourth not at all. Picture two halves: the authoring half (file + load + version + review) is complete; the observability half (pair + log) is empty.
@@ -339,3 +387,4 @@ Updated: 2026-05-29 — Documented the `{categories}` runtime checklist injectio
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

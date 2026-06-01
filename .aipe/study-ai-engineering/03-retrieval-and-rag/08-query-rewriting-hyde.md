@@ -41,6 +41,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers: the user query (raw), the pre-retrieval transform (rewrite, expand, decompose, or HyDE — embed a hypothetical answer), the retriever (cosine over real documents), and the reranker / LLM context. The transform sits *before* retrieval, reshaping the question to look more like the answer.
+
+**Axis: state.** What's the shape of the string that crosses each boundary — a question, a transformed question, a hypothetical answer, or retrieved real answers? This axis is the right lens because the file's whole insight is that *changing the input's shape* (question → answer-shaped doc in HyDE) makes retrieval land in a different neighborhood. Cost is downstream; control doesn't flip; the load-bearing change is what *kind of string* is being embedded.
+
+**Seams.** The cosmetic seam is between retriever and reranker — same string-shape passes through. The load-bearing WOULD-BE seam is between the raw query and the transformed query (or hypothetical document): state-shape flips from "user-phrased question" to "answer-shaped string." This is the seam HyDE exists to install — embedding a question-shape always lands among other questions; embedding an answer-shape lands among real answers. blooming insights has a cousin transform upstream (`classifyIntent` labels intent), but it doesn't reshape for retrieval.
+
+```
+  Structure pass — query rewriting & HyDE (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  user query (raw)                              │
+  │  transform (rewrite / decompose / HyDE)        │
+  │  retriever (cosine)                            │
+  │  reranker / LLM context                        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state (shape): what KIND of string crosses    │
+  │  each boundary — question or answer-shape?     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  retriever↔reranker: cosmetic                  │
+  │  raw query↔transform: LOAD-BEARING             │
+  │    question-shape → answer-shape               │
+  │    HyDE lands embeddings near real answers     │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Retrieval quality is bounded by the query you hand it: garbage query, garbage candidates, and no reranker can recover. Query rewriting is input pre-processing — the same discipline as sanitizing and normalizing a form field before you use it — applied to the retrieval query. You have three levers.
@@ -289,3 +324,4 @@ What query-understanding does blooming insights do today, and why is retrieval-q
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

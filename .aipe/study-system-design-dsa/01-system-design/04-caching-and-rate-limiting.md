@@ -43,6 +43,54 @@ Zoom out — where caching + rate-limiting lives
 
 ---
 
+## Structure pass
+
+**Layers.** Caching + rate-limiting is a single-class stack with four ordered stages: the **caller** (any agent in the pipeline), the **cache check** (TTL Map — short-circuits on hit), the **spacing gate** (1100 ms minimum interval between live calls), and the **live call + retry loop** (transport + bounded 429-handling). Each stage either returns or falls through to the next — a strict pipeline of policies composed inside `callTool`.
+
+**Axis: failure.** Where does the bad thing originate, propagate, and get contained? This axis is right because the whole point of these four stages is *failure containment* — the cache contains stale-but-valid bursts, the spacing gate contains "we hit the server too fast" failures, the retry loop contains "the server already said no" failures, and the no-cache-on-error rule contains "don't memorize the failure" failures. Cost is the natural alternate axis (latency, retry budget) — but cost is the *consequence* of failure handling, not the structure. Pick failure and the seams pop; pick cost and the cache and spacing gate look like the same kind of optimization.
+
+**Seams.** Three seams matter; one is load-bearing. **Seam 1: cache hit/miss boundary.** Failure cannot originate inside the cache (it's a Map lookup); it can only originate downstream of this seam. **Seam 2: spacing gate → live call.** Failure-origin flips from CLIENT-SIDE (we're guarding against overage) to SERVER-SIDE (the server might still 429 us, or the network might drop). **Seam 3 (load-bearing): live result → cache write decision.** This is the no-cache-on-error guard. Failure-containment flips from "this slot might get filled" to "this slot will be skipped." The retry loop and the cache compose safely *only* because this seam exists — without it a 429 would poison the cache for the whole TTL, blocking real retries until expiry.
+
+```
+Structure pass — caching + rate-limiting
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Caller · Cache (TTL Map) · Spacing gate (1100 ms) · │
+│  Live call + retry loop                              │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  failure: where does a bad result originate,         │
+│  propagate, and get contained?                       │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: cache hit/miss (no failure possible upstream)   │
+│  S2: spacing gate → live call (CLIENT → SERVER)      │
+│  S3: live result → cache write ★load-bearing         │
+│      (no-cache-on-error guard; the composition rule) │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S3 seam — "do we memorize this result?" answered two ways
+
+┌─ Live call returned ┐  seam     ┌─ Cache write step ───┐
+│  isError === true   │ ═════╪═══►│  SKIP write (no fill)│
+│                     │  (it     │                       │
+│  isError === false  │   flips) │  WRITE with expiresAt │
+└─────────────────────┘          └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (failure), two answers ─┘
+                → this is the cache↔retry composition rule
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 Every tool call passes through the same four-stage funnel before a result reaches the caller.
@@ -449,3 +497,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers; retry
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

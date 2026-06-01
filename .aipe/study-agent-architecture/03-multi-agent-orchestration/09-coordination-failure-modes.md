@@ -43,6 +43,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Coordination failures cluster across four layers: the **Pipeline coordinator** (where synthesis failure, infinite handoff, and cost blowup would originate in a more autonomous topology), the **Per-agent / message-passing layer** (where context bloat would originate if state were shared), the **Shared agent loop** (where tool-call cascade and runaway turns originate), and the **Tools + MCP transport** (where token-revocation and rate-limit failures originate). Each layer has its own failure family and its own containment story.
+
+**Axis: failure.** Where does each failure mode originate, how does it propagate, and where does it get contained — structurally (the system shape doesn't allow it) or mechanically (a cap stops it before it explodes)? This is the right axis because the whole file is a *failure taxonomy mapped against containment*. Control is a tempting alternate (because choosing deterministic orchestration is what makes most of these structurally absent) but control is the *cause* of containment; failure is the lens that organizes which failures actually need handling.
+
+**Seams.** Two seams matter. Seam 1 sits between the would-be failure surfaces and what blooming insights' design *removes by being deterministic* — failure propagation flips from "possible" (autonomous shape) to "structurally absent" (CODE-supervised shape). Seam 2 sits between the failures that *can* still happen and the per-layer caps that bound them (turn caps, tool-call caps, budget caps, one-time auto-reconnect) — failure flips from "possible and unbounded" to "possible and capped." Seam 2 is the load-bearing one for the working system: it's where the explicit mechanisms earn their keep. Seam 1 is the load-bearing one for the *argument* — most of this file's thesis is "deterministic orchestration buys you fewer failure modes."
+
+```
+  Structure pass — Coordination failure modes
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Pipeline coordinator (synthesis, handoff,     │
+  │     cost blowup)                               │
+  │  Per-agent / message-passing (context bloat)   │
+  │  Shared agent loop (tool cascade, turn drift)  │
+  │  Tools + MCP transport (token revoke, 429s)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does it originate, propagate,  │
+  │           get contained?                       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: possible-failures ↔ structural-       │
+  │          absences (autonomous shape →          │
+  │          CODE-supervised shape)                │
+  │  Seam 2: still-possible failures ↔             │
+  │          per-layer caps (unbounded → capped)   │
+  │          ★ load-bearing — where mechanisms     │
+  │          earn their keep                       │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the failure taxonomy and which row blooming insights handles structurally vs mechanically.
+
+---
+
 ## How it works
 
 **The mental model: every multi-agent failure is "I forgot to constrain a loop or a budget."** The question is whether you constrain it structurally (the loop doesn't exist) or mechanically (the loop has a cap). Deterministic orchestration is the structural answer; budgets and counters are the mechanical answer.
@@ -601,3 +642,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -48,6 +48,54 @@ Zoom out — where the coverage gate functions live
 
 ---
 
+## Structure pass
+
+**Layers.** The coverage gate is a tight three-layer stack: the **nested schema** (the bootstrapped `WorkspaceSchema` — events, properties, catalogs), the **flat capability set** (a `Set<string>` of tokens — `event`, `event.prop`, `catalog:name` — derived once by `schemaCapabilities`), and the **per-item classification** (the registry walk that runs two `every()` tests per category and returns `full`/`limited`/`unavailable`). All three layers are pure — one `Set` build, N membership tests, no I/O.
+
+**Axis: state.** Where does the data live at each layer, what's the lookup cost, and what mutates? This is the right axis because the load-bearing transformation here is *state-shape*: nested schema → flat `Set` → boolean verdict. The whole reason `schemaCapabilities` exists is to turn an O(depth × breadth) nested lookup into an O(1) `Set.has` lookup; that's a state-shape decision. Cost is a tempting alternate, and it's real (O(N) to build the set, O(1) per `has`), but cost is *downstream* of state-shape — pick state and the cost falls out; pick cost and you have to reverse-engineer why the Set exists.
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1 (load-bearing): nested schema → flat `Set`.** State-shape flips from "tree of typed events with nested properties and catalogs" to "flat string-keyed Set with O(1) membership." This seam IS the gate's value-add — without it, every per-category check would have to walk the nested schema looking for matches. **Seam 2: per-item test → classification.** State flips from "the item's `requires[]` and `enriches[]` are arrays of strings" to "the item is now one of three labels (`full`/`limited`/`unavailable`)." This is where the two short-circuiting `every()` tests collapse the array into a single enum.
+
+```
+Structure pass — coverage gate
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Nested schema · Flat capability Set · Per-item     │
+│  classification (full/limited/unavailable)           │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: how does the shape change across layers,    │
+│  and what's the lookup cost?                         │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: nested schema → flat Set ★load-bearing          │
+│      (tree walk → O(1) Set.has)                      │
+│  S2: per-item test → verdict                         │
+│      (arrays + every() → single enum label)          │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "is this capability available?" answered two ways
+
+┌─ Without flat Set ─┐    seam     ┌─ With flat Set ──────┐
+│  walk nested       │ ═════╪═════►│  set.has(token):      │
+│  schema each time: │  (it flips) │  O(1) check           │
+│  O(depth × breadth)│             │  per dep              │
+└────────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (state), two answers ─┘
+                → this is what makes 10 categories × N deps cheap
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Mental model
@@ -385,3 +433,4 @@ Your teammate says: "Drop `enriches` — just have `requires`, and a category is
 → ../01-system-design/08-schema-gated-coverage.md · → 05-severity-sort.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -43,6 +43,62 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Prompt-injection defense lives across four layers, and the entire framing is "what does an attacker's text get to touch at each layer?" Layer A is the *network boundary* — `?q=` arrives from the user, gets `.trim()`-ed in the route handler, and that's the only processing. Layer B is the *prompt assembly* — the query agent stuffs the user text into the `userPrompt` slot with no delimiters, no instruction hierarchy, no "treat this as data" framing. Layer C is the *model* — system and user occupy the *same* context-window channel; the model can't enforce a wall between trusted instructions and untrusted text. Layer D is the *output and action surface* — JSON-validator gates on three agents (which reject injected free-text), read-only MCP tools (no destructive action exists), prose path on the fourth agent (no validator gate at all).
+
+**Axis: trust.** What is each layer allowed to *see* or *do* with user-controlled content? Trust is the right axis (the brief calls this one out) because the entire concept is a propagation question — once attacker text enters at Layer A, what does it get to reach at B, C, D? The standard XSS analogy applies and then breaks: XSS has a parseable boundary you can escape; prompt injection has a statistical boundary in one medium. So the trust axis is about *blast radius reduction*, not boundary enforcement.
+
+**Seams.** Three seams, and the load-bearing one is hypothetical-and-urgent-if-it-changes. Seam 1 (A↔B) — trust flips (or should) from *untrusted network input* to *quoted/delimited data inside the prompt*; this is the missing prompt-side defense. Seam 2 (B↔C) — trust flips from *string we assembled* to *bytes the model reads, indistinguishable from system rules*; the model itself is the seam-without-a-wall. The load-bearing seam is Seam 3 (C↔D) — trust flips from *model emission (might contain injected content)* to *what the system actually does with it*. Today this seam holds the blast radius: read-only tools (no destructive action available), validators (JSON injection fails the type guard), no LLM output triggers side effects. The moment a write tool (`send_email`, `update_segment`) gets added, this seam stops holding — and the trim-only `?q=` becomes a path to a destructive action.
+
+```
+  Structure pass — prompt injection defense
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: network boundary (?q= → .trim())            │
+  │  B: prompt assembly (userPrompt slot)           │
+  │  C: model (system + user in ONE channel)        │
+  │  D: output + action surface (validators, tools) │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  trust: what can user-controlled content       │
+  │  reach at each layer? where's blast radius?     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): untrusted input → quoted data       │
+  │            (MISSING: no delimiters, no hierarchy│
+  │             in query.md)                        │
+  │  S2 (B↔C): assembled string → model can't tell │
+  │            author from attacker (statistical    │
+  │             not enforced)                       │
+  │  S3 (C↔D): model emission → system action      │
+  │            (LOAD-BEARING — read-only tools +    │
+  │             validators bound the blast radius;  │
+  │             one write tool flips this)          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what can a successful injection actually do?" answered two ways
+
+  ┌─ today ──────────┐    seam     ┌─ + one write tool ───┐
+  │  inject text →   │ ═════╪═════► │  inject text →       │
+  │  no write tool   │  (it would  │  destructive action  │
+  │  → crafted       │   flip if   │  callable from a     │
+  │  ANSWER only     │   added)    │  crafted ?q=         │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → adding a single write tool moves this from
+                   "should add prompt-side defense" to "must ship first"
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** The model concatenates everything it is given into one context window and predicts the next token from all of it. Your system prompt and the user's input occupy the *same* channel; the model has no hard wall between "rules I was configured with" and "text the user typed." Injection exploits exactly that: put instruction-shaped text in the user slot and the model may follow it over (or alongside) the system prompt.
@@ -340,3 +396,4 @@ On the `?q=` query path, which line passes the user's input to the model and wha
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -42,6 +42,57 @@ Zoom out — where client stream handoff lives
 
 ---
 
+## Structure pass
+
+**Layers.** Client stream handoff stacks four layers around three storage tiers: the **mount lifecycle** (React StrictMode double-invokes the effect; `startedRef` is the in-process latch), the **live UI tier** (`useState` slots — `items`, `diagnosis`, etc., owns what renders right now), the **durable tier** (`sessionStorage` with four keys — survives a route change, survives a refresh), and the **wire** (the `?insight=` / `?diagnosis=` URL params + NDJSON stream that bridge to a serverless route which may land on a different instance). The three storage tiers are the *layers within the client*; the wire is the layer that crosses to the server.
+
+**Axis: state.** Who owns each piece of data, where does it live, and when is it written or discarded? This is the right axis because the whole hook IS a state-ownership choreography — `startedRef` owns "did this mount already fire," `useState` owns "what to render now," `sessionStorage` owns "what survives route navigation and instance hops," URL params own "what the server cannot remember on its own." Control is the alternate (the effect drives the fetch) but flattens to "the hook fetches" which says nothing about why there are four sessionStorage keys. Pick state and the keys explain themselves.
+
+**Seams.** Three seams matter; one is load-bearing. **Seam 1: startedRef → useState.** State-ownership flips from "in-process latch (survives only this mount)" to "React-managed (re-renders on change)." The `startedRef` exists because React 18 StrictMode would otherwise double-fire the fetch — the ref is the joint that absorbs the double-invoke. **Seam 2 (load-bearing): useState → sessionStorage.** Ownership flips from "live, lost on navigate" to "durable, survives route change AND instance hop." This seam is where the architecture's decision to use `sessionStorage` (not a backend store) becomes visible — it's why the hook can re-mount and hydrate without re-running the agents. **Seam 3: sessionStorage → URL query param.** Ownership flips from CLIENT-OWNS to SERVER-CAN-READ. The `?diagnosis=` param exists because Vercel instance B cannot read what instance A wrote into memory — the client must carry the diagnosis on the wire to feed it back to a different process.
+
+```
+Structure pass — client stream handoff
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Mount lifecycle (startedRef) · Live UI (useState)  │
+│  · Durable (sessionStorage 4 keys) · Wire (URL      │
+│  params + NDJSON stream)                            │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: who owns each piece, where does it live,    │
+│  when is it written or discarded?                    │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: startedRef → useState (latch → re-render owner) │
+│  S2: useState → sessionStorage ★load-bearing         │
+│      (live but ephemeral → durable across nav/instance)│
+│  S3: sessionStorage → URL param                      │
+│      (CLIENT-owns → SERVER-can-read on a fresh instance)│
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "what survives a route change?" answered two ways
+
+┌─ useState ────────┐    seam     ┌─ sessionStorage ─────┐
+│  ephemeral; lost  │ ═════╪═════►│  durable; survives    │
+│  on navigate or   │  (it flips) │  route change AND a   │
+│  re-mount         │             │  serverless cold      │
+│                   │             │  instance hop         │
+└───────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (state), two answers ─┘
+                → this is why re-mounts don't re-run agents
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **Move 1 — mental model: the hook is a state machine with three storage tiers.**
@@ -390,3 +441,4 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

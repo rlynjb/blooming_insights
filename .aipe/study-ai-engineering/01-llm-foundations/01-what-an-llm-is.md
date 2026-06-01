@@ -37,6 +37,53 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers stack from caller to model: the per-agent code that constructs the call and consumes its return, the agent loop (`runAgentLoop`) that wraps `messages.create` and joins text blocks into `finalText`, the provider SDK that frames an HTTPS request, and the model itself (frozen weights producing a token distribution). The layers are stacked one-way: input goes down, a `string` comes back up.
+
+**Axis: trust.** What does each layer trust about the bytes flowing past it? This axis is the right lens because the whole reason this file exists is to say "the model output is untrusted until the per-agent code earns its type." Control would flatten everything (the caller always decides the prompt; the model always decides the tokens); cost is downstream; trust is the lens that makes the load-bearing seam pop.
+
+**Seams.** The seam between the provider SDK and the agent loop is cosmetic — both treat the response as raw text blocks. The load-bearing seam is one layer up: between the agent loop's returned `finalText: string` and the per-agent code that consumes it. Trust flips here from "probabilistic, possibly-malformed prose" to "must be a typed `Diagnosis` / `Anomaly[]` or the floor `FALLBACK` kicks in." Every parse, every type guard, every three-tier fallback exists to honor this single seam.
+
+```
+  Structure pass — what an LLM is
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent (constructs + consumes)             │
+  │  agent loop (messages.create + join text)      │
+  │  provider SDK (HTTPS framing)                  │
+  │  model (frozen weights → token distribution)   │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  trust: what does each layer trust about the   │
+  │  bytes flowing past it?                        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  SDK↔loop: cosmetic (both see raw text)        │
+  │  loop↔per-agent: LOAD-BEARING                  │
+  │    finalText: string → typed Diagnosis or      │
+  │    FALLBACK; parse + validate live here        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what is this string?" answered two ways
+
+  ┌─ agent loop ─┐    seam     ┌─ per-agent ─┐
+  │ untrusted    │ ════╪═════► │ typed value │
+  │ finalText    │  (it flips) │ or FALLBACK │
+  └──────────────┘             └─────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → this boundary carries the contract
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** An LLM is a pure function `f(tokens) → next-token-distribution`, sampled and looped. Give it a sequence of tokens; it returns a probability distribution over the next token; you sample one, append it, and call again. Repeat until a stop condition. The "intelligence" is entirely in the learned weights; the runtime is a `while` loop over a sampling step. This is why the output is a `string` and nothing more — there is no JSON encoder in the model, only a sequence of sampled tokens that *happen* to spell valid JSON when the prompt is good and the dice cooperate.
@@ -352,3 +399,4 @@ Updated: 2026-05-29 — Monitoring degradation path moved: `parseAgentJson` + de
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

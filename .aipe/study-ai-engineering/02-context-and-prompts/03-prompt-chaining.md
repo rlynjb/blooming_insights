@@ -39,6 +39,53 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form the chain: the route + client (own the order between links — via `await` for legacy combined-capture or via the `step`-gated HTTP handoff for the live diagnose→recommend split), each per-agent invocation (one link's focused model call with its own prompt + tool subset + validator), the agent loop inside each link (gather→synthesize micro-chain), and the provider call that fires per link.
+
+**Axis: control.** Who decides the next step at each layer — CODE (the route/client/agent runs a fixed sequence) or MODEL (the agent loop picks tools within its stage)? This axis is the right lens because prompt chaining IS a control-structure decision: the chain says "CODE owns the order between links." That's what makes it a chain and not an agent. State is downstream (state flows from link to link), but the load-bearing question is whose control decides the next step.
+
+**Seams.** The cosmetic seam is between the provider call and the agent loop inside one link — both are part of one link's execution. The load-bearing seam is between the per-agent invocations (link N → link N+1): control flips here from "MODEL was deciding what to do within link N" to "CODE is deciding what link comes next." This is the chain's defining seam — the moment when the model's autonomy ends and the route/client's hard-coded order picks up. A second load-bearing variant: in the live path this same seam is *also* an HTTP boundary (sessionStorage `bi:diag:<id>` handoff), which means failure-containment also flips across it.
+
+```
+  Structure pass — prompt chaining
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  route + client (own the order)                │
+  │  per-agent invocations (one link each)         │
+  │  agent loop (gather→synthesize micro-chain)    │
+  │  provider call (per-link create)               │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: CODE owns order between links;       │
+  │  MODEL owns step choice within a link          │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  provider↔agent loop: cosmetic                 │
+  │  link N↔link N+1: LOAD-BEARING                 │
+  │    MODEL control → CODE control                │
+  │    (live path: also an HTTP boundary)          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "who picks the next step?" answered two ways
+
+  ┌─ inside link ──┐  seam   ┌─ between links ─┐
+  │ MODEL          │ ══╪═══► │ CODE            │
+  │ (picks tool)   │  flips  │ (fixed order)   │
+  └────────────────┘         └─────────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → this is what defines a chain
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A prompt chain is a fixed sequence of model calls wired by ordinary control flow — `await` within a request, or (in this codebase's live path) the client firing two `step`-gated requests in order — where step N's typed output is step N+1's input. The path is *predetermined*: the code decides the order (detect → diagnose → recommend), not the model. That distinction is the whole difference between a chain and an agent (→ ../04-agents-and-tool-use/01-agents-vs-chains.md): a chain's control flow is yours; an agent's control flow is the model's.
@@ -367,3 +414,4 @@ Updated: 2026-05-29 — Added "The monitoring link is gated to the workspace's r
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

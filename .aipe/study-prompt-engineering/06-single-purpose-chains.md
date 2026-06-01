@@ -43,6 +43,58 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Single-purpose chains span four layers and the discipline only makes sense if you keep them straight. Layer A is the *route handler* (`app/api/agent/route.ts`) — the entry point that decides whether this is an investigation or a query. Layer B is the *pipeline coordinator* — the explicit `await diag.investigate()` then `await rec.propose(diagnosis)` sequence, written as code, not chosen by a model. Layer C is the *per-agent prompt* — each `## Role` scoped to one verb (detect / diagnose / recommend / answer) and explicitly disclaiming the adjacent links' jobs. Layer D is the *agent loop + provider* — where each link's model actually runs, with its own `maxToolCalls` and (potentially) its own model ID.
+
+**Axis: control.** Who decides what happens at the next step — code or the model? This is the heart of the agents-vs-chains distinction, and it's the right axis for this concept because the entire value proposition (attributable failures + per-job model routing) hinges on the answer being *code* between the links. State is downstream; cost is downstream; the load-bearing question is "when the diagnostic step ends, who decides to run the recommendation step?" The answer here is `route.ts L158` — a literal line of TypeScript — not a model planning step.
+
+**Seams.** Two seams; the second is the canonical one. Seam 1 (A↔B) — control flips from *routing on intent* (classify-then-branch) to *executing a fixed sequence* (always diagnose-then-recommend). Seam 2 (B↔C, repeated per link) is the load-bearing one: between the pipeline coordinator and each per-agent loop, control flips from *CODE-decides-the-order* to *MODEL-decides-within-the-stage*. The code says "now run the diagnostic agent"; inside the diagnostic agent, the model decides which queries to issue, when to stop, what to emit. The typed `Diagnosis` handoff is the contract crossing that seam — link 1's typed output is link 2's typed input. Get this seam right and a wrong recommendation is a *named link's* failure (the trace tells you whether the diagnosis or the recommendation was wrong); merge it back into a monolith and the same wrong recommendation is buried in one undifferentiated blob.
+
+```
+  Structure pass — single-purpose chains
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: route handler (entry)                      │
+  │  B: pipeline coordinator (code-wired sequence) │
+  │  C: per-agent prompt (one verb, disclaims rest)│
+  │  D: agent loop + provider (model runs here)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: code-decides vs model-decides at     │
+  │  each step?                                     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): intent routing → fixed sequence     │
+  │  S2 (B↔C, per link): CODE decides order →     │
+  │            MODEL decides within stage           │
+  │            (LOAD-BEARING — typed Diagnosis     │
+  │             crosses this seam; failures        │
+  │             localize across it)                 │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "who decides what runs next?" answered two ways
+
+  ┌─ Layer B ────────┐    seam     ┌─ Layer C/D ──────────┐
+  │  CODE:           │ ═════╪═════► │  MODEL:              │
+  │  await diag()    │  (it flips) │  decides queries,    │
+  │  await rec(diag) │             │  when to stop,       │
+  │                  │             │  what to emit        │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary is what makes failures attributable
+                   and per-job model routing possible
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Picture a pipeline where each stage is a prompt scoped to exactly one verb, the stages are wired in code (not by the model deciding what to do next), and each stage's `## Role` carries an explicit disclaimer of the adjacent stages' jobs. The disclaimers are the typed boundaries — they keep a stage from bleeding into its neighbor's responsibility, the way a function signature keeps a transform from also making network calls.
@@ -379,3 +431,4 @@ In the investigation flow, what is the typed value passed from the diagnostic li
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

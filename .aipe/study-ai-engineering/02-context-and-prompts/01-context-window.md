@@ -38,6 +38,40 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers compete for the same fixed-size slot array: the per-agent prefix construction (the system prompt + `schemaSummary`), the agent loop (which grows the transcript turn by turn and runs `truncate` on each tool result), and the provider's call where `max_tokens` reserves room for the answer at the end. The window is the *shared resource* every layer writes into.
+
+**Axis: state.** What's in the message array, how big is it, and when does it stop growing? This axis is the right lens because the context window is fundamentally a state-quantity problem: every layer either adds to it (prefix, transcript, tool results) or constrains it (`truncate`, `forceFinal`, `max_tokens`). Cost is downstream of state size; control is downstream of state size; state-occupancy is the upstream measurement.
+
+**Seams.** The cosmetic seam is between the per-agent prefix and the agent loop's first turn — both are state-additions. The load-bearing seam is between the agent loop's turn growth and the forced-final-turn moment: state-growth flips here from "transcript can grow another tool-call cycle" to "tools are omitted; the model must synthesize from what's already here." This is where the loop yields the remaining window back to the model for output. A second cosmetic seam exists between agent loop and provider — the array crosses unchanged.
+
+```
+  Structure pass — context window
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent prefix (system + schemaSummary)     │
+  │  agent loop (transcript growth + truncate)     │
+  │  provider call (max_tokens reserves answer)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state: what's in the array, how big, when     │
+  │  does it stop growing?                         │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  prefix↔loop: cosmetic (both add state)        │
+  │  loop-grow↔forceFinal: LOAD-BEARING            │
+  │    "can still grow" → "tools off; must answer" │
+  │    yields the rest of the window to output     │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Picture the request as one fixed-length array the model reads top to bottom. Each entry — system prompt, user turn, assistant turn, tool result — occupies real slots. The model's *output* needs free slots at the end. If the input entries fill the array, there is nowhere for the answer to go.
@@ -343,3 +377,4 @@ Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` refs (`T
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

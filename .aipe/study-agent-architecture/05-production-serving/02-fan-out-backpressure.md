@@ -37,6 +37,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be fan-out backpressure setup needs four layers: the **Supervisor / producer** (spawns worker tasks faster than upstream can serve), the **Bounded queue** (max depth M, holds pending tasks), the **Semaphore-gated worker pool** (admits ≤K concurrent workers, each making provider/tool calls), and the **Upward signal back to the supervisor** (when queue depth → M, tell the producer to stop spawning). All four are absent in blooming insights for the analyst flow; the Pipeline coordinator is sequential and user-gated, with serial spacing in the Provider wrappers as the only rate-protection mechanism.
+
+**Axis: failure.** Where does upstream-overload originate, how does it propagate (silent queue growth!), and where does it get contained? This is the right axis because backpressure is *the discipline of containing the failure mode "I'm producing faster than I can serve."* Cost is downstream (queueing memory, dropped tasks, retried calls) — but the failure mode (queue grows unbounded; supervisor never gets feedback) is what the topology has to prevent. Pick the wrong axis (control, say) and the semaphore looks like just "a counter"; failure makes the silent-queue trap legible.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape. Seam 1 sits between the Supervisor and the Bounded queue — failure flips from "the supervisor can keep spawning forever" to "the queue caps depth and refuses." Seam 2 sits between the Queue and the Supervisor *via the upward signal* — without this seam, the queue silently grows when it can't refuse (or rejection errors fall to the floor) and the producer never adapts. Seam 2 is the load-bearing one: most implementations get Seam 1 (the semaphore) and forget Seam 2 (the back-channel), and that's the most common production failure of fan-out systems. In blooming insights both are absent because the topology isn't fan-out; the sequential pipeline + serial spacing solves the upstream-overload problem at a different layer entirely.
+
+```
+  Structure pass — Fan-out backpressure (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Supervisor / producer (spawns workers)        │
+  │  Bounded queue (max depth M)                   │
+  │  Semaphore-gated worker pool (≤K in flight)    │
+  │  Upward signal (queue depth → supervisor)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does upstream-overload         │
+  │           originate / propagate / get bounded? │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Supervisor ↔ Queue                    │
+  │          (unbounded spawn → depth cap)         │
+  │  Seam 2: Queue ↔ Supervisor (upward signal)    │
+  │          (silent growth → "STOP spawning")     │
+  │          ★ load-bearing — most implementations │
+  │          forget this back-channel              │
+  │  In this repo: topology is sequential —        │
+  │  serial spacing replaces fan-out backpressure  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the semaphore + queue + upward-signal mechanics, the silent-queue failure mode, and the breakpoint where blooming insights would need to add backpressure.
+
+---
+
 ## How it works
 
 **The mental model: a worker pool with a queue in front and a stop signal pointing back at the producer.** You've written this on the frontend whenever you've had more outbound calls than the API tolerates. The semaphore admits up to N concurrent calls; new requests queue when N is in flight; the queue has a max depth. When the queue is full, *something* needs to tell the upstream producer (the code firing requests) to stop adding more — otherwise the producer happily piles into an unbounded queue.
@@ -509,3 +550,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

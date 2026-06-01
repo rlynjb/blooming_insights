@@ -40,6 +40,56 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Output mode mismatch lives across four layers, and the mismatch class is "two layers disagree about which mode they're in." Layer A is the *prompt's `## Output` section* — declares JSON-fenced or prose. Layer B is the *synthesis instruction* — the forced-final-turn nudge that *also* declares the mode (so the mode lives in two places per agent). Layer C is the *model's finalText* — what actually came back. Layer D is the *consumer code that reads finalText* — `parseAgentJson` + guard for JSON, `.trim()` for prose. The contract is held by A + B + D agreeing on the mode; C is the test of whether the model honored A + B.
+
+**Axis: guarantees.** What does each layer promise about output shape, and which layers *enforce* vs *request*? Guarantees is the right axis (over control or trust) because the mismatch class is exactly a guarantee gap — A and B *request* a mode, the model *might* honor it, D *assumes* a mode. When A says JSON and D assumes prose (or vice versa), nothing crashes — the guarantee silently shifts. The bug is invisible at the layer where it's authored; it surfaces three layers downstream as degraded output.
+
+**Seams.** Two seams, and the second is where you go looking when the user sees raw JSON. Seam 1 (A↔B) — both sites must declare the *same* mode; this is the *internal-consistency seam* within the producer. A refactor that changes A's mode but forgets B leaves the model with conflicting final-turn instructions. The load-bearing seam is Seam 2 (C↔D) — the guarantee flips from *whatever the model emitted* to *whatever the consumer assumes*. The two assumptions either agree (mode honored end-to-end) or disagree (silent degradation: empty `[]` if prose hits the JSON consumer, raw JSON string shown to the user if JSON hits the prose consumer). Neither failure throws. Catching it requires reading A, B, and D together at review-time — the seam is invisible in any one file.
+
+```
+  Structure pass — output mode mismatch
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: prompt ## Output (mode declared)           │
+  │  B: synthesis instruction (mode RE-declared)   │
+  │  C: model finalText (the actual emission)      │
+  │  D: consumer code (mode assumed)                │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: which layer requests vs which     │
+  │  enforces the mode? where do they disagree?    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): internal producer consistency —    │
+  │            both must declare the same mode     │
+  │  S2 (C↔D): emitted mode vs assumed mode        │
+  │            (LOAD-BEARING — silent degradation; │
+  │             never throws, only worsens output) │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what mode is this output?" answered two ways
+
+  ┌─ Layer C ────────┐    seam     ┌─ Layer D ────────────┐
+  │  finalText is    │ ═════╪═════► │  consumer assumes    │
+  │  whatever the    │  (it flips  │  JSON (parseAgentJson)│
+  │  model emitted   │   silently) │  OR prose (.trim())  │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → if they disagree: [] or raw JSON to user
+                   no exception, just degraded output
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Each agent is a producer with a declared output mode; each agent's caller is a consumer with an assumed mode. The two must agree. The declaration is a line (or block) in the prompt's `## Output` section; the enforcement is the code that reads `finalText`. Picture a switch in each agent's `## Output`: flip it to JSON and the output flows into `parseAgentJson` + guard; flip it to prose and the output flows straight into `.trim()`. A mismatch is the switch declared one way and the consumer wired the other.
@@ -347,3 +397,4 @@ Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -38,6 +38,56 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Self-critique / self-consistency would sit across four layers and you have to name them precisely or you'll mistake `synthesize()` for verification (the trap this whole file fights). Layer A is the *first generation* — `DiagnosticAgent.investigate` returns a diagnosis, or `classifyIntent` returns one word. Layer B is the *trigger gate* — *what decides whether a second call fires?* Today this gate fires only on parse-failure (`tryParseDiagnosis(finalText) == null`); a real verify pass would fire on the *successful* path. Layer C is the *second call's input* — today `synthesize()` re-reads evidence in clean context (the first output is never seen); a critique pass would take v1 as input. Layer D is the *shipped output* — the artifact that reaches the user.
+
+**Axis: control.** What triggers the second call, and what does it look at? Control is the right axis because the entire distinction between "recovery" and "verification" is *which condition controls the second call's invocation* and *what the second call sees*. State doesn't bite (both paths produce a typed value); guarantees is downstream of the control choice. The bug to avoid — calling `synthesize()` self-critique because there's "a second model call" — collapses if you trace control across A→D: today's second call is *gated on failure* and *blind to v1*; a critique call would be *gated on success* and *anchored on v1*. Different gate, different input — different concept entirely.
+
+**Seams.** One load-bearing seam dominates this concept. Seam 1 (A↔B) — control flips from *v1 was produced* to *should a second call fire, and why?* The today-answer is "only if v1 didn't parse"; the would-be answer is "yes, to verify v1 follows from evidence" (critique) or "yes, run v1 again N times and vote" (consistency). Pick the wrong trigger condition and you have recovery dressed up as verification — `synthesize()` exactly. The second seam (B↔C) — control flips from *trigger condition* to *what the second model sees*. A clean-context retry sees evidence only; a critique sees v1 + evidence; a vote sees nothing extra (each run is independent). These two seams together determine whether you've built recovery (today), verification (would-be), or voting (would-be), and the answer is determined by *which gate fires when* and *what crosses the seam*.
+
+```
+  Structure pass — self-critique and self-consistency
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: first generation (v1)                       │
+  │  B: trigger gate (parse-failure? success?)      │
+  │  C: second call input (evidence? v1?)           │
+  │  D: shipped output                              │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: what triggers the second call, and  │
+  │  what does it see?                              │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): v1 produced → which gate fires?     │
+  │            (LOAD-BEARING — failure-gate is     │
+  │             recovery; success-gate is verify)   │
+  │  S2 (B↔C): gate → what the second call sees    │
+  │            (evidence-only vs v1-as-input)       │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "why does the second call fire?" answered two ways
+
+  ┌─ today ──────────┐    seam     ┌─ would-be ───────────┐
+  │  v1 failed to    │ ═════╪═════► │  v1 is VALID → run   │
+  │  parse → re-     │  (it flips) │  critique → revise   │
+  │  derive (recover)│             │  (verify)            │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → same model call shape, opposite gate:
+                   recovery (today) vs verification (built)
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** These are two different shapes for "use the model more than once to get a more reliable answer."
@@ -319,3 +369,4 @@ What is the exact trigger condition under which `synthesize()` runs in the diagn
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

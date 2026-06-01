@@ -38,6 +38,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form a "scope before spend" pipeline: the schema bootstrap (`bootstrapSchema` returns a live `WorkspaceSchema`), the capability gate (`schemaCapabilities` → `coverageReport` → `runnableCategories` — a free in-memory pure function), the per-agent invocation (`MonitoringAgent.scan(hooks, runnable)` receives only the runnable checklist), and the agent loop (queries only those categories). The same gate-output also drives the UI's coverage grid.
+
+**Axis: control.** Who decides which categories run — CODE (the gate, deterministic, before any spend) or MODEL (the agent, expensive, after the gate)? This axis is the right lens because capability gating is fundamentally about *removing options from the model's menu before it can pick wrong*. The cheat-sheet's "CODE vs MODEL" agent-arch axis lands cleanly here: the gate is a CODE-decided narrowing that fences the MODEL's autonomy.
+
+**Seams.** The cosmetic seam is between the schema bootstrap and the gate — both are in-memory data prep. The load-bearing seam is between the gate and the per-agent invocation: control flips here from "free CODE-decided in-memory filter" to "expensive MODEL-decided rate-limited tool calls." This is the seam capability gating *exists* to install — cross it with the wrong set of categories and the agent burns budget on data the workspace can't emit. A second observation: the same gate output flows sideways to the UI's coverage tiles, so the seam also separates "live" from "honest no-data-source."
+
+```
+  Structure pass — capability gating
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  schema bootstrap (WorkspaceSchema)            │
+  │  capability gate (caps → coverage → runnable)  │
+  │  per-agent invocation (scan(runnable))         │
+  │  agent loop (queries only runnable)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: CODE-decided pre-filter vs           │
+  │  MODEL-decided spend?                          │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  schema↔gate: cosmetic (both in-memory)        │
+  │  gate↔agent: LOAD-BEARING                      │
+  │    free CODE filter → expensive MODEL spend    │
+  │    scope before spend                          │
+  │    (sideways: gate output → UI coverage)       │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** The gate sits between "you know the schema" and "you spend the budget," exactly where a feature flag sits between config and render. It is a pure function: flatten the workspace schema into a set of capability tokens, then classify each of the ten registry categories by testing its declared dependencies against that set. Three outcomes — `full`, `limited`, `unavailable` — map to three things: which categories the agent runs, and (for the UI) which tiles render as live, degraded, or ghost.
@@ -327,3 +363,4 @@ Updated: 2026-05-29 — created (the anomaly-coverage schema gate: scope the mon
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

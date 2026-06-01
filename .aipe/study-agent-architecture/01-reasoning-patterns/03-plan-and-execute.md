@@ -39,6 +39,44 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be plan-and-execute setup needs four layers: the **Pipeline coordinator** (decides when to plan), a **Planner model call** (one expensive call that emits a structured JSON plan), the **Plan as data** (a list of step objects the executor consumes), and the **Executor loop** (walks the plan step by step, calling tools). In blooming insights only three of these exist — the Planner call layer is absent. The closest analog is the static "Suggested query plan" section baked into the monitoring system prompt, which lives at the Per-agent-definitions band and gets read by `runAgentLoop` (still ReAct, not a separate executor).
+
+**Axis: control.** Who decides the route — a separate up-front model call, or the same model deciding turn by turn? This is the right axis because the entire distinction between plan-and-execute and ReAct lives in *where the routing decision happens* and *who makes it*. Cost is a real concern (the win is "one expensive call → many cheap calls") but cost is the *consequence* of the control choice, not its driver. Pick the wrong axis (say, dependency) and the would-be planner and the executor look identical — both call the model, both use tools.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape, and both are absent here. Seam 1 sits between the Pipeline coordinator and the Planner call — control flips from CODE (decides "now plan") to MODEL (decides the steps). Seam 2 sits between the Plan-as-data and the Executor loop — control flips from MODEL (already decided) back to CODE (walks the array). That second seam is the load-bearing one because it's what makes the executor cheap (it iterates a list, it doesn't reason about route). In blooming insights, both seams collapse: the "plan" is engineer-written prose in a system prompt (CODE on both sides of seam 1) and the executor is `runAgentLoop` re-deciding every turn (no flip at seam 2). That collapse is precisely what makes this a Case B file — the seams describe what isn't there, and the absence is the lesson.
+
+```
+  Structure pass — Plan-and-execute (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Pipeline coordinator                          │
+  │  Planner model call (would-be — absent here)   │
+  │  Plan-as-data (a list of step objects)         │
+  │  Executor loop (walks the list)                │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the route, up front or   │
+  │           turn by turn?                        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Coordinator ↔ Planner                 │
+  │          (CODE → MODEL) — absent in this repo  │
+  │  Seam 2: Plan-as-data ↔ Executor               │
+  │          (MODEL → CODE) ★ load-bearing —       │
+  │          this is what makes the executor cheap │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it (and the specific reason both seams collapsed into a prompt section instead).
+
+---
+
 ## How it works
 
 **The mental model: split the model that picks the route from the model that walks it.** A planner sees the task once, returns an ordered list of steps. An executor walks the list — usually a cheaper/faster model — calling tools per step. The planner is expensive and called once; the executor is cheap and called many times. The split is the win and the brittleness at the same time.
@@ -410,3 +448,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

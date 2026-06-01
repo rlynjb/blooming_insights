@@ -42,6 +42,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers: the source corpus (changing), a change-detection feed (file watcher, DB CDC, version-hash diff), the indexer's write path (upsert by id, delete by id, embed-only-the-new), and the vector store. The change-detection feed is what makes incremental indexing different from a full rebuild — it tells you exactly what to touch.
+
+**Axis: lifecycle.** When and how often does each layer's work happen — every change (incremental) or every rebuild (full)? This axis is the right lens because the file's whole insight is that the write-path lifecycle changes from O(N) per rebuild to O(changes) per change — same correctness, different cost-per-event. State is downstream of lifecycle; control doesn't move; the upstream question is "when do you pay."
+
+**Seams.** The cosmetic seam is between change-detection and the indexer — both are write-time. The load-bearing WOULD-BE seam is between full-rebuild and incremental-upsert as two alternative shapes of the same write layer: lifecycle flips from "everything, on every change" to "only what changed." This is the seam that makes a live index affordable. blooming insights already crosses an analogous seam for its investigation store (`mem.set(insightId, events)` is keyed upsert, not list-rebuild) — same primitive, different payload.
+
+```
+  Structure pass — incremental indexing (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  source corpus (changing)                      │
+  │  change-detection feed (CDC / watcher / hash)  │
+  │  indexer write path (upsert / delete)          │
+  │  vector store (stays live)                     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: full rebuild on every change, or   │
+  │  upsert only what changed?                     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  change-detection↔indexer: cosmetic            │
+  │  full-rebuild↔incremental: LOAD-BEARING        │
+  │    O(N) per change → O(changes) per change     │
+  │    cousin in repo: mem.set keyed upsert        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Treat the index as a keyed store you mutate, not a build artifact you regenerate. The codebase already has the right instinct in its in-process state map for investigations: `Map.set(key, value)` updates one entry in place. Incremental indexing is the three CRUD-by-key operations — upsert (add or replace), delete — over vectors, gated by change-detection so you only touch what changed.
@@ -281,3 +316,4 @@ What keyed in-place update does blooming insights already perform, and what two 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

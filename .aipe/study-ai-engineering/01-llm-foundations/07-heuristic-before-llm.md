@@ -38,6 +38,40 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers, each a deeper check: the route's parameter-presence branch (`q && !insightId` — free, zero ops), the pure-substring `parseIntent` (free, deterministic string predicate), and the haiku-backed `classifyIntent` (paid call, but only when the two free layers fail to decide). The classifier's output is then re-fed through `parseIntent` for normalization.
+
+**Axis: cost.** What does each layer cost per call (latency, tokens, money), and at what point are we forced to pay? This axis pops the seam because the entire design hinges on a price gradient: route check costs nothing, substring match costs nothing, the LLM call is the first thing that costs *anything*. Control is a candidate (CODE decides at every layer), but cost is what makes the layering *worth doing* — control alone could be one giant if-ladder; cost is what forces the ordering.
+
+**Seams.** The seam between the route's parameter check and `parseIntent` is cosmetic — both are CODE-decided, both cost zero. The load-bearing seam is between `parseIntent` and `classifyIntent`: cost flips from "free, deterministic" to "paid, probabilistic." This is the only seam where a model is reached for, and the file's whole point is that this seam is crossed *as rarely as possible*. A second cosmetic seam returns the model's output through `parseIntent` for normalization — cost doesn't flip there, but the *trust* axis briefly does (model output is re-checked by the deterministic parser).
+
+```
+  Structure pass — heuristic before LLM
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  route param check (q && !insightId)           │
+  │  parseIntent (pure substring)                  │
+  │  classifyIntent (haiku call — last resort)     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what does each layer cost per call, and │
+  │  when are we forced to pay?                    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  route↔parseIntent: cosmetic (both free)       │
+  │  parseIntent↔classifyIntent: LOAD-BEARING      │
+  │    free deterministic → paid probabilistic     │
+  │    crossed only when free path fails           │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Two functions, same return type, ordered cheapest-first. The intent parser is a pure string function — no network, no model, no async. The intent classifier is the LLM. The system reaches for the model *only* when the cheap function cannot decide, and even the classifier runs its model output back through the parser to normalize it. The cheap path is both the pre-filter and the post-parser.
@@ -327,3 +361,4 @@ Updated: 2026-05-28 — Re-derived the drifted `app/api/agent/route.ts` structur
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

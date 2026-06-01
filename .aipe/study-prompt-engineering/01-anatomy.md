@@ -37,6 +37,53 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Prompt anatomy is a four-layer stack and you have to keep them straight or you'll spend an hour staring at the wrong file. Layer A is the *constant markdown* (`monitoring.md` etc.) — bytes committed once, loaded at import, never mutated. Layer B is the *per-call `.replace` chain* in each agent class — the stamping that turns `{schema}` / `{project_id}` / `{anomaly}` into real values. Layer C is the *forced-final-turn synthesis append* inside the shared loop — a string glued onto the system on exactly one turn. Layer D is the *assembled bytes the model reads* — what `anthropic.messages.create` actually sees. A → B → C → D, and "the prompt" is a different thing at each layer.
+
+**Axis: control.** Who decides what goes into the system string at each layer? This is the right axis because the bug class this concept exists to make legible is "a value showed up in the model's context that I didn't expect, and I can't tell who put it there." Cost is irrelevant (these layers cost nothing to assemble); state-ownership is downstream of control. Trace control across A→D and the seams pop: an author decides the constant, code decides the injection, the loop decides the synthesis append, the model decides nothing about its own system prompt.
+
+**Seams.** Two seams matter, one load-bearing. Seam 1 is between A and B — control flips from *human-at-PR-review-time* to *code-at-request-time*. That's where `{project_id}` becomes the real id; if the `.replace` is wrong (single-replace where global was needed) the model reads a literal `{project_id}` brace string and dutifully passes it as a tool argument. I've watched that exact bug ship. Seam 2 is the load-bearing one: between B and C — control flips from *per-call stamping* (happens every turn) to *forced-final-turn appending* (happens on exactly one turn, with tools removed). This is the seam where the model's instructions change *mid-loop*, and it's why "the prompt" answered for a normal turn is a different string than "the prompt" answered for the synthesis turn. Get this seam wrong (e.g. always-appending the synthesis) and the model stops querying after turn one.
+
+```
+  Structure pass — prompt anatomy
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: constant .md (Role/Hard rules/Output/…)    │
+  │  B: per-call .replace chain (agent class)      │
+  │  C: forced-final-turn synthesis append (loop)  │
+  │  D: assembled bytes (provider.create sees)     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what enters the system   │
+  │  string at each layer?                          │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): author-at-review → code-at-request  │
+  │  S2 (B↔C): every-turn stamping → one-turn      │
+  │            append (load-bearing)                │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "who decides what's in the system string THIS turn?" answered two ways
+
+  ┌─ Layer B ────────┐    seam     ┌─ Layer C ────────────┐
+  │  stamping runs   │ ═════╪═════► │  synthesis append    │
+  │  on EVERY turn   │  (it flips) │  runs on ONE turn,   │
+  │  with tools on   │             │  tools REMOVED       │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary changes what the model reads mid-loop
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Three layers stacked in time. Layer 1 is the versioned markdown prompt file — loaded once at module load, never mutated, the same bytes for every investigation. Layer 2 is per-call injection — a string-replace chain stamps the runtime values into the placeholders right before the call. Layer 3 is the forced-final-turn append — a synthesis instruction glued onto the end of the system string only on the turn where the model must stop and answer. Read top to bottom, the model sees one coherent system prompt; read by *origin*, every line traces to exactly one of those three layers.
@@ -364,3 +411,4 @@ Updated: 2026-05-29 — Corrected stale monitoring.md section line refs (Role L3
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

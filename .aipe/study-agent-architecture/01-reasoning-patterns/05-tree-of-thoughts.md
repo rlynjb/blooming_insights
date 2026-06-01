@@ -37,6 +37,44 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be Tree-of-Thoughts setup needs four layers: the **Branch generator** (the model proposing K candidate next thoughts per step), the **Parallel explorer** (runtime that walks each branch forward to some depth), the **Scorer** (a model call grading each leaf or partial trajectory), and the **Commit step** (CODE picks the winning branch and returns it). All four are absent in blooming insights — the band that would hold them holds a single bounded `runAgentLoop`. The contrast layer is that single-path loop: b=1, depth ≤ `maxToolCalls`, no scoring step.
+
+**Axis: control.** Who decides which path to commit to — the model on each turn (ReAct), or a runtime that lets the model propose many and then picks one? This is the right axis because ToT's defining move is *deferring the commit*: it takes single-turn control away from the model and hands it to a runtime branch-and-score loop. Cost is the killing argument in this codebase (b^d multiplies tokens, and the MCP rate limit and 300s route ceiling can't afford it) — but cost is the *consequence* of the control choice. The control flip is what gets you the cost; trace control to see why ToT doesn't fit.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape, and both are absent here. Seam 1 sits between the Branch generator and the Parallel explorer — control flips from MODEL (proposes K branches) to CODE (manages parallel execution, tracks fan-out). Seam 2 sits between the Scorer and the Commit step — control flips from MODEL (scores each branch) back to CODE (picks the winner, discards the losers). Seam 2 is the load-bearing one: without it, branching is just expensive random walk; with it, the cost-multiplier buys you something. In blooming insights both collapse — the single ReAct loop has no fan-out and no commit step, and the "commit" is just "the model's last turn."
+
+```
+  Structure pass — Tree of Thoughts (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Branch generator (MODEL proposes K thoughts)  │
+  │  Parallel explorer (runtime walks branches)    │
+  │  Scorer (MODEL grades branches)                │
+  │  Commit step (CODE picks the winner)           │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides which path to commit to? │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Branch gen ↔ Parallel explorer        │
+  │          (MODEL → CODE fan-out)                │
+  │  Seam 2: Scorer ↔ Commit step                  │
+  │          (MODEL → CODE pick) ★ load-bearing —  │
+  │          without this, branching is just spend │
+  │  In this repo: both seams absent — single path │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the branch-and-score mechanics that hang off it (and the cost arithmetic that rules ToT out for this codebase).
+
+---
+
 ## How it works
 
 **The mental model: BFS or beam search over thought sequences, with the model as both the branch generator and the scorer.** At each step, instead of committing to one next thought, the model generates K candidate next thoughts. Each candidate is run forward a few steps (or evaluated immediately). Branches are scored; low-scoring branches are pruned; high-scoring branches are explored further. The final answer comes from the best-scoring leaf.
@@ -398,3 +436,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

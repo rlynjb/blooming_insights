@@ -39,6 +39,59 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Sequential pipeline is anchored to real code in this codebase, so the layers are concrete: the **Pipeline coordinator** (`lib/agents/pipeline.ts` plus the route's `if`-ladder — wires `monitoring → diagnostic → recommendation` and carries the typed `Diagnosis` from stage two into stage three's call signature), the **Per-agent stages** (`monitoring.ts` / `diagnostic.ts` / `recommendation.ts` — each defining its system prompt, tool subset, iteration budget, and synthesis instruction), the **Shared agent loop** (`runAgentLoop` — what each stage runs internally), and the **Typed handoff schemas** (`Anomaly`, `Diagnosis` — the value types passed between stages, the contract that makes the chain typed). The user gates the cross-stage transition; everything else is mechanical.
+
+**Axis: control.** Who decides the order of stages, and who decides what happens inside a stage? This is the right axis because the entire shape of a sequential pipeline is *placing the control flow* at two levels — CODE owns the cross-stage order, MODEL owns the within-stage work. Dependency is a tempting alternate (the data flow IS sequential — stage 3 needs stage 2's `Diagnosis`), but dependency is what the order *encodes*; control is the placement question the topology answers.
+
+**Seams.** Two seams matter, and the second is THE seam this topology is built on. Seam 1 sits between stages — between one Per-agent's output and the next Per-agent's input. Control stays in CODE on both sides (the coordinator picks the next call, the `Diagnosis` is just an argument). The seam is real (it's where the typed handoff lives, where the user-gate sits, where you'd add a re-run or skip later) but control doesn't flip across it. Seam 2 sits between the Pipeline coordinator and the Shared agent loop, *inside* every stage — control flips from CODE (coordinator picks the stage and hands it inputs) to MODEL (the agent loop decides which tool to call). This is the load-bearing seam: it's the chains-vs-agents boundary repeated at every stage, and it's why this topology is "a chain of agents" rather than "a chain of LLM calls."
+
+```
+  Structure pass — Sequential pipeline
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Pipeline coordinator (lib/agents/pipeline.ts) │
+  │  Per-agent stages (monitoring/diag/rec)        │
+  │  Shared agent loop (runAgentLoop)              │
+  │  Typed handoff schemas (Anomaly, Diagnosis)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who owns order across stages, and    │
+  │           who owns work within a stage?        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: stage N output ↔ stage N+1 input      │
+  │          (CODE → CODE, typed handoff)          │
+  │  Seam 2: Pipeline coord ↔ Shared agent loop    │
+  │          (CODE → MODEL, repeated each stage)   │
+  │          ★ load-bearing — this is why each     │
+  │          stage IS an agent, not just a call    │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  Seam 2 — "who decides the next move?" answered two ways, at every stage
+
+  ┌─ Pipeline coord ─┐    seam      ┌─ Agent loop ──┐
+  │  CODE: order is  │ ═════╪═════► │ MODEL: tool   │
+  │  monitoring →    │   (flips,    │ calls chosen  │
+  │  diag → rec      │   every      │ turn by turn  │
+  │  (fixed)         │   stage)     │ (variable)    │
+  └──────────────────┘              └───────────────┘
+         ▲                                     ▲
+         └───── same axis (control), two answers ─┘
+                → this seam fires N times per request
+```
+
+The skeleton is mapped — the rest of this file walks the typed handoffs, the per-stage budgets, and the schema gate between stages.
+
+---
+
 ## How it works
 
 **The mental model: a `.then()` chain where each link is an agent.** The order between links is owned by code (the route file's pipeline). What each link *does* — which tools, how many turns, when to stop — is owned by the model. Two layers of control, with the boundary cleanly drawn between them.
@@ -467,3 +520,4 @@ Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skel
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

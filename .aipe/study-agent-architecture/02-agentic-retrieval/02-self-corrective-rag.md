@@ -38,6 +38,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be self-corrective RAG setup has four layers: the **Retriever tool** (returns chunks), the **Grader** (a model or classifier scoring relevance + groundedness), the **Fallback router** (decides rewrite / widen / escalate / accept), and the **Generator** (consumes accepted context to produce the answer). In blooming insights only the first and last bands exist, occupied by `runAgentLoop` calling MCP tools and consuming the results directly; the Grader and Fallback-router bands are empty. The closest architectural analog is the premise gate at the Pipeline coordinator — CODE deciding whether the diagnostic stage should run at all based on whether monitoring found an anomaly.
+
+**Axis: control.** Who decides whether the retrieved context is good enough to generate from — the generator (use whatever came back), a separate model grader (judge the chunks), or your code (a deterministic threshold)? This is the right axis because the entire move self-corrective RAG makes is *inserting a control point* between retrieve and generate. Trust is a tempting alternate axis (you don't trust the retriever, so you add a verifier) but trust is the *motivation*; the control flip is the mechanism.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape. Seam 1 sits between the Retriever tool and the Grader — control flips from CODE (tool returns chunks) to MODEL (judges them). Seam 2 sits between the Grader and the Fallback router — control flips from MODEL (verdict) to CODE (route accordingly, cap retries). Seam 2 is the load-bearing one because without it, a "fail" verdict has nowhere to go and the grader is just a comment. In blooming insights both are absent on the retrieval path; what carries the same shape is the Pipeline coordinator's premise gate (CODE deciding whether downstream work runs at all based on a CODE-side count). The pattern's shape recurs at a different boundary, and that's the lesson.
+
+```
+  Structure pass — Self-corrective RAG (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Retriever tool (returns chunks)               │
+  │  Grader (would-be — absent here)               │
+  │  Fallback router (would-be — absent here)      │
+  │  Generator (consumes context)                  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides if context is good       │
+  │           enough to generate from?             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Retriever ↔ Grader                    │
+  │          (CODE → MODEL judge)                  │
+  │  Seam 2: Grader ↔ Fallback router              │
+  │          (MODEL → CODE) ★ load-bearing —       │
+  │          without it, the grader is a comment   │
+  │  In this repo: closest analog is the premise   │
+  │  gate at the Pipeline coordinator              │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the grader/fallback mechanics that hang off it (and where the same control-flip lives instead in this codebase).
+
+---
+
 ## How it works
 
 **The mental model: form validation between fetch and submit.** When you build a multi-step form, you don't post the data the moment the user clicks Next — you validate first. If the email looks malformed, you stop, surface the error, and the user fixes it. Self-corrective RAG is that, applied to retrieval: don't generate from the chunks the moment they come back; validate them, and if they fail, fall back to a different action instead of generating garbage.
@@ -444,3 +484,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

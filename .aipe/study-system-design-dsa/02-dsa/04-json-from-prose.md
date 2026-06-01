@@ -45,6 +45,57 @@ Zoom out — where JSON-from-prose extraction lives
 
 ---
 
+## Structure pass
+
+**Layers.** JSON-from-prose extraction is a four-layer stack: the **caller** (a specialist agent that just received `finalText` from `runAgentLoop`), the **extractor** (`parseAgentJson` — the three-attempt fallback ladder: fenced-block regex → bare parse → substring scan), the **validator** (a `v is T` type guard that walks every required field), and the **consumer** (the route → UI, which only ever sees a typed value or the agent's fallback). The extractor is intentionally liberal; the validator is intentionally strict — and that asymmetry is the whole point.
+
+**Axis: cost.** Cost here is *parse attempts × probability-of-success-per-attempt* — and the ladder is ordered cheapest-most-likely first. Pick this axis because the extraction ladder IS a cost-minimization strategy: try the cheapest, most-likely-to-work parse first (fenced block — the model was told to use one); fall through to slightly costlier alternates (bare parse — no extraction needed; substring scan — chop and parse). Each attempt costs only if the previous failed. State competes (the candidate variable changes between attempts) but it's a thin axis — the ladder isn't about state ownership; it's about *probabilistic cost ordering*. Pick cost and the ordering reveals itself; pick state and the ordering looks arbitrary.
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1: extractor → validator.** Cost-shape flips from "best-effort parse, may have produced anything" to "strict structural check, must match the expected shape." This is the liberal-extraction/strict-validation seam — the whole reason both pieces exist. **Seam 2 (load-bearing): validator → consumer (or fallback).** Cost flips from "we hold an `unknown` value" to "we hold a typed `T` we can trust" — OR the validator rejected, the fallback fires, and we hold a known-safe placeholder. This is the joint that lets the downstream route + UI assume types are real; without the validator, the model's output would leak directly into typed code paths.
+
+```
+Structure pass — JSON-from-prose
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Caller (agent) · Extractor (ladder: fenced → bare  │
+│  → substring) · Validator (v is T) · Consumer (route│
+│  + UI) or Fallback                                   │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  cost: attempts × probability of success — ladder    │
+│  is ordered cheapest-most-likely first               │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: extractor → validator                           │
+│      (LIBERAL parse → STRICT structural check)       │
+│  S2: validator → consumer ★load-bearing              │
+│      (unknown → typed T, or → known-safe fallback)   │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "can downstream trust this value?" answered two ways
+
+┌─ Validator ────────┐    seam     ┌─ Consumer ───────────┐
+│  v is T returned   │ ═════╪═════►│  typed T, safe to     │
+│  true              │  (it flips) │  ship to route/UI     │
+│                    │             │                       │
+│  v is T returned   │             │  fallback placeholder │
+│  false             │             │  (known-safe shape)   │
+└────────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (cost), two answers ─┘
+                → this is why model output never leaks into typed code
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 The extraction is a three-attempt fallback ladder. Each attempt either returns a parsed value or falls through to the next. Once a value is parsed — by any path — it passes to a structural validator before being used.
@@ -538,3 +589,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers; noted
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

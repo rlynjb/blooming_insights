@@ -39,6 +39,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers: the agent loop (emits 6–13 sequential tool calls per run), the provider wrappers (`McpClient.liveCall` enforces a 1100 ms minimum-gap spacer per instance — no shared queue, no backpressure signal), and the MCP transport to Bloomreach (~1 req/s per-user quota, 429 = run killed). The spacer is solo; concurrent users share only the spacer per instance, not a global limiter.
+
+**Axis: failure.** When upstream demand exceeds capacity, where does the failure originate, propagate, and get contained — or not? This axis is the right lens because the file's whole frame is "one user's spacing works; many users sharing the limit doesn't." Failure originates at the upstream limit, would propagate as 429s, and is *partially* contained by spacing for solo flows. The gaps (shared queue, backpressure, load-shedding) are where failure-containment is absent.
+
+**Seams.** The cosmetic seam is between the agent loop and `liveCall` — both are CODE on the same side. The load-bearing seam is between `liveCall`'s spacer and the MCP transport: failure containment flips here from "I control my pacing" to "the upstream enforces theirs (and 429 will kill the run)." The would-be seams that don't exist: between concurrent users and a shared queue (no coordination), and between burst load and a load-shedding policy (no signal). The spacer solves the solo case; the rest is gap.
+
+```
+  Structure pass — rate limiting + backpressure
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  agent loop (6–13 sequential tool calls)       │
+  │  provider wrappers (liveCall — 1100ms spacer)  │
+  │  MCP transport (Bloomreach, ~1 req/s, 429s)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does over-capacity originate,  │
+  │  propagate, and get contained?                 │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  agent loop↔spacer: cosmetic                   │
+  │  spacer↔upstream: LOAD-BEARING                 │
+  │    "I pace myself" → "they enforce theirs"     │
+  │  GAPS: no shared queue across concurrent runs, │
+  │   no backpressure, no load-shedding            │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Rate limiting is "don't send faster than X." There are two sub-problems. **Spacing** answers "how do I slow one caller down?" — track the last send time, wait until enough has passed. **Backpressure** answers "what do I do when more demand arrives than the limit allows?" — queue it (with a bound), reject it (load-shed), or block the producer. You implement spacing and skip backpressure, because the deployment target is one user at a time.
@@ -360,3 +395,4 @@ Updated: 2026-05-28 — maxDuration 60→300 (route.ts L20); re-derived liveCall
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

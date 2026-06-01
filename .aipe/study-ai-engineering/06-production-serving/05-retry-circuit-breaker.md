@@ -40,6 +40,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers, only two of which are built: the agent loop (outbound tool call), the provider wrappers (`McpClient.callTool` retries up to 3× with Retry-After or exponential backoff capped at 20s — *no jitter*), and the MCP transport. The would-be circuit breaker would sit alongside retry — *stops calling* during sustained outage with a closed/open/half-open state machine — and is absent.
+
+**Axis: failure.** What does each layer do when the next layer down fails — try again, stop calling, or just propagate? This axis is the right lens because retry and circuit breaker answer the *same* failure question with opposite mechanisms: retry says "try again," breaker says "stop calling." The file's structure is "we built one, not the other." Cost is downstream of the failure-handling decision; the upstream question is what behavior the wrapper imposes on failure.
+
+**Seams.** The cosmetic seam is between the agent loop and the wrapper — both are CODE. The load-bearing seam is between the retry wrapper and the MCP transport: failure handling flips here from "amplify on transient blip with backoff" (good) to "amplify on sustained outage with full retry tax" (bad, because no breaker). The would-be breaker seam — closed → open → half-open — would *flip* this from "every call retries" to "fail fast for cooldown window." A pointed observation: the missing jitter means concurrent retries can synchronize, which is the same problem the missing breaker has at scale.
+
+```
+  Structure pass — retry + circuit breaker
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  agent loop (outbound tool call)               │
+  │  provider wrappers (retry x3, no jitter)       │
+  │  (would-be: circuit breaker — ABSENT)          │
+  │  MCP transport                                 │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: try again, stop calling, or just     │
+  │  propagate?                                    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  agent loop↔wrapper: cosmetic                  │
+  │  retry wrapper↔transport: LOAD-BEARING         │
+  │    blip → backoff (good)                       │
+  │    outage → full retry tax every call (bad)    │
+  │  would-be breaker: closed→open→half-open       │
+  │    flips "always retry" → "fail fast"          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Failure handling has two layers that answer different questions. **Retry** answers "this failed — should I try again?" and is right when the failure is transient. **Circuit breaker** answers "is the upstream healthy enough to call at all?" and is right when the failure is sustained — it trips after repeated failures and fails fast (no call, no retry) until a cooldown passes. Retry without a breaker amplifies outages; a breaker without retry is brittle to blips. You want both.
@@ -359,3 +396,4 @@ Updated: 2026-05-28 — Corrected the retry framing from "fixed 1200ms delay" to
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -36,6 +36,54 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers stack from outside in: the **Route handler** (`app/api/agent/route.ts` — receives the HTTP request and reads the step), the **Pipeline coordinator** (a thin orchestrator that fires the agents in order), the **Per-agent definitions** (monitoring, diagnostic, recommendation, query — each one a system prompt + tool subset + handoff schema), and the **Shared agent loop** (`runAgentLoop` — the reason → act → observe cycle that drives one stage). The model itself sits one layer below as the actual decider inside the loop. The layers are stacked, not parallel — every request walks them top to bottom.
+
+**Axis: control.** Who decides what happens next at each layer? This axis pops the seam because the whole concept of "chains vs agents" IS a control-flow question — code-decides vs model-decides is the only thing that separates one from the other. Cost is downstream of control (you pay for whatever decides), dependency is uniform (every layer calls the one below), and state is incidental. Control is the upstream lens.
+
+**Seams.** Two seams matter, and the second one is THE seam this whole file is about. Seam 1 sits between the Route handler and the Pipeline coordinator — control stays in CODE on both sides (an if-ladder calls a function that calls functions); the boundary is real but the axis doesn't flip. That makes it cosmetic for this concept. Seam 2 sits between the Pipeline coordinator (and the per-agent wrapper) and the Shared agent loop — control flips from CODE (engineer-written `if`-ladder, fixed monitoring → diagnostic → recommendation order) to MODEL (the agent decides which tool to call, in what order, when to stop). This is the load-bearing seam: it is literally the chain/agent boundary, and the whole file's job is to teach what lives on each side of it.
+
+```
+  Structure pass — Chains vs agents
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Route handler                                 │
+  │  Pipeline coordinator                          │
+  │  Per-agent definitions                         │
+  │  Shared agent loop (runAgentLoop)              │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what happens next?       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Route ↔ Pipeline (CODE → CODE, flat)  │
+  │  Seam 2: Pipeline ↔ Agent loop (CODE → MODEL)  │
+  │          ★ load-bearing — this IS the concept  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  Seam 2 — "who decides what happens next?" answered two ways
+
+  ┌─ Pipeline coord ─┐    seam      ┌─ Agent loop ──┐
+  │  CODE: if-ladder │ ═════╪═════► │ MODEL: ReAct  │
+  │  picks the next  │   (it flips) │ picks the next│
+  │  STAGE           │              │ TOOL CALL     │
+  └──────────────────┘              └───────────────┘
+         ▲                                     ▲
+         └───── same axis (control), two answers ─┘
+                → THIS is the chain/agent boundary
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **The mental model: a chain of agents.** The outer shape is a fixed pipeline the route code wrote — monitoring, then diagnostic, then recommendation, in that order, every time. The inner shape, inside each stage, is an autonomous loop the model drives — reason, call a tool, read the result, repeat until done. The boundary is the seam between them: the route owns *which agent runs next*; the agent owns *what it does inside its turn*.
@@ -340,3 +388,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

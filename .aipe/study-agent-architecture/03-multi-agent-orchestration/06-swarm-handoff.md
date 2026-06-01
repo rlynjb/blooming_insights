@@ -40,6 +40,44 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be swarm has three layers: the **Peer agents** (each one a Per-agent definition with its own role, prompt, and tool subset — but ALSO with `transfer_to_X` tools in its menu), the **Shared agent loop** (`runAgentLoop` — but extended to interpret a `transfer_to_X` `tool_use` as "end my loop, begin theirs"), and the **Shared conversation state** (a single message history that gets handed across peers when a transfer fires). Crucially, the Pipeline coordinator band collapses or shrinks: there's no central supervisor mediating — the next agent is whoever the current agent transferred to.
+
+**Axis: control.** Who decides which agent runs next — a central authority (CODE pipeline or LLM supervisor) or each agent itself at runtime via a transfer tool? This is the right axis because the entire definition of swarm is *moving the inter-agent control decision into the agents themselves*. Trust is a tempting alternate (you have to trust each agent not to ping-pong forever) but trust is downstream of the control placement choice.
+
+**Seams.** One seam is load-bearing: the seam between the current agent's loop and the next agent's loop, at the moment a `transfer_to_X` tool fires. Control flips from MODEL-in-agent-A (decides "you take it") to CODE (interprets the transfer, swaps the loop's identity) to MODEL-in-agent-B (resumes with A's context). The flip happens *inside* what used to be a single bounded loop, and the CODE side of this seam is what must enforce the **handoff cap** — without it, A → B → A → B can burn the budget on routing instead of work. In blooming insights this seam doesn't exist; the Pipeline coordinator is the only thing that ever picks "next" and it picks once.
+
+```
+  Structure pass — Swarm / handoff (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Peer agents (each w/ transfer_to_X tools)     │
+  │  Shared agent loop (extended for transfers)    │
+  │  Shared conversation state (hands across)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the next agent — a       │
+  │           central authority or each peer?      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam: agent A's loop ↔ agent B's loop         │
+  │        (MODEL-in-A → CODE swap → MODEL-in-B)   │
+  │        ★ load-bearing — the CODE side must     │
+  │        enforce the handoff cap or A↔B loops    │
+  │  In this repo: this seam doesn't exist;        │
+  │  Pipeline coordinator picks once, no transfer  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the handoff mechanics, the infinite-handoff failure mode, and the bounding tricks that keep it from happening.
+
+---
+
 ## How it works
 
 **The mental model: peer specialists, each capable of deciding "you take it now."** Control is distributed. The model running in agent A includes in its tool subset a `transfer_to_B` or `transfer_to_C` tool; calling that tool *transfers control* — A's loop ends, B's loop begins with A's context handed over.
@@ -502,3 +540,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -40,6 +40,54 @@ Zoom out — where the sort + dedup live
 
 ---
 
+## Structure pass
+
+**Layers.** The sort + dedup primitives sit in a tight three-layer stack: the **input** (the parsed-but-unordered array — `Anomaly[]` for sort, three overlapping tool arrays for union), the **transform** (the rank table + comparator, or the `new Set` collapse), and the **output** (a sorted, top-N-truncated array, or a deduplicated union). All three layers are pure — no I/O, no async, no state outside the call.
+
+**Axis: cost.** Operations per element, comparisons per call, time complexity? This is the right axis because both primitives ARE cost-shape decisions: the rank table replaces O(N) string comparisons with O(1) integer subtractions inside the comparator (which runs O(N log N) times), and `new Set` replaces an O(N²) cross-product dedup with O(N) hash insertion. State is the obvious alternate (data flows through), but state here is uninteresting — everything is immutable input → immutable output. Pick cost and the rank table reveals itself as the load-bearing optimization; pick state and it looks like decoration.
+
+**Seams.** Two seams matter; both are load-bearing because they're where the cost shape changes. **Seam 1: string severity → integer rank.** Cost flips from "O(N) lexical compare per pair × O(N log N) pairs = O(N² log N) char compares" (naive string compare) to "O(1) integer subtract × O(N log N) pairs = O(N log N)" (rank table). The `SEV_RANK` table is the joint that buys this. **Seam 2: three arrays → Set → array.** Cost flips from "O(N²) cross-product dedup" (naive nested loop) to "O(N) hash insert + O(N) array spread = O(N)" (Set). The `new Set([...a, ...b, ...c])` idiom is the joint.
+
+```
+Structure pass — rank-mapped sort + set union
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Input (parsed array) · Transform (rank table +     │
+│  comparator, or new Set collapse) · Output          │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  cost: ops per element, comparisons per call, big-O  │
+│  shape across the layers                             │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: string severity → integer rank ★load-bearing    │
+│      (O(N² log N) char compares → O(N log N) ints)   │
+│  S2: three arrays → Set → array ★load-bearing        │
+│      (O(N²) cross-product → O(N) hash insert)        │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "how do we compare two severities?" answered two ways
+
+┌─ Without rank table┐    seam     ┌─ With rank table ─────┐
+│  cmp("critical",   │ ═════╪═════►│  SEV_RANK[b] -         │
+│   "warning"): O(N) │  (it flips) │   SEV_RANK[a]: O(1)    │
+│   char compares    │             │  integer subtract       │
+└────────────────────┘             └────────────────────────┘
+        ▲                                       ▲
+        └────── same axis (cost), two answers ─┘
+                → the rank table is the cost-flip primitive
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **Mental model.** A comparator is a function that returns a number. If the number is negative, `a` sorts before `b`. If positive, `b` sorts before `a`. If zero, their order is unchanged (JS sort is stable). The rank table is the bridge: it maps each string severity to an integer so the comparator has numbers to subtract.
@@ -411,3 +459,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers (sort 
 Updated: 2026-05-29 — sort + slice moved L102 → L119; `SEV_RANK` now L51 (was cited L50); `scan` method L69 (was L68); `queryTools` refs unchanged.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

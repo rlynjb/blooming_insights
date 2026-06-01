@@ -42,6 +42,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers each guard against a different failure: the route handler (try/catch → `error` event + finally close), the per-agent fallback chain (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), the agent loop (`budgetSpent → forceFinal` caps the runaway), and the provider/MCP wrappers (`McpClient` exponential-backoff on 429, no-cache-on-error, alpha-token one-time auto-reconnect). Each layer guards the one below it.
+
+**Axis: failure.** Where does each failure mode originate, propagate, and get contained — and is there a recovery at every layer? This axis is the right lens because the file is structured by failure mode: each layer has a named failure (parse failure, loop runaway, 429, config throw) with a named recovery. Cost is downstream of failure; control doesn't move; the load-bearing question is "where does this error get caught and turned into something safe."
+
+**Seams.** The cosmetic seam is within the per-agent fallback chain — `?? synthesize ?? FALLBACK` are three steps of *one* recovery. The load-bearing seams are *between* layers: each one represents "if the lower layer's recovery fails, the next layer up catches it." The most important is between agent loop and per-agent: failure containment flips from "loop terminated cleanly via `forceFinal`" to "loop produced unusable output → fallback chain absorbs." The route's try/catch is the outermost guarantee — even a config throw becomes an `error` event, not a dropped stream.
+
+```
+  Structure pass — error recovery
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  route handler (try/catch/finally)             │
+  │  per-agent fallback chain (?? ?? FALLBACK)     │
+  │  agent loop (forceFinal caps runaway)          │
+  │  provider/MCP wrappers (429 retry, etc.)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does each failure originate    │
+  │  and where does it get contained?              │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  within fallback chain: cosmetic               │
+  │  agent loop↔per-agent: LOAD-BEARING            │
+  │    loop-terminated → output unusable           │
+  │    fallback chain absorbs                      │
+  │  per-agent↔route: LOAD-BEARING                 │
+  │    fallback returned → route guarantees event  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Error recovery here is a `try/catch` cascade with a guaranteed safe default at the bottom — the same shape as `data ?? cachedData ?? emptyState` in a component, extended to an agent. Each `??` is a recovery tier: try the primary, fall to the secondary, and if all else fails return a value that is *valid* (a non-crashing empty or fallback) rather than an exception. The budget is the loop's `for (i < max)` bound — the structural guarantee that the loop terminates no matter what the model does.
@@ -476,3 +513,4 @@ Updated: 2026-05-28 — Corrected the transport claim: retry is now exponential 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

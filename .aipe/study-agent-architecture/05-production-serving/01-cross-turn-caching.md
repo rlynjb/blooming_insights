@@ -40,6 +40,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three cache scopes nest by blast radius across three bands: the **Provider wrappers** (`lib/llm/cache.ts` — TTL cache on prompt-hash, the smallest scope), the **Tools + MCP transport** (`lib/mcp/client.ts` — intra-run `Map` cache keyed on `name:JSON.stringify(args)` with a 60s TTL, the middle scope), and an **orthogonal cross-run semantic cache band** (the widest scope — deliberately absent in blooming insights). Each layer caches a different unit; each owns a different blast radius.
+
+**Axis: failure (stale-hit blast radius) + cost.** Where does a stale hit originate, how far does it propagate, and what does it cost vs what does it save? This is the right axis because the entire reason to nest caches by scope is *the blast radius of being wrong grows with the scope*. A stale single-turn prefix is invisible; a stale intra-run hit poisons one trajectory; a stale cross-run hit poisons every matching trajectory. State is a real concern (the cache IS state) but the question the structure asks is not "who owns it" — it's "what happens when it's wrong, and is the saving worth that risk?"
+
+**Seams.** Two seams matter. Seam 1 sits between intra-run and cross-run caching — failure blast radius flips from "this trajectory only, one user, TTL-bounded" to "every matching trajectory, all users, unbounded by request scope." Seam 2 sits between cache hit and cache miss on every layer — cost flips from "0 ms, 0 tokens, 0 quota" to "the full provider/MCP round-trip with retry/rate-limit attached." Seam 1 is the load-bearing one for *design*: it's the seam blooming insights chose not to cross, and the choice is what defines the system's trustworthiness. Seam 2 is the load-bearing one for *every individual hit*: it's where the win happens, request by request.
+
+```
+  Structure pass — Cross-turn caching
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Provider wrappers (prompt-hash TTL)           │
+  │  Tools + MCP (intra-run Map, 60s TTL)          │
+  │  Cross-run semantic cache (absent, deliberate) │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure (stale-hit blast radius) + cost:      │
+  │     how far does a wrong cached value spread,  │
+  │     and what does a hit save vs a miss cost?   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: intra-run ↔ cross-run                 │
+  │          (one trajectory → every trajectory)   │
+  │          ★ load-bearing for DESIGN — the seam  │
+  │          blooming insights chose not to cross  │
+  │  Seam 2: cache hit ↔ cache miss                │
+  │          (0 ms → full network round-trip)      │
+  │          ★ load-bearing for every REQUEST      │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks all three scopes, which two blooming insights ships, and the deliberate reason the third was skipped.
+
+---
+
 ## How it works
 
 **The mental model: three caches at three scopes, nested by blast radius.** The smallest scope is one turn of one run (provider-side prompt-prefix caching — skip the tokenizer). The middle scope is many turns of one run (intra-run memoization — skip the network for repeated tool calls within a single task). The widest scope is many runs (cross-run semantic cache — return Task A's answer to Task B's similar question). The blast radius of a wrong cached value grows with the scope: a single-turn stale prefix is invisible; a stale intra-run hit affects one trajectory; a stale cross-run hit affects every trajectory that matches it.
@@ -456,3 +496,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

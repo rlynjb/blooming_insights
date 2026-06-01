@@ -46,6 +46,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers swap the embedding pipeline for a graph one: source entities + relationships, the indexer that extracts nodes and typed edges, the graph store, and the retriever that traverses edges instead of cosine-scoring vectors. blooming insights already builds the graph *shape* (`bootstrapSchema` walks events → properties → catalogs); it just doesn't yet *retrieve* over it.
+
+**Axis: state.** What's the shape of the state each layer operates on — flat document vectors, or a graph of nodes-and-edges? This axis is the right lens because GraphRAG is fundamentally a state-model swap from "bag of vectors" to "typed graph." Lifecycle is similar to vector RAG; the upstream change is what *kind of thing* the index represents. Vector cosine is blind to "linked to"; graph traversal is built for it.
+
+**Seams.** The cosmetic seam is between the indexer's extract step and the graph store — both are nodes-and-edges. The load-bearing WOULD-BE seam is between the graph store and the retriever: state-shape determines what queries are *expressible*. Cosine answers "what means the same as this?"; traversal answers "what is linked to this via edge type X, depth N?" These are different questions, and only the second is expressible with a graph state-model. A second observation: this is the seam where blooming insights' partial implementation lives — the graph is built, the traversal-as-retrieval is absent.
+
+```
+  Structure pass — GraphRAG (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  source entities + relationships               │
+  │  indexer (extract nodes + typed edges)         │
+  │  graph store (nodes, edges)                    │
+  │  retriever (edge traversal, multi-hop)         │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state: flat vectors vs typed graph — what     │
+  │  KIND of state does each layer hold?           │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  indexer↔graph store: cosmetic                 │
+  │  graph store↔retriever: LOAD-BEARING           │
+  │    state-shape decides what queries are        │
+  │    expressible (cosine vs traversal)           │
+  │    today: graph built, traversal absent        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A knowledge graph is the data structure you already reach for when entities reference each other: a `Map<nodeId, Node>` plus a `Map<nodeId, Edge[]>` adjacency list — the normalized shape, not a flat array of independent rows. Retrieval is traversal: start at a node, follow edges of a given type, collect neighbors, optionally hop again. Vector similarity finds an *entry point*; graph edges find what is *connected*.
@@ -314,3 +350,4 @@ Updated: 2026-05-28 — corrected one stale ref: `bootstrapSchema` moved to `lib
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -36,6 +36,45 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be reflexion setup needs four layers: the **Generator** (the base ReAct loop producing a draft), the **Critic call** (a second model pass grading the draft), the **Retry router** (decides accept vs send-back-with-feedback, capped), and the **Downstream consumer** (the Pipeline coordinator or HTTP response). In blooming insights only the Generator and Consumer exist; the Critic and Retry router bands are empty. What occupies that slot instead is the forced-synthesis retry inside `runAgentLoop` — a same-model, tool-less re-ask when the budget expires without a final answer.
+
+**Axis: control.** Who gets to decide the answer is acceptable — the generator alone, a separate critic, or your code (via parser/validators)? This axis pops the seam because the whole concept of a critic loop is about *adding a control point* between "model produced X" and "X gets accepted." Trust is a tempting alternate axis (you don't trust the generator, so you add a verifier), but trust is the *motivation* for the control flip — control is the mechanism the axis traces.
+
+**Seams.** Two seams matter. Seam 1 sits between the Generator and the Critic — control flips from MODEL-as-producer (decides the content) to MODEL-as-judge (decides if the content is good). This is the seam the whole pattern is named after. Seam 2 sits between the Critic and the Retry router — control flips from MODEL (verdict + feedback) to CODE (cap-aware: have we retried too many times? route accordingly). Seam 2 is the load-bearing one for *production* reflexion because without the cap-enforcer the critic-generator pair can ping-pong forever; for this codebase both seams are absent, and the same load-bearing flip lives instead at a much cheaper boundary — between the generator's output and a code-side parser/validator (CODE judges the JSON shape, no second model call).
+
+```
+  Structure pass — Reflexion / self-critique (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Generator (ReAct draft)                       │
+  │  Critic call (would-be — absent here)          │
+  │  Retry router (cap-aware — absent here)        │
+  │  Downstream consumer                           │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the answer is OK?        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Generator ↔ Critic                    │
+  │          (MODEL-producer → MODEL-judge)        │
+  │  Seam 2: Critic ↔ Retry router                 │
+  │          (MODEL → CODE cap) ★ load-bearing —   │
+  │          without it, ping-pong forever         │
+  │  In this repo: both seams replaced by a        │
+  │  CODE-side parser at the generator's exit      │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it (and the specific reasons a same-model critic shares the producer's blind spot here).
+
+---
+
 ## How it works
 
 **The mental model: a generator-then-critic pipeline with a bounded retry.** The base agent produces a draft. A critic step reads the draft and either approves it ("ship it") or rejects it with reasons ("the evidence section is missing a number"). On rejection, the runtime loops back to the generator with the critic's feedback included, capped at a small number of retries.
@@ -402,3 +441,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

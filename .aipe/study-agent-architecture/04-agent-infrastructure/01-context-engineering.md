@@ -40,6 +40,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Context engineering is cross-cutting, so its "layers" are the curation points it touches: the **Per-agent definitions** (system prompts and the `filterToolSchemas` tool subset — what enters the window in the first place), the **Shared agent loop** (`runAgentLoop` — accumulates the message history, truncates tool results to a 16KB cap), the **Tools + MCP transport** (where the 112KB raw schema gets summarised into a top-20 events injection before it ever reaches the prompt), and the **Window itself** (the message array sent on any given turn — the *intersection* of all the curation decisions upstream).
+
+**Axis: state.** What's in the window right now, who put it there, when does it grow, when does it get evicted, and what shape does it take by the time it reaches the model? This is the right axis because the entire discipline of context engineering is *managing the lifecycle of token-state in the window*. Cost is a real concern (tokens cost money and latency) but cost is the *consequence* of state-growth. Pick the wrong axis (control, say) and every curation point looks like just "an `if`" — state-as-content is what makes the difference legible.
+
+**Seams.** Three seams matter, and the second is load-bearing. Seam 1 sits between raw material (full schema, all tools, full tool response) and curated entries (summarised schema, per-agent subset, truncated result) — state-ownership flips from "MCP server / external API owns it" to "our code owns the slice that enters the window." Seam 2 sits between the prior turn's window and this turn's window — state flips from "everything from last turn" to "everything from last turn + this turn's tool results, truncated." That seam is the load-bearing one: it's where context bloat would originate if there were no truncation, and it's the *only* moment per turn when the system gets to evict. Seam 3 sits at the agent-to-agent boundary (handled by message passing in the sibling file) — state flips from "agent A's full window" to "agent B sees only the typed message it was handed."
+
+```
+  Structure pass — Context engineering
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Per-agent definitions (prompt + tool subset)  │
+  │  Shared agent loop (accumulates + truncates)   │
+  │  Tools + MCP transport (schema summarised)     │
+  │  The window (intersection of all curation)     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state: what's in the window, who put it       │
+  │         there, when does it grow / evict?      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: raw material ↔ curated entries        │
+  │          (external owns → we own the slice)    │
+  │  Seam 2: prior turn ↔ this turn's window       │
+  │          (full → full + truncated additions)   │
+  │          ★ load-bearing — only eviction point  │
+  │  Seam 3: agent A ↔ agent B                     │
+  │          (A's full window → B sees one message)│
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the curation policies and where each one earns its keep in tokens.
+
+---
+
 ## How it works
 
 **The mental model: the window is a slice you compute, not a bucket you dump into.** Every turn, your code is choosing — explicitly or by neglect — what tokens to put in front of the model. The undisciplined version is "everything I have, in the order I have it." The disciplined version is "the smallest slice that lets the model do this turn correctly, in the order that puts the load-bearing parts at the edges (start and end) where the model attends best."
@@ -405,3 +445,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

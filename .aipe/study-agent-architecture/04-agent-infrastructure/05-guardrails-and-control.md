@@ -40,6 +40,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Five guardrail layers stack around the dangerous middle (the autonomous loop) at four bands: the **Per-agent definitions** (capability gating — `runnableCategories` filters categories the workspace can support, applied *before* the loop runs), the **Shared agent loop** (iteration cap `maxTurns=8` and tool-call cap `maxToolCalls=6/4` plus the forced-final turn that strips tools), the **Pipeline coordinator** (output validators — `parseAgentJson` plus typed `isDiagnosis` / `isAnomalyArray` / `isRecommendationArray` on every handoff), and the **Tools + MCP transport** (the read-only tool surface — no writable tools exist, and a one-time auto-reconnect for revoked tokens guarded by the `bi:reconnecting` flag).
+
+**Axis: failure + trust.** Two axes braid here. Failure: where does each failure mode originate, propagate, and get contained? Every guardrail you don't put in is a failure mode you've accepted. Trust: what can each side (model, tools, downstream) tamper with — and which sides do you contractually limit? The read-only tool surface is a *trust* guardrail (the LLM's output can't trigger a side effect because no writable tool exists to be triggered); the budget cap is a *failure* guardrail (it stops the loop from running forever). Together they describe a complete envelope.
+
+**Seams.** Two seams matter, and one is the load-bearing one. Seam 1 sits at every guardrail boundary — failure-containment flips from "possible upstream" to "bounded by this layer." Each layer has its own seam, each catching one failure mode (capability mismatch, runaway turns, malformed JSON, side-effect from model output, revoked token). Seam 2 is the one that does the most blast-radius reduction: the seam between the model's output (untrusted) and what that output can *cause* in the world. In a writable-tools system, control flips from MODEL (decides) to EXTERNAL (state changes); in blooming insights, control flips from MODEL to READ-ONLY (nothing changes because nothing is writable). This single seam being a wall is what makes prompt injection a low-stakes attack here.
+
+```
+  Structure pass — Guardrails and control
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Per-agent definitions (capability gate)       │
+  │  Shared agent loop (budget + forced-final)     │
+  │  Pipeline coordinator (output validators)      │
+  │  Tools + MCP transport (read-only + reconnect) │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure + trust: where does each failure mode │
+  │     originate / get contained, and what can    │
+  │     each side tamper with?                     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: every guardrail boundary              │
+  │          (possible upstream → bounded here)    │
+  │  Seam 2: MODEL output ↔ effects on the world   │
+  │          (could-cause → READ-ONLY)             │
+  │          ★ load-bearing — biggest blast-radius │
+  │          reduction in the whole system         │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks all five layers and which line carries each cap.
+
+---
+
 ## How it works
 
 **The mental model: five layers around the loop, each catching a different failure mode.** Think of the loop as the dangerous middle (the part you can't fully control because the model decides), wrapped in layers like the layers around a checkout form — input validation, side-effect idempotency, output validation, auth, retry. Each layer has one job. None of them is enough alone; together they bound the system.
@@ -501,3 +541,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

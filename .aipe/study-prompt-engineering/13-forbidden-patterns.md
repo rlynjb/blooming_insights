@@ -44,6 +44,60 @@
 
 ---
 
+## Structure pass
+
+**Layers.** This concept has two halves that operate at different scales, so the "layers" are actually two scopes the model produces output at. Layer A is *one generation* — a single call's output, the unit a negative constraint ("do NOT use `customers matching`") shapes. Layer B is *the prompt* — the lines that fence off drift on that single generation, scattered across Hard rules / method / field-rules sections of each `.md`. Layer C is *the sequence of generations for one recipient* — the broader scope a rotating formula would shape if it existed: same generation × same user × over time. Layer D is *the recipient and channel* — who reads the output and how often, which is what makes phrasing convergence visible or invisible.
+
+**Axis: control.** What is the prompt controlling — one generation, or a sequence of them? Control is the right axis because the two halves of this file do *different control jobs*: negative constraints control *a single call's behavior* (don't drift into the bad shape); rotating formulas control *the phrasing distribution across calls* (don't converge on a house opening). Trace control across A→D and the seams pop: A and B work at the single-call scope, C and D require the cross-call scope to even exist as a problem.
+
+**Seams.** Two seams; the second is the conditional one this whole file is honest about. Seam 1 (A↔B) — control flips from *output the model would default to* to *output fenced by negative constraints*; pair each "do NOT" with a positive alternative (the model attends to the salient token, so a bare ban can backfire) and the seam holds. The load-bearing seam is Seam 2 (B↔C) — control would flip from *shaping one generation* to *shaping a sequence*; today this seam *doesn't exist as a problem* because every repeated chain emits structured output (JSON has no phrasing to converge) and the one prose agent is one-shot per question (no repetition for one user). The discipline is conditional: this seam *would* become load-bearing if a recurring prose digest shipped. The trap to avoid is treating "rotation absent is correct" as a permanent rule rather than a conditional one — the moment same-user-repeated-prose enters the system, the rotation half stops being optional.
+
+```
+  Structure pass — forbidden patterns + rotating formulas
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: one generation (single call output)         │
+  │  B: the prompt (negative constraints inside)    │
+  │  C: sequence of generations for one recipient   │
+  │  D: recipient + channel (who reads, how often)  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: one generation vs a sequence?         │
+  │  what scope is the prompt actually shaping?     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): default output → fenced by negative │
+  │            constraints (used pervasively)       │
+  │  S2 (B↔C): single-call shaping → sequence      │
+  │            shaping (LOAD-BEARING — and          │
+  │            CONDITIONAL; doesn't bite until a    │
+  │            recurring prose-for-one-user feature │
+  │            exists, which is nowhere today)      │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what scope is being controlled?" answered two ways
+
+  ┌─ negative ───────┐    seam     ┌─ rotating formula ───┐
+  │  constraints     │ ═════╪═════► │  controls a SEQUENCE │
+  │  control a       │   (conditional│ of generations for │
+  │  SINGLE call     │    flip — not│  ONE user over time │
+  │                  │    triggered │                      │
+  │                  │    today)    │                      │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → would flip the day a recurring prose digest
+                   for one merchant ships; rule stays conditional
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** This concept has two halves that solve different problems. *Negative constraints* ("do NOT X") fence off specific behaviors the model would otherwise drift into — they shape a *single* generation. *Rotating formulas* fight a different problem: when you generate the *same kind of thing repeatedly for one user*, free-form prose converges on a house style and feels robotic, so you rotate openings/structures to keep it fresh. The decision is conditional: rotation is only needed when output is **prose** AND **repeated for the same user**.
@@ -350,3 +404,4 @@ Updated: 2026-05-29 — Resynced the sibling-prompt refs previously left per sco
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

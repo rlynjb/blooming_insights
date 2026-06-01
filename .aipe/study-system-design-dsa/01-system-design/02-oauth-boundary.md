@@ -40,6 +40,55 @@ Zoom out — where the OAuth boundary lives
 
 ---
 
+## Structure pass
+
+**Layers.** The OAuth boundary stacks four layers around one ephemeral state object: the **browser** (carries `bi_session` + encrypted `bi_auth` cookies), the **route handler** (`connectMcp` + `/api/mcp/callback`), the **provider/SDK seam** (`BloomreachAuthProvider` implementing `OAuthClientProvider`, with the MCP SDK driving the protocol), and the **persistent store** (file in dev, encrypted `bi_auth` cookie in prod, in-memory `Map` in test). The per-session shape (`clientInformation`, `codeVerifier`, `tokens`, `state`) is the same across all backends; only the durability backend changes.
+
+**Axis: trust.** Who can see, tamper with, or forge each piece of state — and what part of the codebase decides? This is the right axis because OAuth IS a trust protocol: PKCE replaces a `client_secret`, the `bi_auth` cookie is encrypted because the browser is hostile, `redirectToAuthorization` captures-don't-opens because the server has no browser to trust. Control is a tempting alternate (the SDK clearly drives), but trust is the deeper question — it explains *why* the SDK drives (inversion-of-control reduces the surface our code can betray) and *why* prod uses an encrypted cookie (the browser is the only state both serverless instances can see, but only if we don't trust its contents). State as an axis would flatten the encryption decision into "where does it live"; trust pops it into "what can each side do with it."
+
+**Seams.** Three seams matter; one is load-bearing. **Seam 1: browser ↔ route.** Trust flips from UNTRUSTED (user agent, attacker-controllable) to TRUSTED (server process). The `bi_auth` cookie is the contract — it crosses this seam encrypted because we don't trust the browser with cleartext tokens. **Seam 2 (load-bearing): provider ↔ MCP SDK.** Trust flips from APPLICATION-CODE-OWNS-THE-STATE-MACHINE to SDK-OWNS-IT. Our code answers callbacks ("here's where to persist", "here's how to handle redirect"); the SDK drives DCR+PKCE+exchange. This is the inversion-of-control seam — it's why the OAuth flow is ~150 lines of provider plumbing instead of 200+ lines of hand-rolled protocol. **Seam 3: connect-instance ↔ callback-instance.** Trust flips from "same process" (dev) to "two ephemeral serverless processes that only share the browser" (prod). The encrypted cookie is what makes the bridge possible without an external KV store.
+
+```
+Structure pass — OAuth boundary
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Browser (cookies) · Route handler · Provider/SDK   │
+│  seam · Persistent store (file/cookie/Map)          │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  trust: who can see/tamper, and which side decides   │
+│  how the OAuth state machine runs?                   │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: browser → route       (UNTRUSTED → TRUSTED)     │
+│  S2: provider → MCP SDK ★load-bearing                │
+│      (APP owns state → SDK owns state machine)       │
+│  S3: connect instance → callback instance            │
+│      (same process → two processes via cookie)       │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "who owns the OAuth state machine?" answered two ways
+
+┌─ Our provider ────┐    seam     ┌─ MCP SDK ────────────┐
+│  Owns: persistence│ ═════╪═════►│  Owns: protocol order │
+│  (where to store, │  (it flips) │  (DCR → PKCE → code   │
+│   how to redirect)│             │   → token → refresh)  │
+└───────────────────┘             └───────────────────────┘
+        ▲                                      ▲
+        └────── same axis (trust), two answers ─┘
+                → this is the inversion-of-control joint
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Move 1 — Mental model
@@ -639,3 +688,4 @@ Updated: 2026-05-28 — documented the PRODUCTION auth store: AES-256-GCM encryp
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

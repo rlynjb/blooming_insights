@@ -40,6 +40,56 @@ Zoom out — where NDJSON streaming lives
 
 ---
 
+## Structure pass
+
+**Layers.** Streaming NDJSON is a producer/consumer pipe with four layers: the **producer** (route handler enqueuing events via `controller.enqueue(encodeEvent(e))`), the **wire** (HTTP chunked transfer carrying TCP packets that may split a JSON line mid-byte), the **consumer** (`fetch` + `getReader()` loop in the browser, with a line-buffering reassembly step), and the **handler** (the `switch (e.type)` that maps each event to a React `setState`). Producer and consumer operate independently — each at its own cadence — connected only by the byte stream.
+
+**Axis: failure.** Where does a broken event originate, propagate, and get contained? This is the right axis because every load-bearing decision in NDJSON streaming is a failure-containment choice: line-buffering exists because TCP can split a line mid-byte (chunk-boundary failure); the `error` event exists because a producer throw mid-stream can't return an HTTP 500 (the headers already went); the cache-replay path uses the same wire format so a snapshot replay can't drift from live (drift failure). Control is the alternate axis (producer pushes, consumer pulls) — but it doesn't pop the seams. Pick failure and you see why each piece exists; pick control and they all look like generic "events flowing downstream."
+
+**Seams.** Three seams matter; one is load-bearing. **Seam 1: producer → wire.** Failure flips from APPLICATION-ERROR (catchable, can emit `{type:"error"}`) to TRANSPORT-ERROR (TCP reset, headers-already-sent — uncatchable mid-stream). **Seam 2 (load-bearing): wire → consumer.** Failure-mode flips from "bytes arrive intact" to "bytes might arrive split across chunks." This is where line-buffering becomes mandatory — `buf.split('\n')` + `lines.pop()` is the *only* contract that survives this seam. Drop it and a single line split across two TCP chunks corrupts the next two parses. **Seam 3: consumer → handler.** Failure flips from PARSE-ERROR (malformed JSON, log-and-skip) to STATE-ERROR (unexpected event type, ignored by the switch default).
+
+```
+Structure pass — streaming NDJSON
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Producer (route + enqueue) · Wire (HTTP chunked)   │
+│  · Consumer (reader + line buffer) · Handler        │
+│  (switch on e.type → setState)                      │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  failure: where does a broken event originate,      │
+│  propagate, and get contained?                       │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: producer → wire (APP-ERROR → TRANSPORT-ERROR)   │
+│  S2: wire → consumer ★load-bearing                   │
+│      (bytes intact → bytes split mid-line)           │
+│  S3: consumer → handler (PARSE-ERR → STATE-ERR)      │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "are bytes line-aligned?" answered two ways
+
+┌─ Wire (TCP) ──────┐    seam     ┌─ Consumer (reader) ─┐
+│  chunks may split │ ═════╪═════►│  must reassemble:    │
+│  a line mid-byte  │  (it flips) │  buf += chunk        │
+│                   │             │  lines = split('\n') │
+│                   │             │  buf = lines.pop()   │
+└───────────────────┘             └──────────────────────┘
+        ▲                                       ▲
+        └────── same axis (failure), two answers ─┘
+                → drop line-buffering → 2+ parses corrupt
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Mental model
@@ -785,3 +835,4 @@ Updated: 2026-05-29 — documented the briefing route as a second NDJSON surface
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

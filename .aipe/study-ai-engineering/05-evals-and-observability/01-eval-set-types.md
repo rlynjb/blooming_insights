@@ -43,6 +43,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers run *parallel* to the live request, not nested inside it: the eval harness (loads fixed inputs from a set), the same per-agent code that serves live users (`DiagnosticAgent.investigate`), the scorer (rubric or judge consumes the produced output and compares to expected), and a quality number tracked over time. Three set types — golden, adversarial, regression — answer different quality questions.
+
+**Axis: guarantees.** What does each layer's result guarantee — a deterministic pass/fail (unit test) or a probabilistic quality measurement (eval)? This axis is the right lens because the file's whole frame is "evals are not unit tests" — they consume the *live* model and tolerate non-determinism. The 169 Vitest tests guarantee plumbing; the absent eval sets would guarantee *quality on representative input*. Cost is downstream; the upstream question is what kind of statement you're trying to make.
+
+**Seams.** The cosmetic seam is between the harness and the per-agent code — both are CODE. The load-bearing seam is between the per-agent output and the scorer: guarantees flip here from "live probabilistic prose" to "a number you can act on." A second load-bearing seam sits parallel to the live request flow: live UI consumes the same per-agent output for users; the eval scorer consumes it for *measurement*. Same data, two different guarantees — one "show the user," the other "is this getting better."
+
+```
+  Structure pass — eval set types
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  eval harness (loads fixed inputs)             │
+  │  same per-agent code (live model)              │
+  │  scorer (rubric / judge / exact-match)         │
+  │  quality number (tracked over time)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: deterministic pass/fail vs        │
+  │  probabilistic quality measurement?            │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  harness↔per-agent: cosmetic                   │
+  │  per-agent↔scorer: LOAD-BEARING                │
+  │    probabilistic prose → actionable number     │
+  │  live↔eval (parallel): LOAD-BEARING            │
+  │    same output, two guarantees                 │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Picture your existing test suite, then change one thing about each test: the assertion. A unit test asserts `result === expected` against a deterministic value with the network mocked out. An eval *case* runs the input through the **real** model and scores the result against a reference answer with a method that tolerates non-determinism (fuzzy match, rubric, LLM-as-judge — see `02-eval-methods.md`). Same input/expected pairing; different assertion and a live model behind it.
@@ -349,3 +385,4 @@ Updated: 2026-05-29 — Test count 157→169 (all live occurrences); diagnostic 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

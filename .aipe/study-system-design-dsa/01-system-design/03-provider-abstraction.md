@@ -42,6 +42,53 @@ Zoom out — where the provider/transport seam lives
 
 ---
 
+## Structure pass
+
+**Layers.** The provider abstraction is a vertical stack, not a horizontal one. Four layers: the **caller** (any code that needs MCP behavior — `runAgentLoop`, `McpClient` itself), the **owned interface** (`McpCaller` and `McpTransport` — TypeScript types this codebase defines), the **implementation slot** (the concrete object that satisfies the interface — real `McpClient`/`SdkTransport` in prod, plain-object fakes in tests), and the **vendor SDK / network** (the `@modelcontextprotocol/sdk` calls and the wire). Two seams sit between four layers — this is the load-bearing detail that makes the whole codebase testable offline.
+
+**Axis: dependency.** Which direction does the type-arrow point at each layer boundary? This is the right axis because the entire reason this abstraction exists is dependency *inversion* — flipping who points at whom. State and control work but flatten things: state would frame it as "where do tool results live" (everywhere — boring); control would frame it as "who calls callTool" (the caller — also boring). Dependency pops the seam: in a naive design the caller depends on the SDK; here the caller depends on a type *this codebase owns*, and the SDK is the thing that depends on satisfying it. That arrow-flip is the whole pattern.
+
+**Seams.** Two seams matter; both are load-bearing because they're the *same pattern* repeated. **Seam 1: caller → owned interface.** Dependency flips from "I import vendor types" to "I import my own interface type." Cosmetic if the interface mirrors the SDK exactly — load-bearing because it doesn't (the owned interfaces are narrower: two methods, not the full SDK surface). **Seam 2: owned interface → implementation slot.** Dependency flips from TYPE to OBJECT, and the object can be a real SDK adapter or a plain-object test fake — the type can't tell. This seam is why 125 tests run with no network: every place a vendor edge would be is instead a swap point.
+
+```
+Structure pass — provider abstraction
+
+┌─ 1. LAYERS ────────────────────────────────────────────┐
+│  Caller · Owned interface (McpCaller/McpTransport) ·   │
+│  Implementation slot · Vendor SDK / network            │
+└───────────────────────────┬────────────────────────────┘
+                            │  pick the axis
+┌─ 2. AXIS ────────────────▼─────────────────────────────┐
+│  dependency: which way does the type-arrow point at    │
+│  each boundary?                                        │
+└───────────────────────────┬────────────────────────────┘
+                            │  trace across layers, find flips
+┌─ 3. SEAMS ───────────────▼─────────────────────────────┐
+│  S1: caller → owned interface (vendor types → own type)│
+│  S2: owned interface → impl slot ★load-bearing         │
+│      (TYPE → OBJECT; real adapter or test fake)        │
+└───────────────────────────┬────────────────────────────┘
+                            ▼
+                    Block 4 — How it works
+```
+
+```
+S2 seam — "what satisfies this type?" answered two ways
+
+┌─ Owned interface ─┐    seam     ┌─ Implementation slot ──┐
+│  type McpCaller = │ ═════╪═════►│  prod: SdkTransport →   │
+│  { callTool(...) }│  (it flips) │        vendor SDK       │
+│                   │             │  test: { callTool: fn } │
+└───────────────────┘             └─────────────────────────┘
+        ▲                                       ▲
+        └──── same axis (dependency), two answers ─┘
+              → this is why 125 tests run offline
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 A caller asks for behaviour through an interface it owns. The real implementation satisfies that interface by delegating to the vendor SDK. A fake implementation satisfies the same interface with a plain object. The caller never knows which it got.
@@ -477,3 +524,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers; added
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

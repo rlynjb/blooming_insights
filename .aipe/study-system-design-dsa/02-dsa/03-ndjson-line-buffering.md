@@ -42,6 +42,56 @@ Zoom out — where NDJSON line-buffering lives
 
 ---
 
+## Structure pass
+
+**Layers.** NDJSON line-buffering is a tight three-layer stack: the **byte stream** (`reader.read()` returning chunks of `Uint8Array` that may arbitrarily split a line), the **buffer + decoder** (the `buf` string + `TextDecoder({ stream: true })` that accumulates partials and decodes multi-byte UTF-8 safely), and the **parsed-event consumer** (`JSON.parse` per complete line → `switch (e.type)` → `setItems`/`setDiagnosis`/etc. plus the `replaceRunningTool` reverse-scan reconciliation). The buffer is the load-bearing piece — it's the only mutable state that has to be right.
+
+**Axis: state.** Who owns `buf` (the partial-line accumulator), when does it grow, when does it shrink, and what's the invariant after each iteration? This is the right axis because the whole correctness of NDJSON parsing depends on one invariant: *after every loop iteration, `buf` contains at most one incomplete record*. Cost is an alternate (O(L) per chunk where L is the chunk length), but cost is uninteresting here — the gymnastics are about state discipline, not throughput. Pick state and the `pop()` trick (keep the last element, parse everything before it) reveals itself as the invariant maintainer.
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1 (load-bearing): chunk arrival → buffer.** State-ownership flips from "no guarantee bytes are line-aligned" (network) to "string buffer with the invariant that complete records are everything-before-the-last-split-element" (parser). This seam is the joint that absorbs the chunk-boundary problem; it's why `lines.pop()` is mandatory (not optional cleanup). **Seam 2: parsed event → React state.** Ownership flips from "one event, parsed, ephemeral" to "merged into React state with reconciliation" (the reverse-scan pairs a `tool_call_end` with the last running `tool_call_start` of the same name).
+
+```
+Structure pass — NDJSON line-buffering
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Byte stream (chunks) · Buffer + decoder (buf +     │
+│  TextDecoder stream-mode) · Parsed-event consumer   │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: who owns buf, when does it grow/shrink,     │
+│  what invariant holds after each iteration?          │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: chunk arrival → buffer ★load-bearing            │
+│      (no line alignment → invariant: at most one     │
+│       partial in buf)                                │
+│  S2: parsed event → React state                      │
+│      (ephemeral parse → merged with reconciliation)  │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "where do partial lines live?" answered two ways
+
+┌─ Chunk arrival ──┐    seam     ┌─ Buffer (buf) ───────┐
+│  bytes may split │ ═════╪═════►│  buf += decoded;      │
+│  a line anywhere │  (it flips) │  lines = split('\n'); │
+│                  │             │  buf = lines.pop();   │
+│                  │             │  // ← the invariant   │
+└──────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (state), two answers ─┘
+                → pop() is what makes the invariant hold
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **Mental model — the buffer as a sliding window over the byte stream.**
@@ -478,3 +528,4 @@ Show every variable at every step: `buf` before and after each chunk, `lines`, `
 Updated: 2026-05-28 — repointed the reader-loop + reverse-scan reconciliation refs from `app/investigate/[id]/page.tsx` (now removed) to the `useInvestigation` hook (`lib/hooks/useInvestigation.ts` L184–L208, L86–L121) and the feed's own loop (`app/page.tsx` L418–L443); noted the hook's started-guard + no-cancel-on-cleanup StrictMode decision
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

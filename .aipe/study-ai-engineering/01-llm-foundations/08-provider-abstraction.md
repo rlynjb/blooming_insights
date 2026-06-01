@@ -39,6 +39,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers: the chooser (Route in production, test setup in tests) that constructs concrete clients, the agent loop / per-agent code that depends only on the injected parameters (`McpCaller`, `anthropic`), and the provider/MCP transports themselves (Anthropic SDK, MCP HTTPS transport). The agent layer constructs nothing; the chooser constructs everything; the transports do the network.
+
+**Axis: dependency.** Who depends on whom, and which way does the import arrow point? This axis is the right lens because dependency injection IS a dependency-direction inversion: the agent layer would normally `import { Anthropic } from '@anthropic-ai/sdk'` and `new` it; instead the chooser holds that import and passes the instance in. Control would mis-frame (the agent loop always decides what to call); trust isn't moving here; dependency direction is what flips at the seam.
+
+**Seams.** The cosmetic seam is between the agent loop and the SDK call itself — both run on the same provider concretion. The load-bearing seam is the parameter boundary: between the chooser and the agent loop, dependency flips from "concrete classes constructed here" to "no construction, only a shape parameter." Crossing this seam is what makes 169 tests run with no API key. A sideways non-flip worth naming: this is *not* a multi-provider seam — the `anthropic` parameter is the concrete SDK type, not a vendor-neutral interface, so swapping providers would still touch the agent layer.
+
+```
+  Structure pass — provider abstraction
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  chooser (route or test) — constructs clients  │
+  │  agent loop / per-agent — depends on params    │
+  │  provider + MCP transports — do the network    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  dependency: who depends on whom, and which    │
+  │  way does the import arrow point?              │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  agent↔SDK call: cosmetic                      │
+  │  chooser↔agent: LOAD-BEARING                   │
+  │    "constructs here" → "only consumes param"   │
+  │    this is what makes fakes work               │
+  │  (NOT a multi-provider seam — concrete type)   │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Two narrow interfaces define the *shape* the agent layer depends on; concrete classes implement them for production; the agent layer receives an implementation by parameter and never constructs one. Swapping the implementation (real → fake) is a different argument, not a code change inside the consumer.
@@ -337,3 +372,4 @@ Updated: 2026-05-29 — Test count 157→169 (both occurrences).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

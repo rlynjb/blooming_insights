@@ -42,6 +42,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Two parallel WOULD-BE retrieval branches sit between the query and the LLM context: the sparse branch (exact-term: BM25 / EQL / `String.includes`) and the dense branch (embed → cosine). They run independently, each emitting a ranked list; a hybrid combiner (next file) merges them. blooming insights has only the sparse branch today.
+
+**Axis: control.** Who decides what a "match" means — the index (exact tokens present?) or the embedding model (vectors close in meaning?)? This axis is the right lens because dense vs sparse is fundamentally a *matching-policy* split: each side has a different definition of relevance, and they fail in complementary places. Cost is similar across both; control over the matching predicate is what flips.
+
+**Seams.** The cosmetic seam is within each branch (sparse index → sparse retriever, dense embedder → dense retriever) — neither flips. The load-bearing WOULD-BE seam is *between the two branches at the same level*: sparse asks "do tokens overlap?" and dense asks "are vectors close?" — same query, two definitions of match. This is the seam the next file (hybrid + RRF) has to fuse. In blooming insights only one side of the seam exists, so there's nothing to fuse.
+
+```
+  Structure pass — dense vs sparse (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  sparse branch (exact tokens → BM25/EQL)       │
+  │  dense branch (embed → cosine)                 │
+  │  (downstream: hybrid combiner → next file)     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what counts as a match — │
+  │  the token index or the embedding model?       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  within a branch: cosmetic                     │
+  │  sparse↔dense (same level): LOAD-BEARING       │
+  │    "tokens overlap" vs "vectors close"         │
+  │    same query, two definitions of match        │
+  │    today: only sparse exists                   │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Think of two index shapes. A *sparse* index maps each term to the documents containing it — a `Map<term, docId[]>`, mostly empty per document (a document "contains" only a few hundred of the millions of possible terms, so its term-vector is almost all zeros: *sparse*). A *dense* index maps each document to a short float array where nearly every entry is non-zero (*dense*). Sparse matches by shared terms; dense matches by vector closeness.
@@ -298,3 +333,4 @@ What kind of retrieval does blooming insights do, and which tool is the evidence
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

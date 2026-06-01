@@ -39,6 +39,55 @@
 
 ---
 
+## Structure pass
+
+**Layers.** ReAct lives at the Shared agent loop band, but it touches three layers to do its job: the **Per-agent caller** (`monitoring.ts` / `diagnostic.ts` / `recommendation.ts` / `query.ts` — supplies the prompt, tool subset, budget, synthesis instruction), the **Loop body itself** (`runAgentLoop` — the bounded `for` plus the model call plus the tool-result push), and the **Tool execution path** (MCP client → tool → result). The model is the actor whose decisions the loop relays; the runtime is what counts the turns.
+
+**Axis: control.** Who decides what happens next on each turn? This is the right axis because ReAct's definition — the thing that makes it ReAct rather than a single completion or a fixed chain — is the *interleave* of model-decided actions and code-enforced bounds. The model picks the next tool; the code picks whether there is a next turn at all. Cost is a real concern (the budget exists to bound it) but cost only matters because control would otherwise be unbounded — control is upstream.
+
+**Seams.** Two seams matter and both are load-bearing in different ways. Seam 1 sits inside one turn — between the model's emitted `tool_use` block and the code that executes it. Control flips from MODEL (which tool, what args) to CODE (does the tool exist? did it 429? does the result get pushed back?). Seam 2 sits between turns — between the loop body and the per-loop budget. Control flips from MODEL (decides whether to call another tool or stop) to CODE (decides whether the model is allowed to call another tool — the forced-final escape hatch strips the tools and forces a text answer). Seam 2 is the one that distinguishes ReAct from "an LLM in a `while True`" — without that flip, the loop is unbounded.
+
+```
+  Structure pass — ReAct
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Per-agent caller (system + tools + budget)    │
+  │  Loop body (for turn: model.create → exec)     │
+  │  Tool execution path (MCP → result)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what happens next?       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1 (within turn): MODEL picks tool →      │
+  │          CODE executes it                      │
+  │  Seam 2 (between turns): MODEL wants more →    │
+  │          CODE allows or strips tools           │
+  │          ★ load-bearing — bounds the loop      │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  Seam 2 — "is there a next tool turn?" answered two ways
+
+  ┌─ Model intent ───┐    seam       ┌─ Runtime gate ─┐
+  │  MODEL: "I want  │ ═════╪══════► │ CODE: budget?  │
+  │  to call X next" │  (it flips)   │ → omit tools,  │
+  │                  │               │ force final    │
+  └──────────────────┘               └────────────────┘
+         ▲                                     ▲
+         └─── same axis (control), two answers ─┘
+              → THIS is the forced-final escape hatch
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **The mental model: a `while` loop the model drives, with your code as the runtime.** The model returns a message that either says "call tool X with these args" or "I'm done, here's the answer." Your code runs the tool, feeds the result back into the next request, and re-asks. The loop ends when the model emits no tool call — or when your code yanks the tools away to force a final answer.
@@ -421,3 +470,4 @@ Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skel
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

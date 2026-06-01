@@ -39,6 +39,54 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form the RAG shape: the query, the *retriever* (an interface — implemented here as MCP tool calls instead of cosine over an embedding index), the LLM context (where retrieved facts land), and the generator (the model's answer conditioned on that context). blooming insights swapped the retriever's implementation but kept the four-layer shape intact.
+
+**Axis: lifecycle.** When is the retrieval done — at build-time against a pre-built index, or per-query against the live source? This axis is the right lens because RAG-vs-live-tools is fundamentally a lifecycle choice for the retriever: classic RAG amortizes embed cost at build-time and accepts staleness; live tools pay per query and accept latency. Control doesn't flip (model decides what to retrieve in both cases); the load-bearing question is when does the lookup happen.
+
+**Seams.** The cosmetic seam is between the LLM context and the generator — both belong to the model. The load-bearing seam is between the query/retriever-interface and *whatever fills it*: lifecycle flips from "pre-built index built once, scanned per query" (classic RAG) to "no index, query the source fresh every time" (live tool retrieval, this codebase's choice). This is the one decision that defines the architecture. A secondary observation: blooming insights' choice trades latency-and-rate-limit pain for *freshness* — exactly the trade you'd make against a fresh live API with exact analytics.
+
+```
+  Structure pass — RAG (live-tool variant)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  query                                         │
+  │  retriever (interface; live MCP tool here)     │
+  │  LLM context (retrieved facts land here)       │
+  │  generator (model conditions on context)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: build-time index vs per-query      │
+  │  live retrieval?                               │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  context↔generator: cosmetic                   │
+  │  retriever-interface↔implementation:           │
+  │    LOAD-BEARING                                │
+  │    classic: pre-built index (amortized)        │
+  │    here:    live tool call (fresh, per query)  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "when do you retrieve?" answered two ways
+
+  ┌─ classic RAG ─┐  seam   ┌─ live tools ─┐
+  │ build-time    │ ══╪═══► │ per-query    │
+  │ (amortized)   │  flips  │ (fresh)      │
+  └───────────────┘         └──────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → architectural choice
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Strip RAG to its essence and it is two steps: *retrieve* relevant context, then *generate* an answer conditioned on that context. The famous version uses an embedding index as the retriever. But "retriever" is an interface, not an implementation — anything that returns relevant context for a query qualifies. A live tool call is a retriever. So is an embedding index. This system swapped the retriever implementation, not the RAG shape.
@@ -297,3 +345,4 @@ Updated: 2026-05-28 — corrected one stale ref: `maxDuration: 60` → `maxDurat
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -40,6 +40,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three WOULD-BE layers in a two-stage retrieval pipeline: the fast first-stage retriever (recall over thousands, scores query and doc *independently*), the second-stage reranker (precision over ~20, scores them *together* in one model pass), and the LLM context that finally consumes the reordered top-3. Each stage has opposite tradeoffs and exists because the other can't do both jobs.
+
+**Axis: cost.** What does each layer pay per candidate, and over how many candidates is that price paid? This axis is the right lens because the entire two-stage shape is a *cost-vs-precision* division of labor — the cheap stage handles volume, the expensive stage handles the short list. The load-bearing question is "how many candidates can I afford to run this scorer over?"
+
+**Seams.** The cosmetic seam is between retriever and reranker as ranked-list pipes — both produce ordered candidates. The load-bearing WOULD-BE seam is *inside* that transition: cost-per-candidate flips from cheap-independent (cosine/BM25) to expensive-joint (cross-encoder). This is the seam that makes two-stage retrieval cheaper than running the cross-encoder over everything. A second consequence sits sideways — reranking's payoff is lost-in-the-middle mitigation (best result at position 1), connecting back to → ../02-context-and-prompts/02-lost-in-the-middle.md.
+
+```
+  Structure pass — reranking (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  first-stage retriever (cheap, over thousands) │
+  │  reranker / cross-encoder (precise, over ~20)  │
+  │  LLM context (best result at position 1)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what does each layer pay per candidate, │
+  │  over how many candidates?                     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  retriever↔reranker pipe: cosmetic             │
+  │  cheap-independent ↔ expensive-joint:          │
+  │    LOAD-BEARING                                │
+  │    division of labor: volume vs precision      │
+  │    payoff: best at pos 1 (mitigates middle)    │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Two stages with opposite tradeoffs. Stage 1 (retrieval) is a cheap filter run over everything: like `array.filter()` narrowing a million rows to 20. Stage 2 (rerank) is an expensive precise sort run only over those 20: like an `array.sort()` whose comparator calls an API. You would never run the expensive comparator over a million; you run it over the short list the cheap filter produced.
@@ -283,3 +318,4 @@ Does blooming insights rerank retrieved candidates by query relevance, and what 
 → 06-hybrid-retrieval-rrf.md · → 01-embeddings.md · → ../02-context-and-prompts/02-lost-in-the-middle.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

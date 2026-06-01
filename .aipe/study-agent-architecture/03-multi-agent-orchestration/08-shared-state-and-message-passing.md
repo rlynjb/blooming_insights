@@ -40,6 +40,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers carry this concept: the **Pipeline coordinator** (the orchestrator that owns the inter-agent handoff), the **Per-agent definitions** (each one's own conversation history, prompt, and tool subset), the **Message contracts** (the typed schemas — `lib/schemas/*` — that define what crosses an agent boundary), and the **Cross-request carrier** (in-process function args today; `sessionStorage` + URL param for the two-step UI). The would-be alternative — a shared blackboard — would replace the second and third layers with a single global store every agent reads and writes.
+
+**Axis: state.** Who owns each piece of conversational data, where does it live, and who is allowed to mutate it? This is the right axis because the entire choice between message passing and shared state is *who owns context at the inter-agent boundary*. Trust is a real concern (a shared blackboard is unsafe because anyone can poison it) but trust is downstream of state ownership: trust matters because ownership is diffuse in the shared-state model.
+
+**Seams.** Two seams matter. Seam 1 sits between one agent's output and the next agent's input — state-ownership flips from "agent A owns its scratchpad" to "the orchestrator owns the typed message it built from A's output." That seam IS message passing; in the shared-state variant the flip never happens because no one owns anything (everyone reads/writes the blackboard). Seam 2 sits between in-request state (function args in a single request) and cross-request state (`sessionStorage` + URL param across the two-step UI) — state-ownership flips from "the call stack carries it" to "the browser carries it" — but the *principle* is identical (explicit typed message, not global state). Seam 1 is the load-bearing one for the concept; Seam 2 is the same shape recurring across a request boundary.
+
+```
+  Structure pass — Shared state vs message passing
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Pipeline coordinator                          │
+  │  Per-agent definitions (own conversation each) │
+  │  Message contracts (typed schemas)             │
+  │  Cross-request carrier (sessionStorage + URL)  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state: who owns context at the inter-agent    │
+  │         boundary, and who can mutate it?       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Agent A output ↔ Agent B input        │
+  │          (A owns scratch → orchestrator owns   │
+  │          typed message → B owns its scratch)   │
+  │          ★ load-bearing — this IS the choice   │
+  │  Seam 2: in-request ↔ cross-request            │
+  │          (call stack → sessionStorage)         │
+  │          same shape, different carrier         │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks both shapes, the cost ledger, and why a curated typed message beats a blackboard for this codebase.
+
+---
+
 ## How it works
 
 **The mental model: explicit props vs global Redux store, applied to agent context.** Each agent's input is curated by whoever called it. The schema of the input is the contract between agents. No agent reads another agent's scratchpad.
@@ -612,3 +652,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

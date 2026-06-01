@@ -49,6 +49,55 @@ Zoom out — where multi-agent orchestration lives
 
 ---
 
+## Structure pass
+
+**Layers.** Multi-agent orchestration stacks five layers across two HTTP requests: the **client handoff** (`sessionStorage` carries the diagnosis from step-2 to step-3), the **route coordinator** (`route.ts` files that map a step param → one specialist agent per request), the **per-agent definition** (monitoring/diagnostic/recommendation — each owns its prompt + tool subset + JSON validator + fallback), the **shared agent loop** (`runAgentLoop` — the while loop, the forceFinal nudge, the tool execution), and the **provider/MCP** (the actual tool calls). The first three layers are *per-stage*; the last two are *per-turn-within-a-stage*.
+
+**Axis: control.** Who decides what happens next at each layer? This is the right axis because multi-agent orchestration IS a control-topology decision (single agent vs sequential pipeline vs supervisor vs parallel) — the architecture name *is* the control name. Pick anything else and the diagram flattens. State is tempting because of the sessionStorage handoff, but state is downstream of control: the handoff exists because the pipeline is sequential, which is a control choice. Failure also competes, but the fallback chain (`tryParse ?? synthesize ?? FALLBACK`) is interesting only once you know which level of control owned that choice.
+
+**Seams.** Three seams matter; one is load-bearing. **Seam 1: route coordinator → per-agent definition.** Control flips from CODE (route's step-param if-ladder picks the agent) to CODE-still (the per-agent class picks the prompt + tools). Procedural-to-procedural; bookkeeping seam. **Seam 2 (load-bearing): per-agent definition → agent loop.** Control flips from CODE-DECIDES (the agent class set up the call) to MODEL-DECIDES (Claude picks which tool to call, how many turns to take, when to emit final JSON). This is the procedural→agentic joint — the same one as in request-flow, but here it's repeated three times, once per agent. **Seam 3: step-2 response → step-3 request.** Control flips from SERVER (route finished, response sent) to CLIENT (must persist diagnosis, must initiate next request). The whole reason blooming insights is "sequential pipeline" not "supervisor" is that the client owns this seam — no orchestrator survives the round-trip.
+
+```
+Structure pass — multi-agent orchestration
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Client handoff · Route coordinator · Per-agent def │
+│  · Shared agent loop · Provider/MCP                  │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  control: who decides what happens next? (topology   │
+│  IS a control structure)                             │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: route → per-agent def (CODE → CODE; bookkeeping)│
+│  S2: per-agent def → agent loop ★load-bearing        │
+│      (CODE-DECIDES → MODEL-DECIDES; repeated 3×)     │
+│  S3: step-2 response → step-3 request                │
+│      (SERVER → CLIENT; why "sequential pipeline")    │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "who picks the next tool call?" answered two ways
+
+┌─ Per-agent def ───┐    seam     ┌─ Agent loop ─────────┐
+│  CODE picks:      │ ═════╪═════►│  MODEL picks:         │
+│  prompt + tool    │  (it flips) │  which tool, when     │
+│  subset + budget  │             │  to stop, final JSON  │
+└───────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (control), two answers ─┘
+                → this seam exists once per agent stage
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **Mental model.** Think of the shared agent loop as the `while` loop in your paginator, except the "next-page token" is replaced by tool-use blocks in the model's response. Each iteration: ask the model → if the response contains tool-use blocks, execute them and push their results back as the next user message → if no tool-use blocks, the loop is done and you return whatever text the model produced.
@@ -654,3 +703,4 @@ Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `s
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

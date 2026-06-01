@@ -40,6 +40,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Parallel fan-out would need four layers: the **Splitter** (decomposes the request into N independent sub-questions — deterministic or LLM-driven), the **Concurrent workers** (N agent loops running simultaneously), the **Merger** (combines results — function call or another agent), and a **Concurrency-backpressure layer** sitting alongside (enforces N-at-a-time against provider rate limits). In blooming insights none of these exist for the analyst flow; what occupies the Pipeline coordinator band is the sequential pipeline (`monitoring → diagnostic → recommendation`) with a typed `Diagnosis` data-dependency enforcing the order.
+
+**Axis: control.** Who decides which sub-jobs run, in what order, and against what concurrency budget? This is the right axis because fan-out is fundamentally about *placing concurrency decisions* — splitting, scheduling, merging — and each of those is a control-flow choice. Cost is the killing argument in this codebase (the ~1 req/s MCP rate limit means wide concurrency just serializes again, with extra coordination tax), but cost is the *consequence* of letting control fan out without a backpressure layer. Control is upstream.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape. Seam 1 sits between the Splitter and the Concurrent workers — control flips from CODE (or MODEL) deciding the split, to CODE managing N parallel executions. Seam 2 sits between the Concurrent workers and the Merger — control flips from N-workers-with-results back to a single point that aggregates. Seam 2 is the load-bearing one because that's where partial failures get handled (one worker errors, the merger still has to produce something) and where the *fake independence* failure mode hides (the merger silently combines outputs that needed to talk to each other). In blooming insights both seams are absent because the typed `Diagnosis` enforces sequential dependency at the Pipeline band; there's nothing to split.
+
+```
+  Structure pass — Parallel fan-out (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Splitter (decomposes into N sub-questions)    │
+  │  Concurrent workers (N agent loops)            │
+  │  Merger (aggregates results)                   │
+  │  Concurrency-backpressure (caps N for limits)  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what runs in parallel    │
+  │           and against what budget?             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Splitter ↔ Concurrent workers         │
+  │          (single decision → fan-out)           │
+  │  Seam 2: Workers ↔ Merger                      │
+  │          (N results → 1) ★ load-bearing —      │
+  │          partial failure + fake-independence   │
+  │          hide here                             │
+  │  In this repo: typed Diagnosis dependency      │
+  │  prevents the fan-out from existing            │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the fan-out mechanics, the silent fake-independence failure mode, and the future query shape that would earn the topology.
+
+---
+
 ## How it works
 
 **The mental model: `Promise.all()` with a merge.** Each promise is an agent; the merge is either a function call (deterministic) or another agent (when the merge itself needs reasoning).
@@ -496,3 +537,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

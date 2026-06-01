@@ -39,6 +39,48 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers stack from model to network: the **Per-agent tool surface** (each agent's filtered subset via `filterToolSchemas` — what tool schemas this agent is even allowed to see), the **Shared agent loop** (`runAgentLoop` — parses `tool_use` blocks, dispatches to the MCP client, pushes results back), the **MCP client + transport** (`lib/mcp/client.ts` — StreamableHTTP, OAuth PKCE+DCR auth, spacing, retry, cache), and the **External MCP server** (Bloomreach's loomi MCP — the actual tool host across HTTPS). Brain → wires → hands, with a filter at the top deciding what the brain can ask for.
+
+**Axis: trust + control.** Two axes braid here because the seams flip both ways. Trust: what can each side see or tamper with — the model can emit any tool call name from its menu (untrusted), our loop validates against the schema (trusted), the MCP client signs the call with our OAuth token (trusted), the external server executes against our project scope (trusted but external). Control: who decides which tool runs — the model picks from its filtered menu (MODEL), the loop dispatches (CODE), the MCP server resolves (EXTERNAL). The two axes flip across different seams, which is the point.
+
+**Seams.** Three seams matter. Seam 1 sits between the Per-agent tool surface and the loop — control + trust both flip from "MODEL emits an intent against an untrusted text channel" to "CODE validates against the filtered schema before dispatching." Seam 2 sits between the loop and the MCP client — trust flips from "CODE running in our process" to "MCP client adding OAuth headers and rate-limit awareness on behalf of our process" (still our trust domain but a different concern). Seam 3 sits between the MCP client and the external server — trust flips from internal to external, control flips from CODE-in-our-process to EXTERNAL (the server resolves bootstrap chain, applies project scoping). Seam 3 is the load-bearing one for *security*: it's where credentials cross a network boundary. Seam 1 is the load-bearing one for *correctness*: it's where the model's untrusted output becomes a typed call.
+
+```
+  Structure pass — Tool calling and MCP
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Per-agent tool surface (filterToolSchemas)    │
+  │  Shared agent loop (parse + dispatch)          │
+  │  MCP client + transport (OAuth, rate, retry)   │
+  │  External MCP server (Bloomreach loomi)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  trust + control: what can each side see /     │
+  │                   tamper with, and who decides │
+  │                   what runs?                   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Tool surface ↔ Loop                   │
+  │          (MODEL untrusted → CODE validated)    │
+  │          ★ load-bearing for correctness         │
+  │  Seam 2: Loop ↔ MCP client                     │
+  │          (CODE in-process → CODE w/ OAuth)     │
+  │  Seam 3: MCP client ↔ External server          │
+  │          (internal → external, network cross)  │
+  │          ★ load-bearing for security            │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the discovery + execute mechanics and what each piece of the client's complexity earns.
+
+---
+
 ## How it works
 
 **The mental model: tool calling is brain + hands, MCP is the wiring between them.** The model is the brain — it emits structured tool calls but doesn't execute anything. Your loop is the hands — it runs the call, captures the result, feeds it back. MCP is the contract between them: a JSON-RPC protocol over HTTP that defines how a host (the agent's runtime) discovers what tools a server (Bloomreach's loomi MCP) exposes, calls them, and reads the structured results.
@@ -485,3 +527,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -39,6 +39,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three phases per loop iteration, each with its own taps: Thought (model emits text → `onText` → `reasoning_step` event), Action (model emits `tool_use` → `onToolCall` → `tool_call_start`), Observation (`mcp.callTool` returns → `onToolResult` → `tool_call_end`). All three sit inside the agent loop; the route's NDJSON stream surfaces them as live events.
+
+**Axis: control.** Who decides what happens next at each phase — MODEL (Thought and Action) or CODE (Observation)? This axis is the right lens because ReAct is fundamentally an alternation of agencies — the model thinks, then the model acts, then *code* observes and feeds back. The loop is asymmetric: two model-controlled phases, one code-controlled phase, and the alternation is what makes it ReAct rather than a one-shot completion.
+
+**Seams.** The cosmetic seam is between Thought and Action — both are model-emit phases. The load-bearing seam is between Action and Observation: control flips here from "MODEL emitting a tool request" to "CODE executing the tool and shaping the result into a `tool_result` block." This is where the rubber meets the road — and it's also where the live NDJSON event (`tool_call_end`) fires, making the seam observable. A second meaningful flip happens between Observation and the next Thought: results re-enter the message array and the model picks up reasoning again.
+
+```
+  Structure pass — ReAct pattern
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Thought (model emits text)                    │
+  │  Action (model emits tool_use)                 │
+  │  Observation (CODE runs tool → tool_result)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: MODEL phases vs CODE phase — when    │
+  │  does control hand over?                       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Thought↔Action: cosmetic (both MODEL)         │
+  │  Action↔Observation: LOAD-BEARING              │
+  │    MODEL request → CODE execution              │
+  │    fires tool_call_end event                   │
+  │  Observation↔next Thought: LOAD-BEARING        │
+  │    CODE result → MODEL reasoning resumes       │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** ReAct is a `while` loop where each iteration has three phases, and this system attaches a callback to each phase that emits an event. Think of the loop as a state machine that cycles `THINK → ACT → OBSERVE → THINK …`, where the shared agent loop's hooks (`onText`, `onToolCall`, `onToolResult`) are the taps that turn each transition into an NDJSON line the client renders.
@@ -398,3 +434,4 @@ Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skel
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

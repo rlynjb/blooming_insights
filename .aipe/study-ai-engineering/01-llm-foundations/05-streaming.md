@@ -39,6 +39,55 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers spanning three bands: the provider stream (Claude's reasoning increments arrive into `runAgentLoop`), the per-agent / pipeline hooks (`onText`, `onToolCall`) that turn increments into typed events, the route handler's `ReadableStream` (`send(e) → encode → enqueue`, NDJSON framing), and the browser consumer (`fetch` + `getReader()` + line-buffer loop).
+
+**Axis: control.** Who decides what gets sent next at each layer? This axis is the right lens because streaming is fundamentally a *push-from-server, pulled-by-client* arrangement, and the transport choice (`fetch`/`getReader` vs `EventSource`) hinges on whether the *client* or the *transport* gets to decide when to reconnect/re-run. State is tempting (where does the half-line buffer live?), but state is downstream of control: the load-bearing decision is "who fires the agent run again on a dropped connection."
+
+**Seams.** The cosmetic seam is between the provider's reasoning increments and the per-agent hooks — both push events forward. The load-bearing seam is the route's `ReadableStream` boundary: server-side control of "what becomes one line" flips to client-side control of "when do I parse the next line." A second load-bearing seam is sideways — between this transport (NDJSON over `fetch`) and the road-not-taken (`EventSource`): control over reconnection flips from explicit application code (this codebase: never auto-reconnect, never re-fire the agent) to the browser's built-in reconnect (which would double-fire the run).
+
+```
+  Structure pass — streaming
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  provider (reasoning increments)               │
+  │  per-agent hooks (onText, onToolCall)          │
+  │  route ReadableStream (NDJSON framing)         │
+  │  browser consumer (getReader + line buffer)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides what gets sent next —    │
+  │  and who decides when to reconnect/re-fire?    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  provider↔hooks: cosmetic (both push)          │
+  │  route↔browser: LOAD-BEARING                   │
+  │    server controls framing; client controls    │
+  │    parse cadence; neither auto-re-fires        │
+  │  (sideways) NDJSON↔EventSource: LOAD-BEARING   │
+  │    control over reconnect/re-run flips         │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "who reconnects on a dropped stream?" two ways
+
+  ┌─ NDJSON+fetch ─┐  seam   ┌─ EventSource ─┐
+  │ app code (no)  │ ══╪═══► │ browser (yes) │
+  │ never re-fires │ flips   │ DOUBLES run   │
+  └────────────────┘         └───────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → this is why fetch was chosen
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** This is the exact shape of consuming any chunked HTTP body in the browser: `fetch` gives you a `res.body` `ReadableStream`, you `getReader()` it, and you pull `Uint8Array` chunks in a loop, decoding each. The only domain-specific part is the framing: each *line* is one complete JSON event (NDJSON), so the client splits on `\n` and parses each line. The server's job is the mirror — write one `JSON.stringify(event) + '\n'` per increment.
@@ -448,3 +497,4 @@ Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (l
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

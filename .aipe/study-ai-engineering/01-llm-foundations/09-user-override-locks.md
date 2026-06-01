@@ -42,6 +42,39 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three WOULD-BE layers (this file is Case B): the UI edit/dismiss control on a record, the state layer's `_overridden_at` marker on that record, and the per-agent regeneration step that consults the marker before writing. blooming insights today is read-only — no edit path exists — so the layers are hypothetical; the structure pass describes the would-be skeleton.
+
+**Axis: control.** When a value can be set by either CODE (regeneration) or a USER (edit), who wins on the next re-run? This axis is the right lens because the override lock is fundamentally an answer to "who owns this field." State is downstream (the marker is *how* control is recorded); trust is downstream (the marker is what the regenerator must trust). Control is the upstream question — the marker exists only to make a CODE-vs-USER decision deterministic.
+
+**Seams.** The cosmetic seam is between the UI control and the state layer — both are USER-side. The load-bearing WOULD-BE seam is between the state layer (marker present or absent) and the per-agent regeneration step: control flips here from "set by USER's edit timestamp" to "decided by CODE's reconciliation rule." This is the seam the override lock defends — without it, regeneration silently overrides the human. In current blooming insights this seam doesn't exist because the regenerator never runs against a user-editable field.
+
+```
+  Structure pass — user-override locks (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  UI edit / dismiss control                     │
+  │  state layer (_overridden_at marker)           │
+  │  per-agent regeneration (consults marker)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who owns the field — USER or CODE?   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  UI↔state: cosmetic (both USER-side)           │
+  │  state↔regenerator: LOAD-BEARING (would be)    │
+  │    USER-set marker → CODE reconciliation rule  │
+  │    today: seam doesn't exist (no edit path)    │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Every regenerable field gets an optional companion marker recording when (and by whom) a human last overrode it. The regeneration step is no longer "write the new value" — it is "write the new value *only if* no override marker is present (or the new data is genuinely newer than the override)." It is the `dirty` set from a controlled form, except it lives on the persisted record and the "refetch" is an LLM re-run.
@@ -329,3 +362,4 @@ Updated: 2026-05-28 — Re-derived the drifted refs (`Recommendation` types.ts L
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -41,6 +41,44 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three tiers stack by durability and a fourth band sits orthogonal: **Working memory** (the `messages[]` array inside `runAgentLoop` — alive for one run, gone the moment the loop returns), **Episodic memory** (between-stage handoff and between-request stash — the typed `Diagnosis` carried as a function arg or as `sessionStorage` + URL param, alive for one investigation), **Long-term memory** (a persistent semantic / vector store — absent in this codebase, would live outside any request band), and the **Retrieval mechanism** that pulls from each tier (free for working — it's already in the array; cheap for episodic — function arg or storage lookup; a network call for long-term — vector search).
+
+**Axis: lifecycle.** When does each piece of memory come into existence, how long does it live, and when is it discarded? This is the right axis because the entire three-tier model is *durability-stratified* — the only reason to split memory into tiers at all is that different facts need different lifetimes. Cost is correlated (retrieval gets more expensive as you go deeper) but cost is the *consequence* of durability — you pay more to keep things longer. State-ownership is incidental (each tier obviously has its own owner); lifecycle is the discriminator.
+
+**Seams.** Two seams matter, and they map onto the tier boundaries. Seam 1 sits between working and episodic — lifetime flips from "this run" (gone at loop return) to "this investigation" (survives a stage handoff and sometimes a page navigation). Seam 2 sits between episodic and long-term — lifetime flips from "hours to days, scoped to one investigation/session" to "persistent, retrieved across sessions by relevance." Seam 2 is the load-bearing one: it's the boundary where the system stops being amnesic, and it's the boundary blooming insights chose *not* to cross — which is why the agent has no memory of you between sessions, by design.
+
+```
+  Structure pass — Agent memory tiers
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Working (messages[] in agent loop)            │
+  │  Episodic (typed handoff + sessionStorage)     │
+  │  Long-term (semantic / vector — absent here)   │
+  │  Retrieval (free / cheap / network)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each tier live and die?  │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: working ↔ episodic                    │
+  │          (one run → one investigation)         │
+  │  Seam 2: episodic ↔ long-term                  │
+  │          (one session → persistent across)     │
+  │          ★ load-bearing — crossing it is the   │
+  │          "we have memory of you" boundary      │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks each tier, what blooming insights has wired, and what changes when the long-term tier becomes a requirement.
+
+---
+
 ## How it works
 
 **The mental model: three tiers stacked by durability — working (this run), episodic (between runs, short-lived), long-term (persistent, retrieved by relevance).** Every fact an agent reasons about belongs in exactly one tier. The further down the stack a fact lives, the more durable and the more expensive it is to retrieve (a `messages[]` push is free; a vector search is a network call). The decision rule is the same as for browser storage: pick the tier by lifetime, not convenience.
@@ -442,3 +480,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

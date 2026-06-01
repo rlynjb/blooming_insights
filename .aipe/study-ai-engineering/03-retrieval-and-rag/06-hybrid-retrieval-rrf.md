@@ -44,6 +44,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three WOULD-BE layers: two parallel retrievers (sparse BM25 and dense cosine), the RRF fusion layer that merges their ranked lists into one, and the reranker / LLM context that consumes the fused list. Each retriever emits its top-k; RRF runs over positions, not scores.
+
+**Axis: state.** What state does each layer consume — *raw scores* on incompatible scales, or *positions* (ranks) on compatible scales? This axis is the right lens because RRF's whole trick is *state simplification*: throw away the unbounded BM25 scores and the [0,1] cosines, keep only the rank-positions, which are comparable. Cost is downstream of this state choice; the upstream move is the lossy projection from "score" to "position."
+
+**Seams.** The cosmetic seam is between the two retrievers — they both emit ranked lists. The load-bearing WOULD-BE seam is between the retrievers and the RRF fusion layer: state flips here from "scored ranked list (incompatible scales)" to "rank-only list (sum of 1/(k+rank))." This is the seam the RRF algorithm exists to bridge. The next seam (fusion → reranker) is cosmetic at this resolution — both consume ranked candidates.
+
+```
+  Structure pass — hybrid retrieval + RRF (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  sparse retriever (BM25 ranked list)           │
+  │  dense retriever (cosine ranked list)          │
+  │  RRF fusion (positions, not scores)            │
+  │  (downstream: reranker / LLM context)          │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state: raw scores (incompatible) vs           │
+  │  positions (comparable)?                       │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  sparse↔dense: cosmetic (both ranked lists)    │
+  │  retrievers↔RRF: LOAD-BEARING                  │
+  │    scored lists → rank-only fusion             │
+  │    avoids score calibration entirely           │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Picture two leaderboards for the same set of players, scored by different games. You cannot average a chess Elo with a tennis ranking — different scales. But you *can* say "give each player points based on their *position* on each board: 1st place is worth a lot, 50th place almost nothing," then total the points. RRF is exactly that points system over ranked retrieval lists.
@@ -293,3 +328,4 @@ How many retrieval paths does blooming insights run, and what would hybrid need 
 → 05-dense-vs-sparse.md · → 07-reranking.md · → 01-embeddings.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -41,6 +41,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form the injection surface and its bounds: the route (entry point — `?q=` is `.trim()`'d, no other sanitization), the per-agent + provider (where user text lands in the flat token stream alongside the system prompt), the tool layer (read-only by construction, which caps the blast radius), and the output contract (parse + validate + `FALLBACK` — non-conforming output can't reshape the artifact).
+
+**Axis: failure.** Where does an injection attack originate, propagate through the layers, and ultimately get *contained*? This axis is the right lens because the file's whole frame is "where does the damage stop?" — injection enters at the route, traverses the model with no privilege boundary, and is bounded by what the model can *cause* (tools) and what shape its output can *take* (validator). Trust is a candidate (untrusted input lands next to trusted prompt) but the load-bearing question is what eventually contains the failure.
+
+**Seams.** The cosmetic seam is between the route and the per-agent — the input crosses unchanged. The load-bearing seams are *downstream* of the injection point: per-agent/provider → tools (failure containment flips from "any instruction the attacker writes" to "only read-only tools available") and provider → output contract (failure containment flips from "any prose the model emits" to "must conform to a typed shape or `FALLBACK`"). The defense is *structural* at both seams — read-only tools and validated outputs — not prompt-discipline. The seam between user input and system prompt INSIDE the token stream is where the privilege boundary *should* be but isn't.
+
+```
+  Structure pass — prompt injection
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  route (?q= entry, .trim() only)               │
+  │  per-agent + provider (flat token stream)      │
+  │  tool layer (READ-ONLY by construction)        │
+  │  output contract (parse + validate + FALLBACK) │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does injection originate,      │
+  │  propagate, and get contained?                 │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  route↔per-agent: cosmetic (unsanitized)       │
+  │  provider↔tools: LOAD-BEARING                  │
+  │    "any instruction" → "only READ tools"       │
+  │  provider↔output contract: LOAD-BEARING        │
+  │    "any prose" → "typed shape or FALLBACK"     │
+  │  defenses are STRUCTURAL, not prompt-based     │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** The model receives `system_prompt + user_input` as one sequence and weights all of it as instructions. There is no privilege boundary inside the token stream. Prompt injection is the attacker writing tokens into `user_input` that the model treats with the same authority as `system_prompt`. The only real defenses are: (1) guard the input before it reaches the model, and (2) constrain what the model's output can *do* — so that even a successful injection cannot cause harm.
@@ -373,3 +410,4 @@ Updated: 2026-05-28 — Re-derived the `?q=` path refs (trim L115, classifyInten
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

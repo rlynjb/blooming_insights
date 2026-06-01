@@ -41,6 +41,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Supervisor-worker has three layers: the **Supervisor** (decomposes, delegates, merges — today `lib/agents/pipeline.ts` plus the route's entry `if`-ladder; would-be an LLM supervisor agent), the **Workers** (per-agent definitions — monitoring, diagnostic, recommendation, query — unchanged either way), and the **Shared agent loop** (`runAgentLoop`, runs inside each worker). The topology is hub-and-spoke; the supervisor is the hub and the workers don't talk to each other.
+
+**Axis: control.** Who decides which worker runs next and what context it gets — a model or your code? This is the right axis because the entire supervisor-worker pattern is *the act of placing the decomposition decision*, and the only meaningful variant is whether that placement uses a model or doesn't. Cost is the second-order axis (LLM supervisor adds one model call per decision, plus context the supervisor needs to hold to merge) but cost flows from the control choice. The shape doesn't change; only who's in the hub seat.
+
+**Seams.** One seam carries the weight: between the Supervisor and the Workers. In the CODE-supervisor variant blooming insights uses today, control on the Supervisor side is in CODE (the `if`-ladder picks the worker), and inside each Worker it flips to MODEL (the per-agent ReAct loop). The flip happens at the worker's entry. In the LLM-supervisor variant the Supervisor side is also MODEL — and the flip happens twice (MODEL → MODEL across the supervisor/worker seam, then MODEL drives the worker loop). That double-MODEL is what costs you the coordination tax: each worker invocation carries an extra reasoning step about delegation.
+
+```
+  Structure pass — Supervisor-worker
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Supervisor (CODE today / MODEL alt)           │
+  │  Workers (per-agent definitions)               │
+  │  Shared agent loop (inside each worker)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides which worker runs &      │
+  │           what context it gets?                │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam: Supervisor ↔ Workers                    │
+  │        (CODE → MODEL today)                    │
+  │        ★ load-bearing — the variant differs    │
+  │        only in WHICH side of this seam is CODE │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks both flavors and why the order-is-knowable property lets code play the supervisor for free in this codebase.
+
+---
+
 ## How it works
 
 **The mental model: a parent component that delegates to children and assembles their returns.** What changes between flavors is who's doing the delegation reasoning — code or a model — and that single choice changes the cost ledger, the debug surface, and the failure modes.
@@ -486,3 +522,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

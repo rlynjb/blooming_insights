@@ -39,6 +39,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form the round-trip: the model (emits `tool_use` blocks), the agent loop (extracts blocks, dispatches via `mcp.callTool`, pushes results back), the MCP transport (sends HTTPS to the Bloomreach server and returns the JSON), and the tool execution itself on the backend. The model is the brain; everything below is the hands.
+
+**Axis: trust.** What can each layer trust about the bytes from the layer next to it? This axis is the right lens because tool calling is a *call-untrusted-from-untrusted* arrangement — the model emits a structured request your code must validate before executing, and the result coming back is a string the model must integrate without trusting it absolutely. Control is shared in a balanced loop (both layers decide things); the load-bearing question is who-can-tamper-with-what.
+
+**Seams.** The cosmetic seam is between the MCP transport and the tool backend — both are server-side. The load-bearing seam is between the model and the agent loop: trust flips here from "structured `tool_use` describing what to do" to "must be validated against the tool registry (`filterToolSchemas`) before any execution." A second load-bearing seam is between the tool execution and the model on the way back: results re-enter the context as the next user turn, and the `tool_use_id` pairing is the contract that makes results trace back to requests — drop one and the model loses the thread.
+
+```
+  Structure pass — tool calling
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  model (emits tool_use blocks)                 │
+  │  agent loop (dispatches via mcp.callTool)      │
+  │  MCP transport (HTTPS to server)               │
+  │  tool execution (backend)                      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  trust: what can each layer trust about what   │
+  │  the layer next to it just said?               │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  transport↔backend: cosmetic                   │
+  │  model↔agent loop: LOAD-BEARING                │
+  │    tool_use is a REQUEST not a command         │
+  │    must be validated before execution          │
+  │  tool result↔model (return): LOAD-BEARING      │
+  │    tool_use_id is the trace contract           │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Tool calling is a typed function-call boundary where the *caller* is a model and the *dispatcher* is your code. You have written this shape before without an LLM: a message handler that receives `{ type: 'SAVE', payload }` over a `postMessage`, looks up the handler for `type`, runs it, and posts a reply back. The model's `tool_use` block is that message; the tool-schema filter is the registry of which messages are legal; the MCP caller is the dispatcher; the `tool_result` block is the reply. The model never touches the dispatcher — it only sends messages the dispatcher understands.
@@ -366,3 +403,4 @@ Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTo
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

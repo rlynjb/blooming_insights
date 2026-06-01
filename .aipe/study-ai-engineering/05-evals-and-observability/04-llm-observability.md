@@ -45,6 +45,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers form the trace: the provider + tools (per-tool timing measured), the per-agent / agent loop (emits `reasoning_step` / `tool_call_start` / `tool_call_end{durationMs}` via hooks), the route handler (frames events as NDJSON via the `send` choke-point), and the UI (renders live + the cache snapshot replays event-for-event). The trace flows up; the cache snapshot flows sideways for replay.
+
+**Axis: guarantees.** What does the trace guarantee at each layer — eventual delivery for backend analysis, or per-event live render? This axis is the right lens because the file's whole frame is "the trace IS the product surface, not an add-on log." Blooming insights' trace guarantees real-time UI render and replay (`saveInvestigation`), but NOT export to OpenTelemetry/Langfuse/Datadog. The guarantee shape is what distinguishes a product-trace from a backend-trace.
+
+**Seams.** The cosmetic seam is between the per-agent hooks and the route's `send` — both move typed events forward. The load-bearing seam is between the route's NDJSON stream and the UI: guarantees flip here from "per-event server emission" to "per-event UI state update + cache snapshot." A second load-bearing seam, parallel to the live render, is between the in-memory trace and the cache snapshot — guarantees flip from "live, ephemeral" to "persistent, replayable." A would-be third seam (currently missing) is between the live trace and a backend observability sink — that's the backend-grade gap the file names.
+
+```
+  Structure pass — LLM observability
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  provider + tools (timing measured)            │
+  │  per-agent / agent loop (emits events)         │
+  │  route handler (NDJSON framing)                │
+  │  UI (live render) + cache snapshot (replay)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: what does the trace guarantee     │
+  │  at each layer — live render or replay?        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  hooks↔send: cosmetic                          │
+  │  route↔UI: LOAD-BEARING                        │
+  │    server NDJSON → live UI state               │
+  │  in-memory↔cache snapshot: LOAD-BEARING        │
+  │    ephemeral live → persistent replay          │
+  │  (gap: live↔backend observability sink)        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A trace is a sequence of typed events emitted in execution order; each tool call is a span bracketed by a `start` and an `end` that carries its `durationMs`. You define this as a discriminated union (`AgentEvent`), encode each event as one NDJSON line, and stream the lines to the client as the agent runs. The client reads the stream and the cache stores the captured events — so the same event list is a *live* trace while running and a *replayable* trace afterward.
@@ -426,3 +463,4 @@ Updated: 2026-05-28 — Replaced the dead `summarizeTrace` view with the real br
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

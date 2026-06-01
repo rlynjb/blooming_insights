@@ -39,6 +39,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers, each making a placement decision: the per-agent prefix construction (where the `synthesisInstruction` is *appended last* to the system prompt on the final turn), the agent loop's transcript management (tool results enter as the most-recent user turn), and the dedicated `synthesize()` call (which collapses the whole context into a short flat message to defeat the middle entirely). A would-be retrieval/rerank layer is absent.
+
+**Axis: state.** Where in the message array does each piece of content land, and is that position in the "attention-strong" or "attention-sag" zone? This axis is the right lens because lost-in-the-middle is fundamentally a position-of-state problem — content's *value* is constant, but the model's *use* of it depends on its slot. Cost doesn't move here; trust doesn't move; the load-bearing question is "where does this piece sit in the array."
+
+**Seams.** The cosmetic seam is between per-agent prefix construction and the agent loop — both push state to the "ends" (start of system, end of messages). The load-bearing seam is between the agent loop's growing-transcript state and the `synthesize()` call's flat fresh state: the entire middle is *thrown away* across this seam, replaced by a short message where every piece sits at an end. Position-state flips from "many pieces, some in the sag" to "few pieces, all in the strong zone."
+
+```
+  Structure pass — lost in the middle
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent prefix (instructions, schema)       │
+  │  agent loop (transcript with tool results)     │
+  │  synthesize() (flat, fresh context)            │
+  │  (would-be: retrieval + rerank — absent)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  state (position): where in the array does     │
+  │  each piece sit — strong zone or sag?          │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  prefix↔loop: cosmetic (both place at ends)    │
+  │  loop↔synthesize(): LOAD-BEARING               │
+  │    many pieces (some in sag) → few pieces      │
+  │    (all at ends); middle is discarded          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Treat the model's attention over a long context like a U-shaped curve: high at the front, high at the back, sagging in the middle. Anything you place in the sag risks being underweighted regardless of how relevant it is.
@@ -343,3 +378,4 @@ Updated: 2026-05-28 — Re-derived the drifted `synthesize()` ranges (diagnostic
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

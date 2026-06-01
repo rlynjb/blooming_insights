@@ -43,6 +43,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers: the source document (too large to embed whole), the chunker (splits at size/semantic/structural boundaries), the embedder (turns each chunk into a vector), and the retriever that returns *whole chunks* to LLM context. The chunk boundary is decided once at the chunker layer and lived with at every layer below.
+
+**Axis: lifecycle.** When is the chunk boundary decided, and how easy is it to change later? This is the right axis because the file's whole frame is "the chunk is the atomic unit of retrieval" — the boundary is fixed at build-time and every query forever after gets back *whole chunks*. Cost is downstream; control doesn't move; lifecycle (when does this decision get made) is what makes the design irrevocable.
+
+**Seams.** The cosmetic seam is between the embedder and the retriever — both treat chunks as atomic. The load-bearing WOULD-BE seam is between the chunker and everything downstream: lifecycle flips here from "boundary is a parameter you can still tune" (chunker) to "boundary is baked in; only re-chunking + re-embedding can change it" (downstream). The cousin seams already in blooming insights — `schemaSummary` rank-truncation and `truncate(16_000)` char-offset cut — sit at the same conceptual position but use structure-blind cuts.
+
+```
+  Structure pass — chunking strategies (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  source document (too large)                   │
+  │  chunker (size + overlap, where to split)      │
+  │  embedder (one vector per chunk)               │
+  │  retriever (returns WHOLE chunks)              │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when is the chunk boundary decided │
+  │  and how hard is it to change later?           │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  embedder↔retriever: cosmetic                  │
+  │  chunker↔downstream: LOAD-BEARING (would be)   │
+  │    tunable parameter → baked-in for the index  │
+  │    cousins in repo: schemaSummary, truncate    │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A chunk is a `key` in a retrieval index — and like a React list `key`, it must be *stable and meaningful*. The retriever can only return whole chunks, so the chunk boundary is the resolution of your search. Picking chunk size is picking the granularity at which questions can be answered: coarse chunks answer "what is this document about," fine chunks answer "what does it say about X."
@@ -300,3 +335,4 @@ What chunking strategy does blooming insights use today, where, and what does it
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

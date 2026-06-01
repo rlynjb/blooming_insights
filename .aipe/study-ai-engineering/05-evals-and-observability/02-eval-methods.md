@@ -43,6 +43,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers: the per-agent output (Anomaly[] enum, Diagnosis prose, Recommendation[] array), the scoring method (the right rung on the ladder: exact-match / F1, rubric / LLM-judge, set overlap + per-item rubric), and the tracked quality score. The scoring method must match the output's *shape* — wrong rung produces noise.
+
+**Axis: guarantees.** What does the scorer guarantee about its result — strict equality (cheap, brittle), tolerant rubric (nuanced, expensive), or human verdict (most accurate, slowest)? This axis is the right lens because the file is structured as a *rung ladder* — each rung trades determinism for tolerance, and the right choice depends on the output shape. The unifying question is "what guarantee does this score carry."
+
+**Seams.** The cosmetic seam is within a rung (variants of rubric grading are all rubric-like). The load-bearing seam is between *rungs*: exact-match → rubric flips guarantees from "deterministic, cheap, brittle to wording" to "tolerant, expensive, depends on judge." A second load-bearing seam is between the output shape and the scorer choice: get this wrong and the eval lies (exact-match on prose produces noise; LLM-judge on enums is expensive and biased). Match scorer to shape — that's the load-bearing decision.
+
+```
+  Structure pass — eval methods
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent output (enum / prose / array)       │
+  │  scoring method (right rung on the ladder)     │
+  │  tracked quality score                         │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: what does each rung guarantee —   │
+  │  strict, tolerant, or human?                   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  variants within rung: cosmetic                │
+  │  rung↔rung: LOAD-BEARING                       │
+  │    deterministic → tolerant → human            │
+  │  output↔scorer: LOAD-BEARING                   │
+  │    wrong rung for the shape = eval lies        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Think of the methods as a ladder. Each rung up handles more output variability and more nuance, and costs more (compute, money, latency, human time). You climb only as high as the output's variability forces you to — the cheapest rung that does not produce false failures is the right one. This is the same discipline as `../01-llm-foundations/07-heuristic-before-llm.md`: do not reach for the model when a string compare suffices.
@@ -355,3 +390,4 @@ Updated: 2026-05-28 — Test count 125→157; re-derived `MonitoringAgent.scan` 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

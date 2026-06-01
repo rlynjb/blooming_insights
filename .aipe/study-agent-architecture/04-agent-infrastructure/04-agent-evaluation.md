@@ -38,6 +38,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Agent evaluation sits orthogonal to the request flow — its own band that grades the others. Four layers: the **Live request band** (what runs in production — Pipeline → agent loop → tools, emitting NDJSON trace events as it goes), the **Recorded trajectory** (the stream of `{tool, args, duration, result, error}` events the loop already emits, persistable but not yet persisted at eval scope), the **Eval-time gates** (`lib/eval/*` — today: schema validation + coverage gate run against agent outputs), and the **Trajectory-eval harness** (would replay recorded runs against golden expectations, grade tool-call accuracy / trajectory length / recovery / cost — absent today). The eval band runs offline, the live band runs per-request, but they share a vocabulary.
+
+**Axis: guarantees.** What does the eval promise vs what does it merely best-effort observe — and at what moment in the lifecycle (request-time deterministic check vs offline probabilistic grade)? This is the right axis because the entire discipline of agent evaluation is about *layering different kinds of guarantees onto different stages*. A schema gate at request time is a hard guarantee (parse or fail); a trajectory grade at offline-eval time is a probabilistic measurement against a golden set. Pick the wrong axis (control, say) and the eval band looks like just "another call into the loop" — guarantees is what makes the offline/online split legible.
+
+**Seams.** Two seams matter. Seam 1 sits between the live request band and the recorded trajectory — guarantees flip from "request-time deterministic check (schema parse, coverage gate)" to "observed event stream you can replay later." Seam 2 sits between the recorded trajectory and the trajectory-eval harness — guarantees flip from "this happened" (a fact about one run) to "this is the rate at which our agent picks the right first tool" (a statistical claim across many runs against a golden set). Seam 2 is the load-bearing one: it's the boundary between observability and evaluation, and it's the boundary blooming insights hasn't crossed yet — the recorder exists, the harness doesn't.
+
+```
+  Structure pass — Agent evaluation
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Live request band (emits NDJSON trace)        │
+  │  Recorded trajectory (event stream)            │
+  │  Eval-time gates (schema + coverage today)     │
+  │  Trajectory-eval harness (absent today)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: hard request-time check vs        │
+  │              probabilistic offline grade?      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Live band ↔ Recorded trajectory       │
+  │          (sync deterministic check →           │
+  │          observed event stream)                │
+  │  Seam 2: Recorded trajectory ↔ Eval harness    │
+  │          (one run "happened" → many runs       │
+  │          graded against golden)                │
+  │          ★ load-bearing — observability ↔ eval │
+  │  In this repo: Seam 2 is the unbuilt one       │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the unit-of-evaluation expansion, what's recorded today, and what a trajectory-eval harness would add on top.
+
+---
+
 ## How it works
 
 **The mental model: the unit of evaluation expands from {input → output} to {input → trajectory → output}.** A single-LLM-call eval grades one Q/A pair. An agent eval grades a sequence: what tool got called first, what came back, what got called next, did the model recover when a call errored, how many steps did it take, what did it cost. Same instinct as upgrading from a unit test of one render to an integration test that walks a multi-step flow — and the same expansion of what could go wrong.
@@ -444,3 +485,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

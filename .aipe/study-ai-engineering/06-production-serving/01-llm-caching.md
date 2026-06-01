@@ -44,6 +44,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers, three of which can be cached: the pipeline / per-agent (where a whole investigation can be replayed via the investigation cache), the agent loop (where the prompt prefix WOULD be cached via Anthropic `cache_control` — but isn't), the tool layer (where MCP tool results sit behind the 60s TTL `Map`), and the MCP transport (rate-limited live calls). Three caches sit at three different layers and protect three different costs.
+
+**Axis: cost.** What does each cache layer skip — a whole agent run, a model-prefix re-charge, or a rate-limited network call? This axis is the right lens because the file is structured as "right cache at the right layer" — cache the wrong layer and the bill stays untouched. Lifecycle is downstream (each cache has its own TTL/key shape); the upstream question is which cost is being avoided.
+
+**Seams.** The cosmetic seam is within the agent loop's call layer (provider call and prompt construction are both "make the request"). The load-bearing seams are *between cache layers*: investigation cache skips everything; tool cache skips one network hop; prompt prefix cache would skip input-token re-charge. Each one targets a different *kind* of cost — wrong-layer caching has zero effect on the dominant line item. The most pointed gap-seam: the would-be prompt prefix cache sits at the provider call, and the file's whole insight is that this is the unbuilt cache that would move the bill the most.
+
+```
+  Structure pass — LLM caching
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  pipeline (investigation cache — whole run)    │
+  │  agent loop (prompt prefix cache — ABSENT)     │
+  │  tool layer (TTL Map — 60s tool results)       │
+  │  MCP transport (rate-limited live)             │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: which cost does each cache skip — run,  │
+  │  re-charge, or network call?                   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  within agent loop call: cosmetic              │
+  │  between cache layers: LOAD-BEARING            │
+  │    each layer targets a different cost         │
+  │    GAP: prompt prefix cache (the dominant cost)│
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** An LLM request is `(static_prefix + dynamic_suffix) → tokens → response`. There are three places to short-circuit that pipeline, and they nest from coarse to fine. The outermost cache returns the whole *response* (skip everything). The middle cache returns a *tool result* the response needed (skip one network hop). The innermost cache reuses the *tokenized prefix* (skip re-charging the input you already sent). You own the outer two and leave the inner one on the table.
@@ -392,3 +427,4 @@ Updated: 2026-05-28 — Re-derived drifted refs after the client.ts/route.ts rew
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

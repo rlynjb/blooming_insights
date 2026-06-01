@@ -41,6 +41,46 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be retrieval router has four layers: the **Agent loop** (emits a "I want to retrieve about X" intent), the **Source router** (reads the query shape, picks among vector / SQL / web / live API), the **Retrievers** (one per source), and the **Sources** (the actual stores). In blooming insights only one source exists (Bloomreach MCP), so the Source-router band collapses; what lives at the same architectural slot is `filterToolSchemas` — a *capability* router that hands each per-agent definition a different tool subset of the same source.
+
+**Axis: control.** Who decides which retrieval source (or which tool subset) the query goes to — the model picking from a full menu every time, or a router that pre-filters based on something deterministic about the request? This is the right axis because retrieval routing is *literally a control-flow placement question* about the retrieval dispatch step. Cost is downstream (you route to avoid paying the wrong retriever); lifecycle is downstream too (you route to hit the freshest source). Control is what the axis traces.
+
+**Seams.** Two seams matter, and the first is load-bearing in the WOULD-BE shape. Seam 1 sits between the Agent loop and the Source router — control flips from MODEL (intent) to CODE (which source matches). That seam IS retrieval routing; remove it and you're back to "agent calls one retriever or none." Seam 2 sits between the Source router and the Retrievers — control stays in CODE on both sides (route → call), so it's cosmetic. In blooming insights the source-router collapses and Seam 1 sits instead at *agent-construction time* (CODE picks the tool subset for each agent role) rather than at *per-query time*. The flip is the same shape; the moment it happens is earlier.
+
+```
+  Structure pass — Retrieval routing (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Agent loop (intent)                           │
+  │  Source router (picks vector/SQL/web/live)     │
+  │  Retrievers (per source)                       │
+  │  Sources (the actual stores)                   │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the retrieval source?    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Agent loop ↔ Source router            │
+  │          (MODEL → CODE) ★ load-bearing —       │
+  │          this IS retrieval routing             │
+  │  Seam 2: Source router ↔ Retrievers            │
+  │          (CODE → CODE) cosmetic                │
+  │  In this repo: Seam 1 lives at agent-          │
+  │  construction time as filterToolSchemas        │
+  │  (capability route, not source route)          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it (and where the same dispatch flip lives at a different moment in this codebase).
+
+---
+
 ## How it works
 
 **The mental model: a request handler whose route is decided by the query's shape.** You've already built this on the frontend — a search bar that fires different fetches based on input pattern. If the input matches an email regex, hit `/api/users/by-email`. If it starts with `#`, hit `/api/issues`. If it's a free string, hit Algolia. The router *isn't* the retriever; it's the dispatch step in front of the retriever, picking which one runs.
@@ -467,3 +507,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

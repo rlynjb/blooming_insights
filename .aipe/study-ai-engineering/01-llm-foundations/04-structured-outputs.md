@@ -36,6 +36,42 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers from prompt to typed value: the per-agent prompt that asks for JSON (the `synthesisInstruction` plus the agent's system prompt), the provider call that returns `finalText: string` (possibly prose-with-fenced-JSON), the parse step (`parseAgentJson` with its three escalating strategies), and the validate step (`v is T` type guard) — followed by the repair tier (`synthesize()` clean-context retry) and the floor (`FALLBACK`).
+
+**Axis: trust.** What can the layer above trust about the bytes coming from the layer below? This axis is the right lens because the entire contract exists to convert "untrusted prose" into "typed value or hand-written floor" — each layer earns a stronger guarantee than the one below. Control would flatten things (the model always decides the prose; the parser always decides the typed value); cost is downstream; trust is what makes each tier's job distinct.
+
+**Seams.** Three seams in a row, each upgrading the guarantee. Prompt → provider is cosmetic (a string goes out, a string comes back). The load-bearing seam is provider → parse + validate: trust flips from "probabilistic prose" to "either a typed value or `null`." A second load-bearing seam is parse/validate → repair-or-fallback: trust flips from "best effort" to "always a valid typed value, by construction." The contract is the *composition* of these flips.
+
+```
+  Structure pass — structured outputs
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent prompt (asks for JSON)              │
+  │  provider call (finalText: string)             │
+  │  parse + validate (extract + shape-prove)      │
+  │  repair (synthesize) + floor (FALLBACK)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  trust: what can each layer trust about the    │
+  │  bytes from below?                             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  prompt↔provider: cosmetic                     │
+  │  provider↔parse+validate: LOAD-BEARING         │
+  │    prose → typed or null                       │
+  │  parse+validate↔repair/fallback: LOAD-BEARING  │
+  │    null → always a valid typed value           │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Think of the model's output as an HTTP response body you must parse defensively, except the body is `string` and the JSON may be embedded in prose. The contract is a three-stage funnel: *extract* the JSON from the prose, *validate* its shape against a type guard, and *repair* via a clean-context retry when extraction or validation fails. Only output that clears all three becomes a typed value.
@@ -392,3 +428,4 @@ Updated: 2026-05-29 — Synthesis-instruction append ref drifted to L96–L98 (w
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -41,6 +41,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers, all configured by one model-choice decision: the architectural decision itself (pick a model → fixes a dimension D), the indexer (`embed(term)` at dimension D), the vector store (N × D floats per row), and the per-query retriever (per-query `embed(query)` plus cosine cost both scale with D). The choice is upstream of every layer below.
+
+**Axis: cost.** What does each layer pay per call as a function of the chosen model's dimension? This axis is the right lens because the whole file frames the decision as a measurement problem — the dimension is a multiplier on storage, latency, and per-query cost forever. Lifecycle is constant (every layer's lifecycle is fixed); cost is what varies and what the decision is *for*.
+
+**Seams.** The cosmetic seam is between the indexer and the vector store — both pay the dimension once at write. The load-bearing WOULD-BE seam is between the architectural decision and everything below it: cost flips here from "free to change" (before commit) to "paid on every comparison forever" (after commit). This is a *temporal* seam — once embeddings are produced at dimension D, switching D means re-embedding the whole corpus. blooming insights hasn't crossed this seam, so this remains the cheapest possible moment to think.
+
+```
+  Structure pass — embedding model choice (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  architectural decision (pick model → fix D)   │
+  │  indexer (embed at dim D)                      │
+  │  vector store (N × D floats)                   │
+  │  retriever (per-query embed + cosine ∝ D)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what does each layer pay as a function  │
+  │  of the chosen dimension D?                    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  indexer↔store: cosmetic                       │
+  │  decision↔everything-below: LOAD-BEARING       │
+  │    "free to change" → "paid forever"           │
+  │    crossed only at commit time (one-way door)  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Three knobs, traded against each other, decided by measuring on your own data:
@@ -279,3 +314,4 @@ What model-selection discipline does blooming insights already demonstrate, and 
 → 01-embeddings.md · → 04-vector-databases.md · → 09-stale-embeddings.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

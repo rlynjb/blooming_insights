@@ -38,6 +38,56 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Routing as a concept sits between the Route handler and whatever it dispatches to, but the routing layer itself has internal stack: the **Heuristic tier** (`parseIntent` in `lib/agents/intent.ts` — `String.includes` rules, free), an **LLM-classifier tier** (would-be — a cheap classifier call for inputs the heuristic doesn't confidently match; absent here), and the **Dispatch consumer** (the Pipeline coordinator that picks an agent from the routed intent). The Route handler hands raw query string in; the consumer takes a routed intent out.
+
+**Axis: control.** Who decides which handler the input goes to — engineer-written rules or a model? This is the right axis because routing is *literally a control-flow placement question* at the request boundary, and the entire pattern's value is letting you split that decision between cheap-deterministic (CODE) and expensive-flexible (MODEL). Cost is the second-order axis here (the heuristic exists *because* it's cheaper), but the heuristic is meaningful only when it actually decides — so control is upstream.
+
+**Seams.** Two seams matter, and the first is load-bearing. Seam 1 sits between the Heuristic tier and the LLM-classifier tier — control flips from CODE (a confident keyword match dispatches without further work) to MODEL (an ambiguous input gets handed to a classifier call). That seam IS the two-stage router; the whole pattern collapses to "just an LLM" if you delete it, and collapses to "just regex" if you don't have the second tier ready. In blooming insights the second tier is empty today, which means Seam 1 is currently a one-way wall — every input is decided in CODE. Seam 2 sits between the routing layer and the Pipeline coordinator — control stays in CODE on both sides (intent token → if-ladder), so it's cosmetic; the routed intent is just data crossing a function boundary.
+
+```
+  Structure pass — Routing
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Heuristic tier (CODE rules)                   │
+  │  LLM-classifier tier (would-be, absent here)   │
+  │  Dispatch consumer (Pipeline coordinator)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides which handler runs?      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Heuristic ↔ LLM classifier            │
+  │          (CODE → MODEL) ★ load-bearing —       │
+  │          this IS the two-stage router          │
+  │  Seam 2: Routing layer ↔ Pipeline              │
+  │          (CODE → CODE) cosmetic — data passes  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  Seam 1 — "who decides the handler?" answered two ways
+
+  ┌─ Heuristic tier ─┐    seam      ┌─ LLM classifier ┐
+  │  CODE: keyword   │ ═════╪═════► │ MODEL: cheap    │
+  │  match → route   │  (it flips,  │ classifier call │
+  │  zero cost       │   when un-   │ ~$0.0001/call   │
+  │                  │   matched)   │                 │
+  └──────────────────┘              └─────────────────┘
+         ▲                                     ▲
+         └───── same axis (control), two answers ─┘
+                → today this seam is one-way: tier 2 empty
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **The mental model: a two-stage funnel — fast/deterministic for the obvious cases, model-decided for the ambiguous ones.** Stage 1 is keyword or rule matching that catches the easy 70–90% of inputs at zero LLM cost. Stage 2 is a small/cheap LLM call that handles the rest. Together they keep average latency low while still covering the long tail.
@@ -432,3 +482,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

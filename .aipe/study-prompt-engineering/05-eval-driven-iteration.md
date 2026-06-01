@@ -37,6 +37,58 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Eval-driven iteration is a four-layer loop that lives in a *dev-time* band parallel to the production request path, and the layers don't help unless you keep them at that altitude. Layer A is the *dataset* — 20–50 labeled cases accreted from real production misses, each one a bug you already paid for. Layer B is the *runner* — a script that exercises the *real* agent classes (loaded prompt, real model, real validator) against each case, with an injected deterministic `McpCaller` so the tool results are reproducible. Layer C is the *scorer* — a field assertion for JSON agents or an LLM-judge for the prose agent, turning each output into pass/fail or 0–1. Layer D is the *gate* — the two-condition ship check: aggregate up AND no critical case regressed.
+
+**Axis: lifecycle.** When does each layer fire — at dev-time (the edit), at ship-gate-time (the merge), or never (the gap)? Lifecycle is the right axis because the whole concept is a *parallel timeline* to the request flow, with one critical missing tick: the dataset is forever (Layer A), the runner is invoked on demand (Layer B), the scorer runs per case per dev-time iteration (Layer C), and the gate fires at ship-time (Layer D). Today blooming insights' lifecycle has the wrong shape entirely — the "runner" is a human re-reading one output, the "scorer" is vibes, the "gate" is whether the demo looks better. Every layer exists informally, none exists as code.
+
+**Seams.** Two seams matter. Seam 1 (A↔B) — the dataset is *static-and-curated*, the runner uses the *live agent classes and the live model* (non-deterministic by nature); the deterministic injected `McpCaller` is the gate that makes the case reproducible despite the model being sampled. The load-bearing seam is Seam 2 (C↔D) — lifecycle flips from *measuring* (per-case scores) to *deciding* (ship or reject). And this is exactly where the "average went up" trap lives: a single-condition gate (only aggregate) ships silent regressions; a two-condition gate (aggregate AND zero per-case regressions) catches them. The whole value of having a harness is that this seam stops being a vibe and starts being a number.
+
+```
+  Structure pass — eval-driven iteration
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: dataset (cases accreted from misses)       │
+  │  B: runner (real agent path + injected mcp)    │
+  │  C: scorer (field assert | LLM judge)           │
+  │  D: gate (aggregate ↑ AND no regression)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each layer fire — dev    │
+  │  edit, ship gate, post-incident accretion?      │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): static curated cases → live agent   │
+  │            run, made reproducible by injected   │
+  │            deterministic McpCaller              │
+  │  S2 (C↔D): per-case scores → ship/reject       │
+  │            decision (LOAD-BEARING — where the  │
+  │            "average up but edge case down"      │
+  │            trap lives)                          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "did the change ship?" answered two ways
+
+  ┌─ aggregate-only ─┐    seam     ┌─ two-condition ──────┐
+  │  avg ↑ → ship    │ ═════╪═════► │  avg ↑ AND no per-   │
+  │  (silent         │   (it       │  case regression →   │
+  │   regressions)   │    flips)   │  ship                │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary is the difference between
+                   "we have evals" and "evals actually gate"
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** An eval harness is three parts: a *dataset* of cases (input + a notion of what a good output is), a *runner* that feeds each case through the real prompt-and-model path, and a *scorer* that turns each output into pass/fail or a number. You iterate by editing the prompt, re-running the whole dataset, and comparing the aggregate AND the per-case deltas. The aggregate tells you if the change helped on average; the per-case diff tells you what it broke.
@@ -354,3 +406,4 @@ Updated: 2026-05-29 — Resynced stale prompt-line refs (the {categories} shift 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

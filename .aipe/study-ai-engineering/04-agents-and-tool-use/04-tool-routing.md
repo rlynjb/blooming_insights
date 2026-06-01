@@ -42,6 +42,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers stage two routing decisions: the route handler receives `?q=` or `?insightId=`, the intent-parsing band picks an agent (`parseIntent` → `classifyIntent`), the per-agent definitions hand the chosen agent a filtered tool subset (`filterToolSchemas`), and the agent loop runs the model against only that subset. Two routers, two decisions, one combined effect.
+
+**Axis: control.** Who decides which tool fires — and is that decision made at *build/config time* (the static tool subset) or at *request time* (the dynamic intent classifier and then the model's tool pick)? This axis is the right lens because tool routing is a *layered narrowing of choices*: each layer removes options the next layer can't pick from. The recurring sub-section axis (CODE vs MODEL) shows up here as two CODE-side gates that fence the MODEL's options.
+
+**Seams.** The cosmetic seam is between the route handler and the intent parser — both are URL parsing. The load-bearing seam is between the intent-parsing band (chose agent) and the per-agent definitions (filtered subset): control flips here from "request-time dynamic pick" to "build-time static allow-list." A second load-bearing seam: between the curated tool menu and the agent loop — once the menu is filtered, the model's choice is *within a safe set by construction*, not by prompt discipline. Subset-scoping beats prompt instructions every time.
+
+```
+  Structure pass — tool routing
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  route handler (q vs insightId)                │
+  │  intent parsing (parseIntent → classifyIntent) │
+  │  per-agent definitions (filterToolSchemas)     │
+  │  agent loop (model picks within subset)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: build-time static vs request-time    │
+  │  dynamic — at each layer who decides?          │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  route↔intent: cosmetic                        │
+  │  intent↔subset: LOAD-BEARING                   │
+  │    request-time → build-time control           │
+  │  subset↔agent loop: LOAD-BEARING               │
+  │    fenced choice → MODEL picks within it       │
+  │    by-construction beats by-prompt             │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Two routers with opposite mechanisms. The first is a *static allow-list* applied before the model runs — like rendering only the buttons a role may click, the agent is built with only the tools it may use. The second is a *dynamic classifier* applied per request — like a `switch` that first tries a fast `string.includes` check and only falls back to an expensive lookup when the fast path is inconclusive.
@@ -373,3 +410,4 @@ Updated: 2026-05-28 — Corrected `set.has` to L15 and refreshed the `route.ts` 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

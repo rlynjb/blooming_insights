@@ -40,6 +40,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three WOULD-BE layers, plus a real-codebase analog: the source document (changes over time), the vector store with a freshness marker (`embedding_stale_at`, source-version hash), and the retriever that consults the marker before serving. The parallel in real code: `McpClient`'s TTL cache (`expiresAt` check, no-cache-on-error) — same shape, different payload.
+
+**Axis: lifecycle.** When does each vector go from "fresh" to "stale," and what decides? This axis is the right lens because the entire file is about *time-bound validity* — an embedding has a lifecycle tied to its source, and the index needs a policy to track it. State is downstream (the marker is *how* lifecycle is recorded); the upstream question is "when does this thing expire."
+
+**Seams.** The cosmetic seam is between the source document and the vector store as an indexing relationship — both are write-side. The load-bearing WOULD-BE seam is between the vector store (with marker) and the retriever's decision (stale → re-embed or skip; fresh → serve): lifecycle flips here from "tracked" to "acted upon." This is the seam blooming insights *already* implements for TTL tool-result caching — the pattern is in-codebase, just for a different payload. The danger this seam guards against is silent staleness — unlike a 404 or a thrown error, stale embeddings return wrong-but-plausible answers with no signal.
+
+```
+  Structure pass — stale embeddings (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  source document (changes over time)           │
+  │  vector store (with freshness marker)          │
+  │  retriever (consults marker)                   │
+  │  (real-code analog: McpClient TTL cache)       │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each vector expire and   │
+  │  what decides?                                 │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  source↔store: cosmetic (index relationship)   │
+  │  store↔retriever: LOAD-BEARING (would be)      │
+  │    "tracked" → "acted upon"                    │
+  │    silent staleness if seam absent             │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** An embedding index *is* a cache: `Map<docId, vector>` where each vector is a derived value computed from a source document. Every truth you know about caches applies — cache invalidation is the hard part, stale reads are silent, and you need an expiry or invalidation rule. This codebase's TTL cache (`Map<key, {result, expiresAt}>` inside the MCP client wrapper) is the same structure with the same problem already solved for tool results.
@@ -283,3 +318,4 @@ What freshness/staleness mechanism does blooming insights already implement, and
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

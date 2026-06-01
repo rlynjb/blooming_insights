@@ -33,6 +33,53 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers from caller down to provider: the per-agent prompt-construction code (where the schema-summary and tool-result strings are assembled), the service-layer truncation primitives (`truncate`, `schemaSummary` caps, `TRUNC`), and the provider call where `max_tokens` is the one real token-denominated parameter. Above all three sits the route's UI-stream truncation, which uses the same primitive shape but for a different reason (wire size, not window size).
+
+**Axis: cost.** What unit does each layer count work in, and does that unit match what the provider bills? This axis pops the seams because the whole file hinges on a unit mismatch — the proxy unit (characters) above the seam, the real unit (tokens) below. State would flatten everything (data flows down, the model writes back up); cost asked as "is the proxy unit the same as the billed unit?" makes the boundaries flip.
+
+**Seams.** The cosmetic seam is between per-agent prompt construction and the service-layer truncators — both count characters; the unit doesn't flip. The load-bearing seam is between the service layer (characters as proxy) and the provider call (tokens as truth). On the input side the proxy goes in unmeasured; on the output side `max_tokens` is the only real token control. A second cosmetic seam sits sideways: the route's `TRUNC = 4000` looks like model-window bounding but is wire-size bounding — same primitive, different axis answer.
+
+```
+  Structure pass — tokenization
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  per-agent prompt construction                 │
+  │  service-layer truncators (truncate, caps)     │
+  │  provider call (max_tokens)                    │
+  │  (route UI-stream — sideways, different axis)  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what unit does each layer count work in │
+  │  and does it match what the provider bills?    │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  prompt↔truncators: cosmetic (both in chars)   │
+  │  truncators↔provider: LOAD-BEARING             │
+  │    chars (proxy) → tokens (truth); max_tokens  │
+  │    is the only real-unit control               │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what unit are we in?" answered two ways
+
+  ┌─ truncators ─┐    seam     ┌─ provider ──┐
+  │ characters   │ ════╪═════► │ tokens      │
+  │ (proxy: ÷4)  │  (it flips) │ (the bill)  │
+  └──────────────┘             └─────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → this boundary carries the slop
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Tokenization is the model's `.split()`. Before the transformer sees your text, a tokenizer chops it into subword units drawn from a fixed vocabulary (~100k entries for modern models). "tokenization" might become `token` + `ization`; a rare word splits into more pieces; common words are single tokens. The model's context window, its `max_tokens` cap, and its bill are all counted in these pieces — not in your characters and not in your words.
@@ -326,3 +373,4 @@ Updated: 2026-05-29 — Corrected the two stale diagnostic-synthesis `max_tokens
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

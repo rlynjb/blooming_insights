@@ -44,6 +44,56 @@ Zoom out — where derivation lives
 
 ---
 
+## Structure pass
+
+**Layers.** Enrichment derivation stacks three layers, all in one file: the **raw evidence** (an `Anomaly`'s `evidence[]` array, a `Diagnosis`'s `hypotheses[]`, a `RecommendationAgent` `EstimatedImpact` union), the **derivation functions** (`findCurrentPrior`, `deriveInsightFields`, `diagnosisConfidence`, `impactRange` / `impactAssumption` — pure scans, folds, and type narrows over the evidence), and the **display fields** (the business-owner-facing values rendered by `InsightCard`, `EvidencePanel`, `RecommendationCard`). No layer touches I/O — everything is a pure transformation.
+
+**Axis: state.** Where does each piece of data live, who computes it, and what's the lifecycle? This is the right axis because the load-bearing question for derivation is *"do we own this, or do we fetch it again?"* — the whole point is that every display field is a function of state we already have. Cost competes (everything is O(n) over single-digit n) but doesn't pop the seam: the cost is dominated by what we *don't* do (re-fetch), not by what we do. Pick state and the seam between "raw agent output" and "derived display field" reveals itself; pick cost and everything looks uniformly cheap (which it is, but that's not the *structural* insight).
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1 (load-bearing): raw evidence → derivation.** State-ownership flips from "the agent produced this and won't touch it again" to "we own a derived view computed by a pure function of the evidence." This seam is the joint that lets the UI ask new questions (revenue lost? leak stage? confidence label?) *without* going back to the agent or the network. **Seam 2: derivation → display.** Ownership flips from "we hold a derived value" to "the UI reads it." Cosmetic from a state perspective, but it's where the spread (`...deriveInsightFields(a)`) lives — the actual binding into the `Insight` object the route ships.
+
+```
+Structure pass — enrichment derivation
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Raw evidence (agent output) · Derivation functions │
+│  (pure scans/folds) · Display fields (UI)            │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: where does each piece live, who computes it, │
+│  what's the lifecycle?                               │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: raw evidence → derivation ★load-bearing         │
+│      (agent owns it → we own a derived view)         │
+│  S2: derivation → display                            │
+│      (we hold value → UI reads via spread)           │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "where does revenueImpact come from?" answered two ways
+
+┌─ Without derivation ─┐  seam     ┌─ With derivation ────┐
+│  agent must include  │ ═════╪═══►│  agent produces       │
+│  every display field │  (it     │  evidence; we derive   │
+│  in its JSON output  │   flips) │  display fields from   │
+│  (bigger prompt,     │          │  it (smaller prompt,   │
+│   wider validator)   │          │   smaller validator)   │
+└──────────────────────┘          └────────────────────────┘
+        ▲                                       ▲
+        └────── same axis (state), two answers ─┘
+                → this is why the agent's JSON shape stays tiny
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 **Move 1 — mental model: derivation is a pure projection from evidence to display.**
@@ -445,3 +495,4 @@ Updated: 2026-05-29 — funnel-leak reduce refreshed to current lines (block L15
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

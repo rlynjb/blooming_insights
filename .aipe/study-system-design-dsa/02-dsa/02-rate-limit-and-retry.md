@@ -43,6 +43,55 @@ Zoom out — where spacing + retry live
 
 ---
 
+## Structure pass
+
+**Layers.** Spacing + retry sits in a tight three-layer stack: the **caller** (`callTool`, which owns the retry attempt counter), the **spacing gate** (`liveCall` — owns `lastCallAt` + the `await sleep(minIntervalMs - elapsed)` step), and the **transport + response classifier** (the SDK call + the `isRateLimited(result)` shape check). The retry loop re-enters the gate on a 429-equivalent, so retries automatically inherit the spacing — there's no separate "spaced retry" code path; the layers just get walked again.
+
+**Axis: state.** Who owns each piece of timing data, when does it mutate, and what's the lifespan? This is the right axis because the gate-and-retry mechanism is *entirely* about a single mutable variable — `lastCallAt` — and the discipline of who updates it and when. The spacing gate reads it before the call, the live call writes it after, the retry loop's re-entry causes a fresh read on the next attempt. Cost is the natural alternate axis (1100 ms per call × N calls = pipeline latency), but cost is a *consequence* of state — the latency budget falls out of `minIntervalMs` and the retry count. Pick state and the timing discipline is visible; pick cost and the spacing gate looks like just "a wait."
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1 (load-bearing): caller → spacing gate.** State-ownership flips from "I don't know when the last call was" (caller) to "I own `lastCallAt`, and I'll make you wait if you're too early" (gate). This seam is the joint that absorbs the burstiness — without it the agent would slam the server. **Seam 2: transport result → retry decision.** State flips from "raw SDK return" to "classified as 429 or not." The classifier (`isRateLimited(result)`) is the contract that turns an unstructured result into a retry signal; this is also where the retry-after hint is parsed and turned into a sleep duration.
+
+```
+Structure pass — rate-limit spacing + retry
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Caller (retry counter) · Spacing gate (lastCallAt  │
+│  + sleep) · Transport + classifier                   │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: who owns lastCallAt, when does it mutate,   │
+│  what's the lifespan?                                │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: caller → spacing gate ★load-bearing             │
+│      (no timing knowledge → owns lastCallAt + sleep) │
+│  S2: transport result → retry decision               │
+│      (raw result → classified 429 + parsed delay)    │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "when can the next call go out?" answered two ways
+
+┌─ Caller ──────────┐    seam     ┌─ Spacing gate ───────┐
+│  no timing state; │ ═════╪═════►│  owns lastCallAt;     │
+│  ready now        │  (it flips) │  if (now - last <     │
+│                   │             │   minInterval) sleep  │
+└───────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (state), two answers ─┘
+                → this is what makes retries safe to re-enter
+                  (they walk the gate again, inheriting it)
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 Every live call passes through a spacing gate that delays it until the minimum interval has elapsed, and the result feeds a bounded retry loop that re-enters that same gate on a 429-equivalent response.
@@ -498,3 +547,4 @@ Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skel
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

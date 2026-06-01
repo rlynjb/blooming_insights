@@ -39,6 +39,59 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Meta-prompting is a four-layer pipeline that sits *entirely above* the runtime path you already know. Layer A is the *human-authored input* — a one-line goal + the workspace schema shape. Layer B is the *meta-prompt itself* — instructions to the drafting model about how to write a blooming insights agent prompt (it has to encode the house anatomy from 01-anatomy.md: Role disclaiming the other agents' jobs, Hard rules, EQL reminders, Output schema, `{schema}` placeholder). Layer C is the *drafting call* that emits a candidate `.md` text. Layer D is the *human review pass* that turns the draft into a committed file — kill the hedging, verify the placeholders, check the EQL syntax the model invented. The commit then drops the artifact into the same `lib/agents/prompts/` directory the hand-written four live in, and runtime never knows the difference.
+
+**Axis: lifecycle.** When does each layer fire — authoring-time (one-off) or runtime (every request)? Lifecycle is the right axis (the brief calls this out explicitly) because the whole concept lives or dies on whether the model-in-the-loop sits *before* commit or *during* a request. Sliding meta-prompting into runtime would make every request slow, non-deterministic, and unreviewable — the same anti-pattern as a prompt loaded from a database instead of source. Authoring-time meta-prompting is a dev tool; runtime meta-prompting is malpractice. The axis makes that line crisp.
+
+**Seams.** Two seams, and the load-bearing one is the human review pass. Seam 1 (C↔D) — lifecycle still in the *authoring* band but flips from *model-produced* to *human-validated*. This is the seam where the draft's polite-LLM voice ("try to be efficient where possible") has to be dragged to spec voice ("at most 6 tool calls, then stop"). Skip this seam and you ship a prompt whose load-bearing rules read as suggestions. The load-bearing seam is Seam 2 (D↔commit/runtime) — lifecycle flips hard from *authoring-time* to *runtime-immutable* (the seam from 03-prompts-as-code.md). The artifact crossing this seam is indistinguishable from a hand-written prompt; the runtime path doesn't know and doesn't care that a model drafted it. That's the discipline — meta-prompting changes how the file got written, never how the file gets read.
+
+```
+  Structure pass — meta-prompting
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: human goal + schema shape                  │
+  │  B: meta-prompt (encodes house anatomy)         │
+  │  C: drafting call → candidate .md text          │
+  │  D: human review (kill hedging, verify EQL)     │
+  │  → commit → runtime path (unchanged)            │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: authoring-time one-off vs           │
+  │  runtime per-request? (must stay authoring)     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→commit, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (C↔D): model-produced → human-validated    │
+  │            (the hedging-drift fix lives here)   │
+  │  S2 (D↔commit): authoring-time → runtime-      │
+  │            immutable (LOAD-BEARING — the        │
+  │            seam that makes meta-prompting       │
+  │            indistinguishable from hand-author)  │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "when does the model run on this prompt?" answered two ways
+
+  ┌─ authoring-time ─┐    seam     ┌─ runtime ────────────┐
+  │  model drafts    │ ═════╪═════► │  model READS the     │
+  │  the .md once,   │  (it flips) │  committed .md every │
+  │  human reviews   │             │  request (no drafting)│
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → cross this seam in the wrong direction
+                   (drafting per-request) and the whole thing
+                   becomes slow, non-deterministic, unreviewable
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Meta-prompting puts a model in the loop at *authoring* time, not runtime. There is a meta-prompt (instructions to the model about how to write a good agent prompt), an input (the goal plus context like the workspace schema), a drafting call (the model emits a candidate prompt), and — the non-negotiable step — a human review that turns the draft into a committed artifact. The output of the whole process is a versioned `.md` prompt file in the per-agent prompts directory, identical in kind to the hand-written ones (→ 03-prompts-as-code.md); only its origin differs.
@@ -325,3 +378,4 @@ Updated: 2026-05-29 — Resynced the stale `diagnostic.md` "customers matching" 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

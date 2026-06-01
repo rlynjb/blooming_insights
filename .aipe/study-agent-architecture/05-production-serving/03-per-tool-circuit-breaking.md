@@ -38,6 +38,48 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers carry a would-be agent-aware breaker: the **Shared agent loop** (where the model emits `tool_use` blocks and reads `tool_result` observations), the **Provider/MCP wrapper** (today: bounded retry + backoff in `McpClient.callTool` and `lib/llm/retry.ts`), the **Per-tool breaker state machine** (would be: closed / open / half-open per tool, absent today), and the **Observation feedback path** (would surface open-state back to the agent loop as a `tool_result` saying "tool X is open, route around it" — also absent today). The first two exist; the second two are the gap this file is describing.
+
+**Axis: failure.** Where does a flaky tool's failure originate, how does it propagate (an agent re-calling a dead tool every turn multiplies the failure by iteration count!), and where does it get contained? This is the right axis because the whole concept is *containing a per-tool failure inside an autonomous loop that has no instinct to give up*. Cost is downstream (every retry burns model tokens + provider quota); control is downstream (the model would route around if it knew, but it doesn't). Failure is the lens.
+
+**Seams.** Two seams are load-bearing. Seam 1 sits between the per-call retry layer and the per-tool breaker state — failure-containment flips from "this call is bounded" (bounded retry, what blooming insights has) to "this *tool* is bounded for some window" (open state across calls). That seam is what stops a flaky tool from burning the agent's whole budget across many turns. Seam 2 sits between the breaker state machine and the agent loop *as an observation* — failure flips from "the wrapper knows the tool is open" (silent) to "the model knows the tool is open and chooses something else" (observable). Seam 2 is the load-bearing one because *without it*, the breaker just fails fast over and over and the agent keeps re-calling the same dead tool — the loop doesn't learn. Surfacing open-state as a tool_result is what turns the breaker from "service mesh pattern" into "agent-aware pattern."
+
+```
+  Structure pass — Per-tool circuit breaking
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Shared agent loop (emits tool_use, reads obs) │
+  │  Provider/MCP wrapper (bounded retry today)    │
+  │  Per-tool breaker state (closed/open/half-open │
+  │     — absent today)                            │
+  │  Observation feedback (open-state →            │
+  │     tool_result — absent today)                │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  failure: where does a flaky tool's failure    │
+  │           propagate / get contained?           │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: per-call retry ↔ per-tool breaker     │
+  │          (one call bounded → tool bounded for  │
+  │          some window)                          │
+  │  Seam 2: breaker state ↔ agent loop (as obs.)  │
+  │          (wrapper knows → model knows)         │
+  │          ★ load-bearing — without it, the loop │
+  │          re-calls the dead tool forever        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the closed/open/half-open mechanics and the specific gap where "feed it back to the agent" would slot in.
+
+---
+
 ## How it works
 
 **The mental model: closed/open/half-open, one breaker per tool, and the open-state surfaces as an observation.** You know the closed/open/half-open shape from service mesh and resilience libraries (Hystrix, resilience4j, Polly). The agent-specific addition is the *observation feedback* — the breaker isn't just a guard around the call site; it's a fact the agent's reasoning has to know about so the next turn picks a different tool.
@@ -545,3 +587,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

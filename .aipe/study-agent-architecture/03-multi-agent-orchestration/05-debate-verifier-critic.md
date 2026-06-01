@@ -40,6 +40,47 @@
 
 ---
 
+## Structure pass
+
+**Layers.** A would-be debate or verifier-critic setup needs four layers: the **Producer** (an agent that makes a thing), the **Critic** (a separate agent — ideally a different model family — that reviews it), the **Verdict router** (decides approve / reject / loop / pick-a-winner-via-judge, cap-aware), and the **Consumer** (the downstream stage). All four are absent in blooming insights for the analyst flow; the sequential pipeline goes straight from producer to consumer. The closest analog is the forced-synthesis turn inside `runAgentLoop` — a same-model, tool-less re-pass on budget exhaustion (still inside one producer, not a separate critic).
+
+**Axis: control.** Who gets to decide the producer's output is acceptable — the producer alone, a separate critic, or your code (parser/validators)? This is the right axis because the entire pattern is *inserting a control point* between the producer and the consumer. Trust is the *motivation* (you don't trust a single producer), but the mechanism the topology adds is a new decider — that's a control flip.
+
+**Seams.** Two seams are load-bearing in the WOULD-BE shape, and both need to be present for the pattern to earn its overhead. Seam 1 sits between the Producer and the Critic — control flips from MODEL-as-producer to MODEL-as-judge, and this seam only carries signal if the two models *don't share blind spots* (different family, different training). If the critic shares the producer's biases, the flip is cosmetic — same answer, twice. Seam 2 sits between the Critic and the Verdict router — control flips from MODEL (verdict) to CODE (route accordingly, cap retries to prevent ping-pong). Seam 2 is the load-bearing one for production: without the cap-enforcer, debate loops can run forever. In blooming insights both seams are absent, and the lesson is that adding them without orthogonality between models would be all cost and no signal.
+
+```
+  Structure pass — Debate / verifier-critic (would-be shape)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Producer (agent)                              │
+  │  Critic (different model family, ideally)      │
+  │  Verdict router (cap-aware)                    │
+  │  Consumer (downstream stage)                   │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the output is OK?        │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Producer ↔ Critic                     │
+  │          (MODEL-producer → MODEL-judge)        │
+  │          carries signal ONLY if blind spots    │
+  │          don't overlap                         │
+  │  Seam 2: Critic ↔ Verdict router               │
+  │          (MODEL → CODE cap) ★ load-bearing —   │
+  │          without it, ping-pong forever         │
+  │  In this repo: both absent — same-model        │
+  │  forced-synthesis is the closest analog        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the debate and verifier-critic mechanics, the blind-spot failure mode, and the breakpoint that would justify either topology.
+
+---
+
 ## How it works
 
 **The mental model: a second perspective applied to the first agent's output.** The key word is *perspective*. If the critic shares the producer's blind spots, the "review" is a rubber stamp. The architecture is only as good as the orthogonality between producer and critic.
@@ -484,3 +525,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

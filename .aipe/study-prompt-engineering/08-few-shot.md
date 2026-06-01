@@ -42,6 +42,60 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Few-shot sits in four layers, and you have to name them or "where do we use few-shot?" becomes an unfalsifiable question. Layer A is the *prompt's exemplar block* — the worked EQL lines, the filled JSON output block, the suggested-query-plan sequence. Layer B is the *prompt's descriptive block* — field-rules prose, label definitions, "Reply with ONLY the one word." Layer C is the *model's emission* — the actual EQL it writes, the actual JSON it returns, the actual intent label. Layer D is the *consumer / next link* — the parser that reads the JSON, the loop that executes the EQL, the route handler that branches on the intent.
+
+**Axis: control.** *How* is the model being told what to emit at each layer — by demonstration (an example to imitate) or by description (a rule to parse)? Control via demonstration vs control via description — that's the lens that distinguishes a few-shot exemplar from a zero-shot definition. The wrong axis here would be "guarantees" (Layer D enforces the guarantee for JSON paths regardless of whether the request came from an exemplar or a rule); the right axis is which form of control the prompt uses, because that decides what the model *actually does* on the path.
+
+**Seams.** Two seams, and the load-bearing one is where the codebase's design choice lives. Seam 1 (A↔B) — within the prompt, control flips from *demonstrated shapes* (filled JSON, worked queries) to *described rules* (field rules, label defs). Both exist in the same `.md`, and the model attends to demonstration more reliably than description — which is why the output exemplar is the request side of the structured-output contract and the field-rules prose is the also-ran. The load-bearing seam is Seam 2 — between the *format-shaping use* and the *classification-decision use*. Control via demonstration is used pervasively for *format* (the model copies the JSON exemplar's shape, the EQL one-liners' syntax); control via description is used for *the actual classification* (`classifyIntent` gives three label definitions, zero query→label examples). The codebase made one of these choices for shape (demonstrate) and the other for the discrete decision (describe), and whether the second choice is *correct* is the project exercise — a measured question, not a settled one.
+
+```
+  Structure pass — few-shot prompting
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: exemplar block (filled JSON, worked EQL)   │
+  │  B: descriptive block (field rules, defs)       │
+  │  C: model emission (what comes out)             │
+  │  D: consumer / next link (parser, executor)     │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: demonstration (example to imitate)   │
+  │  vs description (rule to parse)?                │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): demonstrated shapes → described     │
+  │            rules in the same prompt             │
+  │  S2 (format use ↔ classification use):         │
+  │            format → demonstrate (used)         │
+  │            decision → describe (chosen here)   │
+  │            (LOAD-BEARING — the codebase's      │
+  │             measured-question split)            │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "how is the model told what to emit?" answered two ways
+
+  ┌─ format-shaping ─┐    seam     ┌─ classification ─────┐
+  │  DEMONSTRATE:    │ ═════╪═════► │  DESCRIBE:           │
+  │  filled JSON,    │  (the split │  three label defs,   │
+  │  worked EQL      │   chosen    │  no labeled pairs    │
+  │                  │   here)     │                      │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → format wants demonstration; the classification
+                   decision was given description — defensible,
+                   measurable, not yet measured
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Few-shot is showing the model k worked examples of the task *inside the prompt* so it infers the pattern from the demonstrations rather than from a description. There is a spectrum: zero-shot (describe the task, no examples), few-shot (show 1–5 examples), and the in-between blooming insights actually occupies most — *format exemplars*, where you show the shape of the output without showing labeled input→output pairs for the actual decision.
@@ -385,3 +439,4 @@ Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagn
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

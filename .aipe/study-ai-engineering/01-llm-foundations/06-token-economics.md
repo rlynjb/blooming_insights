@@ -37,6 +37,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers, each home to a cost lever or its absence: the intent classifier (tier lever — haiku vs sonnet), the per-agent definitions (call-count budgets `maxToolCalls`), the agent loop (input truncation via `truncate`, output bound via `max_tokens`), and the provider response (`res.usage` returning exact input/output token counts — never read).
+
+**Axis: cost.** What does each layer contribute to the per-run bill, and is there a meter on it? This is the right axis because the file's whole frame is "three dials are present, the gauge is absent" — the layers cleanly partition into "bound" (turns the dial) and "measure" (reads the gauge), and only the cost lens makes that distinction visible. Control would flatten it (every layer is CODE-decided); failure would mis-frame (cost overrun is the failure, not the mechanism).
+
+**Seams.** The cosmetic seam is between the per-agent definitions and the agent loop — both are *bounding* layers, just with different primitives. The load-bearing seam is between the agent loop (where the call is made) and the provider response (where `res.usage` comes back). Cost-knowledge flips here from "estimated by characters and call count" to "exactly known per call" — but the codebase doesn't cross it. The unread `res.usage` field *is* the missing meter; the load-bearing seam is open on both sides because nothing connects them.
+
+```
+  Structure pass — token economics
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  intent classifier (tier lever)                │
+  │  per-agent definitions (call-count budgets)    │
+  │  agent loop (truncate + max_tokens)            │
+  │  provider response (res.usage — never read)    │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what does each layer contribute to the  │
+  │  bill, and is there a meter on it?             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  per-agent↔loop: cosmetic (both bound)         │
+  │  loop↔res.usage: LOAD-BEARING                  │
+  │    "estimated by chars" → "exactly known"      │
+  │    but this codebase NEVER crosses it          │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Token cost is `input_tokens × input_price + output_tokens × output_price`, summed over every call in a run, where `output_price ≈ 5 × input_price`. So three levers move the bill: how many *calls* you make (budget), how *big* each call's input is (truncation), and how *expensive* each call's model is (tiering). blooming insights pulls all three on the bounding side and pulls none on the measuring side.
@@ -337,3 +372,4 @@ Updated: 2026-05-28 — `maxDuration` 60→300 (route.ts L20); re-derived the `s
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

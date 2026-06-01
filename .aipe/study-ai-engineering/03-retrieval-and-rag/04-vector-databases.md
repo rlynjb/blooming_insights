@@ -40,6 +40,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three WOULD-BE storage tiers stacked by scale: in-memory `Map` (<1k vectors, brute-force scan), SQLite + sqlite-vss (~10k, B-tree + ANN extension), and managed service like Pinecone (>100k, HNSW/IVF). Above all three sits the indexer that writes; below all three sits the retriever that reads top-k. blooming insights already uses the in-memory `Map` pattern for caches — different payload, same primitive.
+
+**Axis: cost.** What does each tier pay per query as the corpus grows? This axis is the right lens because the entire file is a *cost-vs-scale* tier ladder — each tier earns its place at a different N. Lifecycle is constant (everything is per-query at the retriever); the only variable is "how much does a query cost at this corpus size."
+
+**Seams.** The cosmetic seam is between the indexer and any one tier — write is the same shape everywhere. The load-bearing WOULD-BE seams are *between tiers*: scaling from Map to SQLite to managed each represents a cost-vs-precision flip (brute-force exact → approximate-but-fast). The most consequential is Map → ANN: cost flips from O(N) per query (acceptable below 1k) to O(log N) — and *exact* answers flip to *approximate* answers. blooming insights sits firmly in the "Map tier you don't need a vector DB at all" zone.
+
+```
+  Structure pass — vector databases (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Map<id, vector> (<1k, brute-force)            │
+  │  SQLite + sqlite-vss (~10k, ANN ext)           │
+  │  managed (Pinecone, >100k, HNSW/IVF)           │
+  │  (above: indexer; below: retriever top-k)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: what does each tier pay per query as    │
+  │  the corpus grows?                             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  indexer↔any tier: cosmetic                    │
+  │  Map↔ANN: LOAD-BEARING                         │
+  │    O(N) exact → O(log N) approximate           │
+  │    don't cross until microseconds stop working │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A vector database is two things bolted together: a place to *store* float arrays (like a `Map` or a JSON file in the state layer) and an *index* that answers nearest-neighbor queries without scanning everything. At small scale the storage is a `Map` and the "index" is sorting computed cosines. At large scale the storage is on disk and the index is an approximate graph.
@@ -294,3 +329,4 @@ What storage tier does blooming insights already run that a small vector index w
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

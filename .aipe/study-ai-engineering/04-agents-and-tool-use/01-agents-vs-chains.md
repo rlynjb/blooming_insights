@@ -35,6 +35,52 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Two layers, nested: the outer chain layer (route + client own the order between agents — `step=diagnose` then `step=recommend`), and the inner agent layer (`runAgentLoop` inside each step, where the model picks the next tool and decides when to stop). Below those sit tools + provider. The whole topology is "chain of agents" — chain at the top, bounded agent at each node.
+
+**Axis: control.** Who decides the next step at each layer — CODE (fixed sequence, hard-coded order) or MODEL (loop body picks the next tool based on what it sees)? This axis IS the file — agents-vs-chains is by definition a question about where control lives. Other axes flatten the file: state flows through both; cost is similar; the axis that pops the seam is who decides next.
+
+**Seams.** The cosmetic seam is between tools and provider — both serve the agent. The load-bearing seam is between the chain layer and the agent layer: control flips here from "CODE owns the order" (chain decides diagnose-then-recommend) to "MODEL owns the order" (the agent loop picks which tool to call within its step). Crossing this seam is the moment the system stops being procedural and becomes agentic. The budgets (`maxToolCalls`, `forceFinal`) are what bound the model's autonomy so the inner-agent doesn't run forever.
+
+```
+  Structure pass — agents vs chains
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  outer chain (route + client own order)        │
+  │  inner agent (runAgentLoop per step)           │
+  │  tools + provider                              │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: CODE-decided order vs MODEL-decided  │
+  │  next-step — and where does it flip?           │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  tools↔provider: cosmetic                      │
+  │  chain↔agent: LOAD-BEARING                     │
+  │    CODE order → MODEL choice                   │
+  │    bounded by maxToolCalls + forceFinal        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "who picks the next step?" answered two ways
+
+  ┌─ outer chain ──┐  seam   ┌─ inner agent ─┐
+  │ CODE           │ ══╪═══► │ MODEL         │
+  │ (fixed order)  │  flips  │ (picks tool)  │
+  └────────────────┘         └───────────────┘
+         ▲                              ▲
+         └────── same axis, two answers ─┘
+                 → this is the topology decision
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Think of the route as a `step`-keyed dispatcher and each agent as a `useReducer` whose actions are chosen at runtime by a model instead of by user clicks. The outer flow is deterministic — diagnostic always runs before recommendation, and the `step` param enforces it: `step=diagnose` produces the diagnosis, `step=recommend` consumes it. The inner flow is data-driven — you cannot read the shared agent loop and know how many tool calls the model will make, because that depends on what the model sees.
@@ -373,3 +419,4 @@ Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

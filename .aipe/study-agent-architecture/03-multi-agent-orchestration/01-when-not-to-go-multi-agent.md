@@ -41,6 +41,54 @@
 
 ---
 
+## Structure pass
+
+**Layers.** This file is a *decision about the Pipeline coordinator band*, so the layers it weighs are the three bands the decision spans: the **Pipeline coordinator** (today: `lib/agents/pipeline.ts`, an engineer-written sequential `if`-ladder; alternative: an LLM supervisor agent that reasons about the next stage), the **Per-agent definitions** (monitoring, diagnostic, recommendation, query — these stay the same either way), and the **Shared agent loop** (`runAgentLoop` — also unchanged either way). Only the top band's owner is at stake.
+
+**Axis: control.** Who decides the order in which the four agents run — engineer-written code or a model? This is the right axis because the entire gate is asking *should I move control of the inter-agent step from CODE to MODEL?* — and that's a yes/no on a single seam. Cost is a real concern (the supervisor variant costs +1 LLM call per stage, roughly a 2–5x coordination tax) but cost is the *consequence* of the control choice. State doesn't flip across the gate (every variant passes the same data shapes). Control is what the gate tests.
+
+**Seams.** One seam is load-bearing: the seam between the Pipeline coordinator and the per-agent loops. Today control sits in CODE on the Pipeline side (the `if`-ladder fixes the order, no model is consulted about it) and flips to MODEL inside each per-agent loop (the agent decides its tool calls). Promoting to a supervisor would move the Pipeline side itself to MODEL — the flip would happen one boundary earlier, and the supervisor would re-decide what code already knew. The gate is the test for whether that move pays for itself.
+
+```
+  Structure pass — When NOT to go multi-agent (the gate)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Pipeline coordinator (CODE today / MODEL?)    │
+  │  Per-agent definitions (unchanged either way)  │
+  │  Shared agent loop (unchanged either way)      │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides which agent runs next?   │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam: Pipeline coord ↔ per-agent loops        │
+  │        (CODE → MODEL today)                    │
+  │        ★ load-bearing — the gate is asking     │
+  │        "should this seam move one band up?"    │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  The seam — "who decides the next stage?" answered two ways
+
+  ┌─ Today (chosen) ─┐   gate    ┌─ Supervisor (alt) ┐
+  │ CODE: if-ladder, │ ═══╪═════►│ MODEL: supervisor │
+  │ fixed order,     │ (would    │ reasons each next │
+  │ 0 extra LLM/run  │  flip)    │ stage, +1 LLM/run │
+  └──────────────────┘           └───────────────────┘
+         ▲                                     ▲
+         └───── same axis (control), two answers ─┘
+                → the gate decides if the flip earns it
+```
+
+The skeleton is mapped — the rest of this file walks the gate's criteria and how blooming insights passes them.
+
+---
+
 ## How it works
 
 **The mental model: a one-way gate you cross once you've earned it.** Single-agent on one side, multi-agent on the other. You don't walk through it because you read a blog post; you walk through it because the single-agent baseline measurably failed in a way only decomposition can fix.
@@ -463,3 +511,4 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

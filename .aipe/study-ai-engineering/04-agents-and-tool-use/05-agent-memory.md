@@ -38,6 +38,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three memory layers — two real and one would-be: short-term (the `messages` array inside `runAgentLoop`, gone when the run ends), long-term (the keyed snapshot store with mem→file→seed lookup chain), and semantic (an embedding index of past investigations — not implemented).
+
+**Axis: lifecycle.** When does each layer's state exist, and when is it discarded? This axis is the right lens because the file's whole frame is *per-run vs across-runs vs semantic recall* — a temporal/scope distinction. State is downstream of lifecycle (the *shape* of state depends on how long it lives); the upstream question is "when does this thing get garbage collected."
+
+**Seams.** The cosmetic seam is within the long-term tier (mem → file → seed are three steps of the *same* exact-key lookup). The load-bearing seam is between short-term and long-term: lifecycle flips here from "scoped to one run, append-only, then discarded" to "scoped across runs, keyed by `insightId`, persistent." A second WOULD-BE seam sits beyond long-term — between exact-key snapshot replay and semantic recall: lifecycle stays the same but *retrieval mode* flips from "exact match only" to "similarity match" (the latter is what an embedding index would enable).
+
+```
+  Structure pass — agent memory
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  short-term (messages[] inside one run)        │
+  │  long-term (keyed snapshot: mem→file→seed)     │
+  │  semantic (embedding recall — would be)        │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each layer's state exist │
+  │  and when is it discarded?                     │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  mem↔file↔seed: cosmetic (one lookup)          │
+  │  short↔long: LOAD-BEARING                      │
+  │    one-run scope → across-runs scope           │
+  │  long↔semantic: LOAD-BEARING (would be)        │
+  │    exact-key replay → similarity recall        │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Short-term memory is an array you append to across turns and discard when the function returns — `useState` for one render lifecycle. Long-term memory is a keyed lookup with a fallback chain — `localStorage.getItem(key) ?? defaultValue`, except the chain has three tiers (process memory, a dev file, a committed seed). Neither layer is semantic: the short-term array is the literal conversation, and the long-term store is keyed by an exact `insightId` string, not by meaning.
@@ -385,3 +420,4 @@ Updated: 2026-05-29 — Added a "cross-step memory" sub-section (with diagram) o
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

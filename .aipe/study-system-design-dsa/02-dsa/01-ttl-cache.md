@@ -39,6 +39,53 @@ Zoom out — where TTL cache lives
 
 ---
 
+## Structure pass
+
+**Layers.** TTL cache lives in a tight three-layer stack: the **caller** (any agent in the pipeline that needs a tool result), the **cache wrapper itself** (the `Map<key, {result, expiresAt}>` plus its lookup and write logic), and the **live-call path** (the spacing gate + retry loop + Bloomreach API). The layers are stacked, not parallel — every request walks them in order, and a hit short-circuits before ever reaching the live layer.
+
+**Axis: state.** Who owns each piece of data, where does it live, and when does it expire? This is the axis that pops the seams because the cache's whole job is *state-ownership*: the in-process `Map` owns the response for a short window, the live-call path owns the freshest version, and the caller owns nothing (it just asks). Cost is a tempting alternate axis — but cost is downstream of state ownership (you pay only when you cross the seam to the live path), so state is the upstream lens.
+
+**Seams.** Two seams matter, and one of them is load-bearing. The first seam is between the **caller and the cache wrapper** — state-ownership flips from "I have no idea where this came from" to "this Map owns it for the next 60 seconds." That seam is the API contract (`callTool(name, args) → result`); cosmetic from the caller's view but real from the cache's. The load-bearing seam is the second one — between the **cache wrapper and the live-call path**. State-ownership flips from "I own a possibly-stale copy" to "I'm going out to fetch the freshest version." That's where the hit/miss decision happens, that's where rate-limiting matters, that's where errors might bubble up. Study this seam and the cache makes sense.
+
+```
+Structure pass — TTL cache
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Caller (agent) · Cache wrapper (Map) · Live-call    │
+│  path (spacing gate + retry + Bloomreach)            │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  state: who owns each piece of data, where does it   │
+│  live, when does it expire?                          │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: caller → cache wrapper (cosmetic API contract)  │
+│  S2: cache wrapper → live-call path ★load-bearing    │
+│      (Map-owns-stale → live-owns-fresh)              │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S2 seam — "who owns the freshest copy?" answered two ways
+
+┌─ Cache wrapper ──┐    seam     ┌─ Live-call path ───┐
+│  Map owns it,    │ ═════╪═════►│  Bloomreach owns it │
+│  possibly stale  │  (it flips) │  always fresh       │
+│  (entry.result)  │             │  (after retry loop) │
+└──────────────────┘             └─────────────────────┘
+        ▲                                    ▲
+        └──── same axis (state), two answers ─┘
+              → this seam is the hit/miss decision
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Mental model
@@ -445,3 +492,4 @@ Updated: 2026-05-28 — refreshed code references to current line numbers
 Updated: 2026-05-30 — Applied study.md v1.46 Move-2-variant (load-bearing skeleton: isolate the kernel + what-breaks-if-removed + skeleton vs hardening) to How it works.
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

@@ -40,6 +40,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four layers, each holding one cost lever: intent parsing (haiku classifier — *route* lever), per-agent definitions (`maxToolCalls` — *bound calls* lever), agent loop (`truncate` + `forceFinal` — *shrink* lever), and provider wrappers (TTL cache + would-be prompt prefix cache + would-be `res.usage` logging — *cache* and *see* levers). The "see" lever is the meter; without it, every other lever is pulled blind.
+
+**Axis: cost.** What does each layer pay per request, and which lever moves *that* line item? This axis is the right lens because the file is a per-layer cost lever inventory. Where token-economics (`01-llm-foundations/06`) asks "what's the bill?", this file asks "which lever moves it?" — same axis, different cut. The unifying observation: output tokens cost ~5× input, and one long `synthesize()` call can outweigh a dozen short tool calls, so the *biggest* line item is whichever layer touches output token volume.
+
+**Seams.** The cosmetic seam is between intent parsing and per-agent — both are CODE-decided pre-spend bounds. The load-bearing seam is between the agent loop's shrink levers and the provider wrappers: cost flips here from "bounded by my code" to "billed by their meter (or unbilled because I don't read it)." The would-be prompt prefix cache and `res.usage` logging both sit at this seam. A pointed observation: the file's tagline is the failure mode of pulling levers without a meter — you optimize the wrong line item.
+
+```
+  Structure pass — LLM cost optimization
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  intent parsing (haiku — route lever)          │
+  │  per-agent (maxToolCalls — bound)              │
+  │  agent loop (truncate, forceFinal — shrink)    │
+  │  provider wrappers (cache + meter)             │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  cost: which lever at which layer moves which  │
+  │  line item — and is there a meter?             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  intent↔per-agent: cosmetic (both pre-spend)   │
+  │  agent loop↔provider wrappers: LOAD-BEARING    │
+  │    bounded by code → billed by meter           │
+  │    meter is absent → optimize blind            │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** A request's cost is `input_tokens × in_price + output_tokens × out_price`, summed over every model call in the request. Three families of lever exist: **route** (send the request to a cheaper model when the task is easy), **shrink** (reduce the tokens — cap exploration, truncate context, cache the prefix), and **see** (measure per-request cost so you optimize the right line). You pull the route lever once at the edge, pull most shrink levers, and pull no see lever at all.
@@ -405,3 +440,4 @@ Updated: 2026-05-29 — Added a "gate before spend" shrink lever: `runnableCateg
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

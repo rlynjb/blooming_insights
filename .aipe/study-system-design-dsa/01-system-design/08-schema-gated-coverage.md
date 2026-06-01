@@ -41,6 +41,58 @@ Zoom out — where schema-gated coverage lives
 
 ---
 
+## Structure pass
+
+**Layers.** Schema-gated coverage is a three-stage stack with a fan-out at the top: the **schema** (bootstrapped `WorkspaceSchema` — the input), the **gate** (three pure functions: `schemaCapabilities` → `Set<string>`, `coverageReport` → 10 verdicts, `runnableCategories` → filtered subset), and two **downstream consumers** (the UI grid that renders per-tile verdicts streamed as `coverage_item` events, and the agent that scans only the runnable subset). One upstream computation feeds two downstream channels with different shapes — that's the architectural shape.
+
+**Axis: trust.** What does each side trust the other to have validated? This axis pops the seams because the whole point of the gate is *trust enforcement*: the agent trusts that it will only be asked to scan categories the schema can actually support; the UI trusts that the grid will show honest "no data" placeholders rather than hide unsupported categories; the gate itself trusts only the schema (the source of truth). Control is a plausible alternate (the route orchestrates the stages), but trust is sharper — it explains *why* the gate runs before `scan` (so the agent never gets the chance to waste its budget probing the impossible) and *why* the UI gets a separate `coverage_item` stream (so it can show "limited" or "unavailable" honestly instead of inferring from the agent's silence).
+
+**Seams.** Two seams matter; one is load-bearing. **Seam 1 (load-bearing): schema → gate.** Trust flips from "we have the workspace's true schema" to "we have a validated checklist verdict the rest of the pipeline can rely on." This is the trust boundary — every downstream decision (what to scan, what to show) trusts that this seam was crossed correctly. **Seam 2: gate → fan-out (agent + UI).** Trust flips from "one source of truth" to "two consumers with two contracts" — the agent contract is *the runnable subset is safe to scan*; the UI contract is *each verdict will be streamed so the grid can render honestly*. The gate is the joint that lets one truth fork into two trustable channels.
+
+```
+Structure pass — schema-gated coverage
+
+┌─ 1. LAYERS ─────────────────────────────────────────┐
+│  Schema (bootstrapped) · Gate (capabilities → report │
+│  → runnable) · Downstream: UI grid + Agent scan      │
+└────────────────────────┬─────────────────────────────┘
+                         │  pick the axis
+┌─ 2. AXIS ─────────────▼──────────────────────────────┐
+│  trust: what does each side trust the other to have │
+│  validated before acting?                            │
+└────────────────────────┬─────────────────────────────┘
+                         │  trace across layers, find flips
+┌─ 3. SEAMS ────────────▼──────────────────────────────┐
+│  S1: schema → gate ★load-bearing                    │
+│      (raw truth → validated checklist verdict)       │
+│  S2: gate → fan-out (UI + Agent)                     │
+│      (one truth → two trustable channels)            │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+                 Block 4 — How it works
+```
+
+```
+S1 seam — "is this category safe to scan?" answered two ways
+
+┌─ Upstream of gate ─┐    seam     ┌─ Downstream of gate ─┐
+│  schema: raw truth │ ═════╪═════►│  agent: only sees the │
+│  (10 categories    │  (it flips) │  runnable subset      │
+│  may or may not    │             │  UI: sees per-tile    │
+│  apply)            │             │  verdict (full/limit/ │
+│                    │             │  unavail.)            │
+└────────────────────┘             └───────────────────────┘
+        ▲                                       ▲
+        └────── same axis (trust), two answers ─┘
+                → this is why no budget is wasted probing
+                  the impossible AND the user sees honest
+                  "no data" placeholders
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
+---
+
 ## How it works
 
 ### Mental model
@@ -327,3 +379,4 @@ Your PM says: "The ghost tiles look broken — just hide categories the workspac
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

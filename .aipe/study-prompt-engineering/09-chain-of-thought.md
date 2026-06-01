@@ -38,6 +38,59 @@
 
 ---
 
+## Structure pass
+
+**Layers.** CoT in this codebase is a four-layer thing and you have to keep "reasoning the process" and "reasoning the output" separate. Layer A is the *forcing instruction* in `diagnostic.md` — "generate 2–3 hypotheses before your first tool call." Layer B is the *live Thought stream* — text blocks the model emits between tool calls, surfaced via the loop's `onText` hook as `reasoning_step` events. Layer C is the *structured output field* — `hypothesesConsidered[]` as a typed array of `{ hypothesis, supported, reasoning }`. Layer D is the *validator* — `isDiagnosis` requires `hypothesesConsidered` to be an array, so the reasoning is part of the typed contract, not free prose hanging off the side.
+
+**Axis: guarantees.** What's promised about reasoning at each layer — required vs optional, typed vs prose, validated vs accepted? Guarantees is the right axis (over control, which is too coarse here — the model controls the words at every layer) because the modern point of CoT on a frontier model isn't to *elicit* reasoning (Sonnet reasons internally regardless) but to *capture and constrain* it as data. Trace guarantees across A→D: A asks for breadth before depth (process guarantee — order), B surfaces whatever the model writes (no guarantee — transient), C requires the field exist (structural guarantee), D enforces shape (typed guarantee).
+
+**Seams.** Two seams; the load-bearing one is what makes CoT here *modern* instead of dated. Seam 1 (A↔B) — the forcing instruction shapes *exploration* (the model must enumerate 2-3 hypotheses before any query result can anchor it); the Thought stream surfaces *whatever process the model went through*, which is transient and post-hoc. The load-bearing seam is Seam 2 (B↔C) — guarantee flips from *transient prose reasoning you might or might not see* to *durable typed field that survives into the saved diagnosis and gets enforced by `isDiagnosis`*. This is the seam where "explainability" stops being a vibe and becomes a column you can query. It's also where CoT gets withheld correctly on the other agents — the monitoring output has no `reasoning` field, the recommendation has a one-line `rationale` not a chain, the classifier has 16 tokens for one word. Knowing where this seam *shouldn't* exist is half the discipline.
+
+```
+  Structure pass — chain of thought
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  A: forcing instruction (hypotheses before     │
+  │     first tool call)                            │
+  │  B: live Thought stream (onText → reasoning    │
+  │     step events, transient)                     │
+  │  C: structured output field                     │
+  │     (hypothesesConsidered[])                    │
+  │  D: validator (isDiagnosis requires it)         │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  guarantees: reasoning required vs optional,   │
+  │  typed vs prose, validated vs accepted?         │
+  └────────────────────────┬───────────────────────┘
+                           │  trace A→D, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  S1 (A↔B): forced ordering → transient stream  │
+  │  S2 (B↔C): transient prose → durable typed     │
+  │            field (LOAD-BEARING — where CoT     │
+  │            stops being prose-you-read and      │
+  │            becomes data-you-keep)               │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+```
+  A seam — "what survives into the saved record?" answered two ways
+
+  ┌─ Layer B ────────┐    seam     ┌─ Layer C ────────────┐
+  │  Thought stream: │ ═════╪═════► │  hypothesesConsidered│
+  │  transient,      │  (it flips) │  typed array, survives│
+  │  watch the run   │             │  into saved diagnosis │
+  └──────────────────┘             └──────────────────────┘
+         ▲                                   ▲
+         └────── same axis, two answers ─────┘
+                 → this boundary is the difference between
+                   "explainability theater" and "queryable reasoning"
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Chain-of-thought is asking the model to produce intermediate reasoning steps before its final answer. The classic form is free-form ("think step by step"); the modern form — the one blooming insights uses — is *structured CoT*, where the intermediate reasoning is required as typed fields in the output so it can be validated, rendered, and compared. The shift is from "reasoning as prose you read" to "reasoning as data you keep."
@@ -381,3 +434,4 @@ Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagn
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

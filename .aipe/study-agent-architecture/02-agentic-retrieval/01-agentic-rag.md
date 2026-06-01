@@ -42,6 +42,43 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Three layers carry agentic RAG: the **Agent loop** (`runAgentLoop` — the bounded `for` that drives turns), the **Retriever tool surface** (the schemas the model picks from — in classic RAG this is `vector_search` / `rerank` / `fetch_chunk`; in this codebase it's `execute_analytics_eql` / `get_event_segmentation` and the rest of the MCP tool set), and the **Retrieval target** (a vector store + embedder in classic RAG, a live analytics API behind MCP here). The Pipeline coordinator hands work in at the top; tool results come back as observations the loop pushes into the next turn.
+
+**Axis: control.** Who decides which retrieval call to make next — your code (one fixed retrieve-then-generate pipeline) or the model (each call shaped by the prior result)? This is the right axis because the entire definition of "agentic" RAG vs static RAG is *who writes the retrieval chain's length and shape*. Cost is a real concern (each retrieval is a model call + a tool call) but cost is downstream of who's authoring the calls. State (the query history, the retrieved chunks) is an interesting alternate but it's just the trail of what control produced.
+
+**Seams.** Two seams matter, and the second is load-bearing. Seam 1 sits between the Agent loop and the Retriever tool surface — control flips from MODEL (decides "I want to retrieve about X") to CODE (resolves the tool schema, calls the right tool). This is the standard tool-call seam — present in any ReAct loop with tools. Seam 2 sits between the Retriever tool surface and the Retrieval target — and in classic agentic RAG, control stays in CODE on both sides (the tool just queries the vector store, no further decision). In blooming insights' live-API variant, this seam carries extra weight because the retrieval target is a *live* MCP server with rate limits, errors, and project-scoped bootstrapping — the contract is fatter than a vector lookup. The model-driven loop is the same; the target is what's different.
+
+```
+  Structure pass — Agentic RAG
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  Agent loop (runAgentLoop)                     │
+  │  Retriever tool surface (schemas)              │
+  │  Retrieval target (vector store OR live API)   │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  control: who decides the next retrieval call? │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  Seam 1: Agent loop ↔ Retriever tool surface   │
+  │          (MODEL → CODE) tool-call boundary     │
+  │  Seam 2: Retriever surface ↔ Retrieval target  │
+  │          (CODE → CODE in classic; CODE → live  │
+  │          MCP here) ★ load-bearing variant —    │
+  │          target shape changes the contract     │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it (and how the live-tool variant occupies the same architectural slot as a vector store would).
+
+---
+
 ## How it works
 
 **The mental model: a `.then()` chain whose length you don't know, where each link is a query.** Static RAG is `embed(q).then(topK).then(stuff).then(generate)` — four links, fixed. Agentic RAG is a `while` loop where each iteration reads the prior result, decides the next query, and either runs it or stops. The model writes the chain's length and shape at runtime — the same shape this codebase's chains-vs-agents file calls "the model writing the steps."
@@ -398,3 +435,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.

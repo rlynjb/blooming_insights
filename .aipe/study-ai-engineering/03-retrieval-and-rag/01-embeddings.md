@@ -41,6 +41,41 @@
 
 ---
 
+## Structure pass
+
+**Layers.** Four WOULD-BE layers in a retrieval pipeline that doesn't yet exist here: the indexer that runs `embed(term)` once per schema term (offline, build-time), the vector store that holds `{ term → vector }`, the per-query retriever that runs `embed(query)` then cosine-nearest, and the LLM context that gets only the relevant slice. blooming insights has none of these — its closest analog is `String.includes` matching in `parseIntent`.
+
+**Axis: lifecycle.** When does each layer's work happen — build-time (once per schema), per-query (every request), or never? This axis is the right lens for a Case B WOULD-BE file because the whole point of embeddings is *moving expensive work from per-query to build-time*. Cost is downstream; the upstream design move is the temporal split: embed once, scan many times. Control doesn't flip (CODE owns both stages).
+
+**Seams.** The cosmetic seam is between the vector store and the retriever — both are query-time but neither flips lifecycle. The load-bearing WOULD-BE seam is between the indexer (build-time, runs once per term) and the retriever (per-query, runs on every request): lifecycle flips here from "amortized cost paid once" to "small cost paid per request." This is the seam that justifies the whole architecture — if you can't pay the build-time cost or the index goes stale (→ 09-stale-embeddings.md), embeddings stop earning their place. In blooming insights this seam doesn't exist; the schema is hand-truncated and re-handed-in on every request.
+
+```
+  Structure pass — embeddings (WOULD BE)
+
+  ┌─ 1. LAYERS ───────────────────────────────────┐
+  │  indexer (embed(term), build-time)             │
+  │  vector store ({term → vector})                │
+  │  retriever (embed(query) + cosine, per-query)  │
+  │  LLM context (relevant slice)                  │
+  └────────────────────────┬───────────────────────┘
+                           │  pick the axis
+  ┌─ 2. AXIS ─────────────▼────────────────────────┐
+  │  lifecycle: when does each layer's work        │
+  │  happen — build-time or per-query?             │
+  └────────────────────────┬───────────────────────┘
+                           │  trace across layers, find flips
+  ┌─ 3. SEAMS ────────────▼────────────────────────┐
+  │  store↔retriever: cosmetic (both per-query)    │
+  │  indexer↔retriever: LOAD-BEARING (would be)    │
+  │    build-time (once) → per-query (every call)  │
+  │    today: this seam doesn't exist              │
+  └────────────────────────┬───────────────────────┘
+                           ▼
+                   Block 4 — How it works
+```
+
+The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+
 ## How it works
 
 **Mental model.** Think of an embedding as a hash function with one critical difference from the hashes you use for `Map` keys. A normal hash (`JSON.stringify(args)` as in `McpClient`'s `cacheKey`) is designed so that *similar* inputs produce *wildly different* outputs — that is what makes it a good hash. An embedding is the opposite: it is designed so that *similar meanings* produce *similar outputs*. Two near-synonyms hash to nearby points; two unrelated words hash to distant points. The "distance" is then a real number you can sort on.
@@ -290,3 +325,4 @@ Does blooming insights compute any vector similarity, and what does the only ter
 → 02-embedding-model-choice.md · → 05-dense-vs-sparse.md · → 11-rag.md · → ../04-agents-and-tool-use/04-tool-routing.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
+Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
