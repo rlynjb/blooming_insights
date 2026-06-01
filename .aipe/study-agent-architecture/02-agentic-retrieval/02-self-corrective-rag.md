@@ -100,7 +100,7 @@ The mental model
                   (the gap is checked)
 ```
 
-The strategy in plain English: **don't generate from unvalidated context.** Retrieval is a step that can fail silently, and the failure isn't "no chunks" — it's "wrong chunks that look right." A grader scores relevance and groundedness; a fallback path handles failure. Without the grader, the model generates from whatever the retriever happened to return, and the user has no way to tell.
+The strategy in plain English: **don't generate from unvalidated context.** Retrieval is a step that can fail silently, and the failure isn't "no chunks" — it's "wrong chunks that look right." A grader scores relevance and groundedness; a fallback path handles failure. Without the grader, the model generates from whatever the retriever happened to return, and the user has no way to tell. blooming insights doesn't run a relevance grader on the retrieval path; the closest cousins are *adjacent* checks at different layers — a pre-retrieval *premise* gate in the monitoring prompt (validates the window has data), and a post-reasoning *groundedness* check via the diagnostic agent's hypothesis-falsification structure. Neither sits at the relevance seam this pattern names.
 
 ### The grader's two jobs — relevance and groundedness
 
@@ -485,3 +485,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase position — no relevance grader, only adjacent premise + groundedness-on-reasoning checks at different layers — alongside the strategy line, instead of waiting until Move 2.4).

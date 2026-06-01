@@ -94,7 +94,7 @@ The tree — branch factor B, depth D
           plus B^D scorer calls.
 ```
 
-The strategy in plain English: **don't commit to a path until you've seen what alternatives look like.** ReAct commits one step at a time and reacts to observations. ToT explores N partial futures and commits to the most promising one. The win is when a wrong early commitment leads to an unrecoverable bad answer; the cost is the multiplication of every per-step cost by the branching factor.
+The strategy in plain English: **don't commit to a path until you've seen what alternatives look like.** ReAct commits one step at a time and reacts to observations. ToT explores N partial futures and commits to the most promising one. The win is when a wrong early commitment leads to an unrecoverable bad answer; the cost is the multiplication of every per-step cost by the branching factor. blooming insights doesn't use ToT for two reinforcing reasons: the diagnostic answer surface is *smooth* (most reasonable early queries converge to similar diagnoses) so branching doesn't buy quality, and the ~1 req/s MCP rate limit + 300s route ceiling can't absorb the b^d cost multiplier — even the minimal b=2, d=2 shape doubles the wall-clock for a non-win.
 
 ### Move 2.1 — Branch generation
 
@@ -437,3 +437,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the two reinforcing reasons blooming insights doesn't use ToT — smooth answer surface + rate-limit-kills-multiplier — alongside the strategy line, instead of waiting until Move 2.4's budget arithmetic).

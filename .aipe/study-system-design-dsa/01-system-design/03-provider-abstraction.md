@@ -118,7 +118,7 @@ A caller asks for behaviour through an interface it owns. The real implementatio
  Vendor SDK / network
 ```
 
-The interface sits between the caller and the vendor. Tests plug in the right branch; production plugs in the left.
+The interface sits between the caller and the vendor. Tests plug in the right branch; production plugs in the left. The load-bearing piece below is *the fake* — the SDK adapter is the obvious half, but it's the plain-object fake (5 lines, no framework) that's the actual value: it's why 125 tests run with no API key and no MCP server.
 
 ### The transport interface
 
@@ -525,3 +525,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.

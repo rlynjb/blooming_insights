@@ -82,7 +82,7 @@ The skeleton is mapped — the rest of this file walks the mechanics that hang o
 
 ## How it works
 
-**Mental model.** Tokenization is the model's `.split()`. Before the transformer sees your text, a tokenizer chops it into subword units drawn from a fixed vocabulary (~100k entries for modern models). "tokenization" might become `token` + `ization`; a rare word splits into more pieces; common words are single tokens. The model's context window, its `max_tokens` cap, and its bill are all counted in these pieces — not in your characters and not in your words.
+**Mental model.** Tokenization is the model's `.split()`, and this codebase never runs it — it bounds work in characters and treats ~4 chars/token as the proxy. Before the transformer sees your text, a tokenizer chops it into subword units drawn from a fixed vocabulary (~100k entries for modern models). "tokenization" might become `token` + `ization`; a rare word splits into more pieces; common words are single tokens. The model's context window, its `max_tokens` cap, and its bill are all counted in these pieces — not in your characters and not in your words. The one real-unit control in the system is `max_tokens` on the output side; everything on the input side is a character budget pretending to be a token budget.
 
 ```
 "conversion_rate dropped 18%"
@@ -374,3 +374,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (Mental model now opens with the "no tokenizer, char-proxy + max_tokens" verdict before unpacking what tokenization is).

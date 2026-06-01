@@ -116,6 +116,8 @@ A string variable `buf` accumulates decoded text across iterations. On each chun
 
 The invariant: after every iteration, `buf` holds at most one incomplete JSON object. That object will be completed — or the stream ends and you flush it.
 
+The four sub-sections below are not equal weight. **The load-bearing one is `split + lines.pop()`** — that single `pop()` is what holds the invariant. The `{stream: true}` decode flag and the reverse-scan reconciliation are correctness hardening; drop them and you get rare corrupt characters or mis-paired tool calls, but the framing itself still works. Drop the `pop()` and every chunk-boundary split corrupts two parses.
+
 ### decode with `{stream: true}`
 
 `TextDecoder.decode(value, { stream: true })` tells the decoder that more bytes are coming. Without that flag, the decoder finalises its internal state on each call and may replace a trailing multi-byte UTF-8 sequence (e.g., a 3-byte emoji split across chunk boundaries) with the Unicode replacement character `U+FFFD`. With `{ stream: true }`, the decoder holds the incomplete byte sequence internally and emits it correctly when the remaining bytes arrive in the next chunk. For ASCII-only JSON this is invisible; for any non-ASCII content in strings (user-facing text, tool results, diagnosis copy) it is load-bearing.
@@ -529,3 +531,4 @@ Updated: 2026-05-28 — repointed the reader-loop + reverse-scan reconciliation 
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.

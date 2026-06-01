@@ -123,7 +123,7 @@ Every tool call passes through the same four-stage funnel before a result reache
                    result returned
 ```
 
-Every call passes through this funnel. A cache hit exits at stage 1; an error result exits before stage 5 without writing the cache.
+Every call passes through this funnel. A cache hit exits at stage 1; an error result exits before stage 5 without writing the cache. **The load-bearing stage is the last one — no-cache-on-error.** The cache and the retry loop only compose safely because of that single rule; remove it and a 429 poisons the cache for the full TTL.
 
 ### Cache-aside with TTL
 
@@ -498,3 +498,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.

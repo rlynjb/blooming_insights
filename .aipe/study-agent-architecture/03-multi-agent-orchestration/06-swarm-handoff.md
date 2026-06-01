@@ -106,7 +106,7 @@ Handoff in one picture
    no central supervisor; the MODEL in each agent decides
 ```
 
-The strategy in plain English: **let the model running this turn decide who should run next, including itself.** The peer that has the conversation right now has the most context to decide who should handle the next turn — including the option to keep going.
+The strategy in plain English: **let the model running this turn decide who should run next, including itself.** The peer that has the conversation right now has the most context to decide who should handle the next turn — including the option to keep going. blooming insights does the opposite by design: control is centralized in the route, no agent has a `transfer_to_*` tool, and the closest existing primitive is the sequential pipeline's function-call transition (`route` invokes `recAgent.propose(...)` after diagnostic returns — code-decided, not model-decided).
 
 ### Layer 1 — the handoff as a tool call
 
@@ -541,3 +541,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (added the codebase-position contrast — centralized in the route, no transfer_to_* tool, sequential pipeline's function-call transition as closest cousin — alongside the strategy line, instead of waiting until Phase A vs B).

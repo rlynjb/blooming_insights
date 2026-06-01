@@ -79,7 +79,7 @@ The skeleton is mapped — the rest of this file walks both flavors and why the 
 
 ## How it works
 
-**The mental model: a parent component that delegates to children and assembles their returns.** What changes between flavors is who's doing the delegation reasoning — code or a model — and that single choice changes the cost ledger, the debug surface, and the failure modes.
+**The mental model: every multi-agent system has a supervisor — the only variant is whether code or a model plays the role.** blooming insights' supervisor is the route file's `if`-ladder; the LLM-supervisor variant would replace that ladder with an agent that reasons about each next worker. The shape (decompose → delegate → synthesize) is identical either way. What changes between flavors is who's doing the delegation reasoning — code or a model — and that single choice changes the cost ledger, the debug surface, and the failure modes.
 
 ```
 The supervisor's job in one diagram
@@ -523,3 +523,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 1 (lead with "every multi-agent system has a supervisor; only variant is who plays it" before the cost/debug breakdown).

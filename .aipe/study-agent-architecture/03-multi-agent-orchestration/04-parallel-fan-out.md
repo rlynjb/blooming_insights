@@ -108,7 +108,7 @@ Parallel fan-out in one picture
           final answer
 ```
 
-The strategy in plain English: **start all the work you can, wait for the slowest, then combine.** The win is latency; the constraint is that the work has to be genuinely independent — and that the upstream provider can absorb N concurrent calls without rate-limiting you back to sequential.
+The strategy in plain English: **start all the work you can, wait for the slowest, then combine.** The win is latency; the constraint is that the work has to be genuinely independent — and that the upstream provider can absorb N concurrent calls without rate-limiting you back to sequential. blooming insights fails both gates today: the typed `Diagnosis` makes recommendation strictly dependent on diagnostic, and the ~1 req/s MCP spacer collapses any fan-out's wall-clock win back toward sequential at the MCP layer. The closest existing primitive is the sequential pipeline (`monitoring → diagnostic → recommendation`) and the per-agent serial spacing — fan-out is the contrast.
 
 ### Layer 1 — the split (decomposition)
 
@@ -538,3 +538,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the two specific gates blooming insights fails — typed Diagnosis dependency + ~1 req/s MCP spacer — alongside the generic strategy line, instead of waiting until Phase A vs B).

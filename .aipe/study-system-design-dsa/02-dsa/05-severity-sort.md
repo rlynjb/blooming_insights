@@ -90,7 +90,7 @@ The skeleton is mapped — the rest of this file walks the mechanics that hang o
 
 ## How it works
 
-**Mental model.** A comparator is a function that returns a number. If the number is negative, `a` sorts before `b`. If positive, `b` sorts before `a`. If zero, their order is unchanged (JS sort is stable). The rank table is the bridge: it maps each string severity to an integer so the comparator has numbers to subtract.
+**Mental model.** The rank table is the bridge — it maps each string severity to an integer so `Array.prototype.sort`'s comparator has numbers to subtract. Without that bridge a comparator on a string enum has nothing to return: the comparator contract demands a number whose sign decides order (negative → `a` first, positive → `b` first, zero → stable), and `Severity` has no native numeric order to feed it. `SEV_RANK` is the injection from the string enum into the integers; the comparator is then a one-line subtraction over those integers.
 
 The following diagram shows the string-to-number bridge:
 
@@ -460,3 +460,4 @@ Updated: 2026-05-29 — sort + slice moved L102 → L119; `SEV_RANK` now L51 (wa
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 1 (re-ordered to lead with the rank-table-as-bridge instead of the comparator primer).

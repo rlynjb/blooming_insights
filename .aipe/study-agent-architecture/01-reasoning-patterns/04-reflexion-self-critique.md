@@ -102,7 +102,7 @@ The loop — generator + critic + cap
                            └─────────────────────┘
 ```
 
-The strategy in plain English: **run the same task twice, but the second time the producer reads the first time's critique.** ReAct produces; the critic judges; the producer revises. The cost is one extra model call per round (or two — one generator, one critic). The win is a recovery pass when the first answer was salvageable.
+The strategy in plain English: **run the same task twice, but the second time the producer reads the first time's critique.** ReAct produces; the critic judges; the producer revises. The cost is one extra model call per round (or two — one generator, one critic). The win is a recovery pass when the first answer was salvageable. blooming insights does NOT do this; the closest cousin in the codebase is *forced synthesis recovery* in diagnostic/recommendation, which re-runs the same model with the same evidence and a "commit now" prompt — same shape on the surface, but no second perspective, no judgment of the prior draft.
 
 ### Move 2.1 — The critic step
 
@@ -442,3 +442,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase-position contrast — forced synthesis is the closest cousin, same shape but no second perspective — alongside the strategy line, instead of waiting until Move 2.3).

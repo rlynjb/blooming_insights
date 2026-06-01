@@ -135,7 +135,7 @@ text input
 └───────────────────────────┘
 ```
 
-The ladder is short-circuit: the moment any step succeeds, the later steps never run.
+The ladder is short-circuit: the moment any step succeeds, the later steps never run. The load-bearing piece of this whole flow is the type guard at the end — not any single ladder step. The ladder gives you *something* parseable from realistic model output; the guard is what makes that something safe to ship into typed code. Drop a ladder step and you get more fallback hits; drop the guard and malformed values leak into the route and UI.
 
 ### The fenced-block regex
 
@@ -590,3 +590,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.

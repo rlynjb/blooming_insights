@@ -78,7 +78,7 @@ The skeleton is mapped — the rest of this file walks the mechanics that hang o
 
 ## How it works
 
-**Mental model.** Think of an embedding as a hash function with one critical difference from the hashes you use for `Map` keys. A normal hash (`JSON.stringify(args)` as in `McpClient`'s `cacheKey`) is designed so that *similar* inputs produce *wildly different* outputs — that is what makes it a good hash. An embedding is the opposite: it is designed so that *similar meanings* produce *similar outputs*. Two near-synonyms hash to nearby points; two unrelated words hash to distant points. The "distance" is then a real number you can sort on.
+**Mental model.** Think of an embedding as a hash function with one critical difference from the hashes you use for `Map` keys — and blooming insights uses *none* of this; the codebase substitutes a truncated `schemaSummary` plus the model's own fuzzy matching for what embeddings would do. A normal hash (`JSON.stringify(args)` as in `McpClient`'s `cacheKey`) is designed so that *similar* inputs produce *wildly different* outputs — that is what makes it a good hash. An embedding is the opposite: it is designed so that *similar meanings* produce *similar outputs*. Two near-synonyms hash to nearby points; two unrelated words hash to distant points. The "distance" is then a real number you can sort on.
 
 ```
   hash (for Map keys)              embedding (for similarity)
@@ -326,3 +326,4 @@ Does blooming insights compute any vector similarity, and what does the only ter
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (Mental model now names the blooming insights contrast — uses none of this; truncated schemaSummary + model's own fuzzy matching — before unpacking the hash analogy).

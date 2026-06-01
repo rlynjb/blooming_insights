@@ -98,7 +98,7 @@ The window as a curated slice
                                       what the model sees
 ```
 
-The strategy in plain English: **decide the slice before you decide the prompt.** Prompt engineering tunes the words; context engineering tunes what's there to tune words about. blooming insights does this in three places that compound: it bounds the schema *before* it enters the system prompt, it injects the runnable-category list *into* the prompt by string replacement, and it caps the size of every tool result *before* it goes back to the loop. Each step is small; together they keep a 200K window from filling with noise across a 6-call investigation.
+The strategy in plain English: **decide the slice before you decide the prompt.** Prompt engineering tunes the words; context engineering tunes what's there to tune words about. blooming insights does this in three places that compound: it bounds the schema *before* it enters the system prompt, it injects the runnable-category list *into* the prompt by string replacement, and it caps the size of every tool result *before* it goes back to the loop. Each step is small; together they keep a 200K window from filling with noise across a 6-call investigation. The most load-bearing of the four moves below is the *bound-vs-pass-through* choice at Move 1 — schema compression from 112KB to ~2KB is what keeps the hard rules out of the lost-in-the-middle zone, and everything else (replacement injection, tool-result truncation, per-agent routing) is hardening on top of that decision.
 
 ### Move 1 — Bound the inputs before they enter the prompt
 
@@ -446,3 +446,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (ranked the four moves: bound-vs-pass-through at Move 1 is the load-bearing decision, the other three are hardening on top of that).

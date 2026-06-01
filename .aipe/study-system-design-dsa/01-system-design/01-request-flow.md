@@ -121,6 +121,8 @@ The route handler is the controller. The schema bootstrap and MCP connect call a
 
 ### Move 2 — Layered walkthrough
 
+The seven hops are not equal. **Hop 6 (the agent run) is the load-bearing one** — it owns the procedural-to-agentic flip and most of the 5-minute budget. **Hop 5.5 (the coverage gate) is the surprising one** — most pipelines run the agent first and check coverage after; this one classifies categories *before* the agent starts so it never wastes EQL budget on probes the schema can't support.
+
 **Hop 1 — The page fetch**
 
 An effect keyed on the resolved demo/live mode fires once persisted state has been read — the same pattern as any data-fetching component. The runtime demo/live toggle picks the URL: demo mode appends a query flag, live mode uses no suffix. State starts at `loading`. The concrete consequence: the browser holds an open HTTP connection until the route resolves — up to the function's hard ceiling (5 minutes on the platform tier this app targets).
@@ -629,3 +631,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.

@@ -96,7 +96,7 @@ The split — one plan call, N execute calls
            └──────────────────────────┘    (no re-planning)
 ```
 
-The strategy in plain English: **decide once, execute many.** ReAct decides on every turn (which is why it scales token cost with depth). Plan-and-execute concentrates the decision-making in one call, then runs a much cheaper executor through the steps. The tradeoff is whether the plan survives contact with the data.
+The strategy in plain English: **decide once, execute many.** ReAct decides on every turn (which is why it scales token cost with depth). Plan-and-execute concentrates the decision-making in one call, then runs a much cheaper executor through the steps. The tradeoff is whether the plan survives contact with the data. blooming insights doesn't run a plan phase anywhere; the closest cousin is the *static "Suggested query plan" section* in the monitoring system prompt — a plan written by the engineer, baked into the prompt, the same for every run — which is plan-in-prompt, not plan-and-execute proper.
 
 ### Move 2.1 — The plan phase
 
@@ -449,3 +449,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase position — no runtime plan phase; closest cousin is the static "Suggested query plan" section in monitoring's prompt — alongside the strategy line, instead of waiting until Move 2.4).
