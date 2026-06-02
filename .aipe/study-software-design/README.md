@@ -2,7 +2,7 @@
 
 > Ousterhout's *A Philosophy of Software Design* (2nd ed.) is the source of every primitive named in this guide — deep modules, information hiding, complexity, layering, readability, pull-complexity-downward, errors-as-special-cases. Read the book for the framework; this guide is the audit. The companion `read-aposd/` guide (when present) teaches the primitives in their own right.
 
-This guide applies APOSD to **this repo**. Every claim cites a real file path and, where it sharpens the point, a line range. Every concept opens with a verdict, names the one finding that matters most, then ranks the rest. Where blooming insights honors the primitive, that's praise — and it's a finding. Where it violates it, that's debt — and it's named plainly, with the move.
+This guide applies APOSD to **this repo**. Every claim cites a real file path and, where it sharpens the point, a line range. Every finding opens with a verdict, names the one move that matters most, then ranks the rest. Where blooming insights honors the primitive, that's praise — and it's a finding. Where it violates it, that's debt — and it's named plainly, with the move.
 
 ## The through-line
 
@@ -28,32 +28,34 @@ The audit, ranked
 
 ## How to read this guide
 
-The eight concept files run in dependency order — each one assumes the one before it. Read 01 for the diagnostic frame (where complexity actually lives), then 02 (which modules earn their depth and which don't), then 03–07 walk the four supporting primitives, and 08 collapses everything into a ranked checklist with file refs.
+Two passes:
+
+1. **`audit.md`** — the one-pass survey. Walks the eight APOSD lenses against the codebase: complexity hotspots, deep vs shallow modules, hides and leaks, layers and pass-throughs, configuration ownership, error strategies, readability, and the red-flags capstone. Lenses with nothing get one line; lenses with significant findings cross-link to the deep walks below.
+
+2. **`01-` through `04-`** — the discovered pattern files. Each one is a deep walk on a single design move the repo actually exercises. Read in order; later files build on earlier ones.
 
 ## Files
 
 ```
 .aipe/study-software-design/
-  README.md                          (you are here)
-  01-complexity-in-this-codebase.md  the diagnostic — three symptoms, three hotspots
-  02-deep-vs-shallow-modules.md      inventory by depth — best & worst, with the move
-  03-information-hiding-and-leakage.md  facts known in two modules that should sit in one
-  04-layers-and-abstractions.md      pass-throughs and layers that don't earn their place
-  05-pull-complexity-downward.md     knobs pushed up that the module could own itself
-  06-errors-and-special-cases.md     try/except sprawl and the special cases you could define out
-  07-readability.md                  names · comments · consistency · obviousness — four-facet audit
-  08-red-flags-audit.md              the capstone checklist, sorted by severity for THIS repo
+  README.md                                 (you are here)
+  00-overview.md                            one-page orientation
+  audit.md                                  PASS 1 — the 8-lens audit, ranked
+  01-mcp-client-deep-module.md              the canonical deep module (172 LOC, 3 methods)
+  02-shallow-module-page-component.md       the canonical shallow module (817 LOC, 8 concerns)
+  03-insight-anomaly-silent-leak.md         the worst information leak (3 files, silent drop)
+  04-synthesize-recovery-duplication.md     the duplicated special case (~90 LOC to delete)
 ```
 
 ## The top three fixes, ranked
 
-The capstone (08) carries the full list; these are the calls.
+The audit (`audit.md → Top 3 ranked findings`) carries the full list; these are the calls.
 
-1. **Split `app/page.tsx` (817 LOC).** It's the worst shallow-module-in-a-file in the repo: rendering, NDJSON streaming, reconnect policy, demo capture, mode toggling, and feed status all live in one client component. Lift each into its own hook (`useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`) and shrink the file to layout + composition. This single move retires the biggest cognitive-load hotspot.
+1. **Split `app/page.tsx` (817 LOC).** It's the worst shallow-module-in-a-file in the repo: rendering, NDJSON streaming, reconnect policy, demo capture, mode toggling, and feed status all live in one client component. Lift each into its own hook (`useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`) and shrink the file to layout + composition. This single move retires the biggest cognitive-load hotspot. See `02-shallow-module-page-component.md`.
 
-2. **Promote `insightToAnomaly` to a single source.** The same mapping ships in `app/api/agent/route.ts` (L29–L31), and the inverse `anomalyToInsight` lives in `lib/state/insights.ts` (L8–L28). Each one is small, but they encode the same knowledge of "what fields cross between an Anomaly and an Insight" — change one and the other drifts. Move them next to each other in `lib/state/insights.ts` and import.
+2. **Promote `insightToAnomaly` to a single source.** The same mapping ships in `app/api/agent/route.ts:29-31`, and the inverse `anomalyToInsight` lives in `lib/state/insights.ts:8-28`. Each one is small, but they encode the same knowledge of "what fields cross between an Anomaly and an Insight" — change one and the other drifts. Move them next to each other in `lib/state/insights.ts` and import. See `03-insight-anomaly-silent-leak.md`.
 
-3. **Define out the "agent won't emit JSON" special case.** `diagnostic.ts` and `recommendation.ts` both ship a `synthesize` method that re-runs the model tool-less to force a structured answer (L86–L126 / L82–L132). Two copies of the same recovery path is the smell; the fix is to lift it into `runAgentLoop` as a `forceFinal` retry mode and delete both. The shared loop already knows when to drop tools (`forceFinal`, base.ts L91); finish the job.
+3. **Define out the "agent won't emit JSON" special case.** `diagnostic.ts` and `recommendation.ts` both ship a `synthesize` method that re-runs the model tool-less to force a structured answer (`lib/agents/diagnostic.ts:86-126` / `lib/agents/recommendation.ts:82-132`). Two copies of the same recovery path is the smell; the fix is to lift it into `runAgentLoop` as a `parseResult` + `recoveryPrompt` pair and delete both. See `04-synthesize-recovery-duplication.md`.
 
 ## What blooming insights does well, what shows up as debt
 

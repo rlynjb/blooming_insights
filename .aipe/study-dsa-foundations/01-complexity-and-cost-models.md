@@ -369,7 +369,7 @@ if (elapsed < this.minIntervalMs) {
 
 This sleep is the cost being paid to *enforce* an amortized throughput bound of 1 call per `minIntervalMs`. Per-call worst case: 1100 ms wait. Amortized throughput over a long sequence: 0.9 req/sec. The design defends itself only when you read it amortized — per-call, it looks like wasted time.
 
-### **`.aipe/study-software-design/01-complexity-in-this-codebase.md`** — design complexity (a different sense of the word)
+### **`.aipe/study-software-design/audit.md#complexity-in-this-codebase`** — design complexity (a different sense of the word)
 
 That file uses "complexity" in the *A Philosophy of Software Design* sense — interface complexity, conceptual load on the reader. This file uses "complexity" in the *algorithmic* sense — operations per N. Same word, different lens; both apply to this codebase, and they don't always agree. A simple algorithm (linear scan) can have ugly cost (O(N²)); a complex algorithm (Timsort) can have great cost (O(N log N)). Don't conflate them.
 
@@ -507,4 +507,4 @@ A teammate says: "Move the TTL cache to Redis so it's shared across processes." 
 
 ## See also
 
-→ `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/01-complexity-in-this-codebase.md` (the design-complexity lens, different sense of the word)
+→ `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/audit.md#complexity-in-this-codebase` (the design-complexity lens, different sense of the word)

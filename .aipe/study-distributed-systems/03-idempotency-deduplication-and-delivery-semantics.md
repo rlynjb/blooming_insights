@@ -391,5 +391,5 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 - `02-partial-failure-timeouts-and-retries.md` — why the cache MUST skip error results: retries depend on it
 - `04-consistency-models-and-staleness.md` — the 60s TTL is also a staleness window
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the user-driven step 2 → step 3 flow has dedup of its own
-- `.aipe/study-system-design/04-caching-and-invalidation.md` — the architectural take on caching
+- `.aipe/study-system-design/audit.md#caching-and-invalidation` — the architectural take on caching
 - `.aipe/study-testing/` — the cache + retry tests live in `test/mcp/client.test.ts`

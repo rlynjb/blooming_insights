@@ -438,4 +438,4 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
 - `02-normalization-and-duplication.md` — re-frames the Insight↔Anomaly leak as a normalization smell, with the fix.
 - `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam, and what the in-memory `Map`s do NOT enforce.
 - `05-migrations-and-evolution.md` — how the schema evolves under git, with the spec-vs-code drift on `Recommendation` as the exemplar.
-- `study-software-design/03-information-hiding-and-leakage.md` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.

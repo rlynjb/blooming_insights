@@ -129,7 +129,7 @@ These guides already cover adjacent territory; this guide intentionally doesn't 
 ```
 this guide                          adjacent (don't duplicate)
 ──────────────────────────────────  ─────────────────────────────────────────
-01 complexity-and-cost-models   →   .aipe/study-software-design/01-complexity-in-this-codebase.md
+01 complexity-and-cost-models   →   .aipe/study-software-design/audit.md#complexity-in-this-codebase
                                     (different lens: design complexity vs algo cost)
 02 arrays-strings-and-hash-maps →   .aipe/study-system-design-dsa/02-dsa/01-ttl-cache.md
                                     (the Map-backed cache as a full case study)

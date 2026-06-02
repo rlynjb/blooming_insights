@@ -413,7 +413,7 @@ Where the audit lands: this codebase's data-modeling work is *small but mostly c
 ## Interview defense
 
 **Q: Where's the worst data-modeling problem in this repo?**
-A: The Insight↔Anomaly field-copy list, encoded in three places: the `Anomaly` interface in `lib/mcp/types.ts` (truth source), `anomalyToInsight` in `lib/state/insights.ts` L8–L28 (copies 8 fields), and `insightToAnomaly` in `app/api/agent/route.ts` L29–L31 (copies 4, drops 4). The round-trip is silently lossy and TypeScript can't catch it because the dropped fields are optional. It's the same finding the software-design audit names (`study-software-design/03-information-hiding-and-leakage.md`), seen through the data-modeling lens instead of the information-hiding lens. The fix is mechanical (colocate the conversions with a shared field-copy helper + a round-trip test) or strategic (fix the wire format so no conversion is needed, which also retires two other smells).
+A: The Insight↔Anomaly field-copy list, encoded in three places: the `Anomaly` interface in `lib/mcp/types.ts` (truth source), `anomalyToInsight` in `lib/state/insights.ts` L8–L28 (copies 8 fields), and `insightToAnomaly` in `app/api/agent/route.ts` L29–L31 (copies 4, drops 4). The round-trip is silently lossy and TypeScript can't catch it because the dropped fields are optional. It's the same finding the software-design audit names (`study-software-design/audit.md#information-hiding-and-leakage`), seen through the data-modeling lens instead of the information-hiding lens. The fix is mechanical (colocate the conversions with a shared field-copy helper + a round-trip test) or strategic (fix the wire format so no conversion is needed, which also retires two other smells).
 
 **Q: How do you rank what's debt vs what's deferred?**
 A: Two scores: severity (impact if left in place) and concreteness (clarity of the fix). High-severity-and-concrete = today. High-and-vague = investigate. Low-and-concrete = while you're in there. "Not yet exercised" = honest gap, not debt — the topic genuinely doesn't apply yet. For this repo, the top-3 are all high-and-concrete: the leak, the dual-shape Diagnosis, the missing cross-Map invariant. The four "not yet exercised" items (no DB constraints, no migrations, no query layer, no transactions) are substrate gaps — they activate when the storage choice graduates, not before.
@@ -453,5 +453,5 @@ A: Two scores: severity (impact if left in place) and concreteness (clarity of t
 - `04-transactions-and-integrity.md` — findings #3, #8, #11.
 - `05-migrations-and-evolution.md` — findings #7, #9.
 - `06-access-patterns-and-storage-choice.md` — the storage migration that retires #3, #8, #11, and reduces #1 to a triviality.
-- `study-software-design/03-information-hiding-and-leakage.md` — the same #1 finding, framed as an information leak.
-- `study-software-design/08-red-flags-audit.md` — the design-side capstone; this guide's capstone is the data-side complement.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the same #1 finding, framed as an information leak.
+- `study-software-design/audit.md#red-flags-audit` — the design-side capstone; this guide's capstone is the data-side complement.

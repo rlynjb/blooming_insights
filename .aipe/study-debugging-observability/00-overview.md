@@ -1,6 +1,18 @@
 # Study — Debugging & Observability (blooming insights)
 
-> The trace IS the product. blooming insights renders an NDJSON event stream of the agent's reasoning + tool calls as the user-facing surface, snapshots the same events for replay, and times every MCP call with `durationMs`. That is unusually strong substrate for an early-stage codebase. What's missing is everything backend-grade: no structured logger, no metrics pipeline, no Sentry/OTel/Langfuse, no on-call rotation, no SLOs. Honest about both halves.
+> The trace IS the product. blooming insights renders a typed NDJSON `AgentEvent` stream as the user-facing surface, snapshots the same events for replay, and times every MCP call with `durationMs`. That's an unusually strong substrate for an early-stage codebase. What's missing is everything backend-grade: no structured logger, no metrics pipeline, no Sentry/OTel/Langfuse, no on-call rotation, no SLOs. Honest about both halves.
+
+---
+
+## How this guide is structured
+
+This is an **audit-style** guide, in two passes.
+
+**Pass 1 — `audit.md`.** One file walks the 8-lens inventory (observability-map, reproduction-and-evidence, structured-logs-and-correlation, metrics-slis-slos-and-alerts, traces-and-request-lifecycles, state-snapshots-and-debugging-boundaries, incident-analysis-and-prevention, debugging-observability-red-flags-audit). Each lens gets one `##` section: what the codebase actually does, with `file:line` grounding, or `not yet exercised` honestly. Lenses with significant findings cross-link into pattern files.
+
+**Pass 2 — the discovered-pattern files (`01-` through `05-`).** Five patterns earned their own files because they pass the three tests in `me.md`: they have a name, they're load-bearing (something specific breaks if you remove them), and a senior engineer skimming the file list recognizes each as a real architectural pattern.
+
+The file list itself is a learning artifact — read it once and you know what's interesting about how this repo handles observability.
 
 ---
 
@@ -36,51 +48,55 @@
   alerts / SLOs            │   not yet exercised
 ```
 
-This guide reads the codebase through that single axis: **at every layer, what evidence exists, and what doesn't?** Each concept file walks one slice.
+This guide reads the codebase through that single axis: **at every layer, what evidence exists, and what doesn't?** `audit.md` walks all 8 lenses; the pattern files take the load-bearing patterns deep.
+
+---
 
 ## The verdict, ranked
 
 The ranking spotlights what's load-bearing in this repo, not a generic checklist.
 
-1. **The NDJSON event union is the load-bearing primitive.** `lib/mcp/events.ts:4–12` defines `AgentEvent` as a discriminated union; `encodeEvent` is one JSON.stringify + '\n'. That eight-line file is the contract every observability surface in the app speaks. If you rebuild this codebase from scratch, this file is what you write first.
+1. **The NDJSON event union is the load-bearing primitive.** `lib/mcp/events.ts:4–12` defines `AgentEvent` as a discriminated union; `encodeEvent` is one JSON.stringify + '\n'. That eight-line file is the contract every observability surface in the app speaks. If you rebuild this codebase from scratch, this file is what you write first. → `01-ndjson-agentevent-discriminated-union.md`
 
-2. **`saveInvestigation(id, events[])` makes the trace replayable.** `lib/state/investigations.ts:30–41` snapshots the captured `AgentEvent[]` to mem→file. `getCachedInvestigation` reads back through mem→dev-file→committed demo seed. The investigation route replays the cached stream with an artificial 180ms tick so the UI animates identically to a live run (`app/api/agent/route.ts:127–141`). State snapshots that double as time-travel debugging — strong for an early-stage repo.
+2. **The cache-first replay path makes the trace re-creatable.** `app/api/agent/route.ts:127–141` short-circuits the live run when a cached `AgentEvent[]` exists, re-emitting it at 180ms ticks so the UI can't tell live from replay. No creds required for seeded runs. → `02-replay-from-snapshot-with-paced-emission.md`
 
-3. **`durationMs` is the only metric primitive — and it's per-call, never aggregated.** `lib/mcp/client.ts:112,134` measures wall-clock around each MCP `liveCall`; `tool_call_end` carries it forward through the trace. It's enough to show "this tool took 340ms" in the UI. It is NOT enough to answer "what's p95 over the last hour" — there's no histogram, no time-series store, no rollup. Cited honestly in `04-metrics-slis-slos-and-alerts.md` as `not yet exercised` past the per-call number.
+3. **`saveInvestigation(id, events[])` lifts the trace into a 3-rung store.** `lib/state/investigations.ts:7–41` writes the captured `AgentEvent[]` to mem (per-process), the dev file (`.investigation-cache.json`, dev only), and the committed seed (`lib/state/demo-investigations.json`, crosses deploys). Each rung serves a different scope. → `03-three-rung-mem-file-seed-store.md`
 
-4. **Logs are unstructured and rare.** Four `console.error` calls in the entire repo — all in the two route handler catch blocks (`app/api/agent/route.ts:160,256`; `app/api/briefing/route.ts:166,248`). No logger, no levels, no correlation ID, no redaction. The correlation primitive that *does* exist is the trace itself — every event in a stream belongs to one investigation, no IDs needed.
+4. **The dual-write `send(e)` closure is what makes the same trace serve live AND replay.** `app/api/agent/route.ts:172–175` pushes to `collected[]` and enqueues NDJSON bytes on every call — one closure, two destinations. Drop the push and replay dies; drop the enqueue and the live UI dies. → `04-dual-write-send-to-stream-and-store.md`
 
-5. **The flake-fix in `e83a8e0` is the canonical incident-post-mortem story.** `process.env.AUTH_SECRET` was mutated directly inside one test file; vitest's parallel workers leaked the var across files, so the crypto round-trip test passed in isolation and flaked ~1-in-N in a full run. The fix is `vi.stubEnv` + `vi.unstubAllEnvs` in `beforeEach`/`afterEach` (`test/mcp/auth.test.ts:117–122`). One-file diff, named root cause, regression-guarded by the test discipline itself. The repo's only "incident" with a documented post-mortem — used as the worked example in `07-incident-analysis-and-prevention.md`.
+5. **The `e83a8e0` flake-fix is the canonical incident post-mortem.** `process.env.AUTH_SECRET` was mutated directly inside one test file; vitest's parallel workers leaked the var across files. Fix is `vi.stubEnv` + `vi.unstubAllEnvs` in `beforeEach`/`afterEach`. The post-mortem shape generalises to any future incident. → `05-auth-secret-flake-postmortem.md`
 
-6. **Two backend-grade gaps are honest and named.** No incident tooling (no Sentry, no on-call rotation, no runbooks, no SLO definitions). No backend trace sink (no OpenTelemetry/Langfuse export, even though `@opentelemetry/api` is transitively in `node_modules` via Next.js). `08-debugging-observability-red-flags-audit.md` ranks them by consequence.
+6. **`durationMs` is the only metric primitive — and it's per-call, never aggregated.** `lib/mcp/client.ts:112,134` measures wall-clock around each MCP `liveCall`; `tool_call_end` carries it forward through the trace. It's enough to show "this tool took 340ms" in the UI. It is NOT enough to answer "what's p95 over the last hour" — there's no histogram, no time-series store, no rollup. Cited honestly in `audit.md` (metrics-slis-slos-and-alerts) as `not yet exercised` past the per-call number.
 
-## Per-section verdict
+7. **Logs are unstructured and rare.** Four `console.error` calls in the entire repo — all in the two route handler catch blocks. No logger, no levels, no correlation ID, no redaction. The correlation primitive that *does* exist is the trace itself — every event in a stream belongs to one investigation, no IDs needed. Top-3 finding in `audit.md`.
 
-| section                                          | verdict       | what carries it / what's missing                                                                                                                              |
-|--------------------------------------------------|---------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 01 observability-map                             | strong        | every layer has at least one evidence channel; the map names them all and the gaps.                                                                            |
-| 02 reproduction-and-evidence                     | strong        | the cache snapshot IS the reproduction primitive — replay an investigation deterministically with no MCP/Anthropic creds.                                      |
-| 03 structured-logs-and-correlation               | partial       | trace = correlation. logs = 4× `console.error`, no levels, no logger, no redaction. honestly named.                                                            |
-| 04 metrics-slis-slos-and-alerts                  | weak — honest | `durationMs` per call exists; nothing aggregates it; SLOs/alerts `not yet exercised`. teaches the gap.                                                          |
-| 05 traces-and-request-lifecycles                 | strong        | NDJSON `AgentEvent` IS a trace; bracketed `tool_call_start`/`_end` are spans; `durationMs` is span latency. cross-link to `study-ai-engineering/05-…04-llm-observability.md`, don't duplicate. |
-| 06 state-snapshots-and-debugging-boundaries      | strong        | `saveInvestigation` + the mem→file→seed chain + the demo replay flow.                                                                                          |
-| 07 incident-analysis-and-prevention              | one example   | the `e83a8e0` flake-fix walked end-to-end; no Sentry/runbook/rotation past that.                                                                               |
-| 08 debugging-observability-red-flags-audit       | the rank      | ranked blind spots with evidence — read this if you only have ten minutes.                                                                                     |
+8. **Two backend-grade gaps are honest and named.** No incident tooling (no Sentry, no on-call rotation, no runbooks, no SLO definitions). No backend trace sink (no OpenTelemetry/Langfuse export, even though `@opentelemetry/api` is transitively in `node_modules` via Next.js). `audit.md` (debugging-observability-red-flags-audit lens) ranks them by consequence.
+
+---
 
 ## Reading order
 
-Read the overview, then `01-observability-map.md` for the bird's-eye. Then pick by need:
+1. **`audit.md`** — the one-pass survey across all 8 lenses. Verdict-first; ends with the Top 3 ranked findings.
+2. **`01-ndjson-agentevent-discriminated-union.md`** — the foundational pattern. Every other file depends on this 8-line union.
+3. **`02-replay-from-snapshot-with-paced-emission.md`** — the cache-first short-circuit that makes the trace a real reproduction primitive.
+4. **`03-three-rung-mem-file-seed-store.md`** — the persistence layer; each rung serves a different scope.
+5. **`04-dual-write-send-to-stream-and-store.md`** — the two-line closure that makes the same trace serve both live and replay.
+6. **`05-auth-secret-flake-postmortem.md`** — the one documented incident, as a reusable template for future ones.
 
-- **understand the trace as substrate** → `05-traces-and-request-lifecycles.md`, then `06-state-snapshots-and-debugging-boundaries.md`.
-- **a real bug landed in your inbox** → `02-reproduction-and-evidence.md`, then `07-incident-analysis-and-prevention.md`.
-- **doing a triage / hand-off** → `08-debugging-observability-red-flags-audit.md` first.
-- **why the metrics section is so short** → `04-metrics-slis-slos-and-alerts.md` — read it precisely *because* it names what isn't here.
+**Then pick by need:**
+
+- **understand the trace as substrate** → start at `01-` then `04-`.
+- **a real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-` for the post-mortem template.
+- **doing a triage / hand-off** → `audit.md` Top 3 ranked findings.
+- **why the metrics section is so short** → `audit.md` (metrics-slis-slos-and-alerts) — read it precisely *because* it names what isn't here.
 
 ## Cross-links (don't duplicate)
 
 - `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` — covers the same `AgentEvent` stream from the LLM-observability angle (trace = product surface, span = bracketed tool call, replay = cache snapshot). This guide cross-links into that file rather than re-teaching it; the angle here is generic debugging/observability (what evidence exists at every boundary), not specifically LLM telemetry.
 - `.aipe/study-testing/` — owns the testing discipline that surrounds the flake-fix (parallel-worker isolation, env stubbing as a pattern). This guide uses the flake-fix as the *incident* worked example; the testing guide owns the *test-design* lesson.
 - `.aipe/study-performance-engineering/` — owns aggregated latency and bottleneck analysis. This guide names `durationMs` as the *primitive*; the performance guide owns what to *do* with it.
+- `.aipe/study-system-design/05-streaming-ndjson.md` — the NDJSON wire as a system-design pattern.
+- `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern around the 3-rung store.
 
 ## What's `not yet exercised` (explicit)
 
@@ -92,4 +108,4 @@ Read the overview, then `01-observability-map.md` for the bird's-eye. Then pick 
 - **error monitoring** — no Sentry, no Bugsnag, no client-side error reporting.
 - **runbooks** — no `docs/runbooks/` directory, no incident response playbook past "read the trace".
 
-Each is called out in the relevant section, not buried.
+Each is called out in the relevant `audit.md` lens, not buried.

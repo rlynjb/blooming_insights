@@ -415,4 +415,4 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 - `03-idempotency-deduplication-and-delivery-semantics.md` — the same 60s TTL is also a dedup window
 - `05-replication-partitioning-and-quorums.md` — why classical consistency models don't apply (no replicas)
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the step 2 → step 3 flow as a cross-boundary workflow
-- `.aipe/study-system-design/03-state-ownership-and-source-of-truth.md` — the architectural take on state ownership
+- `.aipe/study-system-design/audit.md#state-ownership-and-source-of-truth` — the architectural take on state ownership

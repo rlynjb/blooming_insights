@@ -3,7 +3,7 @@
 **Industry name(s):** replicas · shards · partition keys · quorum reads/writes · failover
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first: NOT YET EXERCISED.** blooming insights has **no replication, no partitioning, no quorum protocol, no failover mechanism** — because it has nothing to replicate. There is no database to shard, no Redis cluster to failover, no Cassandra ring to write to with quorum. Vercel runs *multiple instances of the Next.js process* horizontally, but the code treats each instance as if it were the only one — there's no cross-instance state, no leader, no consensus. That isn't a gap to fix; it's the deliberate "no database" architectural choice (see `study-system-design/05-storage-choice-and-durability-boundaries.md`). This file walks the concepts so they're in your vocabulary, names which Bloomreach-side replication is opaque to us, and pinpoints the *first* feature that would force this whole topic to become real.
+> **Verdict-first: NOT YET EXERCISED.** blooming insights has **no replication, no partitioning, no quorum protocol, no failover mechanism** — because it has nothing to replicate. There is no database to shard, no Redis cluster to failover, no Cassandra ring to write to with quorum. Vercel runs *multiple instances of the Next.js process* horizontally, but the code treats each instance as if it were the only one — there's no cross-instance state, no leader, no consensus. That isn't a gap to fix; it's the deliberate "no database" architectural choice (see `study-system-design/audit.md#storage-choice-and-durability-boundaries`). This file walks the concepts so they're in your vocabulary, names which Bloomreach-side replication is opaque to us, and pinpoints the *first* feature that would force this whole topic to become real.
 
 ---
 
@@ -331,4 +331,4 @@ A shared workspace where two users see the same briefing. That breaks the per-bi
 - `04-consistency-models-and-staleness.md` — consistency models only matter when there are multiple replicas to be consistent across
 - `07-clocks-coordination-and-leadership.md` — also NOT YET EXERCISED, for related reasons
 - `09-distributed-systems-red-flags-audit.md` — ranks "in-memory state on serverless" as the #1 risk
-- `.aipe/study-system-design/05-storage-choice-and-durability-boundaries.md` — the architectural take on why no database
+- `.aipe/study-system-design/audit.md#storage-choice-and-durability-boundaries` — the architectural take on why no database

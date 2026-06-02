@@ -495,4 +495,4 @@ A: The `isAnomalyArray` guard in `lib/mcp/validate.ts` (L17–L27). The monitori
 - `02-normalization-and-duplication.md` — the cross-Map invariant (`insights` ↔ `anomalies` keyed alignment) and why no current code path enforces it.
 - `05-migrations-and-evolution.md` — why the guards are deliberately permissive on optional fields (so older snapshots still validate).
 - `06-access-patterns-and-storage-choice.md` — the in-memory storage choice is what removes the transactional layer; a relational migration retires the weakness.
-- `study-software-design/03-information-hiding-and-leakage.md` — the LLM-seam parsing logic is a strong hide (no caller knows the JSON-extraction fallback chain).
+- `study-software-design/audit.md#information-hiding-and-leakage` — the LLM-seam parsing logic is a strong hide (no caller knows the JSON-extraction fallback chain).

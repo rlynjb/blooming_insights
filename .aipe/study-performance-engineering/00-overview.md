@@ -3,7 +3,7 @@
 **Industry name(s):** performance audit · capacity audit · cost-and-latency map
 **Type:** Industry standard · Language-agnostic
 
-> blooming insights is bounded by **three measurable ceilings and one unmeasured cost line**: the **300s Vercel route budget** (`maxDuration = 300` in both `app/api/agent/route.ts:20` and `app/api/briefing/route.ts:17`), the **~1 req/s Bloomreach MCP rate limit** (enforced by `minIntervalMs: 1100` in `lib/mcp/connect.ts:92`, which sets the per-call latency *floor*), and the **per-agent `maxToolCalls` budget** (6, 6, 6, 4 across monitoring/diagnostic/query/recommendation). The unmeasured cost line is the `synthesize()` fallback in `lib/agents/diagnostic.ts:87` and `lib/agents/recommendation.ts:82` — a tool-less, structured-JSON output call that runs whenever the loop fails to emit valid JSON. It's the most output-token-heavy call in the system, and nothing measures it because there is no `res.usage` logging anywhere. Everything else in this guide hangs off those four facts.
+> blooming insights is bounded by **three measurable ceilings and one unmeasured cost line**. The ceilings: `maxDuration = 300s` per route (`app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`), `minIntervalMs = 1100` Bloomreach spacing (`lib/mcp/connect.ts:92`), and per-agent `maxToolCalls` (6/6/6/4). The unmeasured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON, with no `res.usage` logging on any Anthropic call site. The load-bearing gap is the missing meter: ~5 lines of `console.log` would unblock every cost-related decision in this guide.
 
 ---
 
@@ -12,24 +12,26 @@
 **Zoom out — the bigger picture.** Performance audits go wrong when they pick one number ("p95 latency") and ignore which constraint actually moves it. For blooming insights, the constraints aren't compute or bandwidth — they're an external rate limit (Bloomreach), an external API's latency variance (Anthropic), a route-budget ceiling (Vercel), and a model-token bill (Anthropic) that nobody is currently counting. Each constraint owns a different layer; each has a different cheapest fix.
 
 ```
-  Zoom out — where the performance ceilings live          ← we are here (every band, ranked by what's measurable)
+  Zoom out — where the performance ceilings live          ← every band, ranked by what's measurable
 
   ┌─ UI ─────────────────────────────────────────────┐
   │  React 19 streaming UI                            │
-  │  NDJSON reader appends to state per line          │
-  │  Skeleton + ProcessStepper hide latency           │
+  │  NDJSON reader appends to state per event line    │
+  │  Skeleton + ProcessStepper + StatusLog hide       │
+  │   latency until events arrive                     │
   └──────────────────────┬────────────────────────────┘
                          │  HTTPS / chunked NDJSON
   ┌─ Route ────────────▼──────────────────────────────┐
-  │  maxDuration = 300s  ← HARD CEILING               │
+  │  maxDuration = 300s  ★ HARD CEILING ★             │
   │  REPLAY_DELAY_MS = 140/180 (paced demo replay)    │
   │  ReadableStream emits one event at a time         │
+  │  Cache-Control: no-cache, no-transform            │
   └──────────────────────┬────────────────────────────┘
                          │
   ┌─ Agent loop ────────▼─────────────────────────────┐
   │  maxToolCalls 6/6/6/4 (per agent)                 │
   │  truncate(tool_result) at 16_000 chars            │
-  │  synthesize() = output-heavy structured JSON call │  ← UNMEASURED COST CONCENTRATION
+  │  synthesize() = output-heavy structured JSON call │  ← ★ UNMEASURED COST CONCENTRATION
   └──────────────────────┬────────────────────────────┘
                          │
   ┌─ Provider/transport ─▼────────────────────────────┐
@@ -44,55 +46,74 @@
   └───────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this guide answers is: *what's measurably slow or expensive in blooming insights, why, and which change moves the needle without shifting the bottleneck somewhere else?* Eight files. Budget first (the contract). Measurement second (what we can see and what we can't). Then latency, CPU/memory, I/O, caching/backpressure, rendering, and a ranked red-flags audit at the end.
+**Zoom in — narrow to the concept.** The question this guide answers is: *what's measurably slow or expensive in blooming insights, why, and which change moves the needle without shifting the bottleneck somewhere else?* The output is in two passes (per `me.md` v1.59.2's AUDIT-STYLE GENERATORS section): a one-pass survey in `audit.md` (the 8-lens walk), then deep walks of the patterns that actually pop in this codebase (5 promoted patterns in `01-` through `05-`).
 
 ---
 
 ## Reading order
 
 ```
-  01-performance-budget                  the contract: 300s, 1 req/s, 6 calls, 16k chars
-  02-measurement-baselines-and-profiling what we measure today, what we don't, the missing meter
-  03-latency-throughput-and-tail-behavior the ~100-115s investigation, the ~1.1s call floor, no batching
-  04-cpu-memory-and-allocation           messages array growth, in-memory Maps, schema cache, leak boundary
-  05-io-network-and-database-bottlenecks NDJSON out, HTTPS to MCP + Anthropic, no DB, FS only in dev
-  06-caching-batching-and-backpressure   60s TTL cache (hit), schema cache (lifetime), rate-limit compliance ≠ backpressure
-  07-rendering-client-and-mobile-performance streaming UI, skeletons, ProcessStepper, no measurements
-  08-performance-red-flags-audit         ranked risks with file:line evidence
+  audit.md                                  ← Pass 1: the 8-lens survey (start here)
+                                              walks every lens, names what's there,
+                                              names what's `not yet exercised` honestly
+
+  01-300s-vercel-budget-as-hard-ceiling.md  ← Pass 2: pinned-at-ceiling budget,
+                                              the failure mode, the path to lifting
+
+  02-ttl-cache-with-no-cache-on-error.md    ← the 60s cache + the load-bearing
+                                              error-bypass guard
+
+  03-spacing-gate-as-rate-limit-compliance.md ← the 1.1s floor and why it's
+                                              NOT backpressure (and what breaks
+                                              if you ship parallel code thinking
+                                              it is)
+
+  04-synthesize-as-cost-concentration.md    ← the suspected dominant cost line
+                                              and the 5-line meter that would
+                                              confirm or refute it
+
+  05-progressive-streaming-perceived-perf.md ← the 100s → 1-2s perceived
+                                              speedup, four UX moves, the
+                                              load-bearing no-transform header
 ```
+
+The audit is the one-pass survey. The pattern files are the deep walks on the patterns that *actually pop* in this codebase — pinned-at-the-ceiling budget, the cache mechanics, the spacing-gate-vs-backpressure distinction, the unmeasured cost line, and the perceived-perf strategy. Together they cover what's load-bearing without padding.
 
 ---
 
-## The ranked findings (the top of file 08, surfaced here)
+## The ranked findings (the top of audit.md, surfaced here)
 
 Three findings dominate; everything else is small by comparison.
 
 ```
-  1. UNMEASURED COST CONCENTRATION
-     - the synthesize() call (lib/agents/diagnostic.ts:87, lib/agents/recommendation.ts:82)
-       emits a long structured-JSON output — output tokens are several × input
+  1. NO res.usage LOGGING ANYWHERE
+     - the four Anthropic call sites (lib/agents/base.ts:102,
+       diagnostic.ts:97, recommendation.ts:96, intent.ts:18)
+       all RECEIVE res.usage and NONE READ IT
+     - fix: ~5 lines of console.log (the cheapest fix in the codebase)
+     - unblocks: cost budgets, R1 measurement, soft budgets in file 01
+
+  2. COST CONCENTRATION on synthesize()
+     - the synthesize() call (lib/agents/diagnostic.ts:87-126,
+       lib/agents/recommendation.ts:82-132) emits long structured-JSON
+       output — output tokens are several × input
      - runs whenever the agent loop's parse fails (forceFinal turn missed JSON)
-     - no res.usage logging anywhere → cost is invisible
-     - fix: log res.usage on every Anthropic call; cache decision after data
+     - SUSPECTED dominant cost line, NOT CONFIRMED (requires #1 to land)
+     - see 04-synthesize-as-cost-concentration.md
 
-  2. NO LOAD-TESTING / NO PROFILER INTEGRATION
-     - the only per-call timing emitted is tool_call_end{durationMs} in lib/mcp/events.ts:7
-     - no p50/p95/p99 latency, no throughput counters, no flame graph
-     - the 300s budget is set on judgment ("~100-115s under 1 req/s") — not measurement
-     - fix: durationMs per Anthropic call too; persist + summarize per investigation
-
-  3. SPACING GATE MASQUERADING AS BACKPRESSURE
-     - McpClient.liveCall waits minIntervalMs - elapsed (lib/mcp/client.ts:150)
-     - this is rate-limit compliance, NOT backpressure (single-flight, no queue depth signal)
-     - if the system ever fans out (parallel agents), nothing tells the producer to stop
-     - fix: when fan-out arrives, add a semaphore + upward signal — see study-agent-architecture/05/02
+  3. 300s ROUTE BUDGET AT CEILING, ZERO HEADROOM
+     - app/api/agent/route.ts:20, briefing/route.ts:17
+     - pinned at Vercel Pro's max; ~100-115s typical leaves ~185s headroom
+     - bad-day retry storms (~280s) scrape the ceiling
+     - beyond 300s: Vercel kills mid-stream, user sees no diagnosis
+     - see 01-300s-vercel-budget-as-hard-ceiling.md
 ```
 
 ---
 
 ## What we don't have, said honestly
 
-`not yet exercised` for this codebase:
+`not yet exercised` for this codebase (kept honest in `audit.md`):
 
 ```
   → Formal SLOs (no p99 latency target, no error-rate budget)
@@ -106,7 +127,7 @@ Three findings dominate; everything else is small by comparison.
   → Backpressure (single-flight serial calls; no queue, no semaphore)
 ```
 
-The pattern: blooming insights makes **bound-by-judgment** decisions (the 300s budget, the 16k truncation, the 60s TTL) — it has not yet entered the **bound-by-measurement** phase. Files 02 and 08 say which measurements would change which decision.
+The pattern: blooming insights makes **bound-by-judgment** decisions (the 300s budget, the 16k truncation, the 60s TTL) — it has not yet entered the **bound-by-measurement** phase. The audit's `measurement-baselines-and-profiling` lens names which measurements would change which decisions.
 
 ---
 
@@ -116,7 +137,7 @@ The performance lens touches every other guide. The partition keeps each lens cr
 
 ```
   THIS guide        → measurement + optimization of observed bottlenecks
-  study-system-design → architecture-scale tradeoffs (file 07: the three scale ceilings)
+  study-system-design → architecture-scale tradeoffs (the second ceiling at 100x users)
   study-runtime-systems → execution mechanisms (event loop, async, single-process)
   study-agent-architecture/05/01 → cross-turn caching (we anchor to it, don't re-teach)
   study-agent-architecture/05/02 → fan-out backpressure (we anchor to it, don't re-teach)
@@ -129,9 +150,13 @@ A finding belongs here when the question is *"how big? how fast? how often? how 
 
 ## See also
 
-- `01-performance-budget.md` — the contract that bounds the system
-- `02-measurement-baselines-and-profiling.md` — what we can see, and what we can't
-- `08-performance-red-flags-audit.md` — the ranked risks, with evidence
-- `.aipe/study-system-design/07-scale-bottlenecks-and-evolution.md` — the three scale ceilings
+- `README.md` — reading order with cross-links
+- `audit.md` — Pass 1: the 8-lens audit (the one-pass survey)
+- `01-300s-vercel-budget-as-hard-ceiling.md` — Pass 2: the route-budget contract
+- `02-ttl-cache-with-no-cache-on-error.md` — Pass 2: the cache mechanics
+- `03-spacing-gate-as-rate-limit-compliance.md` — Pass 2: compliance vs backpressure
+- `04-synthesize-as-cost-concentration.md` — Pass 2: the unmeasured cost line
+- `05-progressive-streaming-perceived-perf.md` — Pass 2: the UX strategy
+- `.aipe/study-system-design/audit.md#scale-bottlenecks-and-evolution` — the three scale ceilings
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — why spacing isn't backpressure
-- `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — token-economics layer
+- `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — the token-economics layer

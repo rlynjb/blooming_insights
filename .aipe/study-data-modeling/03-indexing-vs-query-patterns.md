@@ -189,7 +189,7 @@ What this models in DB terms: it's a **query-cost ceiling**. SQL has `statement_
 
 ### Move 2 — the cache (the only "index" the repo owns)
 
-`McpClient` has a TTL cache keyed by `${name}:${JSON.stringify(args)}` (mentioned in `study-software-design/03-information-hiding-and-leakage.md` as a strong hide). Identical tool calls within the TTL skip the network round-trip and return cached results.
+`McpClient` has a TTL cache keyed by `${name}:${JSON.stringify(args)}` (mentioned in `study-software-design/audit.md#information-hiding-and-leakage` as a strong hide). Identical tool calls within the TTL skip the network round-trip and return cached results.
 
 ```
   the cache — a degenerate index, by content hash
@@ -394,4 +394,4 @@ A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add
 - `01-the-data-model-and-its-shape.md` — `WorkspaceSchema` and the capability set are the upstream schema view the EQL is constructed against.
 - `04-transactions-and-integrity.md` — the rate-limit slots are the integrity-equivalent here; an agent that ignores them corrupts everyone else's budget.
 - `06-access-patterns-and-storage-choice.md` — the in-memory Map choice is the reason there's no query layer; the JSON-file fallback is the materialized-view pattern.
-- `study-software-design/03-information-hiding-and-leakage.md` — the McpClient cache is named as a strong-hide example; the cache-key construction is owned by one file.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the McpClient cache is named as a strong-hide example; the cache-key construction is owned by one file.

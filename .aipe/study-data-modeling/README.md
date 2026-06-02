@@ -6,7 +6,7 @@
 
 The typed-schema work is **strong**. `lib/mcp/types.ts` carries 8 interfaces that pin every shape the four agents pass between each other — `Insight`, `Anomaly`, `Diagnosis`, `Recommendation`, `CoverageReport`, `ToolCall`, `ReasoningStep`, `Investigation`. The compiler enforces the shape across module boundaries. The runtime guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) re-enforce it at the **LLM seam** — the one boundary where TypeScript can't see (the model emits JSON-as-string).
 
-The leaks live elsewhere. The worst is documented already in `study-software-design/03-information-hiding-and-leakage.md`: the **Insight ↔ Anomaly field-copy list** is encoded in three places (the interface itself, `anomalyToInsight` in state, `insightToAnomaly` in the agent route), and the round-trip silently drops four fields. That's a data-modeling smell — the "same fact stored twice" anti-pattern, but for derived shapes instead of stored rows.
+The leaks live elsewhere. The worst is documented already in `study-software-design/audit.md#information-hiding-and-leakage`: the **Insight ↔ Anomaly field-copy list** is encoded in three places (the interface itself, `anomalyToInsight` in state, `insightToAnomaly` in the agent route), and the round-trip silently drops four fields. That's a data-modeling smell — the "same fact stored twice" anti-pattern, but for derived shapes instead of stored rows.
 
 ```
   the audit at a glance

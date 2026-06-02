@@ -500,4 +500,4 @@ A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a 
 - `02-normalization-and-duplication.md` — the `affectedCustomers` ghost field declared but never written is mid-migration debt.
 - `04-transactions-and-integrity.md` — why the runtime guards are deliberately permissive on optional fields (the migration story depends on it).
 - `06-access-patterns-and-storage-choice.md` — the in-memory store has no migration story because there's no persistent state; the demo seed is the only thing that crosses git commits.
-- `study-software-design/05-pull-complexity-downward.md` — the prompts owning their own output-shape schema is "pull complexity downward" applied to schema evolution.
+- `study-software-design/audit.md#pull-complexity-downward` — the prompts owning their own output-shape schema is "pull complexity downward" applied to schema evolution.

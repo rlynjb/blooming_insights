@@ -3,7 +3,7 @@
 **Industry name(s):** Normalization · single source of truth · denormalization · the "same fact, two places" smell · derived data
 **Type:** Industry standard · Language-agnostic
 
-> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. This repo has neither a relational store nor migration tooling — but the *pattern* shows up clearly in the typed shapes. The worst case is the **Insight↔Anomaly field-copy list**, which lives in three files. The software-design audit already named it as a leakage finding (`study-software-design/03-information-hiding-and-leakage.md`); this file re-frames it as a normalization problem (no single source of truth for "which fields cross between Anomaly and Insight") and adds the data-modeling moves: (1) make the conversion derive from the type, (2) fix the wire format so the conversion isn't needed.
+> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. This repo has neither a relational store nor migration tooling — but the *pattern* shows up clearly in the typed shapes. The worst case is the **Insight↔Anomaly field-copy list**, which lives in three files. The software-design audit already named it as a leakage finding (`study-software-design/audit.md#information-hiding-and-leakage`); this file re-frames it as a normalization problem (no single source of truth for "which fields cross between Anomaly and Insight") and adds the data-modeling moves: (1) make the conversion derive from the type, (2) fix the wire format so the conversion isn't needed.
 
 ---
 
@@ -488,4 +488,4 @@ A: Correct when (a) there's a named single owner, (b) the denormalization is for
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces and where the truth source lives for each shape.
 - `04-transactions-and-integrity.md` — what happens when `insights` and `anomalies` Maps drift out of sync, and why the in-memory store can't enforce the cross-Map invariant.
 - `06-access-patterns-and-storage-choice.md` — the wire-format decision that forces the route-side conversion to exist at all.
-- `study-software-design/03-information-hiding-and-leakage.md` — the original framing of the same leak as an information-hiding problem. Same bug, different lens; this file adds the data-modeling fix paths.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem. Same bug, different lens; this file adds the data-modeling fix paths.

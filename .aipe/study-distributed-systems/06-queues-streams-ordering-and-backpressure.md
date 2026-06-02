@@ -471,5 +471,5 @@ NDJSON over fetch is one-way, which is exactly what we need — the server emits
 - `02-partial-failure-timeouts-and-retries.md` — the retry waits inside `McpClient` are absorbed *visibly* thanks to the streaming pattern; without the stream, the UI would freeze during a 20s retry sleep
 - `03-idempotency-deduplication-and-delivery-semantics.md` — at-most-once-per-stream is part of the delivery story
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the cached investigation array IS a poor-man's outbox for replay
-- `.aipe/study-system-design/02-request-response-and-data-flow.md` — the architectural take on the streaming pattern
+- `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the architectural take on the streaming pattern
 - `.aipe/study-prompt-engineering/` — the agent loop driving the events is the actual content producer

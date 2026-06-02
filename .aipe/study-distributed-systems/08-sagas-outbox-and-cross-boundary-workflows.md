@@ -490,5 +490,5 @@ Everything in this file. Each execute is a write — needs an idempotency key (a
 - `03-idempotency-deduplication-and-delivery-semantics.md` — what changes if any step becomes a write
 - `04-consistency-models-and-staleness.md` — read-your-writes is the consistency property that makes the handoff work
 - `06-queues-streams-ordering-and-backpressure.md` — `collected[]` as an outbox-shaped artifact
-- `.aipe/study-system-design/02-request-response-and-data-flow.md` — the architectural take on the request flow
+- `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the architectural take on the request flow
 - `.aipe/study-agent-architecture/` — the agents inside each step
