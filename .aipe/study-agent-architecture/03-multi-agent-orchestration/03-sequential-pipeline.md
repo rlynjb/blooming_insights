@@ -373,7 +373,7 @@ It also breaks when latency becomes the constraint — a pipeline's latency is t
 - `./04-parallel-fan-out.md` → what the pipeline becomes when sub-jobs are independent
 - `./08-shared-state-and-message-passing.md` → the typed `Diagnosis` is the message-passing version of inter-stage communication
 - `./07-graph-orchestration.md` → pipelines expressed as state graphs with checkpointing and conditional edges
-- `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` → the cross-request handoff via `sessionStorage` from a system-design perspective
+- `../../study-system-design/07-client-stream-handoff.md` → the cross-request handoff via `sessionStorage` from a system-design perspective
 
 ---
 
@@ -512,7 +512,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
+→ `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 Updated: 2026-05-29 — created

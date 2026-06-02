@@ -343,7 +343,7 @@ if (!options.skipCache) {
 }
 ```
 
-The Map's whole job is O(1) keyed lookup. `cache.get(cacheKey)` is the load-bearing op — it runs on every `callTool` invocation, and its O(1) cost is what makes the cache cheaper than the live call (which would otherwise dominate). Why not an array of `{key, value, expiresAt}` records? Because lookup on that would be `arr.find(e => e.key === cacheKey)` — O(N). At the small N this codebase has, both would be fast; the Map version stays correct as N grows. See the full case study in `.aipe/study-system-design-dsa/02-dsa/01-ttl-cache.md`.
+The Map's whole job is O(1) keyed lookup. `cache.get(cacheKey)` is the load-bearing op — it runs on every `callTool` invocation, and its O(1) cost is what makes the cache cheaper than the live call (which would otherwise dominate). Why not an array of `{key, value, expiresAt}` records? Because lookup on that would be `arr.find(e => e.key === cacheKey)` — O(N). At the small N this codebase has, both would be fast; the Map version stays correct as N grows. See the full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
 
 ### **Set — the capability gate (`lib/agents/categories.ts` L116–L127)**
 
@@ -370,7 +370,7 @@ export function coverageFor(cat, available): CategoryCoverage {
 }
 ```
 
-The Set turns a nested-schema-walk-per-dep into a one-time flatten plus O(1) `has` per dep. The kernel insight: **Set membership for any string token, regardless of which kind of thing it represents** — event name, `event.property`, or `catalog:name`. The string-shape contract is what unifies three different ontologies into one membership-testable structure. Full case study in `.aipe/study-system-design-dsa/02-dsa/07-coverage-gate.md`.
+The Set turns a nested-schema-walk-per-dep into a one-time flatten plus O(1) `has` per dep. The kernel insight: **Set membership for any string token, regardless of which kind of thing it represents** — event name, `event.property`, or `catalog:name`. The string-shape contract is what unifies three different ontologies into one membership-testable structure. Full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
 
 ### **Set-union — the queryTools dedup (`lib/mcp/tools.ts` L38–L40)**
 
@@ -381,7 +381,7 @@ export const queryTools = [
 ] as const;
 ```
 
-Three overlapping arrays collapsed into one ordered, deduplicated array — in one expression. The Set does the dedup (insert ignores duplicates by `===`); the spread converts back to an array, preserving insertion order. Insertion order is the load-bearer: it's what makes the result deterministic across reloads. See the full case study (and the rank-mapped sort it sits next to) in `.aipe/study-system-design-dsa/02-dsa/05-severity-sort.md`.
+Three overlapping arrays collapsed into one ordered, deduplicated array — in one expression. The Set does the dedup (insert ignores duplicates by `===`); the spread converts back to an array, preserving insertion order. Insertion order is the load-bearer: it's what makes the result deterministic across reloads. See the full case study (and the rank-mapped sort it sits next to) in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 ### **String + Array — the NDJSON line buffer (`lib/hooks/useInvestigation.ts` L184–L208)**
 
@@ -405,7 +405,7 @@ for (;;) {
 }
 ```
 
-Two primitives composing: a String (`buf`) that accumulates partial bytes across chunks, and an Array (`lines`) that splits the buffer at the delimiter. The Array's `.pop()` is what holds the invariant — the last element is either an incomplete record (saved back to `buf`) or empty (when the chunk ended on `\n`). Full case study in `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md`.
+Two primitives composing: a String (`buf`) that accumulates partial bytes across chunks, and an Array (`lines`) that splits the buffer at the delimiter. The Array's `.pop()` is what holds the invariant — the last element is either an incomplete record (saved back to `buf`) or empty (when the chunk ended on `\n`). Full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
 
 ### **Where the codebase deliberately *avoids* this primitive level — `lib/agents/categories.ts` L139–L141**
 
@@ -550,4 +550,4 @@ A teammate says: "Replace all the `Map<string, T>` instances with `Record<string
 
 ## See also
 
-→ `01-complexity-and-cost-models.md` (the cost framework these primitives are evaluated under) · → `06-sorting-searching-and-selection.md` (where Array.prototype.sort and substring scan live) · → `.aipe/study-system-design-dsa/02-dsa/01-ttl-cache.md` (the Map case study) · → `.aipe/study-system-design-dsa/02-dsa/07-coverage-gate.md` (the Set case study) · → `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md` (the string-buffer case study)
+→ `01-complexity-and-cost-models.md` (the cost framework these primitives are evaluated under) · → `06-sorting-searching-and-selection.md` (where Array.prototype.sort and substring scan live) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Map case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Set case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the string-buffer case study)

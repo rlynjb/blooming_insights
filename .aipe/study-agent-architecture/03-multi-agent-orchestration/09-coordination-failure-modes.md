@@ -635,7 +635,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
+→ `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
 
 ---
 Updated: 2026-05-29 — created

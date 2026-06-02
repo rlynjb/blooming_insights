@@ -102,8 +102,8 @@ The typed `Diagnosis` is the message; carriers are function args (in-process) an
 
 ## Cross-references (paths relative to this README)
 
-- Systems-view of the same architecture: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
-- Cross-request handoff (UX + system shape): `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md`
+- Systems-view of the same architecture: `../../study-system-design/06-multi-agent-orchestration.md`
+- Cross-request handoff (UX + system shape): `../../study-system-design/07-client-stream-handoff.md`
 - Agents-vs-chains mechanics (per-loop): `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
 - LLM-as-judge bias (the verifier-critic failure mode): `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`
 - Sibling sub-sections in this guide:

@@ -505,7 +505,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
+→ `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
 
 ---
 Updated: 2026-05-29 — created

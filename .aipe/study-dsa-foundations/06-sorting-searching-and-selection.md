@@ -139,7 +139,7 @@ arr.sort(comparator)
 return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-Three operations composed: (a) `[...parsed]` makes a copy because `sort` mutates; (b) `.sort(comparator)` does the O(N log N) Timsort; (c) `.slice(0, 10)` takes top-N. The comparator subtracts integers from a rank table (`SEV_RANK`) because string enums have no native order — see the full case study in `.aipe/study-system-design-dsa/02-dsa/05-severity-sort.md`.
+Three operations composed: (a) `[...parsed]` makes a copy because `sort` mutates; (b) `.sort(comparator)` does the O(N log N) Timsort; (c) `.slice(0, 10)` takes top-N. The comparator subtracts integers from a rank table (`SEV_RANK`) because string enums have no native order — see the full case study in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 ```
 trace for input [{s:"info"}, {s:"critical"}, {s:"warning"}, {s:"positive"}]:
@@ -270,7 +270,7 @@ if (start >= 0 && end > start) {
 }
 ```
 
-Two specialized searches: `search(regex)` returns the first index matching the character class, `lastIndexOf` returns the last index of a character. Together they bracket the JSON-looking substring inside arbitrary prose. This is the JSON extraction ladder's third fallback — see the case study in `.aipe/study-system-design-dsa/02-dsa/04-json-from-prose.md`.
+Two specialized searches: `search(regex)` returns the first index matching the character class, `lastIndexOf` returns the last index of a character. Together they bracket the JSON-looking substring inside arbitrary prose. This is the JSON extraction ladder's third fallback — see the case study in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 **Binary search is not yet exercised.** No sorted array has many subsequent lookups against it. The `SEV_RANK` table is a `Record<Severity, number>`, accessed by key (Map-like, O(1)), not by index. The `CATEGORIES` registry is iterated with `.map`, never searched. The TTL cache is a `Map`, hash-keyed, not binary-searched.
 
@@ -429,7 +429,7 @@ const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, p
 return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-The whole sort idiom in one line. `[...parsed]` is a copy (because `.sort()` mutates). The comparator subtracts integers from a rank table — `b - a` is descending, so critical sorts first. `.slice(0, 10)` is the top-N cap. The TypeScript type `Record<Severity, number>` is the compile-time guarantee that every severity has a rank; missing one is a build error, not a runtime NaN. Full case study at `.aipe/study-system-design-dsa/02-dsa/05-severity-sort.md`.
+The whole sort idiom in one line. `[...parsed]` is a copy (because `.sort()` mutates). The comparator subtracts integers from a rank table — `b - a` is descending, so critical sorts first. `.slice(0, 10)` is the top-N cap. The TypeScript type `Record<Severity, number>` is the compile-time guarantee that every severity has a rank; missing one is a build error, not a runtime NaN. Full case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 ### **Sort — the schema event sort by count (`lib/mcp/schema.ts` L100)**
 
@@ -473,7 +473,7 @@ const replaceRunningTool = (arr, e) => {
 };
 ```
 
-Linear search, *reversed*. Walking from the end ensures the most recent matching `tool_call_start` gets paired with the incoming `tool_call_end` — LIFO match. This is the right discipline because tools are dispatched sequentially in this codebase; concurrent dispatches of the same tool would need a unique ID instead of name-matching. Full case study at `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md`.
+Linear search, *reversed*. Walking from the end ensures the most recent matching `tool_call_start` gets paired with the incoming `tool_call_end` — LIFO match. This is the right discipline because tools are dispatched sequentially in this codebase; concurrent dispatches of the same tool would need a unique ID instead of name-matching. Full case study at `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
 
 ### **Substring search — the JSON extraction substring scan (`lib/mcp/validate.ts` L4, L7–L9)**
 
@@ -489,7 +489,7 @@ if (start >= 0 && end > start) {
 }
 ```
 
-Two specialized string searches: `match(regex)` finds the first regex match (the fenced block); `search(regex)` finds the first index matching a character class (the outermost `[` or `{`); `lastIndexOf(char)` finds the last index of a specific character. The combination brackets the JSON-looking substring inside arbitrary prose. The cost is roughly O(N·M) per regex/search (N = text length, M = pattern length); for the small text sizes the agents emit, this is fine. Full case study at `.aipe/study-system-design-dsa/02-dsa/04-json-from-prose.md`.
+Two specialized string searches: `match(regex)` finds the first regex match (the fenced block); `search(regex)` finds the first index matching a character class (the outermost `[` or `{`); `lastIndexOf(char)` finds the last index of a specific character. The combination brackets the JSON-looking substring inside arbitrary prose. The cost is roughly O(N·M) per regex/search (N = text length, M = pattern length); for the small text sizes the agents emit, this is fine. Full case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 ### **Argmin reduce — the funnel-leak selection (`components/feed/InsightCard.tsx` L155–L161)**
 
@@ -504,7 +504,7 @@ const leakKey = funnelStages.length
   : null;
 ```
 
-A *selection* in disguise — find the `k` of the element with the smallest `v` (argmin). This is the K=1 case of top-K. The reduce traverses once (O(N) where N=4 funnel stages), keeping the running min. The `.k` extracts the *key* of the minimum, not the value. This is the most common selection pattern in the codebase; see the full derivation case study at `.aipe/study-system-design-dsa/02-dsa/06-enrichment-derivation.md`.
+A *selection* in disguise — find the `k` of the element with the smallest `v` (argmin). This is the K=1 case of top-K. The reduce traverses once (O(N) where N=4 funnel stages), keeping the running min. The `.k` extracts the *key* of the minimum, not the value. This is the most common selection pattern in the codebase; see the full derivation case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
 
 ### **Binary search — `not yet exercised`**
 
@@ -649,4 +649,4 @@ A teammate suggests: "Replace `.sort().slice(0, 10)` with a quickselect that fin
 
 ## See also
 
-→ `01-complexity-and-cost-models.md` (where the O(N log N) cost of sort and O(log N) of binary search live) · → `02-arrays-strings-and-hash-maps.md` (the primitives these operations work on) · → `03-stacks-queues-deques-and-heaps.md` (heaps as the streaming top-K data structure) · → `.aipe/study-system-design-dsa/02-dsa/05-severity-sort.md` (full case study of the SEV_RANK sort) · → `.aipe/study-system-design-dsa/02-dsa/04-json-from-prose.md` (full case study of the substring scan)
+→ `01-complexity-and-cost-models.md` (where the O(N log N) cost of sort and O(log N) of binary search live) · → `02-arrays-strings-and-hash-maps.md` (the primitives these operations work on) · → `03-stacks-queues-deques-and-heaps.md` (heaps as the streaming top-K data structure) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the SEV_RANK sort) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the substring scan)

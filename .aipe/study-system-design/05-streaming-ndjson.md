@@ -825,10 +825,10 @@ An interviewer asks: "you're manually line-buffering in the browser — isn't th
 
 ## See also
 
-→ [audit.md](./audit.md) (request-response-and-data-flow lens — the three live flows + replay shortcut) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · [01-request-flow.md](./01-request-flow.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md` (line-buffering kernel)
+→ [audit.md](./audit.md) (request-response-and-data-flow lens — the three live flows + replay shortcut) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · [01-request-flow.md](./01-request-flow.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (line-buffering kernel)
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-28 — maxDuration 300; reader loop moved to useInvestigation.ts; schema bootstrap now emitted inside the stream; documented the `step`-filtered cached replay + pre-stream try/catch.
 
 ---

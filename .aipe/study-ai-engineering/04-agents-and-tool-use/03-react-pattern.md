@@ -426,7 +426,7 @@ Which line in `lib/agents/base.ts` turns an Observation into input for the model
 
 ## See also
 
-→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design-dsa/01-system-design/05-streaming-ndjson.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design/05-streaming-ndjson.md · → ../../study-system-design/06-multi-agent-orchestration.md
 
 ---
 Updated: 2026-05-28 — Moved the trace consumer from `app/investigate/[id]/page.tsx` to `lib/hooks/useInvestigation.ts` (StrictMode-safe `startedRef` reader, shared by both step pages) and refreshed all `route.ts` hook/stream and `ReasoningStep` line refs.

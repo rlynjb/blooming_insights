@@ -131,17 +131,17 @@ this guide                          adjacent (don't duplicate)
 ──────────────────────────────────  ─────────────────────────────────────────
 01 complexity-and-cost-models   →   .aipe/study-software-design/audit.md#complexity-in-this-codebase
                                     (different lens: design complexity vs algo cost)
-02 arrays-strings-and-hash-maps →   .aipe/study-system-design-dsa/02-dsa/01-ttl-cache.md
+02 arrays-strings-and-hash-maps →   .aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md
                                     (the Map-backed cache as a full case study)
-03 stacks-queues-deques-and-h.  →   .aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md
+03 stacks-queues-deques-and-h.  →   .aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md
                                     (the buf string IS a one-slot queue)
-06 sorting-searching-and-sel.   →   .aipe/study-system-design-dsa/02-dsa/05-severity-sort.md
+06 sorting-searching-and-sel.   →   .aipe/study-dsa-foundations/06-sorting-searching-and-selection.md
                                     (rank-mapped sort as a full case study)
-                                →   .aipe/study-system-design-dsa/02-dsa/04-json-from-prose.md
+                                →   .aipe/study-dsa-foundations/06-sorting-searching-and-selection.md
                                     (substring scan as a search/parse strategy)
 ```
 
-The legacy `study-system-design-dsa/02-dsa/` files are the deep dives into the seven mechanisms the codebase actually ships. This guide zooms out to the *category* each one belongs to and teaches the category. When this guide's chapter says "see also: 05-severity-sort," that's where the full case study lives.
+The legacy `study-dsa-foundations/` files are the deep dives into the seven mechanisms the codebase actually ships. This guide zooms out to the *category* each one belongs to and teaches the category. When this guide's chapter says "see also: 05-severity-sort," that's where the full case study lives.
 
 ---
 

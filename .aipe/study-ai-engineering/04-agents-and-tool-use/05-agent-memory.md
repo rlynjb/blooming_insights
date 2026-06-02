@@ -410,7 +410,7 @@ In `getCachedInvestigation`, what are the three sources checked in order, and wh
 
 ## See also
 
-→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 06-error-recovery.md · → ../03-retrieval-and-rag/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md
+→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 06-error-recovery.md · → ../03-retrieval-and-rag/ · → ../../study-system-design/06-multi-agent-orchestration.md · → ../../study-system-design/04-caching-and-rate-limiting.md
 
 ---
 Updated: 2026-05-28 — Refreshed the long-term refs for the rewritten route: replay is now `step`-filtered (`filterByStep`, L127–141) and `saveInvestigation` (L254) fires only on the combined `step==null` capture run; the split live steps hand off via sessionStorage.

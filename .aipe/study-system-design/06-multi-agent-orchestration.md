@@ -693,10 +693,10 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 
 ## See also
 
-→ [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · `.aipe/study-system-design-dsa/02-dsa/04-json-from-prose.md` (parse-helper mechanism)
+→ [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (parse-helper mechanism)
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.
 
 ---

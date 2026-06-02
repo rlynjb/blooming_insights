@@ -396,7 +396,7 @@ What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps 
 
 ## See also
 
-→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+→ 01-agents-vs-chains.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design/06-multi-agent-orchestration.md
 
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15, refreshed `route.ts` `listTools` (L203) and `hooksFor` (L181–195) refs, and updated the per-agent `project_id`-injection line numbers.

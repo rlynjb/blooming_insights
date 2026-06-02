@@ -533,7 +533,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./02-supervisor-worker.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` (infinite handoff) · → `./01-when-not-to-go-multi-agent.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+→ `./02-supervisor-worker.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` (infinite handoff) · → `./01-when-not-to-go-multi-agent.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
 Updated: 2026-05-29 — created

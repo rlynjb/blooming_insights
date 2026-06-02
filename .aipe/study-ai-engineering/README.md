@@ -1,6 +1,6 @@
 # blooming insights — AI engineering study guide
 
-A topic-focused companion to [`study-system-design-dsa/`](../study-system-design-dsa/README.md). Same staff-engineer voice, same per-concept template — but the lens is **AI engineering**: LLM foundations, retrieval, agents, evals, and production serving, anchored to blooming insights' real code.
+A topic-focused companion to [`study-system-design/`](../study-system-design/README.md). Same staff-engineer voice, same per-concept template — but the lens is **AI engineering**: LLM foundations, retrieval, agents, evals, and production serving, anchored to blooming insights' real code.
 
 ## Codebase shape: LLM application engineering
 

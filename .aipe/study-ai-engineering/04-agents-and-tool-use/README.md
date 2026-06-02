@@ -16,7 +16,7 @@ This is the codebase's strongest sub-section. The four specialist agents (monito
 
 Read in order: **02 (the round-trip) → 03 (streamed as ReAct) → 04 (which tools, which agent) → 07 (which checks the schema even allows) → 01 (how the agents compose) → 05 (what they remember) → 06 (how each fails safely).**
 
-This guide is the AI-engineering lens on the same loop the system-design guide covers in `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` — read that file for the orchestration/streaming systems view; read this directory for the agent-design view. They are consistent, not duplicative.
+This guide is the AI-engineering lens on the same loop the system-design guide covers in `../../study-system-design/06-multi-agent-orchestration.md` — read that file for the orchestration/streaming systems view; read this directory for the agent-design view. They are consistent, not duplicative.
 
 ---
 Updated: 2026-05-28 — Refreshed the run-flow one-liners for the two-step `?step=diagnose`/`?step=recommend` split, the `useInvestigation` trace consumer, exponential-backoff retry, and the new route/client recovery guards.

@@ -530,7 +530,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
 Updated: 2026-05-29 — created

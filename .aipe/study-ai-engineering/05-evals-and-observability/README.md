@@ -19,7 +19,7 @@ Read in order: **04 (what observability the codebase HAS — the trace, the stre
 
 Start with 04 because it is the implemented, anchored half — the live trace is the codebase's observability win and grounds the abstraction (spans, durations, replay) in real files. Then 01–03 build the missing eval half on top of that, and the two halves join at counterfactual replay: the observability trace, re-run with a changed prompt, is exactly what the eval harness in 02 needs.
 
-This guide is the AI-engineering lens; the observability mechanics overlap the streaming/orchestration systems view in `../../study-system-design-dsa/01-system-design/05-streaming-ndjson.md` and `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`. Read those for the systems view; read this directory for the evals-and-observability view.
+This guide is the AI-engineering lens; the observability mechanics overlap the streaming/orchestration systems view in `../../study-system-design/05-streaming-ndjson.md` and `../../study-system-design/06-multi-agent-orchestration.md`. Read those for the systems view; read this directory for the evals-and-observability view.
 
 ---
 Updated: 2026-05-28 — Test count 125→157; replaced the dead `summarizeTrace` mention with the real briefing narration (`describeToolCall`) and the grown UI surface (`StatusLog`/`TraceContent`/`useInvestigation`, timestamped); `?q=` ref L54→L115. Evals remain Case B.

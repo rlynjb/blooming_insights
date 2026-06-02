@@ -395,7 +395,7 @@ for (;;) {
 
 The `buf` is not a `Queue<string>` — it's a `string`. But it *behaves* like a one-slot queue: bytes go in (appended), records come out (in arrival order), and the discipline is FIFO. The `for (const line of lines)` loop processes records in their arrival order; the saved `buf` between iterations is the queue's "next item to be completed." Walk through what breaks if the discipline were LIFO: chunk 2's records would be processed before chunk 1's tail, so a multi-chunk `tool_call_start` would either be missed or paired with the wrong `tool_call_end`. The reverse-scan reconciliation in `replaceRunningTool` (`useInvestigation.ts` L86–L95) assumes "the running tool I'm closing started before me in the items array" — that assumption depends on the queue discipline up the pipeline.
 
-This is the codebase's only exercise of an ordering discipline beyond raw array order. Full streaming case study in `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md`.
+This is the codebase's only exercise of an ordering discipline beyond raw array order. Full streaming case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
 
 ### **Stack — `not yet exercised`**
 
@@ -563,4 +563,4 @@ A teammate says: "Replace the NDJSON `buf` string with a `Queue<string>` of chun
 
 ## See also
 
-→ `02-arrays-strings-and-hash-maps.md` (the primitives these are built from) · → `04-trees-tries-and-balanced-indexes.md` (heap is technically a tree-shaped structure; this chapter teaches the array-backed variant) · → `05-graphs-and-traversals.md` (BFS uses a queue, DFS uses a stack — both `not yet exercised` here) · → `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md` (the full case study of the implicit queue)
+→ `02-arrays-strings-and-hash-maps.md` (the primitives these are built from) · → `04-trees-tries-and-balanced-indexes.md` (heap is technically a tree-shaped structure; this chapter teaches the array-backed variant) · → `05-graphs-and-traversals.md` (BFS uses a queue, DFS uses a stack — both `not yet exercised` here) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the full case study of the implicit queue)

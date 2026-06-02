@@ -80,7 +80,7 @@ Honest about absence — if you reach for it from training data, it's not here.
 
 ## Cross-links — what lives elsewhere
 
-  → **NDJSON framing details** (how `buf.split('\n')` reassembles lines across TCP chunks, why `lines.pop()` is load-bearing) live in `../study-system-design-dsa/01-system-design/05-streaming-ndjson.md`. This guide covers the HTTP semantics that carry that framing — `Content-Type`, `Cache-Control`, the streamed `ReadableStream` lifecycle, the `maxDuration` window — not the line reassembly itself.
+  → **NDJSON framing details** (how `buf.split('\n')` reassembles lines across TCP chunks, why `lines.pop()` is load-bearing) live in `../study-system-design/05-streaming-ndjson.md`. This guide covers the HTTP semantics that carry that framing — `Content-Type`, `Cache-Control`, the streamed `ReadableStream` lifecycle, the `maxDuration` window — not the line reassembly itself.
   → **Trust boundaries** (what each side can see/tamper with) are the `study-security` guide's territory; this guide names which bytes cross which boundary, not whether crossing it is safe.
   → **Where the seams *belong*** in the architecture (would you put rate-limit logic in a gateway? in a queue?) is the `study-system-design` guide's territory.
 

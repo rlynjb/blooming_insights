@@ -482,7 +482,7 @@ It also breaks when the agents genuinely benefit from inspecting each other's *p
 - `./03-sequential-pipeline.md` → the pipeline shape that uses message passing as its native communication
 - `./07-graph-orchestration.md` → state graphs typically use shared state (with curated schemas)
 - `./09-coordination-failure-modes.md` → "context bloat" is the failure mode this avoids
-- `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md` → the cross-request carrier (`sessionStorage` + URL param) from a system-design perspective
+- `../../study-system-design/07-client-stream-handoff.md` → the cross-request carrier (`sessionStorage` + URL param) from a system-design perspective
 
 ---
 
@@ -645,7 +645,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design-dsa/01-system-design/07-client-stream-handoff.md`
+→ `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md`
 
 ---
 Updated: 2026-05-29 — created

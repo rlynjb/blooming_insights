@@ -356,7 +356,7 @@ What two outputs does the gate produce from a single `coverageReport`, and who c
 
 ## See also
 
-→ 04-tool-routing.md · → 01-agents-vs-chains.md · → ../06-production-serving/02-llm-cost-optimization.md · → ../06-production-serving/04-rate-limiting-backpressure.md · → ../../study-system-design-dsa/01-system-design/08-schema-gated-coverage.md · → ../../study-system-design-dsa/02-dsa/07-coverage-gate.md
+→ 04-tool-routing.md · → 01-agents-vs-chains.md · → ../06-production-serving/02-llm-cost-optimization.md · → ../06-production-serving/04-rate-limiting-backpressure.md · → ../../study-system-design/08-schema-gated-coverage.md · → ../../study-dsa-foundations/02-arrays-strings-and-hash-maps.md
 
 ---
 Updated: 2026-05-29 — created (the anomaly-coverage schema gate: scope the monitoring agent's category checklist against the live schema before spending the rate-limited budget)

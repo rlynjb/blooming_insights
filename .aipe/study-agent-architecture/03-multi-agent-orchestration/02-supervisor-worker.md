@@ -515,7 +515,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./01-when-not-to-go-multi-agent.md` · → `./03-sequential-pipeline.md` · → `./06-swarm-handoff.md` · → `../06-orchestration-system-design-templates/` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → routing primitive: `../01-reasoning-patterns/01-chains-vs-agents.md`
+→ `./01-when-not-to-go-multi-agent.md` · → `./03-sequential-pipeline.md` · → `./06-swarm-handoff.md` · → `../06-orchestration-system-design-templates/` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → routing primitive: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 Updated: 2026-05-29 — created

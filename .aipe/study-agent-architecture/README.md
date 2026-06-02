@@ -42,7 +42,7 @@ The cross-sub-section order is **A → B → C → D → E → F**, but no file 
 ## How this guide composes with the rest of the family
 
 ```
-study-system-design-dsa/        the systems-level view of the same orchestration
+study-system-design/        the systems-level view of the same orchestration
                                 (request flow, multi-agent-orchestration, schema-gated
                                  coverage, NDJSON streaming, client stream handoff)
 study-ai-engineering/           single-agent mechanics + retrieval mechanics

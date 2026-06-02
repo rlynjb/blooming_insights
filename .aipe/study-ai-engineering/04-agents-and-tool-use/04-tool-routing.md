@@ -403,7 +403,7 @@ What does `classifyIntent` do with the haiku model's text output before returnin
 
 ## See also
 
-→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design/06-multi-agent-orchestration.md
 
 ---
 Updated: 2026-05-28 — Corrected `set.has` to L15 and refreshed the `route.ts` query-branch refs (L210–L218); noted the investigation chain is now `step`-gated (`step=diagnose`/`step=recommend`) and fixed the `bootstrapTools`/`list_voucher_pools`/per-agent subset line numbers.

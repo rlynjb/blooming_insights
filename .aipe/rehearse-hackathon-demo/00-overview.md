@@ -134,7 +134,7 @@ exists; the sheets are what you do.
   .aipe/rehearse-interview-defense/ ← answer "how does it actually work?"
                                      (the follow-up after the buzzer)
 
-  .aipe/study-system-design-dsa/   ← the deepest follow-ups
+  .aipe/study-system-design/   ← the deepest follow-ups
   .aipe/study-agent-architecture/    (open these if a judge presses on
   .aipe/study-ai-engineering/        the agent loop, the MCP protocol,
   .aipe/study-prompt-engineering/    or the prompt design)

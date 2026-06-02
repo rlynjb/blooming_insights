@@ -37,7 +37,7 @@ Zoom out — the only realtime path
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: *why this transport*, and what would change if we picked one of the alternatives? The detail of how the line buffering works lives in `../study-system-design-dsa/01-system-design/05-streaming-ndjson.md` (and the DSA companion). Here we name the choice, the alternatives, and the cost of switching.
+**Zoom in — narrow to the concept.** The question this file answers: *why this transport*, and what would change if we picked one of the alternatives? The detail of how the line buffering works lives in `../study-system-design/05-streaming-ndjson.md` (and the DSA companion). Here we name the choice, the alternatives, and the cost of switching.
 
 ---
 
@@ -51,7 +51,7 @@ Zoom out — the only realtime path
 
   → **Seam 1 (THE choice): chunked HTTP + NDJSON vs SSE vs WebSocket.** What flips: auto-reconnect, full-duplex, framing. We chose chunked HTTP + NDJSON; the rest of this file is the case for that choice.
   → **Seam 2 (covered in `05-http-semantics-…`): `no-transform` directive.** Without it, the edge can buffer chunks and the realtime guarantee dies.
-  → **Seam 3 (covered in `../study-system-design-dsa/…/05-streaming-ndjson.md`): line reassembly across TCP chunks.** Without `buf = lines.pop()`, a line split across two TCP packets corrupts two parses.
+  → **Seam 3 (covered in `../study-system-design/…/05-streaming-ndjson.md`): line reassembly across TCP chunks.** Without `buf = lines.pop()`, a line split across two TCP packets corrupts two parses.
 
 ```
 The three realtime transports compared
@@ -462,4 +462,4 @@ Skeleton — what breaks if removed
   → `01-network-map.md` — where this stream sits in the bigger picture.
   → `03-tcp-udp-connections-and-sockets.md` — why the inbound TCP must stay open for the full agent run.
   → `05-http-semantics-caching-and-cors.md` — the `Cache-Control: no-transform` directive that keeps the stream live.
-  → `../study-system-design-dsa/01-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire detail.
+  → `../study-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire detail.

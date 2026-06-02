@@ -475,7 +475,7 @@ Open and verify. ✓ Files + function names + the path-firing rule matter; line 
 
 ## See also
 
-→ 01-chains-vs-agents.md · → 02-react.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` · → multi-agent: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+→ 01-chains-vs-agents.md · → 02-react.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` · → multi-agent: `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
 Updated: 2026-05-29 — created

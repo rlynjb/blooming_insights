@@ -76,7 +76,7 @@ E · production serving      ── McpClient caching + spacing + retry (Case A)
 F · system-design templates ── three generic 9-bullet templates the codebase is mapped against
 ```
 
-The full per-feature breakdown is in [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md). The companion guides this one cross-references rather than duplicates: [`../study-ai-engineering/`](../study-ai-engineering/) (single-agent + retrieval mechanics) and [`../study-system-design-dsa/`](../study-system-design-dsa/) (the systems-level view of the same orchestration).
+The full per-feature breakdown is in [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md). The companion guides this one cross-references rather than duplicates: [`../study-ai-engineering/`](../study-ai-engineering/) (single-agent + retrieval mechanics) and [`../study-system-design/`](../study-system-design/) (the systems-level view of the same orchestration).
 
 ---
 Updated: 2026-05-29 — created

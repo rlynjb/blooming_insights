@@ -506,7 +506,7 @@ When `McpClient.callTool` gets an error result, does it write it to the cache, a
 
 ## See also
 
-→ 01-agents-vs-chains.md · → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → ../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+→ 01-agents-vs-chains.md · → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → ../../study-system-design/04-caching-and-rate-limiting.md · → ../../study-system-design/06-multi-agent-orchestration.md
 
 ---
 Updated: 2026-05-28 — Corrected the transport claim: retry is now exponential backoff (parsed server-window preferred, capped at `retryCeilingMs = 20_000`), not fixed-delay; added the route's pre-stream setup `try/catch` and the feed's one-time token-revocation auto-reconnect; refreshed all `client.ts`/`diagnostic.ts`/`monitoring.ts` line refs.

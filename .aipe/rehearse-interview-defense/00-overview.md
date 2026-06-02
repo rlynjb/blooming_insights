@@ -80,7 +80,7 @@ This book is the **wide opener** — it prepares you for the project-level quest
 
 ```
   .aipe/rehearse-interview-defense/  ← THIS book — the whole project, wide
-  .aipe/study-system-design-dsa/     ← per-concept deep dives (request flow,
+  .aipe/study-system-design/     ← per-concept deep dives (request flow,
                                         caching, streaming, the coverage gate, …)
                                         each concept file has its own Interview
                                         defense block

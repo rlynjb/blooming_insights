@@ -98,7 +98,7 @@ After Gate 3, the artifact flows into the NDJSON stream and into the React feed.
 
 Two existing files in this codebase already cover slices of the security surface from a different angle:
 
-- `.aipe/study-system-design-dsa/01-system-design/02-oauth-boundary.md` — the canonical OAuth/PKCE/DCR + encrypted cookie treatment, from the architecture angle. `01-encrypted-cookie-oauth-state.md` references it instead of re-deriving the OAuth mechanics.
+- `.aipe/study-system-design/02-oauth-boundary.md` — the canonical OAuth/PKCE/DCR + encrypted cookie treatment, from the architecture angle. `01-encrypted-cookie-oauth-state.md` references it instead of re-deriving the OAuth mechanics.
 - `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the prompt-injection treatment from the LLM angle (what the attack shape is, why structural defenses work). Both `03-type-guard-trust-boundary.md` and `04-read-only-tool-whitelist.md` reference it instead of duplicating; the trust-boundary framing here is complementary.
 
 ---

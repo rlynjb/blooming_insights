@@ -1,6 +1,6 @@
 # blooming insights — prompt engineering study guide
 
-The third companion to [`study-system-design-dsa/`](../study-system-design-dsa/README.md) and [`study-ai-engineering/`](../study-ai-engineering/README.md). Same per-concept template, but a different voice — **working AI engineer**, not staff engineer: first-person, concrete about bugs, skeptical of advice that only works in demos. 13 concepts, the complete list for the discipline.
+The third companion to [`study-system-design/`](../study-system-design/README.md) and [`study-ai-engineering/`](../study-ai-engineering/README.md). Same per-concept template, but a different voice — **working AI engineer**, not staff engineer: first-person, concrete about bugs, skeptical of advice that only works in demos. 13 concepts, the complete list for the discipline.
 
 The subject is blooming insights' four prompts — `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md` — read as the versioned, budgeted, validated components they are. Start with [`00-overview.md`](00-overview.md) for the discipline map and the per-concept failure modes.
 

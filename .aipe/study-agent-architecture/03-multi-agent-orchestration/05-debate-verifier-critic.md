@@ -518,7 +518,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md` · → forced-final-turn mechanic: `../01-reasoning-patterns/01-chains-vs-agents.md`
+→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → forced-final-turn mechanic: `../01-reasoning-patterns/01-chains-vs-agents.md`
 
 ---
 Updated: 2026-05-29 — created

@@ -28,7 +28,7 @@ This guide owns architectural shape. Mechanism-level depth lives elsewhere:
 - **Distributed-systems correctness** (across-instance state, encrypted-cookie pattern, no-quorum reads) → `study-distributed-systems`
 - **Database engine internals** (none here — no DB) → `study-database-systems` (mostly N/A for this repo)
 - **Schema shape** (`Insight`/`Anomaly`/`Diagnosis`/`Recommendation` types) → `study-data-modeling`
-- **DSA mechanism teaching** (TTL cache, NDJSON line buffering, rate-limit retry, set-membership classification) → `study-dsa-foundations` (plus the legacy `study-system-design-dsa/02-dsa/*` archive for the prior depth treatments)
+- **DSA mechanism teaching** (TTL cache, NDJSON line buffering, rate-limit retry, set-membership classification) → `study-dsa-foundations` (plus the legacy `study-dsa-foundations/*` archive for the prior depth treatments)
 
 ## The verdict, in one paragraph
 
@@ -36,5 +36,5 @@ The architecture is small, intentional, and shaped by one external constraint (B
 
 ---
 
-Updated: 2026-06-02 — Restructured to v1.59.2 audit-style two-pass shape: `audit.md` (Pass 1, 8 lenses) + 8 discovered-pattern files (Pass 2). The 8 legacy lens-named numbered files are deleted; their content lives in `audit.md`'s lens sections + cross-links. Pattern files promoted from the legacy archive `.aipe/study-system-design-dsa/01-system-design/`.
+Updated: 2026-06-02 — Restructured to v1.59.2 audit-style two-pass shape: `audit.md` (Pass 1, 8 lenses) + 8 discovered-pattern files (Pass 2). The 8 legacy lens-named numbered files are deleted; their content lives in `audit.md`'s lens sections + cross-links. Pattern files promoted from the legacy archive `.aipe/study-system-design/`.
 Updated: 2026-06-01 — Initial generation as v1.55 audit-shaped guide.

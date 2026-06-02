@@ -326,7 +326,7 @@ Two things `audit.md` covers but the diagram doesn't make obvious:
 
 ### The legacy archive
 
-The earlier `.aipe/study-system-design-dsa/` is preserved as the curriculum-DSA companion. Its `02-dsa/*` files teach mechanism-level depth for primitives (TTL cache, line-buffering, rate-limit retry, JSON-from-prose, set-membership coverage gate) — the pattern files in this guide cite them when DSA depth is useful. Its `01-system-design/*` files are the source the Pass 2 pattern files in *this* guide were promoted from; refer to the in-guide versions ([01-request-flow.md](./01-request-flow.md) … [08-schema-gated-coverage.md](./08-schema-gated-coverage.md)) — they carry the same content with refreshed cross-links into `audit.md`.
+The earlier `.aipe/study-system-design/` is preserved as the curriculum-DSA companion. Its `02-dsa/*` files teach mechanism-level depth for primitives (TTL cache, line-buffering, rate-limit retry, JSON-from-prose, set-membership coverage gate) — the pattern files in this guide cite them when DSA depth is useful. Its `01-system-design/*` files are the source the Pass 2 pattern files in *this* guide were promoted from; refer to the in-guide versions ([01-request-flow.md](./01-request-flow.md) … [08-schema-gated-coverage.md](./08-schema-gated-coverage.md)) — they carry the same content with refreshed cross-links into `audit.md`.
 
 ---
 
@@ -336,5 +336,5 @@ The earlier `.aipe/study-system-design-dsa/` is preserved as the curriculum-DSA 
 
 ---
 
-Updated: 2026-06-02 — Restructured to v1.59.2 audit-style two-pass shape: `audit.md` (Pass 1, 8 lenses) + 8 discovered-pattern files (Pass 2). The 8 legacy lens-named files (`01-system-map-and-boundaries.md` through `08-system-design-red-flags-audit.md`) are deleted; their content lives in `audit.md`'s lens sections + cross-links to the pattern files. Pattern files promoted from the legacy archive `.aipe/study-system-design-dsa/01-system-design/` (which remains as the curriculum-DSA companion and is not modified).
-Updated: 2026-06-01 — Initial generation as v1.55 audit-shaped guide; legacy `.aipe/study-system-design-dsa/01-system-design/*` retained as archive (cited, not duplicated).
+Updated: 2026-06-02 — Restructured to v1.59.2 audit-style two-pass shape: `audit.md` (Pass 1, 8 lenses) + 8 discovered-pattern files (Pass 2). The 8 legacy lens-named files (`01-system-map-and-boundaries.md` through `08-system-design-red-flags-audit.md`) are deleted; their content lives in `audit.md`'s lens sections + cross-links to the pattern files. Pattern files promoted from the legacy archive `.aipe/study-system-design/` (which remains as the curriculum-DSA companion and is not modified).
+Updated: 2026-06-01 — Initial generation as v1.55 audit-shaped guide; legacy `.aipe/study-system-design/*` retained as archive (cited, not duplicated).

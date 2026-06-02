@@ -437,10 +437,10 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 
 ## See also
 
-→ [audit.md](./audit.md) (state-ownership-and-source-of-truth lens — the four sessionStorage keys + the started-guard) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [01-request-flow.md](./01-request-flow.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · `.aipe/study-system-design-dsa/02-dsa/03-ndjson-line-buffering.md`
+→ [audit.md](./audit.md) (state-ownership-and-source-of-truth lens — the four sessionStorage keys + the started-guard) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [01-request-flow.md](./01-request-flow.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".

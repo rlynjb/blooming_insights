@@ -409,7 +409,7 @@ Which line in `lib/agents/base.ts` is the single point where the *model*, not yo
 
 ## See also
 
-→ 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md
+→ 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design/06-multi-agent-orchestration.md
 
 ---
 Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`?step=recommend` split (separate calls, sessionStorage diagnosis handoff via `parseDiagnosis`), added the derived `confidence` step, and refreshed all route/diagnostic line refs.

@@ -577,7 +577,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+→ `./03-sequential-pipeline.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
 Updated: 2026-05-29 — created

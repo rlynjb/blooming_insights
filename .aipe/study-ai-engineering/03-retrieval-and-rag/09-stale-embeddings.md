@@ -216,7 +216,7 @@ The first three rows are the same problem the codebase solved for `McpClient`. T
 
 - **Incremental indexing** (`10-incremental-indexing.md`): how change-detection drives selective re-embedding without a full rebuild.
 - **Embedding model choice** (`02-embedding-model-choice.md`): the model swap that invalidates the whole index.
-- **Caching + rate-limiting** (`../../study-system-design-dsa/01-system-design/04-caching-and-rate-limiting.md`): the `McpClient` TTL + no-cache-on-error policy this file parallels.
+- **Caching + rate-limiting** (`../../study-system-design/04-caching-and-rate-limiting.md`): the `McpClient` TTL + no-cache-on-error policy this file parallels.
 
 ---
 

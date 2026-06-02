@@ -270,7 +270,7 @@ The chain breaks when the order stops being fixed — when "which stage next" de
 ### What to explore next
 - ReAct (`02-react.md`) → the specific shape of the loop inside each agent stage
 - Routing (`06-routing.md`) → how the `?q=` path picks an agent — the chain's one model-decided edge
-- Multi-agent orchestration (`../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`) → what the chain becomes when the order goes model-driven
+- Multi-agent orchestration (`../../study-system-design/06-multi-agent-orchestration.md`) → what the chain becomes when the order goes model-driven
 
 ---
 
@@ -381,7 +381,7 @@ Open and verify. ✓ File + function names matter; line numbers drifting is fine
 
 ## See also
 
-→ 02-react.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → `../../study-system-design-dsa/01-system-design/06-multi-agent-orchestration.md`
+→ 02-react.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
 Updated: 2026-05-29 — created

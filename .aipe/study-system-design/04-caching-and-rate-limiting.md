@@ -490,10 +490,10 @@ A colleague argues: "We should remove the in-memory cache because it makes debug
 
 ## See also
 
-→ [audit.md](./audit.md) (caching-and-invalidation + failure-handling-and-reliability lenses — the load-bearing MCP choke-point) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · `.aipe/study-system-design-dsa/02-dsa/01-ttl-cache.md` (DSA mechanism depth) · `.aipe/study-system-design-dsa/02-dsa/02-rate-limit-and-retry.md`
+→ [audit.md](./audit.md) (caching-and-invalidation + failure-handling-and-reliability lenses — the load-bearing MCP choke-point) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (DSA mechanism depth) · `.aipe/study-dsa-foundations/01-complexity-and-cost-models.md`
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-28 — refreshed code references to current line numbers; retry now uses a parsed retry-after window / exponential backoff (default `retryDelayMs = 10_000`, `retryCeilingMs = 20_000`)
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

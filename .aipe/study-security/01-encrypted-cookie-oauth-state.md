@@ -437,7 +437,7 @@ After the response goes out, the cookie holds the full updated state — DCR cli
 
 ### Connection to adjacent patterns
 
-The encrypted cookie *requires* an orchestration layer to be usable from Next handlers — that's `withAuthCookies`, which in turn requires AsyncLocalStorage to safely hold per-request state. See `02-als-scoped-request-store.md` for that piece. The cookie content is consumed by `BloomreachAuthProvider`, which is the OAuth-client-provider shape; the broader OAuth + PKCE + DCR flow lives in `.aipe/study-system-design-dsa/01-system-design/02-oauth-boundary.md`.
+The encrypted cookie *requires* an orchestration layer to be usable from Next handlers — that's `withAuthCookies`, which in turn requires AsyncLocalStorage to safely hold per-request state. See `02-als-scoped-request-store.md` for that piece. The cookie content is consumed by `BloomreachAuthProvider`, which is the OAuth-client-provider shape; the broader OAuth + PKCE + DCR flow lives in `.aipe/study-system-design/02-oauth-boundary.md`.
 
 ---
 
@@ -549,4 +549,4 @@ A teammate proposes replacing `bi_auth` with a JWT signed with `AUTH_SECRET` "so
 
 → [audit.md](./audit.md) · [02-als-scoped-request-store.md](./02-als-scoped-request-store.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
 
-Cross-reference: `.aipe/study-system-design-dsa/01-system-design/02-oauth-boundary.md` — the OAuth + PKCE + DCR flow that produces the state stored in this cookie.
+Cross-reference: `.aipe/study-system-design/02-oauth-boundary.md` — the OAuth + PKCE + DCR flow that produces the state stored in this cookie.

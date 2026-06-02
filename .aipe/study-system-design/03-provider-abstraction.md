@@ -520,7 +520,7 @@ A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is 
 → [audit.md](./audit.md) (system-map-and-boundaries lens — `McpCaller` + `McpTransport` seams) · [01-request-flow.md](./01-request-flow.md) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md)
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens.
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens.
 Updated: 2026-05-28 — refreshed code references to current line numbers; added a note on the capturing-fetch error seam (`HttpErrorHolder`/`makeCapturingFetch`) and `McpToolError`
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

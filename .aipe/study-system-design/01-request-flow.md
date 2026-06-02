@@ -623,7 +623,7 @@ Without reading the file, answer:
 → [audit.md](./audit.md) (request-response-and-data-flow lens) · [02-oauth-boundary.md](./02-oauth-boundary.md) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md)
 
 ---
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design-dsa/01-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens.
+Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens.
 Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now streams NDJSON (`describeToolCall`/`trunc`, no `summarizeTrace`) with `maxDuration = 300`; `connectMcp` is async and wrapped in `withAuthCookies`; setup is in a try/catch returning the real error; noted the runtime `localStorage` `bi:mode` demo/live toggle and `anomalyToInsight`'s `impact`/`history`/`deriveInsightFields`.
 
 ---
