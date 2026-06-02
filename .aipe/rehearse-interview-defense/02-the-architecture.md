@@ -45,6 +45,8 @@ This is the diagram you draw, top to bottom, narrating as you go — UI, then th
 │                  │     │ retry · NO-cache-on-error · {result,durationMs,...}  │  │
 │                  │     │ OAuthClientProvider (PKCE + DCR)                     │  │
 │                  │     │ prod auth: AES-256-GCM `bi_auth` cookie / dev: file  │  │
+│                  │     │ ALS-scoped RequestStore (auth.ts L47) — decrypt once │  │
+│                  │     │ per req, hold in AsyncLocalStorage, flush once       │  │
 │                  │     └──────────────────────────┬───────────────────────────┘  │
 └──────────────────│────────────────────────────────│───────────────────────────┘
        state ──────│ (NO DB)                         ▼  providers (network)
@@ -216,3 +218,4 @@ The architecture's cleanest seam is the shared `runAgentLoop` — four agents, o
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-02 — Added the ALS-scoped `RequestStore` (`lib/mcp/auth.ts` L47) to the auth band of the architecture diagram — it's now a load-bearing pattern documented in study-security and worth being able to point at on the whiteboard.

@@ -124,9 +124,9 @@ Don't say "this is implemented in TypeScript with async/await"
   ┃  that's why the trace fills in live instead of all at once."
 ```
 
-Then point at the top two bands. The whole pipeline lives in
-about two hundred lines of code — the agent loop in
-`lib/agents/base.ts` is the bottom of the diagram, the route in
+Then point at the top two bands. The whole pipeline is three
+files end-to-end — the agent loop in `lib/agents/base.ts` is
+the bottom of the diagram, the route in
 `app/api/agent/route.ts` is the middle, and the
 `useInvestigation` hook in `lib/hooks/useInvestigation.ts` is
 the top.
@@ -273,3 +273,5 @@ infrastructure, not a wrapper."
 ```
 
 Read chapter 4 next.
+
+Updated: 2026-06-02 — v1.59.2 drift refresh: softened "about two hundred lines of code" claim (actual streaming pipeline is ~660 lines across the three files) into "three files end-to-end"; keeps the three load-bearing file paths intact.

@@ -164,6 +164,8 @@ Third, the coverage grid 'loaded all at once.' The per-category logs streamed fi
 
 Notice the honest nuance you can add to the third one: the tile-by-tile reveal you built is real in the *demo replay*, which is paced — on a live run the gate is instant, so the grid resolves at once and the genuinely incremental work is the EQL trace. Volunteering that distinction, unprompted, is a strong senior signal: you know the difference between a real-time effect and a replayed one in your own product.
 
+There's a fourth one you can volunteer if it lands — a correctness bug AI suggested *and* I accepted, which I caught later, not at write-time: `lib/state/insights.ts` line 4 holds the insights `Map` as a module-level global, and `putInsights` line 36 calls `insights.clear()` at the top of every briefing write. For one user that's correct; for two concurrent users on one warm Vercel instance, user A's briefing wipes user B's mid-session. The pattern is what AI assistance is *worst* at: it produces locally-correct code that breaks under a concurrency assumption never written down. The fix is ~30 LOC — session-key the Map — and the lesson is that an AI-suggested in-memory store needs a written concurrency model before it gets accepted, not after. Saying this out loud — "AI wrote this, I accepted it, I later read it as a real bug and here's the fix" — is the strongest possible version of owning a defaulted-to decision.
+
 ---
 
 ╔═══════════════════════════════════════════════════════════════╗
@@ -214,7 +216,7 @@ About how you *used* AI, not about the code: you'd keep a tighter log of the def
 **The questions covered:**
 - *"Did you use AI?"* → "Yes, heavily. The decisions were mine; AI accelerated the typing. I can bucket any part as deliberate, evaluated-and-accepted, or defaulted-to."
 - *"Explain a section line by line."* → Offer one you own (`runAgentLoop`, the coverage gate, the NDJSON line-buffer); walk the mechanism, not a paraphrase.
-- *"What did the AI get wrong?"* → Three real bugs you caught: the StrictMode double-fetch, the prod-only 500, the all-at-once coverage reveal.
+- *"What did the AI get wrong?"* → Four real ones you caught: the StrictMode double-fetch, the prod-only 500, the all-at-once coverage reveal, and the global-`Map` + `putInsights.clear()` concurrent-user wipe in `lib/state/insights.ts` (an AI-default I accepted at write-time and only caught later when reading for concurrency).
 - *"How much could you write without AI?"* → "All of it, slower — except the OAuth flow, which I'd have had to actually learn."
 
 **Pull quotes:**
@@ -225,3 +227,4 @@ About how you *used* AI, not about the code: you'd keep a tighter log of the def
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-02 — Added a fourth "what did AI get wrong" candidate: the `lib/state/insights.ts` global-Map + `putInsights.clear()` concurrent-user race — strongest possible version of owning a defaulted-to decision, per study-system-design audit's CRITICAL red-flag finding.

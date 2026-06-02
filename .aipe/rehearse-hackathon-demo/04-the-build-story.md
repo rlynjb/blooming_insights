@@ -94,7 +94,7 @@ The hard part, drawn. This is what you point at while you talk.
 
 Three pure functions — `schemaCapabilities`, `coverageFor`,
 `coverageReport` — plus one filter, `runnableCategories`. The
-whole subsystem is 60 lines. It's the reason the agent never
+whole subsystem is one file. It's the reason the agent never
 spends its budget on a category it can't actually run.
 
   ## Beat 1 — what shipped   (8:00–8:20)
@@ -276,3 +276,5 @@ chapter 4, say that one line and move to chapter 5.
 ```
 
 Read chapter 5 next.
+
+Updated: 2026-06-02 — v1.59.2 drift refresh: softened "60 lines" claim on the schema-gate subsystem (categories.ts is now 160 lines) into "one file"; the four named exports (schemaCapabilities, coverageFor, coverageReport, runnableCategories) all still match the codebase.

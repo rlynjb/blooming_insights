@@ -96,3 +96,4 @@ Use both. This book gets you through the first fifteen minutes without rambling;
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-05-31 — Migrated to /aipe:rehearse orchestrator (v1.50): directory renamed from .aipe/study-interview-defense/ to .aipe/rehearse-interview-defense/ per spec rename study-interview-defense.md → rehearse-interview-defense.md; cross-references updated. Content unchanged.
+Updated: 2026-06-02 — v1.59.2 drift refresh: surgical edits across chapters 2, 3, 4, 7, 8 to integrate the CRITICAL `lib/state/insights.ts` race condition (audit red flag), tighten the test count to 169 across 18 files, surface the ALS-scoped RequestStore in the architecture diagram, and verify cited line numbers still resolve. No restructuring; book shape unchanged.

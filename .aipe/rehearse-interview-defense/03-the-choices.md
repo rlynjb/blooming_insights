@@ -106,7 +106,7 @@ That last sentence matters — you connected the framework choice to the state c
 
 In your voice:
 
-"An agent loop is small when you write it for one purpose: call the model with a tool schema, run the tool calls it asks for, feed results back, repeat until it answers or you cut it off. That's `runAgentLoop` — one function all four agents share. Each agent is just a prompt, a subset of tools, and an output validator. I built it myself for two reasons. First, control: I needed a hard `maxToolCalls` budget and a forced final synthesis turn, because the MCP server is rate-limited at roughly one request a second and I can't let an agent wander. Second, testability — because the loop takes the MCP client and the Anthropic client as injected dependencies, I test all four agents against fakes with no network. That's how the suite is around 170 tests with zero live calls. A framework would have hidden the loop I specifically needed to control, and made the fakes harder."
+"An agent loop is small when you write it for one purpose: call the model with a tool schema, run the tool calls it asks for, feed results back, repeat until it answers or you cut it off. That's `runAgentLoop` — one function all four agents share. Each agent is just a prompt, a subset of tools, and an output validator. I built it myself for two reasons. First, control: I needed a hard `maxToolCalls` budget and a forced final synthesis turn, because the MCP server is rate-limited at roughly one request a second and I can't let an agent wander. Second, testability — because the loop takes the MCP client and the Anthropic client as injected dependencies, I test all four agents against fakes with no network. That's how the suite is 169 tests across 18 files with zero live calls. A framework would have hidden the loop I specifically needed to control, and made the fakes harder."
 
 ```
 ┃ I didn't avoid the agent framework because frameworks are
@@ -296,3 +296,4 @@ The most reconsiderable choice in this chapter is the fixed roughly-one-second s
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-02 — Test-count precision: "around 170 tests" → "169 tests across 18 files" to match the current vitest suite per study-testing audit.
