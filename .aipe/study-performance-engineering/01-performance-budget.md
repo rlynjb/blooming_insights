@@ -442,5 +442,5 @@ The whole budget picture in one frame: the hard budgets at each layer, what they
 - `03-latency-throughput-and-tail-behavior.md` — how Budgets 2 and 4 compose into total latency
 - `06-caching-batching-and-backpressure.md` — the 60s TTL that lets Budget 4 be cheaper on a hit
 - `08-performance-red-flags-audit.md` — the ranked risks, including "no soft budgets"
-- `.aipe/study-system-design/01-system-design/07-scale-bottlenecks-and-evolution.md` — why Budget 1 is the second ceiling that breaks at 100x
+- `.aipe/study-system-design/07-scale-bottlenecks-and-evolution.md` — why Budget 1 is the second ceiling that breaks at 100x
 - `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — the cost budget that doesn't exist yet

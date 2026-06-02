@@ -132,6 +132,6 @@ A finding belongs here when the question is *"how big? how fast? how often? how 
 - `01-performance-budget.md` — the contract that bounds the system
 - `02-measurement-baselines-and-profiling.md` — what we can see, and what we can't
 - `08-performance-red-flags-audit.md` — the ranked risks, with evidence
-- `.aipe/study-system-design/01-system-design/07-scale-bottlenecks-and-evolution.md` — the three scale ceilings
+- `.aipe/study-system-design/07-scale-bottlenecks-and-evolution.md` — the three scale ceilings
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — why spacing isn't backpressure
 - `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — token-economics layer

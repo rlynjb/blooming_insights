@@ -617,4 +617,4 @@ The full client perf picture — what's shipped, what bounds it, what's missing.
 - `03-latency-throughput-and-tail-behavior.md` — the actual latency the UI is hiding
 - `05-io-network-and-database-bottlenecks.md` — the NDJSON streaming pipeline from the I/O lens
 - `08-performance-red-flags-audit.md` — "no Web Vitals" as a finding
-- `.aipe/study-system-design/01-system-design/02-request-response-and-data-flow.md` — the NDJSON flow from the request-shape lens
+- `.aipe/study-system-design/02-request-response-and-data-flow.md` — the NDJSON flow from the request-shape lens

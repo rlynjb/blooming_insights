@@ -179,7 +179,7 @@ You've inherited a codebase and someone hands you a 50-item "tech debt" list. Th
                  (b) move the agent run out of the route (queue + worker)
                      so the route budget is no longer the cap. cost: a
                      database (does not exist) + a worker process.
-                 cross-ref study-system-design/01-system-design/07 — the
+                 cross-ref study-system-design/07 — the
                  same tradeoff frames as "ceiling 2" in that file.
   unblocks:      headroom on bad days; absent rework, fixing R1+R2 first
                  lets you see if R3 actually bites (today, frequency is
@@ -623,6 +623,6 @@ The full ranked list at a glance — top three, middle four, bottom three, not-y
 - `04-cpu-memory-and-allocation.md` — R5/R6 memory shapes
 - `06-caching-batching-and-backpressure.md` — R4 prompt-prefix cache gap
 - `07-rendering-client-and-mobile-performance.md` — R7 Web Vitals gap
-- `.aipe/study-system-design/01-system-design/07-scale-bottlenecks-and-evolution.md` — the architectural fix for R3
+- `.aipe/study-system-design/07-scale-bottlenecks-and-evolution.md` — the architectural fix for R3
 - `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — R1 theory
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — R8 trigger condition (if fan-out arrives)

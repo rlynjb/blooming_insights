@@ -412,5 +412,5 @@ No per-call timeout on the actual `transport.callTool`. A hung connection (TCP R
 - `01-distributed-system-map.md` — Seam C in context; why the parsed-window approach belongs here
 - `03-idempotency-deduplication-and-delivery-semantics.md` — retrying is only safe because every MCP call is a read
 - `06-queues-streams-ordering-and-backpressure.md` — the NDJSON stream is what makes the long retry waits tolerable in the UI
-- `.aipe/study-system-design/01-system-design/06-failure-handling-and-reliability.md` — the failure-handling audit cross-link
+- `.aipe/study-system-design/06-failure-handling-and-reliability.md` — the failure-handling audit cross-link
 - `.aipe/study-networking/` — HTTP-level retry semantics (when generated)

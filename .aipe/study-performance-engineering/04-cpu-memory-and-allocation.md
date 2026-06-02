@@ -529,5 +529,5 @@ The full memory picture — the three shapes, what bounds each, the CPU hot path
 - `03-latency-throughput-and-tail-behavior.md` — why this workload is I/O-bound by structure
 - `05-io-network-and-database-bottlenecks.md` — the I/O that dominates
 - `06-caching-batching-and-backpressure.md` — the schema cache from a caching lens
-- `.aipe/study-system-design/01-system-design/03-state-ownership-and-source-of-truth.md` — the in-memory Maps as an architectural choice
+- `.aipe/study-system-design/03-state-ownership-and-source-of-truth.md` — the in-memory Maps as an architectural choice
 - `.aipe/study-runtime-systems/` (sibling guide) — the runtime context for the messages-array lifecycle

@@ -520,4 +520,4 @@ The full latency picture — the layers, the per-call math, the per-agent math, 
 - `05-io-network-and-database-bottlenecks.md` — the network contribution to per-call latency
 - `06-caching-batching-and-backpressure.md` — the cache that turns 1.5-3s into 0s
 - `08-performance-red-flags-audit.md` — the unmeasured tail as a top-3 finding
-- `.aipe/study-system-design/01-system-design/07-scale-bottlenecks-and-evolution.md` — what changes at 100x users
+- `.aipe/study-system-design/07-scale-bottlenecks-and-evolution.md` — what changes at 100x users

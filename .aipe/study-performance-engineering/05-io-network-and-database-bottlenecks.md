@@ -567,5 +567,5 @@ The full I/O picture — every destination, every direction, every constraint.
 - `03-latency-throughput-and-tail-behavior.md` — the per-call latency math
 - `06-caching-batching-and-backpressure.md` — the cache that removes Bloomreach round-trips entirely
 - `08-performance-red-flags-audit.md` — Anthropic latency variance as an unmeasured risk
-- `.aipe/study-system-design/01-system-design/05-storage-choice-and-durability-boundaries.md` — why there's no DB
+- `.aipe/study-system-design/05-storage-choice-and-durability-boundaries.md` — why there's no DB
 - `.aipe/study-networking/` (sibling guide) — HTTPS, chunked transfer, TLS reuse from a transport lens

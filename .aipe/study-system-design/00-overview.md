@@ -331,7 +331,7 @@ The earlier `.aipe/study-system-design-dsa/` is now the archive. The legacy `01-
 
 ## Sections
 
-- **[01-system-design/](01-system-design/README.md)** — the eight audit lenses, in reading order.
+- **[README.md](README.md)** — the eight audit lenses, in reading order.
 
 ---
 

@@ -50,7 +50,7 @@
 ### RISK 1 — cross-instance state silently missing (CRITICAL)
 
 **Where:** `lib/state/insights.ts:4-6`, `lib/state/investigations.ts:11`, `lib/mcp/schema.ts:131`
-**Cross-link:** `study-system-design/01-system-design/08-system-design-red-flags-audit.md` ranks this #1 with the same evidence.
+**Cross-link:** `study-system-design/08-system-design-red-flags-audit.md` ranks this #1 with the same evidence.
 
 **The failure:** In production on Vercel, two requests for the same user can land on two different process instances. Each instance has its own `Map<string, Insight>` and its own `cached: WorkspaceSchema | null`. When a request for `/api/agent?insightId=X` lands on an instance whose Map doesn't have X, the lookup returns null. The route falls back to `resolveAnomaly` (`app/api/agent/route.ts:37-62`), which tries in-memory first (miss), then the `?insight=` query param (if the client sent it), then the demo snapshot. For live runs without the query param, the result is a 404.
 
@@ -262,5 +262,5 @@ The day someone adds a write tool — `create_voucher`, `start_campaign`, anythi
 - `03-idempotency-deduplication-and-delivery-semantics.md` — RISK 3 in mechanism depth
 - `04-consistency-models-and-staleness.md` — RISK 5 in mechanism depth
 - `05-replication-partitioning-and-quorums.md` — RISK 1's structural cause
-- `.aipe/study-system-design/01-system-design/08-system-design-red-flags-audit.md` — the system-design twin of this audit
+- `.aipe/study-system-design/08-system-design-red-flags-audit.md` — the system-design twin of this audit
 - `.aipe/study-security/` — security-shaped risks at the same boundaries
