@@ -73,7 +73,7 @@ by panel.
   │             tests · clean code                             │
   │  baseline:  most submissions break or fall back to fakes   │
   │  our take:  demo mode default (creds-free, instant) +      │
-  │             live mode for real-data Q&A · 144 vitest tests │
+  │             live mode for real-data Q&A · 169 vitest tests │
   └────────────────────────────────────────────────────────────┘
 
   ┌─ M5  innovation & differentiation             [20%] ───────┐
@@ -345,6 +345,12 @@ would lead to it can be named.
       → measured: agent's match rate vs the labeled set
       → measured: false-positive rate on "found an anomaly
         that wasn't real"
+      → starter version already spec'd as the queue-head drill
+        (`.aipe/drills/evals-observability-induce-eval-gap-
+        build-min-eval-harness.md`): 10-case goldset +
+        rubric + runner + LLM-as-judge + agreement test,
+        five files in `evals/`, ~5 hours of work — the
+        substrate (NDJSON trace + replay) is already built
 
   D4  if D1–D3 land positive, attempt a 4-week pilot with
       1–2 design partners
@@ -377,3 +383,6 @@ Chapter 05 is the pressure test. Seven skeptical-reviewer
 questions and the answers that hold under each one.
 
 Read chapter 05 next.
+
+---
+Updated: 2026-06-03 — refreshed test-suite count (144 → 169) and pointed D3 at the now-spec'd queue-head eval drill (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md`).

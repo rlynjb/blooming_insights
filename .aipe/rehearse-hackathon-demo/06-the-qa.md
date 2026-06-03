@@ -231,7 +231,10 @@ gathered, then asks for a structured Diagnosis. The validator
 in `lib/mcp/validate.ts` parses the JSON and falls back to a
 "insufficient data" diagnosis if it can't. Hallucinated numbers
 are bounded — the model is reading from real tool results, not
-guessing them.
+guessing them. What I don't have yet is a real eval — a goldset
+of hand-curated cases with a judge that scores diagnosis quality
+against ground truth. That's the next engineering move and
+there's a drill spec for it in `.aipe/drills/`.
 
   ## The followup decision tree
 
@@ -358,3 +361,5 @@ Two sentences. Then stop. The discipline IS the answer.
 
 End of book. Run the demo end-to-end with a timer before reading
 anything else.
+
+Updated: 2026-06-03 — Probe 8 "if they push on hallucination" follow-up extended with the eval-harness drill (named in `.aipe/drills/`) as the named next engineering move; turns the unmeasured-quality gap into a forward-looking answer.

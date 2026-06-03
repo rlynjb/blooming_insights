@@ -47,7 +47,7 @@ demo all five rubric criteria. Anything not in this list was cut.
   │  → OAuth (PKCE + DCR) with encrypted cookie store            │
   │  → NDJSON streaming over ReadableStream                     │
   │  → schema-gated coverage (free filter before expensive scan) │
-  │  → vitest test suite (144 tests, pure logic + agent fakes)   │
+  │  → vitest test suite (169 tests, pure logic + agent fakes)   │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -357,3 +357,6 @@ Each one has a defensible reason it's out of scope. Naming them
 
 Read chapter 03 next — the options analysis, including "do
 nothing" as a real option.
+
+---
+Updated: 2026-06-03 — refreshed test-suite count (144 → 169) to match the 2026-06-02 status snapshot.

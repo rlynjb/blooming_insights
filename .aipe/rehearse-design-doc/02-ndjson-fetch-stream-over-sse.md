@@ -216,7 +216,7 @@ We chose NDJSON over fetch-stream, accepting:
 
 4. **No event IDs / resume.** A reconnecting client can't ask for "events after the last one I saw." *We accept this — see open question #1.*
 
-5. **Two consumers of the wire format.** `lib/hooks/useInvestigation.ts:184-201` (investigation hook) and `app/page.tsx:268-419` (feed page) each have their own copy of the reader loop. Drift risk. *We accept this — extraction is mechanical refactor work, not architectural.*
+5. **Two consumers of the wire format** (actually three — `components/chat/StreamingResponse.tsx:107-132` carries a smaller third copy). `lib/hooks/useInvestigation.ts:184-201` (investigation hook) and `app/page.tsx:268-419` (feed page) each have their own copy of the reader loop. Drift risk. The duplication is also called out in `.aipe/study-frontend-engineering/audit.md` red-flag #2 — the architectural call (one shared `useNdjsonReader` vs hooks each own their own) is gated on the feed-page-hooks extraction. RFC-004 owns the framing for that gating. *We accept this — extraction is mechanical refactor work, not architectural.*
 
 6. **The briefing route's `BriefingEvent` is a local superset of `AgentEvent`.** We deliberately did NOT widen the shared union (which would force the investigation view to handle event types it never receives). Two consumers, one core contract, one local extension. *We accept this — the discipline is "extend locally, never widen the contract."*
 
@@ -299,5 +299,12 @@ For sending ~50 small events over ~115 seconds, the protocol overhead is in the 
 - `app/page.tsx:268-419` — second consumer loop (feed / briefing)
 - `.aipe/study-system-design/05-streaming-ndjson.md` — deeper teaching guide on the mechanism
 - `.aipe/study-networking/06-websockets-sse-streaming-and-realtime.md` — the broader transport landscape
+- `.aipe/study-frontend-engineering/01-ndjson-stream-reader-hook.md` — the consumer-side walk (the hook-shaped reader loop)
+- `.aipe/study-frontend-engineering/audit.md` — confirms the same NDJSON-over-fetch finding from the frontend lens (rendering-and-reactivity + data-fetching-and-cache lenses)
+- `.aipe/rehearse-design-doc/04-framework-runtime-without-data-primitives.md` — the consumer-side companion RFC (why we hand-roll the reader instead of reaching for Suspense / use() / SWR)
 - WHATWG HTML spec — `EventSource` (the standard we deliberately don't use)
 - RFC 7230 — HTTP/1.1 chunked transfer encoding (the primitive that makes streaming work)
+
+---
+
+**Updated:** 2026-06-03 — cross-references added to `study-frontend-engineering/audit.md` and RFC-004 (the consumer-side companion). Reader-loop duplication tradeoff #5 expanded to acknowledge the third copy in `StreamingResponse.tsx` and the RFC-004 framing of the gated extraction.

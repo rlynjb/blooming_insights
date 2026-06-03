@@ -142,7 +142,14 @@ answer — there's no eval harness. Don't pretend otherwise.
 > labeled ground truth: 50–200 anomalies the team independently
 > agreed on (importance + action), then measure the agent's
 > match rate against that set. ~2 weeks of work. Not done; not
-> hidden.
+> hidden — the starter version is already spec'd as the queue-
+> head drill (`.aipe/drills/evals-observability-induce-eval-gap-
+> build-min-eval-harness.md`): five files in `evals/` (goldset,
+> rubric, runner, LLM-as-judge, agreement test), ~5 hours, and
+> the eval substrate (NDJSON trace + deterministic replay) is
+> already built — the harness is the keystone, and the keystone
+> is the only stone missing (`.aipe/audit-refactor-eval-
+> substrate/00-overview.md`).
 
   ### The answer that loses
 
@@ -449,3 +456,6 @@ for the ten-question core, `02-scope-cuts-and-non-goals.md` for
 the cut hierarchy, `03-options-and-opportunity-cost.md` for the
 five-option decision matrix, and `04-success-metrics-and-
 feedback-loop.md` for the two-layer success frame.
+
+---
+Updated: 2026-06-03 — Q3 "how do you know diagnoses are right" now names the queue-head eval drill (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md`) as the concrete first build, with the keystone-missing framing from `.aipe/audit-refactor-eval-substrate/00-overview.md`.

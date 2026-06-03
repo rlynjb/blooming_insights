@@ -95,7 +95,7 @@ Concretely:
 - **Cookie flags** are `httpOnly` (JS can never read it — XSS exfil contained), `secure` (HTTPS-only), `sameSite: 'none'` (must survive the cross-site round-trip from the Bloomreach IdP back to `/api/mcp/callback`), 10-day `maxAge`.
 - **Insights and investigations** live in `lib/state/insights.ts` (`Map<id, Insight>`) and `lib/state/investigations.ts` (`Map<id, AgentEvent[]>`). The investigation flow hands diagnoses from step 2 to step 3 via the browser's `sessionStorage`, not the server — see `app/api/agent/route.ts:222-240` (the `parseDiagnosis(diagnosisParam)` path).
 
-The pattern: **stateful client, stateless server.** Every byte of durable state lives on the browser. The server reconstructs the world from cookies + URL params + sessionStorage handoffs on every request.
+The pattern: **stateful client, stateless server.** Every byte of durable state lives on the browser. The server reconstructs the world from cookies + URL params + sessionStorage handoffs on every request. RFC-004 extends this same stance to the page-to-page boundary on the frontend — no global store, no provider, page hand-offs via `sessionStorage` + URL params.
 
 ---
 
@@ -260,5 +260,10 @@ Yes, and we accept it for a single-user demo. The day we have many users, we add
 - `app/api/agent/route.ts:222-240` — the sessionStorage handoff that compensates for the missing server-side investigation store
 - `.aipe/study-security/01-encrypted-cookie-oauth-state.md` — deeper teaching guide on the crypto
 - `.aipe/study-database-systems/00-overview.md` — the honest accounting of "what's where" when there's no database
+- `.aipe/rehearse-design-doc/04-framework-runtime-without-data-primitives.md` — the same "stateful client, stateless server" stance extended to the page-to-page boundary (no global store, sessionStorage handoff between pages)
 - NIST SP 800-38D — AES-GCM spec, IV uniqueness requirement
 - iron-session (npm) — canonical reference implementation of this pattern
+
+---
+
+**Updated:** 2026-06-03 — cross-link to RFC-004 on the "stateful client, stateless server" pattern. RFC-004 extends the same stance to the page-to-page boundary on the frontend (no global store, sessionStorage + URL params for cross-page state).

@@ -225,6 +225,10 @@ My honest answer: the part I'm least confident defending at depth is the MCP wir
 
 That distinction — *defaulted-to the SDK for the protocol, deliberate for the wrapper* — is the senior move. I'm not claiming to have implemented OAuth; I'm claiming to know precisely where the SDK's responsibility ends and mine begins.
 
+There's a second answer here that's actually sharper, and I'd offer it second if they let me, because it's the answer a staff interviewer would respect most: **the part I'm least confident defending isn't a protocol — it's the eval gap.** There is no `evals/` directory in this repo. No goldset, no judge, no agreement rate. Every prompt edit and every model swap ships with zero quality measurement, and the 169 tests prove plumbing, not output quality. The infrastructure to do evals well is actually built — the NDJSON trace is a span sequence, `lib/state/investigations.ts` replays it deterministically, `parseAgentJson` gives me typed agent outputs to score, the scripted-Anthropic harness proves the seam works against a fake — five seams, all cut. The keystone module is the only one missing. So if an L4 interviewer asks "how do you know any of the agent outputs are good," the honest answer today is "I don't, beyond eyeballing the trace" — and the move I'd respect from a candidate is to say that flatly and then describe the harness I'd build, not to dodge into the test count. I have the recipe written down (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md` — 10-case goldset, LLM-as-judge, measured agreement rate, ~5 hours). Owning the gap with a concrete recipe is the L5 move; pretending the unit tests cover it is the L1 collapse.
+
+One more honest gap, while we're here: a11y on the streaming surfaces. The reasoning trace, the coverage grid resolving live, the insight cards dropping in — none of those streamed regions is wrapped in `aria-live`, `role="status"`, or `role="log"`. A screen-reader user gets silence while a sighted user watches the agent think. That's not a regret; it's a discipline I didn't build into the project, and the fix is small (the regions exist; they just need the right ARIA roles). If they push, I'd own it the same way as the eval gap — name what's there, name what isn't, and name the cheap concrete fix.
+
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║ "I DON'T KNOW" RECOVERY BOX — pushed on OAuth/MCP protocol internals           ║
 ║                                                                                ║
@@ -357,7 +361,7 @@ If I redid the hardest-bug work, the change isn't to the fix — the started-gua
 | Hardest bug? | StrictMode double-fetch in `useInvestigation.ts`: my started-guard and cleanup-cancel fought — cancelled the only fetch, then blocked the remount. Fix: guard + no-cancel-on-cleanup. |
 | Trickier in prod? | Briefing bare-500: demo=200 vs live=500 isolated it to the credentialed setup; `aesKey()` threw on unset `AUTH_SECRET`, unguarded. Wrapped setup, returned the real message. |
 | Proudest part? | The streamed reasoning trace — an analyst that shows its work — backed by the coverage gate that ghosts categories the data can't support instead of faking them. |
-| Least confident? | MCP/OAuth protocol internals — defaulted-to the SDK's provider for the flow, deliberate about the AES-256-GCM cookie store I built around it. I defend the wrapper, not the byte-level handshake. |
+| Least confident? | Two honest answers: (1) **the eval gap** — no `evals/`, no goldset, no agreement rate; 169 tests prove plumbing, not output quality; I have the harness recipe written down and would build it next. (2) MCP/OAuth protocol internals — defaulted-to the SDK's provider; I defend the wrapper, not the byte-level handshake. Streaming a11y is the same shape of admission: no `aria-live` on the trace, fix is small. |
 | Subtle debug? | Coverage "loaded all at once": measured per-line arrival, proved the server streamed fine, the grid waited on one bulk event. Fix: `coverage_item` per tile — honestly only paced in the demo. |
 
 **Pull quotes:**
@@ -370,3 +374,4 @@ If I redid the hardest-bug work, the change isn't to the fix — the started-gua
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-03 — Prompt 3 ("least confident defending") absorbed two new honest gaps from the recon + a11y audits: (1) the eval gap as the sharper L4-grade answer (five substrate seams cut, the harness keystone missing — recipe written in `.aipe/drills/evals-observability-*.md`); (2) streaming-surface a11y (no `aria-live` on the trace/coverage/insights) as a clean "what I'd add" admission. One-page summary updated to match.

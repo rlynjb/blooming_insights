@@ -205,7 +205,11 @@ There's a fourth one you can volunteer if it lands — a correctness bug AI sugg
 
 ## What you'd change
 
-About how you *used* AI, not about the code: you'd keep a tighter log of the defaulted-to decisions as you made them. The OAuth flow, the encryption parameters, the backoff constants — you can identify them as defaults now, in hindsight, but you reconstructed that boundary after the fact. The senior habit is to mark a decision as "accepted the tool's default, didn't evaluate" *at the moment you make it*, so the boundary between your judgment and the tool's is a record, not a reconstruction. Next project, that log is the thing you'd start on day one — it's exactly what makes this interview question easy to answer.
+Two answers here, and the second is the senior-grade one.
+
+The first is about how you *used* AI, not about the code: you'd keep a tighter log of the defaulted-to decisions as you made them. The OAuth flow, the encryption parameters, the backoff constants — you can identify them as defaults now, in hindsight, but you reconstructed that boundary after the fact. The senior habit is to mark a decision as "accepted the tool's default, didn't evaluate" *at the moment you make it*, so the boundary between your judgment and the tool's is a record, not a reconstruction. Next project, that log is the thing you'd start on day one.
+
+The second, and the one a staff interviewer will hear as L5: **I'd have shipped the eval harness in the same week as the agent loop.** The bluntest version of "what would I do differently with more time" on an AI product is owning that I built a 4-agent system with five eval substrate seams cut (the NDJSON trace as a span sequence, the deterministic replay store, the typed agent outputs, the scripted-Anthropic fake harness, the `McpCaller` interface) and stopped one module short of the keystone. The recipe is written down already (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md` — 10-case goldset, LLM-as-judge, measured agreement rate, ~5 hours). Saying that *unprompted*, with the recipe ready, is the strongest possible version of this question's answer: I know the gap, I know the cost (every prompt edit ships blind, every model swap is a guess, the cost of `synthesize()` is suspected but unmeasured), I know the fix, and I haven't shipped it yet. Owning a gap with a concrete recipe is the L5 move. Pretending the 169 plumbing tests cover output quality is the L1 collapse this whole chapter exists to prevent.
 
 ---
 
@@ -223,8 +227,9 @@ About how you *used* AI, not about the code: you'd keep a tighter log of the def
 - The decisions were mine; AI accelerated the typing. I can tell you which bucket any part falls into.
 - "What did the AI get wrong?" is a gift — the honest answer is a story of you catching the machine.
 
-**What you'd change:** Keep a real-time log of defaulted-to decisions as you make them, so the judgment/default boundary is a record, not a reconstruction.
+**What you'd change:** Two answers. (1) Keep a real-time log of defaulted-to decisions as you make them, so the judgment/default boundary is a record, not a reconstruction. (2) The L5 answer: ship the eval harness in the same week as the agent loop — five substrate seams cut, the keystone module missing, recipe written down (~5 hours). Owning the gap with a concrete recipe is the L5 move.
 
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-06-02 — Added a fourth "what did AI get wrong" candidate: the `lib/state/insights.ts` global-Map + `putInsights.clear()` concurrent-user race — strongest possible version of owning a defaulted-to decision, per study-system-design audit's CRITICAL red-flag finding.
+Updated: 2026-06-03 — Promoted the eval harness gap into the "what you'd change" closer as the L5-grade answer (five substrate seams cut, keystone missing, recipe written in `.aipe/drills/evals-observability-*.md`, ~5 hours). Owning the gap with a concrete recipe is the senior move on "what would you have done differently with more time." One-page summary updated.

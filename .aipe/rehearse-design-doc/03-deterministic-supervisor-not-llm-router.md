@@ -277,4 +277,8 @@ The test suite covers it (`test/agents/*.test.ts` — 169 tests, none require an
 - `lib/mcp/tools.ts` — per-agent tool subset filtering
 - `.aipe/study-agent-architecture/03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` — deeper teaching guide on the escalation gate
 - `.aipe/study-agent-architecture/03-multi-agent-orchestration/03-sequential-pipeline.md` — deeper teaching guide on the topology we chose
-- Anthropic, "Building Effective Agents" (2024) — the canonical reference for "don't auto-route what you can hand-route"
+- Anthropic, "Building Effective Agents" (2026) — the canonical reference for "don't auto-route what you can hand-route"
+
+---
+
+**Updated:** 2026-06-03 — no architectural drift. The recon and cleanup audits surfaced eval / observability gaps (no LLM eval; `res.usage` dropped on the floor at four call sites; no phase-timing on the 300s budget) that are real but live in the cleanup-and-readiness layer, not the supervisor decision. The supervisor's `if`-ladder remains the right shape; the gaps are additive instrumentation, not RFC-worthy reversals.

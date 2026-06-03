@@ -67,6 +67,8 @@ In your voice:
 
 That last sentence matters — you connected the framework choice to the state choice. Senior answers show the decisions are *linked*, not a pile of independent picks.
 
+There's a second-order honesty here worth pre-loading, because a sharp interviewer will pull on it: I use Next.js 16 + React 19 as a *runtime*, not for its data primitives. Every routed page is `'use client'`; there are no Server Components in the routed surface, no Suspense boundaries, no `loading.tsx` / `error.tsx`, no server actions, no `use(promise)`. That's not an oversight — it's a fit-for-purpose call. React 19's marquee data features assume request-response: render once, suspend on a promise, resolve with data. This product is a 30-90s NDJSON stream, not a request-response shape. Suspense has nothing to suspend on; a Server Component can't hold a streaming reader loop. So the framework gives me the route-handler streaming, the file-based routing, the deploy story — and I drive the data layer with a hand-written fetch + `ReadableStream` reader, which is the right shape for this product. If they ask "why no Suspense?" the answer is one sentence: *Suspense is built for promises that resolve; mine never does — it streams.*
+
 ```
 "Why Next.js?"
         │
@@ -297,3 +299,4 @@ The most reconsiderable choice in this chapter is the fixed roughly-one-second s
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-06-02 — Test-count precision: "around 170 tests" → "169 tests across 18 files" to match the current vitest suite per study-testing audit.
+Updated: 2026-06-03 — Added a "framework runtime, not its data primitives" paragraph to Choice 1 (Next.js) absorbing the study-frontend-engineering audit's "framework underused" finding — preempts "why no Suspense / Server Components?" with the fit-for-purpose defense (this product is a 30-90s NDJSON stream, not a request-response shape).
