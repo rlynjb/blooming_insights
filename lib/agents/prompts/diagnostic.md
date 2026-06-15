@@ -78,7 +78,7 @@ Under **Olist**:
 
 - Do NOT derive conclusions from empty windows — both baseline and comparison periods are empty and any ratio is meaningless.
 - Under **Bloomreach**, anchor `execution_time` (a Unix timestamp in seconds) to a point inside the populated range. Widen the window (`in last 90 days`, `in last 365 days`, `in last 730 days`) until you get non-zero counts, then compare two windows anchored there.
-- Under **Olist**, the Brazilian e-commerce dataset spans Sep 2016 – Oct 2018. Pick `time_range` values inside that range (e.g. `from: '2018-01-01', to: '2018-04-01'`); recent dates return empty.
+- Under **Olist**, the synthetic dataset's exact horizon is printed in the workspace schema at the bottom of this prompt as `Data horizon: <from> → <to>` (currently `2025-12-01 → 2026-06-01`). Pick `time_range` values inside that range — do NOT use 2017/2018 dates from the original Kaggle Olist dataset; those queries will return empty `points` and waste a call. The anomaly's `anomaly_window` / `baseline_window` fields, when provided, already land inside the horizon; use them directly.
 - If you cannot establish a populated window within your 6-call budget, state this honestly in `conclusion` rather than inventing evidence.
 
 ## Output

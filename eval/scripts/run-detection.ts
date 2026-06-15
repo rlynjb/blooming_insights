@@ -89,7 +89,12 @@ function loadSeededAnomalies(): SeededAnomaly[] {
 function makeResultsDir(): { dir: string; date: string } {
   const today = new Date();
   const date = today.toISOString().slice(0, 10);
-  const dir = resolve(REPO_ROOT, 'eval/results', date);
+  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
+  // `2026-06-15-after-fix/`) instead of overwriting the prior run's
+  // summary.md and raw audit trail.
+  const tag = process.env.EVAL_RUN_TAG;
+  const dirName = tag ? `${date}-${tag}` : date;
+  const dir = resolve(REPO_ROOT, 'eval/results', dirName);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return { dir, date };
 }

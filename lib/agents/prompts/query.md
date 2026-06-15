@@ -63,7 +63,7 @@ Under **Olist**:
 If recent windows return 0 or empty results, the data is historical and stops at some point in the past. In that case, anchor your window to a point inside the populated range:
 
 - **Bloomreach** — set `execute_analytics_eql`'s `execution_time` (a Unix timestamp in seconds) and widen `in last N days` until you get non-zero counts.
-- **Olist** — pick a `time_range` inside Sep 2016 – Oct 2018 (e.g. `from: '2018-01-01', to: '2018-04-01'`).
+- **Olist** — pick a `time_range` inside the workspace schema's `Data horizon` (currently `2025-12-01 → 2026-06-01`, printed at the bottom of this prompt). Do NOT use 2017/2018 dates from the Kaggle Olist dataset — those queries will return empty.
 
 Otherwise, say so honestly. Never invent numbers.
 

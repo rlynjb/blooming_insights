@@ -34,11 +34,19 @@ export function schemaSummary(schema: WorkspaceSchema): string {
   const MAX_CPROPS = 30;
   const customerPropsText = schema.customerProperties.slice(0, MAX_CPROPS).join(', ');
 
+  // Synthetic datasets (Olist) ship with a known horizon — surface it inline
+  // so the model anchors `time_range` to dates that actually exist, instead
+  // of pulling 2017-2018 Kaggle dates from training memory.
+  const horizonLine = schema.dataHorizon
+    ? `Data horizon: ${schema.dataHorizon.from} → ${schema.dataHorizon.to} (${schema.dataHorizon.durationDays} days; \`to\` exclusive). ALL queries MUST land inside this window.`
+    : null;
+
   return [
     `Project: ${schema.projectName} (${schema.projectId})`,
     `Total customers: ${schema.totalCustomers.toLocaleString()}`,
     `Total events: ${schema.totalEvents.toLocaleString()}`,
     `Oldest data: ${oldestDate}`,
+    ...(horizonLine ? [horizonLine] : []),
     `Catalogs: ${schema.catalogs.map((c) => c.name).join(', ') || 'none'}`,
     '',
     `Top events (name, eventCount: properties):`,
