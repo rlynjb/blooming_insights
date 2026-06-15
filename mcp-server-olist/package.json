@@ -1,0 +1,13 @@
+{
+  "name": "mcp-server-olist",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server over a synthetic Brazilian e-commerce (Olist-flavored) SQLite dataset. Three domain tools: get_metric_timeseries, get_segments, get_anomaly_context.",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "seed": "tsc -p tsconfig.json && node dist/scripts/seed-olist.js",
+    "start": "node dist/src/index.js"
+  }
+}

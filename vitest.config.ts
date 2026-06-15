@@ -9,7 +9,7 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['test/**/*.test.ts'],
+    include: ['test/**/*.test.ts', 'mcp-server-olist/test/**/*.test.ts'],
     passWithNoTests: true,
   },
 });
