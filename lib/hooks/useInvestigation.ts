@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { AgentEvent } from '@/lib/mcp/events';
 import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
+import { readNdjson } from '@/lib/streaming/ndjson';
 
 export type InvestigationStep = 'diagnose' | 'recommend';
 
@@ -181,31 +182,7 @@ export function useInvestigation(id: string | undefined, step: InvestigationStep
           return;
         }
 
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
-        let buf = '';
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop() ?? '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              handle(JSON.parse(line) as AgentEvent);
-            } catch {
-              /* ignore malformed line */
-            }
-          }
-        }
-        if (buf.trim()) {
-          try {
-            handle(JSON.parse(buf) as AgentEvent);
-          } catch {
-            /* ignore */
-          }
-        }
+        await readNdjson<AgentEvent>(res.body, handle);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
