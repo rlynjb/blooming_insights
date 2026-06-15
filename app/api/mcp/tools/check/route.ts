@@ -19,8 +19,9 @@ export async function GET() {
     const report = crossCheckToolCoverage(extractToolNames(raw));
     return NextResponse.json(report, { status: report.ok ? 200 : 409 });
   } catch (e) {
+    console.error('[mcp-tools-check] error:', e);
     return NextResponse.json(
-      { error: e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e) },
+      { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
     );
   }

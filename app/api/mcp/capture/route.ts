@@ -51,8 +51,9 @@ export async function GET(req: NextRequest) {
     }
     return NextResponse.json({ captured, dir });
   } catch (e) {
+    console.error('[mcp-capture] error:', e);
     return NextResponse.json(
-      { error: e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e) },
+      { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
     );
   }

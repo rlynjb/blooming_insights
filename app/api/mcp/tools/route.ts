@@ -15,8 +15,9 @@ export async function GET() {
     const tools = await conn.mcp.listTools();
     return NextResponse.json({ tools });
   } catch (e) {
+    console.error('[mcp-tools] error:', e);
     return NextResponse.json(
-      { error: e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e) },
+      { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
     );
   }

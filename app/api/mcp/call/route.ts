@@ -14,8 +14,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ result: r.result, durationMs: r.durationMs });
   } catch (e) {
     // Surface the real error as JSON so the client never sees an empty body.
+    console.error('[mcp-call] error:', e);
     return NextResponse.json(
-      { error: e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e) },
+      { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
     );
   }
