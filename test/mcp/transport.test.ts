@@ -69,6 +69,93 @@ describe('SdkTransport error enrichment', () => {
   });
 });
 
+describe('SdkTransport per-call timeout', () => {
+  it('returns the call result bit-identical when the SDK resolves quickly', async () => {
+    // Sanity check that the AbortSignal.timeout wrap does not alter the
+    // success path — the resolved value must flow through untouched.
+    const expected = { content: [{ type: 'text', text: 'ok' }], isError: false };
+    const client = {
+      async callTool() {
+        return expected;
+      },
+    } as unknown as Client;
+    const t = new SdkTransport(client);
+    await expect(t.callTool('any_tool', {})).resolves.toBe(expected);
+  });
+
+  it('passes an AbortSignal to the SDK so the transport can cancel', async () => {
+    // Pin the contract: we hand the SDK a signal in `options`. The SDK uses
+    // it both to abort the underlying request and (via `AbortSignal.timeout`)
+    // to trip after TOOL_TIMEOUT_MS without the SDK needing its own clock.
+    let receivedSignal: AbortSignal | undefined;
+    const client = {
+      async callTool(
+        _params: unknown,
+        _schema: unknown,
+        options: { signal?: AbortSignal } | undefined,
+      ) {
+        receivedSignal = options?.signal;
+        return { ok: true };
+      },
+    } as unknown as Client;
+    const t = new SdkTransport(client);
+    await t.callTool('any_tool', {});
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('throws "HTTP 0: timeout after 30000ms" when the SDK rejects with TimeoutError', async () => {
+    // Simulate the SDK respecting the passed signal: when the timeout fires,
+    // the SDK rejects with a DOMException-shaped error whose `name` is
+    // `TimeoutError`. The transport must recognise that and surface the
+    // canonical HTTP 0 tag, so callers / errorDetail render it cleanly.
+    // Rejecting synchronously avoids waiting on the real 30s timer; the
+    // contract under test is the `isTimeoutError` branch, not the clock.
+    const client = {
+      async callTool() {
+        const err = new Error('The operation was aborted due to timeout');
+        err.name = 'TimeoutError';
+        throw err;
+      },
+    } as unknown as Client;
+    const t = new SdkTransport(client);
+    await expect(t.callTool('hangs_forever', {})).rejects.toThrow(
+      /HTTP 0: timeout after 30000ms/,
+    );
+  });
+
+  it('preserves the underlying timeout error as `cause`', async () => {
+    const client = {
+      async callTool() {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        throw err;
+      },
+    } as unknown as Client;
+    const t = new SdkTransport(client);
+    try {
+      await t.callTool('hangs', {});
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      const cause = (err as Error & { cause?: unknown }).cause;
+      expect(cause).toBeInstanceOf(Error);
+      expect((cause as Error).name).toBe('AbortError');
+    }
+  });
+
+  it('listTools applies the same timeout wrap', async () => {
+    const client = {
+      async listTools() {
+        const err = new Error('timeout');
+        err.name = 'TimeoutError';
+        throw err;
+      },
+    } as unknown as Client;
+    const t = new SdkTransport(client);
+    await expect(t.listTools()).rejects.toThrow(/HTTP 0: timeout after 30000ms/);
+  });
+});
+
 describe('redactSecrets', () => {
   it('replaces a Bearer token with [redacted]', () => {
     expect(redactSecrets('Authorization: Bearer abc123XYZ.def_ghi+/=')).toBe(

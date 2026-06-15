@@ -18,6 +18,27 @@ export interface HttpErrorHolder {
 
 const MAX_BODY = 2000;
 
+/** Per-call upper bound on a single MCP tool/listTools round-trip. A hung
+ *  Bloomreach connection would otherwise burn the entire 300s route budget on
+ *  one stuck call. Sibling of `retryCeilingMs: 20_000` in client.ts — that
+ *  ceiling bounds a rate-limit retry wait, this one bounds the request itself.
+ *  Thrown as `HTTP 0: timeout after 30000ms`, riding the existing transport
+ *  failure path (McpClient.liveCall already wraps it in McpToolError). The
+ *  retry ladder in McpClient.callTool only retries successful-but-rate-limited
+ *  results, so the timeout error fails fast — exactly what we want, since a
+ *  retry would just risk another 30s wait inside the same route budget. */
+const TOOL_TIMEOUT_MS = 30_000;
+
+/** True when `err` came from an aborted/timed-out signal. The SDK surfaces
+ *  timeouts as either a DOMException-shaped `AbortError`/`TimeoutError` (from
+ *  `AbortSignal.timeout`) or as its own `McpError` with `code: RequestTimeout`.
+ *  Match by name so we don't depend on importing McpError just for this check. */
+function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || !('name' in err)) return false;
+  const name = (err as { name?: unknown }).name;
+  return name === 'AbortError' || name === 'TimeoutError';
+}
+
 /** Patterns whose matches reveal a Bloomreach/OAuth credential. Bearer headers
  *  ride every MCP call and OAuth bodies carry token fields; when either ends up
  *  in `err.cause` (some failure modes attach the request envelope), the secret
@@ -78,9 +99,14 @@ export class SdkTransport implements McpTransport {
 
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     if (this.httpErrors) this.httpErrors.last = null;
+    const signal = AbortSignal.timeout(TOOL_TIMEOUT_MS);
     try {
-      return await this.client.callTool({ name, arguments: args });
+      return await this.client.callTool({ name, arguments: args }, undefined, { signal });
     } catch (err) {
+      // Timeout path — distinct `HTTP 0:` tag so callers can recognize it.
+      if (isTimeoutError(err)) {
+        throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
+      }
       const captured = this.httpErrors?.last;
       if (captured) {
         const body = captured.body.trim();
@@ -92,9 +118,13 @@ export class SdkTransport implements McpTransport {
 
   async listTools(): Promise<unknown> {
     if (this.httpErrors) this.httpErrors.last = null;
+    const signal = AbortSignal.timeout(TOOL_TIMEOUT_MS);
     try {
-      return await this.client.listTools();
+      return await this.client.listTools(undefined, { signal });
     } catch (err) {
+      if (isTimeoutError(err)) {
+        throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
+      }
       const captured = this.httpErrors?.last;
       if (captured) {
         const body = captured.body.trim();
