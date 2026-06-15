@@ -3,7 +3,6 @@
 import { useState } from 'react';
 
 const PRESETS = [
-  'whoami',
   'list_cloud_organizations',
   'list_projects',
   'get_project_overview',
@@ -23,7 +22,7 @@ async function readBody(res: Response): Promise<Record<string, unknown>> {
 }
 
 export default function DebugPage() {
-  const [name, setName] = useState('whoami');
+  const [name, setName] = useState('list_cloud_organizations');
   const [argsText, setArgsText] = useState('{}');
   const [output, setOutput] = useState<string>('');
   const [durationMs, setDurationMs] = useState<number | null>(null);
