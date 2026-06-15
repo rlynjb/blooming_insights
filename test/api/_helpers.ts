@@ -15,6 +15,7 @@ import { vi } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 import { readNdjson } from '../../lib/streaming/ndjson';
 import { AGENT_MODEL } from '../../lib/agents/base';
+import { McpToolError } from '../../lib/mcp/client';
 
 // ---------------------------------------------------------------------------
 // 1. Anthropic SDK mock
@@ -67,11 +68,24 @@ export function mockAnthropicModule(): { default: unknown } {
         anthropicCalls.push(params);
         const next = anthropicQueue.shift();
         if (!next) throw new Error('mock anthropic: scripted queue exhausted');
+        // Function entries may throw — this is the hook tests use to simulate
+        // an SDK failure mid-stream (monitoring scan fails). Errors thrown from
+        // the factory propagate up through `runAgentLoop` into the route's
+        // catch block, which is the path we want to exercise.
         return typeof next === 'function' ? next() : next;
       },
     };
   }
   return { default: MockAnthropic };
+}
+
+/** Helper: queue entry that throws when consumed. Used to script a mid-stream
+ *  Anthropic SDK failure so the agent loop bubbles the error to the route's
+ *  catch block, which then emits an `error` event into the NDJSON stream. */
+export function anthropicErrorResponse(message: string): () => Anthropic.Messages.Message {
+  return () => {
+    throw new Error(message);
+  };
 }
 
 /** Build a canonical `Anthropic.Messages.Message` shape from minimal options. */
@@ -131,6 +145,14 @@ export function mockAnthropicResponse(opts: {
 // `runAgentLoop` expect after the McpClient wraps the raw response.
 
 export type MockMcpScenario = 'ok' | 'list-tools-fail' | 'tool-call-fail' | 'timeout';
+
+export interface MockMcpOptions {
+  /** For `'tool-call-fail'`: which tool name should `callTool` throw on. All
+   *  other tools fall through to the happy-path bootstrap responses. */
+  tool?: string;
+  /** Error message attached to the synthesized `McpToolError`. */
+  errorMessage?: string;
+}
 
 export interface MockMcp {
   callTool: ReturnType<typeof vi.fn>;
@@ -223,18 +245,76 @@ function makeMonitoringToolList() {
   };
 }
 
-/** Build the fake `McpClient` the route receives from `connectMcp`. Phase 1
- *  implements only `'ok'`; the others throw so Phase 2/3 tests that touch them
- *  fail with a clear "not implemented yet" rather than a silent undefined. */
-export function makeMockTransport(scenario: MockMcpScenario): MockMcp {
+/** Build the fake `McpClient` the route receives from `connectMcp`. Each
+ *  scenario pins a specific failure mode the route needs to handle:
+ *    - `'ok'`             happy path — bootstrap tools + listTools succeed
+ *    - `'list-tools-fail'` listTools throws an `McpToolError`; bootstrap callTool
+ *                          still works (those calls fire BEFORE listTools, so
+ *                          the route emits workspace + coverage events first,
+ *                          then the catch block emits an `error` event)
+ *    - `'tool-call-fail'`  a SPECIFIC callTool invocation throws (opts.tool);
+ *                          all other tools fall through to the happy path. For
+ *                          bootstrap-phase failures (e.g. tool='get_event_schema')
+ *                          the route's catch fires after workspace; for
+ *                          monitoring-phase failures the agent loop catches the
+ *                          error and feeds it back as a tool_result block.
+ *    - `'timeout'`         callTool returns a never-resolving promise. Tests
+ *                          using this scenario MUST run with `vi.useFakeTimers()`
+ *                          (or attach an AbortSignal with a short deadline) —
+ *                          the route's real per-call timeout is 30s, far past
+ *                          vitest's default 5s, so blocking real-time would
+ *                          deadlock the suite. */
+export function makeMockTransport(
+  scenario: MockMcpScenario,
+  opts: MockMcpOptions = {},
+): MockMcp {
   if (scenario === 'ok') {
     return {
       callTool: makeBootstrapCallTool(),
       listTools: vi.fn(async () => makeMonitoringToolList()),
     };
   }
-  // TODO Phase 2/3: implement these scenarios.
-  throw new Error(`makeMockTransport: scenario '${scenario}' not implemented in Phase 1`);
+  if (scenario === 'list-tools-fail') {
+    return {
+      callTool: makeBootstrapCallTool(),
+      listTools: vi.fn(async () => {
+        // Match the shape McpClient.liveCall would wrap a transport failure in:
+        // the route ultimately catches an Error whose message includes the tool
+        // name and detail. listTools doesn't go through liveCall, so we throw
+        // a plain Error here — that's what the route's catch sees.
+        throw new Error(opts.errorMessage ?? 'listTools failed: HTTP 503 upstream');
+      }),
+    };
+  }
+  if (scenario === 'tool-call-fail') {
+    if (!opts.tool) {
+      throw new Error("makeMockTransport('tool-call-fail') requires opts.tool");
+    }
+    const targetTool = opts.tool;
+    const happyPath = makeBootstrapCallTool();
+    return {
+      callTool: vi.fn(async (name: string, args: Record<string, unknown>, callOpts?: unknown) => {
+        if (name === targetTool) {
+          throw new McpToolError(
+            name,
+            opts.errorMessage ?? 'tool execution failed',
+          );
+        }
+        return happyPath(name, args, callOpts);
+      }),
+      listTools: vi.fn(async () => makeMonitoringToolList()),
+    };
+  }
+  if (scenario === 'timeout') {
+    // callTool returns a promise that never resolves. Tests MUST drive the
+    // clock with fake timers or wrap the call with a short abort, otherwise
+    // vitest will hit its test-timeout.
+    return {
+      callTool: vi.fn(() => new Promise<never>(() => {})),
+      listTools: vi.fn(async () => makeMonitoringToolList()),
+    };
+  }
+  throw new Error(`makeMockTransport: unknown scenario '${scenario as string}'`);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +334,31 @@ export function makeMockSession(mode: MockSessionMode): MockSession {
   if (mode === 'authed') {
     return { sessionId: 'test-session-001', authed: true };
   }
-  // TODO Phase 2/3: implement 'unauthed' (forces 401) and 'expired'.
-  throw new Error(`makeMockSession: mode '${mode}' not implemented in Phase 1`);
+  if (mode === 'unauthed') {
+    // The briefing route reads `connectMcp(sid)` and branches on `conn.ok`.
+    // Tests use this descriptor to drive the `connectMcp` mock to return
+    // `{ ok: false, authUrl: <session.authUrl> }`. `sessionId` is still
+    // valid (the cookie/jar surface returns one) — the failure is in the OAuth
+    // tokens, not the session id itself.
+    return {
+      sessionId: 'test-session-unauthed-002',
+      authed: false,
+      authUrl: 'http://localhost:3000/api/mcp/start?session=test-session-unauthed-002',
+    };
+  }
+  if (mode === 'expired') {
+    // Not exercised by the /api/briefing tests in Phase 2 — the briefing route's
+    // catch only branches on `conn.ok`, it does not look for a `revoked` flag.
+    // The reconnect-on-revoked path lives in the client-side `useReconnectPolicy`
+    // hook (Phase 3 territory). Provided as a placeholder so the agent route
+    // tests can use it without re-editing this file.
+    return {
+      sessionId: 'test-session-expired-003',
+      authed: false,
+      authUrl: 'http://localhost:3000/api/mcp/start?session=test-session-expired-003',
+    };
+  }
+  throw new Error(`makeMockSession: unknown mode '${mode as string}'`);
 }
 
 // ---------------------------------------------------------------------------
