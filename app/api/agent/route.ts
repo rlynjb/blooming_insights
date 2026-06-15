@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
+import { redactSecrets } from '@/lib/mcp/transport';
 import { bootstrapSchema } from '@/lib/mcp/schema';
 import { DiagnosticAgent } from '@/lib/agents/diagnostic';
 import { RecommendationAgent } from '@/lib/agents/recommendation';
@@ -102,6 +103,27 @@ const trunc = (v: unknown): unknown => {
   return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
 };
 
+/** Walk an error's `cause` chain into one string. `console.error(e)` formats
+ *  nested causes via Node's util.inspect, but plain `String(e)` does not — so
+ *  we assemble the chain ourselves before redacting, otherwise a token nested
+ *  inside `e.cause.cause` would survive the redaction and reach Vercel logs. */
+function formatError(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  let depth = 0;
+  while (cur && depth < 5) {
+    if (cur instanceof Error) {
+      parts.push(cur.stack ?? cur.message);
+      cur = (cur as { cause?: unknown }).cause;
+    } else {
+      parts.push(String(cur));
+      cur = null;
+    }
+    depth++;
+  }
+  return parts.join('\n  caused by: ');
+}
+
 const REPLAY_DELAY_MS = 180;
 
 const NDJSON_HEADERS = {
@@ -159,7 +181,7 @@ export async function GET(req: NextRequest) {
   try {
     conn = await connectMcp(sid);
   } catch (e) {
-    console.error('[agent] setup error:', e);
+    console.error('[agent] setup error:', redactSecrets(formatError(e)));
     return NextResponse.json(
       { error: `/api/agent setup · ${e instanceof Error ? e.message : String(e)}` },
       { status: 500 },
@@ -255,7 +277,8 @@ export async function GET(req: NextRequest) {
         // handed off via the client's sessionStorage.
         if (step == null) saveInvestigation(insightId!, collected);
       } catch (e) {
-        console.error('[agent] error:', e); // full stack/cause in Vercel logs
+        // full stack/cause in Vercel logs, with bearer/OAuth tokens redacted
+        console.error('[agent] error:', redactSecrets(formatError(e)));
         send({
           type: 'error',
           message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,

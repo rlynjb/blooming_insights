@@ -18,15 +18,47 @@ export interface HttpErrorHolder {
 
 const MAX_BODY = 2000;
 
+/** Patterns whose matches reveal a Bloomreach/OAuth credential. Bearer headers
+ *  ride every MCP call and OAuth bodies carry token fields; when either ends up
+ *  in `err.cause` (some failure modes attach the request envelope), the secret
+ *  flows into the surfaced error detail and into Vercel logs. Redacting before
+ *  the body is stored prevents the leak at the source. */
+const TOKEN_PATTERNS: RegExp[] = [
+  /Bearer\s+[A-Za-z0-9._\-+/=]+/g,
+  /"access_token"\s*:\s*"[^"]+"/g,
+  /"refresh_token"\s*:\s*"[^"]+"/g,
+  /"id_token"\s*:\s*"[^"]+"/g,
+  /"code_verifier"\s*:\s*"[^"]+"/g,
+];
+
+/** Replace any token-shaped substring with `[redacted]`. Bearer matches collapse
+ *  to a bare `[redacted]`; JSON field matches keep their key so the shape of the
+ *  surrounding envelope stays readable (`"access_token":"[redacted]"`). */
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const re of TOKEN_PATTERNS) {
+    out = out.replace(re, (match) => {
+      if (match.startsWith('Bearer')) return '[redacted]';
+      const key = match.match(/"([^"]+)"\s*:/)?.[1];
+      return key ? `"${key}":"[redacted]"` : '[redacted]';
+    });
+  }
+  return out;
+}
+
 /** A fetch wrapper that records the body of any non-OK response into `holder`
  *  (cloning so the SDK can still read the original). Pass it to the SDK's
- *  StreamableHTTPClientTransport `fetch` option. */
+ *  StreamableHTTPClientTransport `fetch` option. The stored body is redacted
+ *  first so a Bearer/OAuth token in an error envelope never reaches logs. */
 export function makeCapturingFetch(holder: HttpErrorHolder): FetchLike {
   return async (url, init) => {
     const res = await fetch(url, init);
     if (!res.ok) {
       try {
-        holder.last = { status: res.status, body: (await res.clone().text()).slice(0, MAX_BODY) };
+        holder.last = {
+          status: res.status,
+          body: redactSecrets((await res.clone().text()).slice(0, MAX_BODY)),
+        };
       } catch {
         /* body unreadable / already consumed — leave the holder as-is */
       }
