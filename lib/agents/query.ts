@@ -15,7 +15,7 @@ const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/query.md'), 
 export class QueryAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -30,7 +30,7 @@ export class QueryAgent {
 
     const { finalText } = await runAgentLoop({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'coordinator', // query answering is the coordinator surface
       system,
       userPrompt: query,

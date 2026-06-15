@@ -41,7 +41,7 @@ export interface AgentHooks {
 export class DiagnosticAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -55,7 +55,7 @@ export class DiagnosticAgent {
 
     const { toolCalls, parsed } = await runAgentLoop<Diagnosis>({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'diagnostic',
       system,
       userPrompt: 'Investigate the anomaly and return the diagnosis JSON object.',
@@ -70,7 +70,8 @@ export class DiagnosticAgent {
         'Stop investigating now and output your final answer. ' +
           'Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape ' +
           '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
-          'state your best-supported explanation, even if partial.',
+          'when the data source is the SQL-backed `get_anomaly_context` tool, ground your evidence in its ' +
+          '`pct_change` and `related_segments` fields. State your best-supported explanation, even if partial.',
       ),
       sessionId: this.sessionId,
       parseResult: tryParseDiagnosis,

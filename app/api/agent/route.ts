@@ -3,9 +3,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
-import { connectMcp } from '@/lib/mcp/connect';
+import { makeDataSource, type LiveMode } from '@/lib/data-source';
 import { redactSecrets, formatError } from '@/lib/mcp/transport';
-import { bootstrapSchema } from '@/lib/mcp/schema';
+// `bootstrapSchema` + `olistWorkspaceSchema` are now consumed indirectly via
+// the DataSource factory's per-mode `bootstrap()` — see lib/data-source/index.ts.
 import { DiagnosticAgent } from '@/lib/agents/diagnostic';
 import { RecommendationAgent } from '@/lib/agents/recommendation';
 import { QueryAgent } from '@/lib/agents/query';
@@ -153,11 +154,17 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
   }
 
-  // Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking cookie
-  // encryption in production) returns the real message instead of a bare 500.
-  let conn: Awaited<ReturnType<typeof connectMcp>>;
+  // Resolve the live mode from `?mode=`. Default is `'live-sql'` per PR C's
+  // bi:mode extension; tests + legacy clients with no param land here too.
+  const modeParam = req.nextUrl.searchParams.get('mode');
+  const mode: LiveMode = modeParam === 'live-bloomreach' ? 'live-bloomreach' : 'live-sql';
+
+  // Construct the DataSource via the factory (PR C). Wrapped so a setup throw
+  // (e.g. missing AUTH_SECRET breaking cookie encryption in production, or
+  // mcp-server-olist not built) returns the real message instead of a bare 500.
+  let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
   try {
-    conn = await connectMcp(sid);
+    dsResult = await makeDataSource(mode, sid);
   } catch (e) {
     console.error('[agent] setup error:', redactSecrets(formatError(e)));
     return NextResponse.json(
@@ -165,7 +172,13 @@ export async function GET(req: NextRequest) {
       { status: 500 },
     );
   }
-  if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
+  if (!dsResult.ok) return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
+  // The abstract DataSource surface is what agents + bootstrapSchema consume.
+  // The 4 short MCP routes still use the Bloomreach adapter directly for the
+  // skipCache option (cache-bypass is Bloomreach-specific).
+  const dataSource = dsResult.dataSource;
+  const bootstrap = dsResult.bootstrap;
+  const disposeDataSource = dsResult.dispose;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -207,7 +220,7 @@ export async function GET(req: NextRequest) {
       try {
         // Cancellation is honored at coarse phase boundaries inside the stream
         // AND threaded into every async layer below (bootstrapSchema, listTools,
-        // classifyIntent + the four agent classes → runAgentLoop → mcp.callTool
+        // classifyIntent + the four agent classes → runAgentLoop → dataSource.callTool
         // + anthropic.messages.create). The per-call 30s MCP transport timeout
         // still bounds any single call.
         req.signal.throwIfAborted();
@@ -217,11 +230,15 @@ export async function GET(req: NextRequest) {
           q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
         stepFor(leadAgent, 'thought', 'reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(conn.mcp, { signal: req.signal });
+        // The factory's per-mode bootstrap: Bloomreach runs the live
+        // orchestrator (list_cloud_organizations / get_event_schema / …);
+        // Olist returns a synthesized Brazilian-e-commerce schema because the
+        // mcp-server-olist server intentionally exposes only domain tools.
+        const schema = await bootstrap(req.signal);
         recordPhase('schema_bootstrap', t_schema);
         req.signal.throwIfAborted();
         const t_listTools = performance.now();
-        const rawTools = await conn.mcp.listTools({ signal: req.signal });
+        const rawTools = await dataSource.listTools({ signal: req.signal });
         const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
           ? (rawTools as { tools: McpToolDef[] }).tools
           : [];
@@ -235,7 +252,7 @@ export async function GET(req: NextRequest) {
           const intent = await classifyIntent(anthropic, q, sid, req.signal);
           recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
-          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const queryAgent = new QueryAgent(anthropic, dataSource, schema, allTools, sid);
           const t_query = performance.now();
           const answer = await queryAgent.answer(q, intent, { ...hooksFor('coordinator'), signal: req.signal });
           recordPhase('query_answer', t_query);
@@ -262,7 +279,7 @@ export async function GET(req: NextRequest) {
             'thought',
             `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
           );
-          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
           const t_diag = performance.now();
           diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
           recordPhase('diagnostic_investigate', t_diag);
@@ -274,7 +291,7 @@ export async function GET(req: NextRequest) {
         if (step !== 'diagnose') {
           req.signal.throwIfAborted();
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
           const t_rec = performance.now();
           const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
           recordPhase('recommendation_propose', t_rec);
@@ -300,6 +317,15 @@ export async function GET(req: NextRequest) {
           message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,
         });
       } finally {
+        // Tear the per-request DataSource down. For Olist this kills the
+        // mcp-server-olist subprocess; for Bloomreach it's a no-op (the OAuth
+        // client outlives the request via the cookie store). Best-effort —
+        // a teardown error must NOT swallow the route-level error above.
+        try {
+          await disposeDataSource();
+        } catch (disposeErr) {
+          console.error('[agent] dispose error:', redactSecrets(formatError(disposeErr)));
+        }
         // One summary line per request — shared shape with /api/briefing so a
         // single Vercel filter (e.g. phases.phase = "schema_bootstrap") reads
         // across both routes. Fires even on error so we can see how much of the
@@ -307,6 +333,7 @@ export async function GET(req: NextRequest) {
         console.log(JSON.stringify({
           route: '/api/agent',
           sessionId: sid,
+          mode,
           totalMs: Math.round(performance.now() - t0),
           phases,
           aborted: req.signal.aborted,

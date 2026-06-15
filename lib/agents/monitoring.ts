@@ -64,7 +64,7 @@ export interface MonitorHooks {
 export class MonitoringAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -91,7 +91,7 @@ export class MonitoringAgent {
 
     const { finalText } = await runAgentLoop({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'monitoring',
       system,
       userPrompt:
@@ -107,7 +107,9 @@ export class MonitoringAgent {
       synthesisInstruction: buildSynthesisInstruction(
         'Stop querying now and output your final answer. ' +
           'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
-          'meaningful), based on the data you have already gathered.',
+          'meaningful), based on the data you have already gathered — anchored on revenue / ' +
+          'order_count / payment_value over time, filtered by state / category / payment_type as ' +
+          'relevant to the data shown.',
       ),
       sessionId: this.sessionId,
     });

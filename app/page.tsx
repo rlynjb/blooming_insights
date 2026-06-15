@@ -8,7 +8,7 @@ import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepp
 import ReasoningTrace from '@/components/investigation/ReasoningTrace';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 import QueryBox from '@/components/chat/QueryBox';
-import { useBriefingStream, type FeedStatus } from '@/lib/hooks/useBriefingStream';
+import { useBriefingStream, type BriefingMode, type FeedStatus } from '@/lib/hooks/useBriefingStream';
 import { useDemoCapture } from '@/lib/hooks/useDemoCapture';
 import { useReconnectPolicy, isAuthErrorButton } from '@/lib/hooks/useReconnectPolicy';
 
@@ -51,30 +51,40 @@ export default function HomePage() {
   // lib/hooks/useReconnectPolicy.ts.
   const reconnectPolicy = useReconnectPolicy();
 
-  // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
-  // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
-  // agents against Bloomreach (real data, but the alpha server may need a
-  // reconnect). NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle.
+  // Demo vs live (Olist SQL) vs live (Bloomreach), toggled at RUNTIME (persisted
+  // in localStorage). Demo serves the cached snapshot — instant + reliable, ideal
+  // for a presentation. live-sql runs the agents against the local mcp-server-olist
+  // (the Phase 2 default, real data, no OAuth). live-bloomreach runs the agents
+  // against Bloomreach (real data, but the alpha server may need a reconnect; the
+  // dormant adapter is kept switchable). NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo
+  // and hides the toggle. The legacy `'live'` localStorage value migrates to
+  // `'live-sql'` so existing users transition transparently.
   const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
-  const [mode, setMode] = useState<'demo' | 'live'>('demo');
+  const [mode, setMode] = useState<BriefingMode>('live-sql');
   const [ready, setReady] = useState(false);
   const isDemo = mode === 'demo';
 
-  // Resolve the persisted mode before the first fetch (so we don't waste a demo
-  // fetch when the user previously chose live).
+  // Resolve the persisted mode before the first fetch (so we don't waste a default
+  // fetch when the user previously chose a specific mode).
   useEffect(() => {
-    if (!forcedDemo) {
+    if (forcedDemo) {
+      setMode('demo');
+    } else {
       try {
         const saved = localStorage.getItem('bi:mode');
-        if (saved === 'live' || saved === 'demo') setMode(saved);
+        if (saved === 'demo') setMode('demo');
+        else if (saved === 'live-bloomreach') setMode('live-bloomreach');
+        else if (saved === 'live-sql') setMode('live-sql');
+        else if (saved === 'live') setMode('live-sql'); // legacy → Olist SQL
+        // any other value (or null) → default `'live-sql'` stays
       } catch {
-        /* localStorage blocked — default to demo */
+        /* localStorage blocked — default to live-sql */
       }
     }
     setReady(true);
   }, [forcedDemo]);
 
-  function switchMode(next: 'demo' | 'live') {
+  function switchMode(next: BriefingMode) {
     if (next === mode) return;
     try {
       localStorage.setItem('bi:mode', next);
@@ -156,15 +166,21 @@ export default function HomePage() {
                 overflow: 'hidden',
               }}
             >
-              {(['demo', 'live'] as const).map((m) => (
+              {(
+                [
+                  { value: 'demo', label: 'demo' },
+                  { value: 'live-sql', label: 'live · olist' },
+                  { value: 'live-bloomreach', label: 'live · bloomreach' },
+                ] as const
+              ).map((m) => (
                 <button
-                  key={m}
+                  key={m.value}
                   type="button"
-                  onClick={() => switchMode(m)}
+                  onClick={() => switchMode(m.value)}
                   className="lowercase"
                   style={{
-                    background: mode === m ? 'var(--accent-teal)' : 'transparent',
-                    color: mode === m ? 'var(--bg-base)' : 'var(--text-secondary)',
+                    background: mode === m.value ? 'var(--accent-teal)' : 'transparent',
+                    color: mode === m.value ? 'var(--bg-base)' : 'var(--text-secondary)',
                     border: 'none',
                     cursor: 'pointer',
                     fontFamily: 'var(--font-mono), monospace',
@@ -172,7 +188,7 @@ export default function HomePage() {
                     padding: '4px 12px',
                   }}
                 >
-                  {m}
+                  {m.label}
                 </button>
               ))}
             </div>
@@ -184,7 +200,11 @@ export default function HomePage() {
                 fontSize: '0.68rem',
               }}
             >
-              {isDemo ? 'cached snapshot · instant' : 'live · real workspace data'}
+              {isDemo
+                ? 'cached snapshot · instant'
+                : mode === 'live-sql'
+                  ? 'live · olist (sql) via local mcp server'
+                  : 'live · real bloomreach workspace data'}
             </span>
           </div>
         )}

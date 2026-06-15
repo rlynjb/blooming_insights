@@ -63,6 +63,35 @@ vi.mock('../../lib/mcp/connect', () => ({
   completeAuth: vi.fn(async () => {}),
 }));
 
+// PR C wraps connectMcp behind a `makeDataSource(mode, sid)` factory. The
+// integration tests still mock `connectMcp` to drive the Bloomreach branch's
+// happy/error paths; the factory mock below maps each `mode` onto the
+// existing `currentConn`/`currentMcp` state so test arrange-steps don't have
+// to change. Olist mode is not exercised by this suite — its behaviour is
+// covered in test/data-source/olist.integration.test.ts.
+vi.mock('../../lib/data-source', async () => {
+  const real = await vi.importActual<typeof import('../../lib/data-source')>(
+    '../../lib/data-source',
+  );
+  const { bootstrapSchema } = await import('../../lib/mcp/schema');
+  return {
+    ...real,
+    makeDataSource: vi.fn(async () => {
+      if (!currentConn.ok) {
+        return { ok: false as const, mode: 'live-bloomreach' as const, authUrl: currentConn.authUrl };
+      }
+      const ds = currentConn.mcp as unknown as import('../../lib/data-source').DataSource;
+      return {
+        ok: true as const,
+        mode: 'live-bloomreach' as const,
+        dataSource: ds,
+        bootstrap: (signal?: AbortSignal) => bootstrapSchema(ds, { signal }),
+        dispose: async () => {},
+      };
+    }),
+  };
+});
+
 // Import AFTER the mocks are registered so the route sees them.
 import { GET } from '../../app/api/agent/route';
 import { _resetSchemaCache } from '../../lib/mcp/schema';

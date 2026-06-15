@@ -15,11 +15,16 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SdkTransport, makeCapturingFetch, type HttpErrorHolder } from './transport';
-import { McpClient } from './client';
+import { BloomreachDataSource } from '../data-source/bloomreach-data-source';
 import { BloomreachAuthProvider, withAuthCookies } from './auth';
 
+/** ConnectResult.mcp is the concrete BloomreachDataSource (not just
+ *  `DataSource`) so the 4 short MCP routes — /api/mcp/{call,tools,tools/check,capture}
+ *  — keep access to Bloomreach-specific cache controls (skipCache). Agent + route
+ *  layers that only need the abstract surface narrow to `DataSource` at their
+ *  receive site (bootstrapSchema, agent ctors, etc.). */
 export type ConnectResult =
-  | { ok: true; mcp: McpClient }
+  | { ok: true; mcp: BloomreachDataSource }
   | { ok: false; authUrl: string };
 
 function mcpUrl(): URL {
@@ -52,9 +57,9 @@ async function redirectUri(): Promise<string> {
 }
 
 /**
- * Connect for a session. If the session has valid tokens, returns a ready McpClient.
- * If not, the SDK's auth flow captures an authorize URL via the provider, which we
- * return so the caller can redirect the browser.
+ * Connect for a session. If the session has valid tokens, returns a ready
+ * BloomreachDataSource. If not, the SDK's auth flow captures an authorize URL
+ * via the provider, which we return so the caller can redirect the browser.
  */
 export async function connectMcp(sessionId: string): Promise<ConnectResult> {
   // In production the auth store is the encrypted cookie; withAuthCookies seeds
@@ -82,13 +87,13 @@ async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
     // error text — observed as both "(1 per 1 second)" and "(1 per 10 second)".
     // Proactive spacing stays at ~1.1s on purpose: spacing at the full 10s
     // window would cost ~60s for a 6-call investigation and blow the route's
-    // 60s budget (app/api/agent). Instead, McpClient parses the stated window
-    // from each 429 and waits it out on retry (see retryDelayMs/retryCeilingMs),
+    // 60s budget (app/api/agent). Instead, BloomreachDataSource parses the stated
+    // window from each 429 and waits it out on retry (see retryDelayMs/retryCeilingMs),
     // and the 60s response cache absorbs repeats. retryDelayMs falls back to the
     // observed 10s window when no hint is parseable.
     return {
       ok: true,
-      mcp: new McpClient(new SdkTransport(client, httpErrors), {
+      mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
         minIntervalMs: 1100,
         retryDelayMs: 10_000,
         retryCeilingMs: 20_000,

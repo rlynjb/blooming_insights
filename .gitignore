@@ -46,3 +46,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# mcp-server-olist build output + SQLite WAL artifacts (the committed olist.db
+# stays — only the runtime sidecar files are ignored)
+/mcp-server-olist/dist
+/mcp-server-olist/data/*.db-shm
+/mcp-server-olist/data/*.db-wal
+/mcp-server-olist/data/*.db-journal
