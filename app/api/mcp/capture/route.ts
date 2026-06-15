@@ -3,6 +3,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 
 // DEV-ONLY: captures the bootstrap tool responses to test/fixtures/<tool>.json so
 // the Phase 2 schema parser can be built/tested against real response shapes, and
@@ -51,7 +52,7 @@ export async function GET(req: NextRequest) {
     }
     return NextResponse.json({ captured, dir });
   } catch (e) {
-    console.error('[mcp-capture] error:', e);
+    console.error('[mcp-capture] error:', redactSecrets(formatError(e)));
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },

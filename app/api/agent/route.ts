@@ -4,14 +4,14 @@ import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
-import { redactSecrets } from '@/lib/mcp/transport';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 import { bootstrapSchema } from '@/lib/mcp/schema';
 import { DiagnosticAgent } from '@/lib/agents/diagnostic';
 import { RecommendationAgent } from '@/lib/agents/recommendation';
 import { QueryAgent } from '@/lib/agents/query';
 import { classifyIntent } from '@/lib/agents/intent';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
-import { getAnomaly, getInsight } from '@/lib/state/insights';
+import { getAnomaly, getInsight, insightToAnomaly } from '@/lib/state/insights';
 import { getCachedInvestigation, saveInvestigation } from '@/lib/state/investigations';
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
 import type { AgentName, Anomaly, Diagnosis, Insight, ToolCall } from '@/lib/mcp/types';
@@ -26,10 +26,6 @@ const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 // as two steps (diagnose on step 2, recommend on step 3); a null step is the
 // legacy combined run used by the demo-snapshot capture.
 type Step = 'diagnose' | 'recommend';
-
-function insightToAnomaly(i: Insight): Anomaly {
-  return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
-}
 
 /** Resolve the anomaly to investigate. Prefers the client-provided insight
  *  (handed from the feed via sessionStorage → `?insight=`), which is the only
@@ -102,27 +98,6 @@ const trunc = (v: unknown): unknown => {
   const s = JSON.stringify(v);
   return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
 };
-
-/** Walk an error's `cause` chain into one string. `console.error(e)` formats
- *  nested causes via Node's util.inspect, but plain `String(e)` does not — so
- *  we assemble the chain ourselves before redacting, otherwise a token nested
- *  inside `e.cause.cause` would survive the redaction and reach Vercel logs. */
-function formatError(e: unknown): string {
-  const parts: string[] = [];
-  let cur: unknown = e;
-  let depth = 0;
-  while (cur && depth < 5) {
-    if (cur instanceof Error) {
-      parts.push(cur.stack ?? cur.message);
-      cur = (cur as { cause?: unknown }).cause;
-    } else {
-      parts.push(String(cur));
-      cur = null;
-    }
-    depth++;
-  }
-  return parts.join('\n  caused by: ');
-}
 
 const REPLAY_DELAY_MS = 180;
 
@@ -246,10 +221,10 @@ export async function GET(req: NextRequest) {
         // Free-form query flow (live; never cached) — runs when only `q` is provided.
         if (q && !insightId) {
           const t_intent = performance.now();
-          const intent = await classifyIntent(anthropic, q);
+          const intent = await classifyIntent(anthropic, q, sid);
           recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
-          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools);
+          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_query = performance.now();
           const answer = await queryAgent.answer(q, intent, hooksFor('coordinator'));
           recordPhase('query_answer', t_query);
@@ -275,7 +250,7 @@ export async function GET(req: NextRequest) {
             'thought',
             `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
           );
-          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_diag = performance.now();
           diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
           recordPhase('diagnostic_investigate', t_diag);
@@ -286,7 +261,7 @@ export async function GET(req: NextRequest) {
         // Skipped on the diagnose step — the decision is NOT run until step 3.
         if (step !== 'diagnose') {
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_rec = performance.now();
           const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
           recordPhase('recommendation_propose', t_rec);

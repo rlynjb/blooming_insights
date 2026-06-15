@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop, AGENT_MODEL } from './base';
+import { runAgentLoop, buildSynthesisInstruction } from './base';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { recommendationTools } from '../mcp/tools';
@@ -31,6 +31,7 @@ export class RecommendationAgent {
     private mcp: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
+    private sessionId?: string,
   ) {}
 
   async propose(
@@ -43,7 +44,7 @@ export class RecommendationAgent {
       .replace(/\{project_id\}/g, this.schema.projectId)
       .replace('{diagnosis}', JSON.stringify(diagnosis));
 
-    const { finalText, toolCalls } = await runAgentLoop({
+    const { parsed: idless } = await runAgentLoop<IdlessRecommendation[]>({
       anthropic: this.anthropic,
       mcp: this.mcp,
       agent: 'recommendation',
@@ -55,81 +56,49 @@ export class RecommendationAgent {
       onToolResult: hooks.onToolResult,
       maxTurns: 6,
       maxToolCalls: 4,
-      synthesisInstruction:
-        'You have NO more tool calls available. Stop querying now and output your final answer. ' +
-        'Respond with ONLY a JSON array of at most 3 recommendation objects in a ```json fence ' +
-        '(or [] if you cannot propose grounded actions), based on the diagnosis and the data you ' +
-        'have already gathered. Do NOT include an id field. Do not say you need more queries.',
+      synthesisInstruction: buildSynthesisInstruction(
+        'Stop querying now and output your final answer. ' +
+          'Respond with ONLY a JSON array of at most 3 recommendation objects in a ```json fence ' +
+          '(or [] if you cannot propose grounded actions), based on the diagnosis and the data you ' +
+          'have already gathered. Do NOT include an id field.',
+      ),
+      sessionId: this.sessionId,
+      parseResult: tryParseRecommendations,
+      // The agent often keeps "wanting to query" instead of emitting JSON. If
+      // the loop didn't produce a valid recommendation array, the loop runs one
+      // tool-less synthesis turn with this prompt — hands the model the
+      // diagnosis plus the tool results it already gathered and asks for the
+      // structured recommendations only.
+      recoveryPrompt: (tc: ToolCall[]) => {
+        const evidence =
+          tc
+            .map((c, i) => {
+              const payload = c.error ? { error: c.error } : c.result;
+              return `Query ${i + 1}: ${c.toolName} ${JSON.stringify(c.args).slice(0, 200)}\nResult: ${JSON.stringify(payload).slice(0, 900)}`;
+            })
+            .join('\n\n') || '(no existing-feature queries were completed)';
+        return (
+          `Anomaly that was diagnosed:\n${JSON.stringify(anomaly)}\n\n` +
+          `Diagnosis to act on:\n${JSON.stringify(diagnosis)}\n\n` +
+          `Existing-feature queries run and their results:\n${evidence}\n\n` +
+          'Based on the diagnosis above, output your best 2–3 recommendations as a single JSON ' +
+          'array in a ```json fence. Each object: {"title": string, "rationale": string, ' +
+          '"bloomreachFeature": "scenario"|"segment"|"campaign"|"voucher"|"experiment", ' +
+          '"steps": string[], "estimatedImpact": {"range": string, "rangeUsd"?: {"low": number, ' +
+          '"high": number}, "assumption": string}, "effort": "low"|"medium"|"high", ' +
+          '"timeToSetUpMinutes": number, "readResultInDays": number, "prerequisites": ' +
+          '[{"label": string, "satisfied": boolean}], "successMetric": string, ' +
+          '"confidence": "high"|"medium"|"low"}. Compute the dollar impact from the diagnosis\'s ' +
+          'affected-customer count × AOV (revenue ÷ purchase count from the evidence) × a ' +
+          'reactivation % range. Order by predicted impact (highest first). Do NOT include an id ' +
+          'field. If you cannot propose grounded actions, return []. Do NOT request more queries.'
+        );
+      },
     });
-
-    // The agent often keeps "wanting to query" instead of emitting JSON. If the
-    // loop didn't produce a valid recommendation array, run a dedicated tool-less
-    // synthesis call that hands the model the diagnosis plus the tool results it
-    // already gathered and asks for the structured recommendations only.
-    const idless =
-      tryParseRecommendations(finalText) ??
-      (await this.synthesize(anomaly, diagnosis, toolCalls));
 
     if (!idless) return [];
 
     // Assign ids AFTER validation, cap at 3, and return the canonical shape.
     return idless.slice(0, 3).map((r) => ({ id: crypto.randomUUID(), ...r }));
-  }
-
-  /** Dedicated, tool-less call that turns the diagnosis + gathered query results
-   *  into a structured recommendation array. Returns null on any failure
-   *  (caller falls back to []). */
-  private async synthesize(
-    anomaly: Anomaly,
-    diagnosis: Diagnosis,
-    toolCalls: ToolCall[],
-  ): Promise<IdlessRecommendation[] | null> {
-    try {
-      const evidence =
-        toolCalls
-          .map((tc, i) => {
-            const payload = tc.error ? { error: tc.error } : tc.result;
-            return `Query ${i + 1}: ${tc.toolName} ${JSON.stringify(tc.args).slice(0, 200)}\nResult: ${JSON.stringify(payload).slice(0, 900)}`;
-          })
-          .join('\n\n') || '(no existing-feature queries were completed)';
-
-      const res = await this.anthropic.messages.create({
-        model: AGENT_MODEL,
-        max_tokens: 2048,
-        system:
-          'You are concluding a completed recommendation step. Output ONLY a JSON array of ' +
-          'recommendations. Never ask for more data.',
-        messages: [
-          {
-            role: 'user',
-            content:
-              `Anomaly that was diagnosed:\n${JSON.stringify(anomaly)}\n\n` +
-              `Diagnosis to act on:\n${JSON.stringify(diagnosis)}\n\n` +
-              `Existing-feature queries run and their results:\n${evidence}\n\n` +
-              'Based on the diagnosis above, output your best 2–3 recommendations as a single JSON ' +
-              'array in a ```json fence. Each object: {"title": string, "rationale": string, ' +
-              '"bloomreachFeature": "scenario"|"segment"|"campaign"|"voucher"|"experiment", ' +
-              '"steps": string[], "estimatedImpact": {"range": string, "rangeUsd"?: {"low": number, ' +
-              '"high": number}, "assumption": string}, "effort": "low"|"medium"|"high", ' +
-              '"timeToSetUpMinutes": number, "readResultInDays": number, "prerequisites": ' +
-              '[{"label": string, "satisfied": boolean}], "successMetric": string, ' +
-              '"confidence": "high"|"medium"|"low"}. Compute the dollar impact from the diagnosis\'s ' +
-              'affected-customer count × AOV (revenue ÷ purchase count from the evidence) × a ' +
-              'reactivation % range. Order by predicted impact (highest first). Do NOT include an id ' +
-              'field. If you cannot propose grounded actions, return []. Do NOT request more queries.',
-          },
-        ],
-      } as Anthropic.Messages.MessageCreateParamsNonStreaming);
-      // TODO: thread sessionId once RecommendationAgent carries it (would require touching the route caller).
-      console.log(JSON.stringify({ site: 'agents/recommendation:synthesize', usage: res.usage }));
-
-      const text = res.content
-        .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
-        .map((b) => b.text)
-        .join('');
-      return tryParseRecommendations(text);
-    } catch {
-      return null;
-    }
   }
 }

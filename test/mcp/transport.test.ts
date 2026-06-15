@@ -4,6 +4,7 @@ import {
   SdkTransport,
   makeCapturingFetch,
   redactSecrets,
+  formatError,
   type HttpErrorHolder,
 } from '../../lib/mcp/transport';
 
@@ -202,5 +203,27 @@ describe('redactSecrets', () => {
     expect(holder.last?.body).toContain('[redacted]');
     // the rest of the envelope should be intact so the error tag stays useful
     expect(holder.last?.body).toContain('invalid_token');
+  });
+});
+
+describe('formatError', () => {
+  it('walks the cause chain so nested messages all reach the formatted string', () => {
+    // Pin the contract that the 6 route handlers depend on: the helper has to
+    // descend through `cause` so a token nested inside `e.cause.cause` ends up
+    // in the string and can be redacted — otherwise `String(e)` alone would
+    // hide it from `redactSecrets` and leak to Vercel logs.
+    const e = new Error('top', {
+      cause: new Error('mid', { cause: new Error('bottom') }),
+    });
+    const out = formatError(e);
+    expect(out).toContain('top');
+    expect(out).toContain('mid');
+    expect(out).toContain('bottom');
+  });
+
+  it('falls back to String() when handed a non-Error value', () => {
+    // The catch blocks pass `unknown`, so the helper has to accept anything
+    // and still produce something log-shaped.
+    expect(formatError('not an error')).toBe('not an error');
   });
 });

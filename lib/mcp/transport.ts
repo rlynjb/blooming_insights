@@ -67,6 +67,27 @@ export function redactSecrets(text: string): string {
   return out;
 }
 
+/** Walk an error's `cause` chain into one string. `console.error(e)` formats
+ *  nested causes via Node's util.inspect, but plain `String(e)` does not — so
+ *  we assemble the chain ourselves before redacting, otherwise a token nested
+ *  inside `e.cause.cause` would survive the redaction and reach Vercel logs. */
+export function formatError(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  let depth = 0;
+  while (cur && depth < 5) {
+    if (cur instanceof Error) {
+      parts.push(cur.stack ?? cur.message);
+      cur = (cur as { cause?: unknown }).cause;
+    } else {
+      parts.push(String(cur));
+      cur = null;
+    }
+    depth++;
+  }
+  return parts.join('\n  caused by: ');
+}
+
 /** A fetch wrapper that records the body of any non-OK response into `holder`
  *  (cloning so the SDK can still read the original). Pass it to the SDK's
  *  StreamableHTTPClientTransport `fetch` option. The stored body is redacted

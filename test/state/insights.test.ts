@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { anomalyToInsight, putInsights, getInsight, getAnomaly, listInsights, putInvestigation, getInvestigation, _clear } from '../../lib/state/insights';
-import type { Anomaly } from '../../lib/mcp/types';
+import { anomalyToInsight, insightToAnomaly, putInsights, getInsight, getAnomaly, listInsights, putInvestigation, getInvestigation, _clear } from '../../lib/state/insights';
+import type { Anomaly, Insight } from '../../lib/mcp/types';
 
 const SID = 'test-session';
 
@@ -77,5 +77,55 @@ describe('insight state', () => {
     putInsights('session-b', [iB]);
     expect(getInsight('session-a', iA.id)?.id).toBe(iA.id);
     expect(listInsights('session-a')).toHaveLength(1);
+  });
+});
+
+// Round-trip contract: insight → anomaly preserves the 4 fields the agent loop
+// needs (metric/scope/change/severity) and intentionally drops the rest
+// (evidence/impact/history/category). Pins the silent-drop decision so the
+// next person to add a field to Anomaly has a forcing function.
+describe('Insight ↔ Anomaly round-trip', () => {
+  const sample: Insight = {
+    id: 'insight-1',
+    timestamp: '2026-06-04T00:00:00.000Z',
+    severity: 'warning',
+    headline: 'mobile checkout conversion_rate · -18%',
+    summary: 'conversion_rate down 18% vs 7d',
+    metric: 'conversion_rate',
+    change: { value: -18, direction: 'down', baseline: '7d' },
+    scope: ['mobile', 'checkout'],
+    source: 'monitoring',
+    evidence: [{ tool: 'execute_analytics_eql', result: { current: 0.082, prior: 0.1 } }],
+    impact: 'Conversion is the funnel hinge — an 18% drop loses orders even at flat traffic.',
+    history: [0.1, 0.099, 0.098, 0.095, 0.094, 0.093, 0.092, 0.09, 0.088, 0.086, 0.084, 0.082],
+    category: 'conversion_drop',
+  };
+
+  it('preserves metric/scope/change/severity through insight → anomaly', () => {
+    const anomaly = insightToAnomaly(sample);
+    expect(anomaly.metric).toBe(sample.metric);
+    expect(anomaly.scope).toBe(sample.scope);
+    expect(anomaly.change).toBe(sample.change);
+    expect(anomaly.severity).toBe(sample.severity);
+  });
+
+  it('intentionally drops evidence on insight → anomaly', () => {
+    const anomaly = insightToAnomaly(sample);
+    expect(anomaly.evidence).toEqual([]); // explicit empty, not the source's evidence
+  });
+
+  it('intentionally drops impact on insight → anomaly', () => {
+    const anomaly = insightToAnomaly(sample);
+    expect(anomaly.impact).toBeUndefined();
+  });
+
+  it('intentionally drops history on insight → anomaly', () => {
+    const anomaly = insightToAnomaly(sample);
+    expect(anomaly.history).toBeUndefined();
+  });
+
+  it('intentionally drops category on insight → anomaly', () => {
+    const anomaly = insightToAnomaly(sample);
+    expect(anomaly.category).toBeUndefined();
   });
 });

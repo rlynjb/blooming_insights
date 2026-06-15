@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 
 // Introspection endpoint: returns the tool set the MCP server exposes for the
 // current session (name, description, inputSchema). Used by /debug to discover
@@ -15,7 +16,7 @@ export async function GET() {
     const tools = await conn.mcp.listTools();
     return NextResponse.json({ tools });
   } catch (e) {
-    console.error('[mcp-tools] error:', e);
+    console.error('[mcp-tools] error:', redactSecrets(formatError(e)));
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },

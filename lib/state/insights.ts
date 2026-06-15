@@ -44,6 +44,16 @@ export function anomalyToInsight(a: Anomaly): Insight {
   };
 }
 
+/**
+ * Reverse mapper. Intentionally drops evidence/impact/history/category —
+ * the agent loop only needs metric/scope/change/severity to investigate;
+ * the rest is regenerated downstream. The dropped fields are tested in
+ * test/state/insights.test.ts (round-trip suite).
+ */
+export function insightToAnomaly(i: Insight): Anomaly {
+  return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
+}
+
 export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
   // Replace the previous briefing for THIS session — each run IS the current
   // feed, not an addition. Without clearing, a warm serverless instance (or a

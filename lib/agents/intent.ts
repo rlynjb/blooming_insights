@@ -14,7 +14,7 @@ export function parseIntent(raw: string): Intent {
 const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 
 /** Live: classify a free-form query into an Intent (cheap, fast model). */
-export async function classifyIntent(anthropic: Anthropic, query: string): Promise<Intent> {
+export async function classifyIntent(anthropic: Anthropic, query: string, sessionId?: string): Promise<Intent> {
   const res = await anthropic.messages.create({
     model: CLASSIFIER_MODEL,
     max_tokens: 16,
@@ -23,8 +23,7 @@ export async function classifyIntent(anthropic: Anthropic, query: string): Promi
       'diagnostic (why did something happen), or recommendation (what should I do). Reply with ONLY the one word.',
     messages: [{ role: 'user', content: query }],
   });
-  // TODO: thread sessionId once classifyIntent's signature carries it (spec marks this site as hardest to thread).
-  console.log(JSON.stringify({ site: 'agents/intent:classifyIntent', usage: res.usage }));
+  console.log(JSON.stringify({ site: 'agents/intent:classifyIntent', sessionId, usage: res.usage }));
   const text = res.content
     .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
     .map((b) => b.text)

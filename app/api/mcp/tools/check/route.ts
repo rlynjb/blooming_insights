@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 import { crossCheckToolCoverage, extractToolNames } from '@/lib/mcp/tool-coverage';
 
 // Dev introspection: connects with the current session, dumps the server's
@@ -19,7 +20,7 @@ export async function GET() {
     const report = crossCheckToolCoverage(extractToolNames(raw));
     return NextResponse.json(report, { status: report.ok ? 200 : 409 });
   } catch (e) {
-    console.error('[mcp-tools-check] error:', e);
+    console.error('[mcp-tools-check] error:', redactSecrets(formatError(e)));
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
