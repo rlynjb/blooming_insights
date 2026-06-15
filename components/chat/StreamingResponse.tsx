@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { AgentEvent } from '@/lib/mcp/events';
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import Skeleton from '@/components/shared/Skeleton';
+import { readNdjson } from '@/lib/streaming/ndjson';
 
 interface StreamingResponseProps {
   query: string;
@@ -104,32 +105,7 @@ export default function StreamingResponse({ query, demoSuffix }: StreamingRespon
           return;
         }
 
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
-        let buf = '';
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop() ?? '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              handleEvent(JSON.parse(line) as AgentEvent);
-            } catch {
-              /* ignore malformed line */
-            }
-          }
-        }
-        // flush any trailing buffered line
-        if (buf.trim()) {
-          try {
-            handleEvent(JSON.parse(buf) as AgentEvent);
-          } catch {
-            /* ignore */
-          }
-        }
+        await readNdjson<AgentEvent>(res.body, handleEvent);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }

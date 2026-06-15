@@ -9,6 +9,7 @@ import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepp
 import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 import QueryBox from '@/components/chat/QueryBox';
+import { readNdjson } from '@/lib/streaming/ndjson';
 
 // the free-form "ask anything" box is hidden for now — flip to show it again.
 const SHOW_QUERY_BOX = false;
@@ -178,28 +179,11 @@ export default function HomePage() {
         (body.needsAuth ? 'unauthorized (needs reconnect)' : `http ${res.status}`);
       return { ok: false, error: err };
     }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
     let result: { ok: boolean; error?: string } = { ok: false, error: 'stream ended without done' };
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        try {
-          const evt = JSON.parse(line) as { type?: string; message?: string };
-          if (evt.type === 'done') result = { ok: true };
-          else if (evt.type === 'error') result = { ok: false, error: String(evt.message ?? 'error') };
-        } catch {
-          /* partial line — ignore */
-        }
-      }
-    }
+    await readNdjson<{ type?: string; message?: string }>(res.body, (evt) => {
+      if (evt.type === 'done') result = { ok: true };
+      else if (evt.type === 'error') result = { ok: false, error: String(evt.message ?? 'error') };
+    });
     return result;
   }
 
@@ -320,10 +304,7 @@ export default function HomePage() {
         }
 
         // Live path: NDJSON stream — surface monitoring's real status as it runs.
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
         const collected: Insight[] = [];
-        let buf = '';
 
         const handle = (evt: BriefingEvent) => {
           switch (evt.type) {
@@ -436,32 +417,7 @@ export default function HomePage() {
           }
         };
 
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (cancelled) {
-            await reader.cancel();
-            return;
-          }
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n');
-          buf = lines.pop() ?? '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              handle(JSON.parse(line) as BriefingEvent);
-            } catch {
-              /* skip a partial/garbage line */
-            }
-          }
-        }
-        if (buf.trim()) {
-          try {
-            handle(JSON.parse(buf) as BriefingEvent);
-          } catch {
-            /* ignore trailing partial */
-          }
-        }
+        await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelled });
       } catch (e) {
         if (!cancelled) {
           setErrorMessage(String(e));
