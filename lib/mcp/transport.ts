@@ -2,11 +2,19 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 
+/** Optional per-call options threaded from the route layer down to the SDK.
+ *  Today the only field is `signal`, which composes with the transport's own
+ *  `AbortSignal.timeout(TOOL_TIMEOUT_MS)` so the FIRST signal to fire wins —
+ *  either the client cancelling the request, or the per-call 30s ceiling. */
+export interface CallToolOpts {
+  signal?: AbortSignal;
+}
+
 /** Minimal surface McpClient depends on. Real impl wraps the MCP SDK Client;
  *  tests provide a fake. */
 export interface McpTransport {
-  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
-  listTools(): Promise<unknown>;
+  callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown>;
+  listTools(opts?: CallToolOpts): Promise<unknown>;
 }
 
 /** Holds the body of the most recent failed (non-2xx) HTTP response so the
@@ -118,9 +126,9 @@ export class SdkTransport implements McpTransport {
     private httpErrors?: HttpErrorHolder,
   ) {}
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown> {
     if (this.httpErrors) this.httpErrors.last = null;
-    const signal = AbortSignal.timeout(TOOL_TIMEOUT_MS);
+    const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
     try {
       return await this.client.callTool({ name, arguments: args }, undefined, { signal });
     } catch (err) {
@@ -137,9 +145,9 @@ export class SdkTransport implements McpTransport {
     }
   }
 
-  async listTools(): Promise<unknown> {
+  async listTools(opts?: CallToolOpts): Promise<unknown> {
     if (this.httpErrors) this.httpErrors.last = null;
-    const signal = AbortSignal.timeout(TOOL_TIMEOUT_MS);
+    const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
     try {
       return await this.client.listTools(undefined, { signal });
     } catch (err) {
@@ -154,4 +162,28 @@ export class SdkTransport implements McpTransport {
       throw err;
     }
   }
+}
+
+/** Compose any number of AbortSignals into one — the result fires as soon as
+ *  any source fires. Prefers `AbortSignal.any` (Node 20+ / modern browsers) and
+ *  falls back to a manual `AbortController` glue (no-op in this env, kept for
+ *  belt-and-braces against older runtimes). Used by `SdkTransport` to OR the
+ *  client-cancel signal with the per-call 30s `AbortSignal.timeout` — whichever
+ *  fires first cancels the in-flight MCP call. */
+export function composeSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
+  const filtered = signals.filter((s): s is AbortSignal => !!s);
+  if (filtered.length === 0) return new AbortController().signal;
+  if (filtered.length === 1) return filtered[0];
+  if (typeof (AbortSignal as unknown as { any?: unknown }).any === 'function') {
+    return (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any(filtered);
+  }
+  const ac = new AbortController();
+  for (const s of filtered) {
+    if (s.aborted) {
+      ac.abort((s as unknown as { reason?: unknown }).reason);
+      return ac.signal;
+    }
+    s.addEventListener('abort', () => ac.abort((s as unknown as { reason?: unknown }).reason), { once: true });
+  }
+  return ac.signal;
 }

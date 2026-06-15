@@ -10,9 +10,7 @@
 //   2. The 404 body reads `{ error: 'insight not found' }` (NOT
 //      `'anomaly not found'`).
 //   3. The route never inspects a `revoked` flag on the session — `unauthed`
-//      and `expired` both surface as `conn.ok === false`. The `expired`
-//      placeholder in `_helpers.ts` exists for the future reconnect-policy
-//      hook tests, not this layer.
+//      surfaces as `conn.ok === false`.
 //   4. The cached-investigation cache (`lib/state/investigations.ts`) is
 //      ALSO checked before the auth gate. Tests that use an insightId which
 //      already lives in `demo-investigations.json` would replay the cached
@@ -419,6 +417,55 @@ describe('GET /api/agent — diagnose / recommend / query (Phase 3)', () => {
         const parsed = JSON.parse(line) as { sessionId?: string };
         expect(parsed.sessionId).toBe('test-session-001');
       }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test 9b — cancellation (route honors req.signal)
+  // ---------------------------------------------------------------------------
+  // The agent route plumbs `req.signal` through to every async operation inside
+  // `start(controller)`. When the client aborts BEFORE the stream's try-block
+  // runs, the first `req.signal.throwIfAborted()` fires synchronously, the
+  // catch block returns on AbortError (no `error` event for a cancelled
+  // consumer), and the `finally` still records the phase summary with
+  // `aborted: true`. Pre-aborting is deterministic (no race against the first
+  // chunk landing — mirrors the briefing-route cancel test).
+  it('cleans up reader on client cancel (diagnose flow)', async () => {
+    // Arrange: seed an insight so the route gets past resolveAnomaly into the
+    // stream's try-block (where the first throwIfAborted() lives). Anthropic
+    // queue stays empty — if cancellation didn't short-circuit, the route
+    // would reach DiagnosticAgent.investigate and the mock would throw
+    // 'mock anthropic: scripted queue exhausted'.
+    const insight = seedInsight(currentSessionId, makeAnomaly());
+
+    const ac = new AbortController();
+    ac.abort();
+    const req = new NextRequest(
+      `http://localhost:3000/api/agent?step=diagnose&insightId=${insight.id}`,
+      { signal: ac.signal },
+    );
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      // Act
+      const response = await GET(req);
+      const events = await collectEvents<AgentEvent>(response);
+
+      // Assert: no `done` (the try-block returned before reaching it) and
+      // no `error` (the AbortError catch returned without emitting).
+      const types = events.map((e) => e.type);
+      expect(types).not.toContain('done');
+      expect(types).not.toContain('error');
+
+      // Phase log still fired in the finally, with the new `aborted` field set.
+      const summaryCalls = logSpy.mock.calls
+        .map((c) => c[0])
+        .filter((s): s is string => typeof s === 'string' && s.includes('"/api/agent"'));
+      expect(summaryCalls).toHaveLength(1);
+      const parsed = JSON.parse(summaryCalls[0]) as { aborted?: boolean; phases: unknown[] };
+      expect(parsed.aborted).toBe(true);
     } finally {
       logSpy.mockRestore();
     }

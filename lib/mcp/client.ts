@@ -1,6 +1,7 @@
 import type { McpTransport } from './transport';
 
-export interface CallToolOptions { cacheTtlMs?: number; skipCache?: boolean; }
+export interface CallToolOptions { cacheTtlMs?: number; skipCache?: boolean; signal?: AbortSignal; }
+export interface ListToolsOptions { signal?: AbortSignal; }
 export interface CallToolResult<T = unknown> { result: T; durationMs: number; fromCache: boolean; }
 interface ClientOpts {
   minIntervalMs?: number;
@@ -110,7 +111,7 @@ export class McpClient {
     }
 
     const start = Date.now();
-    let result = await this.liveCall(name, args);
+    let result = await this.liveCall(name, args, options.signal);
 
     // Rate-limit retry. Bloomreach enforces a multi-second global window and
     // states it in the error text; honor the parsed hint, else exponential
@@ -128,7 +129,7 @@ export class McpClient {
         this.retryCeilingMs,
       );
       await sleep(waitMs);
-      result = await this.liveCall(name, args);
+      result = await this.liveCall(name, args, options.signal);
     }
 
     const durationMs = Date.now() - start;
@@ -145,13 +146,13 @@ export class McpClient {
     return { result: result as T, durationMs, fromCache: false };
   }
 
-  private async liveCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+  private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const elapsed = Date.now() - this.lastCallAt;
     if (elapsed < this.minIntervalMs) {
       await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
     }
     try {
-      const result = await this.transport.callTool(name, args);
+      const result = await this.transport.callTool(name, args, { signal });
       this.lastCallAt = Date.now();
       return result;
     } catch (err) {
@@ -166,7 +167,7 @@ export class McpClient {
    *  inputSchema). Used by /debug for introspection and by agents to build the
    *  tool schemas they hand to Claude. Not cached — the tool set is stable per
    *  connection and listed rarely. */
-  async listTools(): Promise<unknown> {
-    return this.transport.listTools();
+  async listTools(options: ListToolsOptions = {}): Promise<unknown> {
+    return this.transport.listTools({ signal: options.signal });
   }
 }

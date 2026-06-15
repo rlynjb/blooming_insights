@@ -1,44 +1,19 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { Insight, CoverageItem, CoverageReport } from '@/lib/mcp/types';
 import InsightCard from '@/components/feed/InsightCard';
 import CoverageGrid from '@/components/feed/CoverageGrid';
 import Skeleton from '@/components/shared/Skeleton';
 import ProcessStepper, { type StepState } from '@/components/shared/ProcessStepper';
-import ReasoningTrace, { type TraceItem } from '@/components/investigation/ReasoningTrace';
+import ReasoningTrace from '@/components/investigation/ReasoningTrace';
 import StreamingResponse from '@/components/chat/StreamingResponse';
 import QueryBox from '@/components/chat/QueryBox';
-import { readNdjson } from '@/lib/streaming/ndjson';
+import { useBriefingStream, type FeedStatus } from '@/lib/hooks/useBriefingStream';
+import { useDemoCapture } from '@/lib/hooks/useDemoCapture';
+import { useReconnectPolicy, isAuthErrorButton } from '@/lib/hooks/useReconnectPolicy';
 
 // the free-form "ask anything" box is hidden for now — flip to show it again.
 const SHOW_QUERY_BOX = false;
-
-interface BriefingResponse {
-  insights: Insight[];
-  workspace?: {
-    projectName?: string;
-    totalCustomers?: number;
-  };
-  // present when a cached snapshot bundles the gathering trace (forward-compat)
-  trace?: TraceItem[];
-  // the anomaly-coverage grid summary (optional — old snapshots lack it)
-  coverage?: CoverageReport;
-}
-
-// The live briefing streams these NDJSON events (see app/api/briefing/route.ts).
-type BriefingEvent =
-  | { type: 'workspace'; workspace: BriefingResponse['workspace'] }
-  | { type: 'coverage_item'; item: CoverageItem }
-  | { type: 'coverage'; coverage: CoverageReport }
-  | { type: 'tool_call_start'; toolName: string; agent: string }
-  | { type: 'tool_call_end'; toolName: string; agent: string; durationMs: number; result?: unknown; error?: string }
-  | { type: 'reasoning_step'; step: { id?: string; kind?: string; content?: string } }
-  | { type: 'insight'; insight: Insight }
-  | { type: 'done' }
-  | { type: 'error'; message?: string };
-
-type FeedStatus = 'loading' | 'error' | 'empty' | 'loaded';
 
 // Monitoring is the only stage that runs on the feed; derive its stepper state
 // and live status line from the feed's fetch status.
@@ -64,57 +39,17 @@ function monitoringSub(
   return `${insightCount} change${insightCount === 1 ? '' : 's'} found`;
 }
 
-/** Stash each insight so the investigation page can hand its anomaly to the
- *  agent route (?insight=…). On Vercel the feed and the investigation request
- *  can hit different instances, so server-side in-memory lookup is unreliable;
- *  the browser carries the data across instead. */
-function stashInsights(list: Insight[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    for (const i of list) sessionStorage.setItem(`bi:insight:${i.id}`, JSON.stringify(i));
-  } catch {
-    /* sessionStorage full/blocked — investigation falls back to server lookup */
-  }
-}
-
-/** Read a response body defensively: parse JSON when possible, otherwise return
- *  the raw text under __raw so a 500/empty/HTML body never throws on res.json(). */
-async function readBody(res: Response): Promise<Record<string, unknown>> {
-  const text = await res.text();
-  if (!text) return {};
-  try {
-    return JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    return { __raw: text };
-  }
-}
-
 function formatCustomerCount(n: number): string {
   return n.toLocaleString();
 }
 
 export default function HomePage() {
-  const [status, setStatus] = useState<'loading' | 'error' | 'empty' | 'loaded'>('loading');
-  const [insights, setInsights] = useState<Insight[]>([]);
-  const [workspace, setWorkspace] = useState<BriefingResponse['workspace']>(undefined);
-  const [errorMessage, setErrorMessage] = useState('');
   const [activeQuery, setActiveQuery] = useState<string | null>(null);
-  // carried onto the query stream; the query box is live-only, so this stays empty
-  const [demoSuffix, setDemoSuffix] = useState('');
-  // live monitoring status for the top stepper (the real query the agent runs)
-  const [stepStatus, setStepStatus] = useState('');
-  const [queryCount, setQueryCount] = useState(0);
-  // the monitoring agent's gathering trace (tool calls + thoughts) for provenance
-  const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
-  // the 10-category anomaly-coverage summary (drives the coverage grid)
-  const [coverage, setCoverage] = useState<CoverageReport>([]);
-  // true briefly while auto-reconnecting after the alpha server revokes the token
-  const [reconnecting, setReconnecting] = useState(false);
-  // dev-only single-click demo capture progress (briefing → investigations → bundle)
-  const [capturing, setCapturing] = useState<{ active: boolean; msg: string }>({
-    active: false,
-    msg: '',
-  });
+
+  // revoked-token reconnect policy (state + one-shot guard + reset+reload).
+  // The alpha Bloomreach server revokes tokens after minutes — see
+  // lib/hooks/useReconnectPolicy.ts.
+  const reconnectPolicy = useReconnectPolicy();
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -150,286 +85,28 @@ export default function HomePage() {
     setMode(next); // re-runs the briefing fetch below
   }
 
-  // ── dev-only: capture the current LIVE briefing as the demo snapshot in ONE
-  //    click. The feed-level features (real current/prior + agent impact) come
-  //    from the briefing itself, so step 1 alone reaches feed parity; steps 2-3
-  //    run each investigation so demo card-clicks replay a real drill-down too.
-  async function postCapture(): Promise<{ ok: boolean; body: Record<string, unknown> }> {
-    const res = await fetch('/api/mcp/capture-demo', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ insights, workspace, trace: traceItems }),
-    });
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    return { ok: res.ok, body };
-  }
+  // The briefing stream — fetch + NDJSON parse + 9-case event dispatcher,
+  // composed with the reconnect policy (auth error → handle; done → clearFlag).
+  // See lib/hooks/useBriefingStream.ts.
+  const {
+    status,
+    insights,
+    workspace,
+    coverage,
+    traceItems,
+    errorMessage,
+    stepStatus,
+    queryCount,
+    demoSuffix,
+  } = useBriefingStream(mode, ready, {
+    onAuthError: reconnectPolicy.handle,
+    onStreamComplete: reconnectPolicy.clearFlag,
+  });
 
-  /** Run (or replay-from-cache) one insight's investigation to completion so it
-   *  lands in .investigation-cache.json. Drains the NDJSON stream, resolving on
-   *  the `done` event (ok) or an `error` event (with the message). */
-  async function runInvestigation(insight: Insight): Promise<{ ok: boolean; error?: string }> {
-    const url =
-      `/api/agent?insightId=${encodeURIComponent(insight.id)}` +
-      `&insight=${encodeURIComponent(JSON.stringify(insight))}`;
-    const res = await fetch(url);
-    if (!res.ok || !res.body) {
-      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-      const err =
-        (body.error as string) ||
-        (body.needsAuth ? 'unauthorized (needs reconnect)' : `http ${res.status}`);
-      return { ok: false, error: err };
-    }
-    let result: { ok: boolean; error?: string } = { ok: false, error: 'stream ended without done' };
-    await readNdjson<{ type?: string; message?: string }>(res.body, (evt) => {
-      if (evt.type === 'done') result = { ok: true };
-      else if (evt.type === 'error') result = { ok: false, error: String(evt.message ?? 'error') };
-    });
-    return result;
-  }
-
-  async function captureAll() {
-    if (capturing.active) return;
-    const AUTH_RE = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
-    try {
-      // 1) capture the briefing now — this alone gives feed parity (real
-      //    current/prior in evidence + the agent's business impact + the trace).
-      setCapturing({ active: true, msg: 'capturing the briefing (impact + comparison)…' });
-      const first = await postCapture();
-      if (!first.ok) {
-        window.alert(`capture failed: ${first.body.error ?? 'unknown'}`);
-        return;
-      }
-
-      // 2) run each investigation so demo card-clicks replay a real drill-down.
-      //    sequential — the MCP server is ~1 req/s; cached ones replay fast.
-      let stoppedFor = '';
-      for (let n = 0; n < insights.length; n++) {
-        const ins = insights[n];
-        setCapturing({
-          active: true,
-          msg: `investigating ${n + 1}/${insights.length} · ${ins.metric}…`,
-        });
-        const r = await runInvestigation(ins);
-        if (!r.ok && r.error && AUTH_RE.test(r.error)) {
-          stoppedFor = r.error;
-          break; // token revoked mid-run — keep what's cached, let the user resume
-        }
-        // non-auth failures: skip that one, keep going
-      }
-
-      // 3) re-capture to bundle the now-cached investigations.
-      setCapturing({ active: true, msg: 'bundling investigations…' });
-      const final = await postCapture();
-      const b = final.body;
-      const lines = [
-        final.ok
-          ? `captured ${b.insights} insights · ${b.traceItems} trace items · ${b.investigations} investigations`
-          : `capture failed: ${b.error ?? 'unknown'}`,
-        b.note ? String(b.note) : '',
-        stoppedFor
-          ? `stopped early — auth expired (${stoppedFor}). reconnect, then click capture again to finish the rest (cached ones are kept).`
-          : '',
-        final.ok ? `commit: ${((b.files as string[]) ?? []).join(', ')}` : '',
-      ].filter(Boolean);
-      window.alert(lines.join('\n'));
-    } catch (e) {
-      window.alert(`capture failed: ${String(e)}`);
-    } finally {
-      setCapturing({ active: false, msg: '' });
-    }
-  }
-
-  useEffect(() => {
-    if (!ready) return; // wait until the persisted mode is resolved
-
-    // demo → cached snapshot (instant, no auth); live → run the agents.
-    const search = isDemo ? '?demo=cached' : '';
-    setDemoSuffix(isDemo ? '&demo=cached' : '');
-
-    // reset the feed for this (re)load — important when toggling demo/live
-    setStatus('loading');
-    setErrorMessage('');
-    setInsights([]);
-    setStepStatus('');
-    setQueryCount(0);
-    setTraceItems([]);
-    setCoverage([]);
-
-    const url = `/api/briefing${search}`;
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const res = await fetch(url);
-
-        // Auth + error cases come back as JSON (the route checks auth before it
-        // commits to a stream), so handle those first.
-        if (res.status === 401) {
-          const body = await readBody(res);
-          if (body?.needsAuth && body?.authUrl) {
-            window.location.href = body.authUrl as string;
-            return;
-          }
-          setErrorMessage('authentication required');
-          setStatus('error');
-          return;
-        }
-        if (!res.ok) {
-          const body = await readBody(res);
-          const msg =
-            typeof body?.error === 'string'
-              ? body.error
-              : typeof body?.__raw === 'string'
-                ? body.__raw
-                : `http ${res.status}`;
-          setErrorMessage(msg);
-          setStatus('error');
-          return;
-        }
-
-        const ct = res.headers.get('content-type') ?? '';
-
-        // Demo / snapshot path: plain JSON, no live stream.
-        if (!ct.includes('ndjson') || !res.body) {
-          const body = await readBody(res);
-          const data = body as unknown as BriefingResponse;
-          const list: Insight[] = Array.isArray(data?.insights) ? data.insights : [];
-          setWorkspace(data?.workspace);
-          setInsights(list);
-          stashInsights(list);
-          if (Array.isArray(data?.trace)) setTraceItems(data.trace);
-          if (Array.isArray(data?.coverage)) setCoverage(data.coverage);
-          setStatus(list.length === 0 ? 'empty' : 'loaded');
-          return;
-        }
-
-        // Live path: NDJSON stream — surface monitoring's real status as it runs.
-        const collected: Insight[] = [];
-
-        const handle = (evt: BriefingEvent) => {
-          switch (evt.type) {
-            case 'workspace':
-              setWorkspace(evt.workspace);
-              break;
-            case 'coverage_item':
-              // accumulate one tile at a time → the grid fills progressively
-              setCoverage((prev) =>
-                prev.some((c) => c.category === evt.item.category) ? prev : [...prev, evt.item],
-              );
-              break;
-            case 'coverage':
-              setCoverage(evt.coverage);
-              break;
-            case 'tool_call_start':
-              setQueryCount((n) => n + 1);
-              setTraceItems((prev) => [
-                ...prev,
-                { kind: 'tool', id: crypto.randomUUID(), toolName: evt.toolName, status: 'running', ts: Date.now() },
-              ]);
-              break;
-            case 'reasoning_step': {
-              const step = evt.step;
-              const content = step?.content;
-              if (content) {
-                setStepStatus(content);
-                setTraceItems((prev) => [
-                  ...prev,
-                  {
-                    kind: 'step',
-                    id: step.id ?? crypto.randomUUID(),
-                    agent: 'monitoring',
-                    stepKind: (step.kind as 'thought' | 'hypothesis' | 'conclusion') ?? 'thought',
-                    content,
-                    ts: Date.now(),
-                  },
-                ]);
-              }
-              break;
-            }
-            case 'tool_call_end':
-              setTraceItems((prev) => {
-                const next = [...prev];
-                for (let i = next.length - 1; i >= 0; i--) {
-                  const it = next[i];
-                  if (it.kind === 'tool' && it.toolName === evt.toolName && it.status === 'running') {
-                    next[i] = {
-                      ...it,
-                      status: 'done',
-                      durationMs: evt.durationMs,
-                      result: evt.result,
-                      error: evt.error,
-                    };
-                    break;
-                  }
-                }
-                return next;
-              });
-              break;
-            case 'insight':
-              collected.push(evt.insight);
-              break;
-            case 'done':
-              setInsights(collected);
-              stashInsights(collected);
-              try {
-                sessionStorage.removeItem('bi:reconnecting');
-              } catch {
-                /* ignore */
-              }
-              setStatus(collected.length === 0 ? 'empty' : 'loaded');
-              break;
-            case 'error': {
-              const msg = evt.message ?? 'something went wrong';
-              // The alpha server revokes tokens after a few minutes; its own 401
-              // says to clear tokens and reconnect ("the client should
-              // automatically re-register and obtain new tokens"). Do that ONCE
-              // automatically — guarded so it can't loop if the fresh token is
-              // also immediately revoked.
-              if (/invalid_token|unauthor|forbidden|401|session expired|reconnect/i.test(msg)) {
-                let alreadyTried = false;
-                try {
-                  alreadyTried = sessionStorage.getItem('bi:reconnecting') === '1';
-                } catch {
-                  /* ignore */
-                }
-                if (!alreadyTried) {
-                  try {
-                    sessionStorage.setItem('bi:reconnecting', '1');
-                  } catch {
-                    /* ignore */
-                  }
-                  setReconnecting(true);
-                  fetch('/api/mcp/reset', { method: 'POST' }).finally(() => {
-                    window.location.href = '/';
-                  });
-                  return;
-                }
-                try {
-                  sessionStorage.removeItem('bi:reconnecting');
-                } catch {
-                  /* ignore */
-                }
-              }
-              setErrorMessage(msg);
-              setStatus('error');
-              break;
-            }
-          }
-        };
-
-        await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelled });
-      } catch (e) {
-        if (!cancelled) {
-          setErrorMessage(String(e));
-          setStatus('error');
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [mode, ready]);
+  // dev-only single-click demo-snapshot capture (briefing → investigations → bundle).
+  // The button below is gated on NODE_ENV !== 'production' && !isDemo; the hook
+  // itself is environment-agnostic — see lib/hooks/useDemoCapture.ts.
+  const { capturing, captureAll } = useDemoCapture(insights, workspace, traceItems);
 
   return (
     <main
@@ -555,7 +232,7 @@ export default function HomePage() {
       )}
 
       {/* auto-reconnecting after a revoked token (brief, before the redirect) */}
-      {reconnecting && (
+      {reconnectPolicy.reconnecting && (
         <p
           className="lowercase"
           style={{
@@ -577,9 +254,9 @@ export default function HomePage() {
       {/* anomaly coverage grid — the category checklist, above the cards. Tiles
           stream in one at a time as the gate reports each category; while
           loading, the not-yet-reported tiles render as pending skeletons. */}
-      <CoverageGrid coverage={coverage} insights={insights} loading={status === 'loading' && !reconnecting} />
+      <CoverageGrid coverage={coverage} insights={insights} loading={status === 'loading' && !reconnectPolicy.reconnecting} />
       {/* loading */}
-      {status === 'loading' && !reconnecting && (
+      {status === 'loading' && !reconnectPolicy.reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <Skeleton height={96} />
           <Skeleton height={96} />
@@ -603,7 +280,7 @@ export default function HomePage() {
           >
             {errorMessage || 'something went wrong'}
           </p>
-          {/unauthor|forbidden|401|session expired/i.test(errorMessage) && (
+          {isAuthErrorButton(errorMessage) && (
             <>
               <p
                 className="lowercase"
@@ -618,15 +295,7 @@ export default function HomePage() {
               </p>
               <button
                 type="button"
-                onClick={async () => {
-                  // clear the revoked token, then reload → re-runs OAuth cleanly
-                  try {
-                    await fetch('/api/mcp/reset', { method: 'POST' });
-                  } catch {
-                    /* ignore — reload still triggers the auth check */
-                  }
-                  window.location.href = '/';
-                }}
+                onClick={reconnectPolicy.reconnect}
                 className="lowercase"
                 style={{
                   background: 'var(--bg-elevated)',

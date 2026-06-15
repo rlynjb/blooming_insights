@@ -51,11 +51,14 @@ export function schemaSummary(schema: WorkspaceSchema): string {
 const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
 
 /** Streaming hooks fired as the monitoring loop runs (used to stream live status
- *  to the feed). All optional; mirror runAgentLoop's hook surface. */
+ *  to the feed). All optional; mirror runAgentLoop's hook surface. The optional
+ *  `signal` is threaded down to `runAgentLoop` so the route layer's `req.signal`
+ *  cancels in-flight Anthropic + MCP calls when the client navigates away. */
 export interface MonitorHooks {
   onToolCall?: (tc: ToolCall) => void;
   onToolResult?: (tc: ToolCall) => void;
   onText?: (t: string) => void;
+  signal?: AbortSignal;
 }
 
 export class MonitoringAgent {
@@ -98,6 +101,7 @@ export class MonitoringAgent {
       onToolCall: hooks?.onToolCall,
       onToolResult: hooks?.onToolResult,
       onText: hooks?.onText,
+      signal: hooks?.signal,
       maxTurns: 8,
       maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
       synthesisInstruction: buildSynthesisInstruction(

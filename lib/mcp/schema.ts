@@ -130,6 +130,13 @@ export function parseWorkspaceSchema(input: {
 
 let cached: WorkspaceSchema | null = null;
 
+/** Optional per-call options threaded down to the MCP client. Today carries
+ *  only an AbortSignal so the route layer's `req.signal` can cancel an
+ *  in-flight bootstrap call when the client navigates away. */
+export interface BootstrapOpts {
+  signal?: AbortSignal;
+}
+
 /** Call a bootstrap tool and surface an error envelope (`isError`) as a tagged
  *  McpToolError carrying the server's text — otherwise `unwrap` fails later with
  *  a cryptic JSON parse error that hides which tool returned what. */
@@ -137,8 +144,9 @@ async function callOrThrow(
   mcp: McpClient,
   name: string,
   args: Record<string, unknown>,
+  opts: BootstrapOpts = {},
 ): Promise<unknown> {
-  const { result } = await mcp.callTool(name, args);
+  const { result } = await mcp.callTool(name, args, { signal: opts.signal });
   const r = result as { isError?: boolean; content?: Array<{ text?: string }> } | null;
   if (r && r.isError === true) {
     const text =
@@ -150,14 +158,15 @@ async function callOrThrow(
 
 export async function resolveProject(
   mcp: McpClient,
+  opts: BootstrapOpts = {},
 ): Promise<{ projectId: string; projectName: string }> {
   const orgs = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(mcp, 'list_cloud_organizations', {}),
+    await callOrThrow(mcp, 'list_cloud_organizations', {}, opts),
   ).data;
   if (!orgs?.length) throw new Error('no cloud organizations for this user');
 
   const projects = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }),
+    await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }, opts),
   ).data;
   if (!projects?.length) throw new Error('no projects in organization');
 
@@ -169,16 +178,17 @@ export async function resolveProject(
 
 export async function bootstrapSchema(
   mcp: McpClient,
+  opts: BootstrapOpts = {},
 ): Promise<WorkspaceSchema> {
   if (cached) return cached;
-  const { projectId, projectName } = await resolveProject(mcp);
+  const { projectId, projectName } = await resolveProject(mcp, opts);
   const args = { project_id: projectId };
 
   // Sequential — the server allows ~1 req/s; McpClient already spaces calls.
-  const eventSchema = await callOrThrow(mcp, 'get_event_schema', args);
-  const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
-  const catalogs = await callOrThrow(mcp, 'list_catalogs', args);
-  const overview = await callOrThrow(mcp, 'get_project_overview', args);
+  const eventSchema = await callOrThrow(mcp, 'get_event_schema', args, opts);
+  const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args, opts);
+  const catalogs = await callOrThrow(mcp, 'list_catalogs', args, opts);
+  const overview = await callOrThrow(mcp, 'get_project_overview', args, opts);
 
   cached = parseWorkspaceSchema({
     projectId,

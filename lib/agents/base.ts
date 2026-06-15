@@ -17,7 +17,7 @@ export interface McpCaller {
   callTool(
     name: string,
     args: Record<string, unknown>,
-    opts?: { cacheTtlMs?: number; skipCache?: boolean },
+    opts?: { cacheTtlMs?: number; skipCache?: boolean; signal?: AbortSignal },
   ): Promise<{ result: unknown; durationMs: number; fromCache: boolean }>;
 }
 
@@ -49,6 +49,12 @@ export type RunAgentLoopOpts<T> = {
   maxToolCalls?: number; // hard cap on total tool calls; once hit, the model is forced to synthesize
   synthesisInstruction?: string; // appended to system on the forced-final turn to compel a structured answer
   sessionId?: string; // optional; surfaced only in the per-turn usage log line so per-session token totals can be joined
+  // Optional cancel propagation: when set, the loop checks `signal.aborted`
+  // between turns and threads it to `anthropic.messages.create(params)` plus to
+  // every `mcp.callTool` call so an in-flight request aborts when the route's
+  // `req.signal` fires. Optional — existing callers without a signal are
+  // unchanged.
+  signal?: AbortSignal;
   // Optional one-turn recovery: if the loop's finalText doesn't parse, the loop
   // runs ONE additional tool-less turn with `recoveryPrompt(toolCalls)` and
   // re-parses. Either both options or neither must be set for recovery to fire.
@@ -91,6 +97,7 @@ export async function runAgentLoop<T = null>(
     maxToolCalls,
     synthesisInstruction,
     sessionId,
+    signal,
   } = opts;
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -101,6 +108,9 @@ export async function runAgentLoop<T = null>(
   let finalText = '';
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Coarse abort check between turns — bails fast on cancel so the route's
+    // catch block sees the AbortError before another SDK call is queued.
+    signal?.throwIfAborted();
     // Omit tools when the model must now produce a final answer instead of
     // another tool call — guarantees a non-empty response and bounds latency:
     //   - on the final allowed turn, or
@@ -117,7 +127,7 @@ export async function runAgentLoop<T = null>(
       messages,
     };
     if (!forceFinal) params.tools = toolSchemas;
-    const res = await anthropic.messages.create(params);
+    const res = await anthropic.messages.create(params, signal ? { signal } : undefined);
     console.log(JSON.stringify({ site: 'agents/base:runAgentLoop', sessionId, usage: res.usage }));
 
     // Append assistant turn to message history
@@ -163,6 +173,7 @@ export async function runAgentLoop<T = null>(
         const { result, durationMs } = await mcp.callTool(
           tu.name,
           tu.input as Record<string, unknown>,
+          signal ? { signal } : undefined,
         );
         tc.result = result;
         tc.durationMs = durationMs;
@@ -226,13 +237,18 @@ async function runRecoveryTurn<T>(
   recoveryUserContent: string,
 ): Promise<string | null> {
   try {
-    const res = await opts.anthropic.messages.create({
-      model: AGENT_MODEL,
-      max_tokens: 2048,
-      system:
-        'You are concluding a completed investigation. Output ONLY the structured answer in the requested shape. Never ask for more data.',
-      messages: [{ role: 'user', content: recoveryUserContent }],
-    } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+    // Early bail if cancellation already fired before we made the SDK call.
+    opts.signal?.throwIfAborted();
+    const res = await opts.anthropic.messages.create(
+      {
+        model: AGENT_MODEL,
+        max_tokens: 2048,
+        system:
+          'You are concluding a completed investigation. Output ONLY the structured answer in the requested shape. Never ask for more data.',
+        messages: [{ role: 'user', content: recoveryUserContent }],
+      } as Anthropic.Messages.MessageCreateParamsNonStreaming,
+      opts.signal ? { signal: opts.signal } : undefined,
+    );
     console.log(
       JSON.stringify({ site: 'agents/base:runRecoveryTurn', sessionId: opts.sessionId, usage: res.usage }),
     );
@@ -240,7 +256,11 @@ async function runRecoveryTurn<T>(
       .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
       .map((b) => b.text)
       .join('');
-  } catch {
+  } catch (err) {
+    // Propagate AbortError up — the route's catch-block distinguishes cancels
+    // from real failures. Swallowing it here would let the loop return its
+    // FALLBACK and emit a `diagnosis` event on an already-cancelled stream.
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
     return null;
   }
 }

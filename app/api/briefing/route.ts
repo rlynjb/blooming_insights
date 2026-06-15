@@ -195,9 +195,16 @@ export async function GET(req: NextRequest) {
         phases.push({ phase, durationMs: Math.round(performance.now() - started) });
       };
       try {
+        // Cancellation is honored at coarse phase boundaries inside the stream
+        // AND threaded into every async layer below (bootstrapSchema, listTools,
+        // MonitoringAgent.scan → runAgentLoop → mcp.callTool + anthropic.messages.create).
+        // Whichever fires first (`req.signal` from the client, or
+        // `AbortSignal.timeout(30_000)` on a per-call basis in the MCP transport)
+        // cancels in-flight work.
+        req.signal.throwIfAborted();
         step('reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(mcp);
+        const schema = await bootstrapSchema(mcp, { signal: req.signal });
         recordPhase('schema_bootstrap', t_schema);
         send({
           type: 'workspace',
@@ -225,8 +232,9 @@ export async function GET(req: NextRequest) {
         });
         recordPhase('coverage_gate', t_coverage);
 
+        req.signal.throwIfAborted();
         const t_listTools = performance.now();
-        const raw = await mcp.listTools();
+        const raw = await mcp.listTools({ signal: req.signal });
         const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
           ? (raw as { tools: McpToolDef[] }).tools
           : [];
@@ -235,6 +243,7 @@ export async function GET(req: NextRequest) {
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const agent = new MonitoringAgent(anthropic, mcp, schema, allTools, sid);
 
+        req.signal.throwIfAborted();
         step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
         const t_scan = performance.now();
         const anomalies = await agent.scan({
@@ -254,15 +263,24 @@ export async function GET(req: NextRequest) {
           onText: (t) => {
             if (t.trim()) step(t.trim());
           },
+          signal: req.signal,
         }, runnable);
         recordPhase('monitoring_scan', t_scan);
 
+        req.signal.throwIfAborted();
         const insights = anomalies.map(anomalyToInsight);
         putInsights(sid, insights, anomalies);
         for (const insight of listInsights(sid)) send({ type: 'insight', insight });
 
         send({ type: 'done' });
       } catch (e) {
+        // Client cancelled (closed tab / navigated away / unmount cleanup) —
+        // skip the error event (no consumer to read it) but still let the
+        // finally fire so the phase log records how much budget was burned
+        // before the cancel landed.
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          return;
+        }
         // full stack/cause in Vercel logs, with bearer/OAuth tokens redacted
         console.error('[briefing] error:', redactSecrets(formatError(e)));
         send({
@@ -279,6 +297,7 @@ export async function GET(req: NextRequest) {
           sessionId: sid,
           totalMs: Math.round(performance.now() - t0),
           phases,
+          aborted: req.signal.aborted,
         }));
         controller.close();
       }

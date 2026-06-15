@@ -54,6 +54,7 @@ export class RecommendationAgent {
       onToolCall: hooks.onToolCall,
       onText: hooks.onText,
       onToolResult: hooks.onToolResult,
+      signal: hooks.signal,
       maxTurns: 6,
       maxToolCalls: 4,
       synthesisInstruction: buildSynthesisInstruction(

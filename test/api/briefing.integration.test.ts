@@ -272,22 +272,48 @@ describe('GET /api/briefing — error + auth + cancellation (Phase 2)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Test 6 — cancellation [SKIPPED]
+  // Test 6 — cancellation
   // ---------------------------------------------------------------------------
-  // The route's stream `start(controller)` does not read `req.signal` and has
-  // no abort check inside the bootstrap / scan pipeline. A consumer-side abort
-  // via `response.body.cancel()` would only stop the reader from receiving
-  // bytes — the route would keep running to natural completion, then the
-  // finally block runs.
-  //
-  // To test cancellation behaviourally we would need:
-  //   (a) the route to plumb `req.signal` through and short-circuit, OR
-  //   (b) an assertion against stream-cancel semantics, which tests the runtime
-  //       not the route.
-  // Neither fits Phase 2's "tests pin REALITY" rule, so this case is skipped
-  // with a documented reason rather than written as a flaky / no-op assertion.
-  it.skip('cleans up reader on client cancel — needs route-side signal handling', () => {
-    // intentionally empty
+  // The route now plumbs `req.signal` through to every async operation inside
+  // `start(controller)`. When the client aborts BEFORE the stream's try-block
+  // runs, the very first `req.signal.throwIfAborted()` fires synchronously, the
+  // catch block recognizes the AbortError and returns (no `error` event is
+  // emitted — the consumer has cancelled), and the `finally` still records the
+  // phase summary with `aborted: true`. Pre-aborting is the deterministic shape
+  // (no race against the first chunk landing).
+  it('cleans up reader on client cancel', async () => {
+    // Arrange: pre-abort the signal so the route's first checkpoint fires
+    // synchronously inside the try block. The Anthropic mock queue is empty
+    // intentionally — if cancellation didn't short-circuit, the route would
+    // reach `MonitoringAgent.scan` and the mock would throw
+    // 'mock anthropic: scripted queue exhausted', which would surface as an
+    // `error` event (a failure we'd see in the assertions below).
+    const ac = new AbortController();
+    ac.abort();
+    const req = new NextRequest('http://localhost:3000/api/briefing', { signal: ac.signal });
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      // Act
+      const response = await GET(req);
+      const events = await collectEvents<AgentEvent | { type: string }>(response);
+
+      // Assert: no `done` (the try-block returned before reaching it) and
+      // no `error` (the AbortError catch returned without emitting).
+      const types = events.map((e) => (e as { type: string }).type);
+      expect(types).not.toContain('done');
+      expect(types).not.toContain('error');
+
+      // Phase log still fired in the finally, with the new `aborted` field set.
+      const summaryCalls = logSpy.mock.calls
+        .map((c) => c[0])
+        .filter((s): s is string => typeof s === 'string' && s.includes('"/api/briefing"'));
+      expect(summaryCalls).toHaveLength(1);
+      const parsed = JSON.parse(summaryCalls[0]) as { aborted?: boolean; phases: unknown[] };
+      expect(parsed.aborted).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   // ---------------------------------------------------------------------------
