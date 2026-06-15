@@ -1,0 +1,637 @@
+{
+  "K": 10,
+  "date": "2026-06-15",
+  "judge_model": "claude-sonnet-4-6",
+  "runs": [
+    {
+      "runIndex": 1,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 58022,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast cross-sell email campaign to a named cohort, an automated win-back scenario with defined entry/exit conditions, and a 7-day A/B promotional experiment — none require platform re-architecture.",
+          "specific": "Each recommendation names the target segment (Dec 8–15 electronics buyers, ~8,800 customers), a time window (7-day send, 30-day inactivity trigger, 7-day experiment window starting 2025-12-22 or 2026-01-06), and either a threshold or A/B framing, satisfying the segment + window + detail bar across all three items.",
+          "impact_sized": "Recommendation 1 gives rangeUsd low=420000, high=704000 with explicit assumptions (8,800 buyers × 6–8% conversion × $80 AOV), and Recommendations 2 and 3 also carry numeric rangeUsd figures, well exceeding the single-item threshold for impact-sized."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast cross-sell email campaign to a named cohort, an automated win-back scenario with defined entry/exit conditions, and a 7-day A/B promotional experiment — none require platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment (Dec 8–15 electronics buyers, ~8,800 customers), a time window (7-day send, 30-day inactivity trigger, 7-day experiment window starting 2025-12-22 or 2026-01-06), and either a threshold or A/B framing, satisfying the segment + window + detail bar across all three items.\",\n    \"impact_sized\": \"Recommendation 1 gives rangeUsd low=420000, high=704000 with explicit assumptions (8,800 buyers × 6–8% conversion × $80 AOV), and Recommendations 2 and 3 also carry numeric rangeUsd figures, well exceeding the single-item threshold for impact-sized.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 61233,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations — a targeted email cross-sell campaign to the December electronics cohort, an automated post-purchase win-back scenario with a 21-day trigger and voucher, and a 3-arm A/B test on incentive depth for the next promotional window — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.",
+          "specific": "Each recommendation names the target segment (8,800 electronics buyers from 2025-12-08 to 2025-12-15), a time window (early January send, 21-day trigger, 14-day test window), and a threshold or framing (frequency cap of 1/7 days, 10% holdout control group, MDE of +8% at 80% power with ~1,500 per arm).",
+          "impact_sized": "Recommendation 1 gives a concrete rangeUsd of $237k–$475k based on 10–20% re-purchase rate × 8,800 buyers × $270 AOV; recommendations 2 and 3 also carry numeric rangeUsd values ($95k–$190k and $54k–$135k respectively), all with explicit assumptions."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations — a targeted email cross-sell campaign to the December electronics cohort, an automated post-purchase win-back scenario with a 21-day trigger and voucher, and a 3-arm A/B test on incentive depth for the next promotional window — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment (8,800 electronics buyers from 2025-12-08 to 2025-12-15), a time window (early January send, 21-day trigger, 14-day test window), and a threshold or framing (frequency cap of 1/7 days, 10% holdout control group, MDE of +8% at 80% power with ~1,500 per arm).\",\n    \"impact_sized\": \"Recommendation 1 gives a concrete rangeUsd of $237k–$475k based on 10–20% re-purchase rate × 8,800 buyers × $270 AOV; recommendations 2 and 3 also carry numeric rangeUsd values ($95k–$190k and $54k–$135k respectively), all with explicit assumptions.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 57725,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a triggered win-back drip scenario with defined nodes and exit conditions, a 3-email broadcast campaign with a fixed 7-day window, and a 50/50 A/B experiment on installment messaging — none require platform re-architecture.",
+          "specific": "Each recommendation names the target segment and additional specifics: rec 1 targets electronics buyers from 2025-12-08 to 2025-12-15 with T+14 and T+30 day triggers and a 10% voucher; rec 2 targets 90-day electronics browsers/purchasers across five named BR states in a 7-day mid-January window; rec 3 targets credit-card electronics buyers in a 21-day 50/50 experiment starting 2026-01-06 with a minimum sample of 400 per arm.",
+          "impact_sized": "All three recommendations carry concrete numeric rangeUsd figures — rec 1: $56k–$140k with explicit assumption of ~530 lapsed buyers × $264 AOV × 10–25% re-engagement; rec 2: $100k–$200k; rec 3: $18k–$45k — well above the one-item bar required."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a triggered win-back drip scenario with defined nodes and exit conditions, a 3-email broadcast campaign with a fixed 7-day window, and a 50/50 A/B experiment on installment messaging — none require platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment and additional specifics: rec 1 targets electronics buyers from 2025-12-08 to 2025-12-15 with T+14 and T+30 day triggers and a 10% voucher; rec 2 targets 90-day electronics browsers/purchasers across five named BR states in a 7-day mid-January window; rec 3 targets credit-card electronics buyers in a 21-day 50/50 experiment starting 2026-01-06 with a minimum sample of 400 per arm.\",\n    \"impact_sized\": \"All three recommendations carry concrete numeric rangeUsd figures — rec 1: $56k–$140k with explicit assumption of ~530 lapsed buyers × $264 AOV × 10–25% re-engagement; rec 2: $100k–$200k; rec 3: $18k–$45k — well above the one-item bar required.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 57435,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions — a cross-sell email campaign targeting ~8,800 defined buyers by Dec 18-20, a triggered post-purchase retention scenario with day-7 and day-14 nodes, and a 50/50 A/B voucher experiment with a defined January start date — each within typical Brazilian e-commerce ops capability this quarter.",
+          "specific": "Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers), a time window (7-day campaign, 14-day experiment, 30-day retention window), and at least one additional parameter (BRL 200 minimum order, 10% voucher, day-7/day-14 trigger nodes), satisfying the segment + window/threshold bar across all three items.",
+          "impact_sized": "All three recommendations carry numeric rangeUsd estimates with explicit assumptions — e.g., rec 1 states '+$115k–$231k incremental revenue' based on '8,800 × 5–10% repurchase rate × $263 AOV', meeting the concrete-magnitude threshold."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions — a cross-sell email campaign targeting ~8,800 defined buyers by Dec 18-20, a triggered post-purchase retention scenario with day-7 and day-14 nodes, and a 50/50 A/B voucher experiment with a defined January start date — each within typical Brazilian e-commerce ops capability this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers), a time window (7-day campaign, 14-day experiment, 30-day retention window), and at least one additional parameter (BRL 200 minimum order, 10% voucher, day-7/day-14 trigger nodes), satisfying the segment + window/threshold bar across all three items.\",\n    \"impact_sized\": \"All three recommendations carry numeric rangeUsd estimates with explicit assumptions — e.g., rec 1 states '+$115k–$231k incremental revenue' based on '8,800 × 5–10% repurchase rate × $263 AOV', meeting the concrete-magnitude threshold.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 62468,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations — a post-surge email re-engagement campaign, a time-limited voucher pool targeting non-converting browsers and lapsed buyers, and a 50/50 A/B experiment on a weekly electronics digest — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.",
+          "specific": "Each recommendation names the target segment (8,800 Dec 8–15 electronics buyers; 3,000–5,000 non-converting browsers/lapsed buyers; ~4,400 spike-week buyers split 50/50), a time window (14-day send window, 10-day voucher validity, 4-week test from 2026-01-06 to 2026-02-03), and either a basket threshold (BRL 500 minimum) or an A/B framing with a declared success threshold (≥15% lift, p<0.05).",
+          "impact_sized": "Recommendation 1 carries a concrete rangeUsd of $92k–$185k with explicit arithmetic (8,800 buyers × 5–10% conversion × ~$210 AOV), satisfying the impact-sized criterion for the set."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations — a post-surge email re-engagement campaign, a time-limited voucher pool targeting non-converting browsers and lapsed buyers, and a 50/50 A/B experiment on a weekly electronics digest — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment (8,800 Dec 8–15 electronics buyers; 3,000–5,000 non-converting browsers/lapsed buyers; ~4,400 spike-week buyers split 50/50), a time window (14-day send window, 10-day voucher validity, 4-week test from 2026-01-06 to 2026-02-03), and either a basket threshold (BRL 500 minimum) or an A/B framing with a declared success threshold (≥15% lift, p<0.05).\",\n    \"impact_sized\": \"Recommendation 1 carries a concrete rangeUsd of $92k–$185k with explicit arithmetic (8,800 buyers × 5–10% conversion × ~$210 AOV), satisfying the impact-sized criterion for the set.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 62931,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations — a triggered post-purchase scenario, a broadcast re-engagement campaign scheduled for 2026-01-06, and a 50/50 A/B voucher experiment — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.",
+          "specific": "Each recommendation names the target segment (8,800 electronics buyers, 2025-12-08 to 2025-12-15), a specific time window (21-day sequence, January 6 launch, or January 6–20 voucher validity), and either a threshold or A/B framing (20% holdout, 50/50 split, min. order R$200).",
+          "impact_sized": "All three recommendations carry explicit rangeUsd fields with numeric low/high bounds (e.g., $185k–$370k for the scenario, $92k–$185k for the campaign, $46k–$92k for the A/B test) with detailed per-customer arithmetic assumptions."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations — a triggered post-purchase scenario, a broadcast re-engagement campaign scheduled for 2026-01-06, and a 50/50 A/B voucher experiment — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter without platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment (8,800 electronics buyers, 2025-12-08 to 2025-12-15), a specific time window (21-day sequence, January 6 launch, or January 6–20 voucher validity), and either a threshold or A/B framing (20% holdout, 50/50 split, min. order R$200).\",\n    \"impact_sized\": \"All three recommendations carry explicit rangeUsd fields with numeric low/high bounds (e.g., $185k–$370k for the scenario, $92k–$185k for the campaign, $46k–$92k for the A/B test) with detailed per-customer arithmetic assumptions.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 61353,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions — a broadcast cross-sell email campaign to a defined cohort, an automated post-purchase scenario with day-7/21/30 nodes, and a 14-day A/B voucher experiment — all within typical Brazilian e-commerce CRM/ops capability this quarter.",
+          "specific": "Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers), a time window (7-day send window, 30-day scenario, 14-day experiment), and either a threshold or A/B framing (≥15% lift at 95% significance, ≥8% repeat rate, ≥R$925k attribution target).",
+          "impact_sized": "Recommendation 1 provides a concrete rangeUsd of $185k–$370k with an explicit calculation (8–15% × 8,800 buyers × $264 AOV), satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions — a broadcast cross-sell email campaign to a defined cohort, an automated post-purchase scenario with day-7/21/30 nodes, and a 14-day A/B voucher experiment — all within typical Brazilian e-commerce CRM/ops capability this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers), a time window (7-day send window, 30-day scenario, 14-day experiment), and either a threshold or A/B framing (≥15% lift at 95% significance, ≥8% repeat rate, ≥R$925k attribution target).\",\n    \"impact_sized\": \"Recommendation 1 provides a concrete rangeUsd of $185k–$370k with an explicit calculation (8–15% × 8,800 buyers × $264 AOV), satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 63621,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 0
+        },
+        "total": 4,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions a Brazilian e-commerce team could schedule this quarter — a post-purchase email sequence, an automated browse-abandonment scenario with voucher, and a 50/50 A/B experiment on voucher necessity — all within typical CRM/ops capability.",
+          "specific": "Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers or non-converter pool), a time window (14-day run, pre-Christmas cut-off 2025-12-20/30), and either an A/B framing or a specific voucher threshold (5–10% off, electronics-only), satisfying the segment + window/framing bar across the set.",
+          "impact_sized": "Although all three estimatedImpact fields carry numeric rangeUsd figures, the AOV assumption of BRL 131,965 per order is implausible for a Brazilian consumer electronics order (roughly $26,000 USD), making the derived figures (BRL 1.19B–1.98B, $238M–$396M) wildly unrealistic — these are not credible magnitudes and function as qualitative hand-waves dressed in numbers, so no item clears the bar for a concrete, believable magnitude."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 0\n  },\n  \"total\": 4,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions a Brazilian e-commerce team could schedule this quarter — a post-purchase email sequence, an automated browse-abandonment scenario with voucher, and a 50/50 A/B experiment on voucher necessity — all within typical CRM/ops capability.\",\n    \"specific\": \"Each recommendation names the target segment (electronics buyers 2025-12-08 to 2025-12-15, ~8,800 customers or non-converter pool), a time window (14-day run, pre-Christmas cut-off 2025-12-20/30), and either an A/B framing or a specific voucher threshold (5–10% off, electronics-only), satisfying the segment + window/framing bar across the set.\",\n    \"impact_sized\": \"Although all three estimatedImpact fields carry numeric rangeUsd figures, the AOV assumption of BRL 131,965 per order is implausible for a Brazilian consumer electronics order (roughly $26,000 USD), making the derived figures (BRL 1.19B–1.98B, $238M–$396M) wildly unrealistic — these are not credible magnitudes and function as qualitative hand-waves dressed in numbers, so no item clears the bar for a concrete, believable magnitude.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 62577,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations — a cross-sell broadcast email to the 8,800 spike buyers, an automated scenario triggered by order-velocity threshold, and a 50/50 voucher A/B experiment — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter using standard platform tooling.",
+          "specific": "Each recommendation names the target segment (8,800 week-2 electronics buyers, or lapsed browsers of electronics category), a time window (2025-12-08 to 2025-12-15 cohort, 60-day experiment window, 7-day rolling trigger), and a specific framing (50/50 A/B split with 8% voucher, 2× baseline order-velocity trigger, 48–72h post-purchase send).",
+          "impact_sized": "Recommendation 1 provides a concrete rangeUsd of $180k–$370k with an explicit calculation (8,800 buyers × 20% conversion × $135 AOV), and Recommendation 3 gives $60k–$150k net of voucher cost with a chi-squared power note — both qualify as concrete magnitude estimates."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations — a cross-sell broadcast email to the 8,800 spike buyers, an automated scenario triggered by order-velocity threshold, and a 50/50 voucher A/B experiment — are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter using standard platform tooling.\",\n    \"specific\": \"Each recommendation names the target segment (8,800 week-2 electronics buyers, or lapsed browsers of electronics category), a time window (2025-12-08 to 2025-12-15 cohort, 60-day experiment window, 7-day rolling trigger), and a specific framing (50/50 A/B split with 8% voucher, 2× baseline order-velocity trigger, 48–72h post-purchase send).\",\n    \"impact_sized\": \"Recommendation 1 provides a concrete rangeUsd of $180k–$370k with an explicit calculation (8,800 buyers × 20% conversion × $135 AOV), and Recommendation 3 gives $60k–$150k net of voucher cost with a chi-squared power note — both qualify as concrete magnitude estimates.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 57925,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a post-purchase cross-sell email campaign, an automated win-back scenario with a day-7 voucher fallback, and a 50/50 A/B test with a nested discount arm — each within standard Brazilian e-commerce CRM/ops capability this quarter.",
+          "specific": "Each recommendation names the target segment (e.g., '8,800 spike-week electronics buyers 2025-12-08 to 2025-12-15', 'lapsed buyers with ≥1 order before 2025-09-08', 'active customers ≥1 order in last 6 months') plus a time window or A/B framing, satisfying the segment + one specificity dimension bar across all three items.",
+          "impact_sized": "All three items carry concrete rangeUsd figures (e.g., item 1: low $186k, high $311k; item 2: low $264k, high $528k; item 3: low $88k, high $220k) with explicit customer-count and conversion-rate assumptions, well exceeding the one-item minimum."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a post-purchase cross-sell email campaign, an automated win-back scenario with a day-7 voucher fallback, and a 50/50 A/B test with a nested discount arm — each within standard Brazilian e-commerce CRM/ops capability this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (e.g., '8,800 spike-week electronics buyers 2025-12-08 to 2025-12-15', 'lapsed buyers with ≥1 order before 2025-09-08', 'active customers ≥1 order in last 6 months') plus a time window or A/B framing, satisfying the segment + one specificity dimension bar across all three items.\",\n    \"impact_sized\": \"All three items carry concrete rangeUsd figures (e.g., item 1: low $186k, high $311k; item 2: low $264k, high $528k; item 3: low $88k, high $220k) with explicit customer-count and conversion-rate assumptions, well exceeding the one-item minimum.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 1,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 52441,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a targeted email re-engagement campaign with a voucher, an automated win-back scenario with branching logic and ops webhook, and a three-arm A/B experiment — each maps to a real Bloomreach capability and has defined setup times (45–120 minutes).",
+          "specific": "Each recommendation names the target segment (SP-state buyers who went silent in week 4, 2025-12-22–29), a time window (14-day campaign or test window), and a framing detail — Rec 1 uses 10% single-use voucher with 14-day expiry, Rec 2 uses a >20% order-count trigger with branching thresholds and 14-day cooldown, Rec 3 uses a three-way split of ~1,400 buyers each with a Chi-square p<0.05 success criterion.",
+          "impact_sized": "Rec 1 provides a concrete rangeUsd of $28k–$56k over 14 days with an explicit calculation (4,200 buyers × 10–20% reactivation × $165 AOV × margin adjustment), satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a targeted email re-engagement campaign with a voucher, an automated win-back scenario with branching logic and ops webhook, and a three-arm A/B experiment — each maps to a real Bloomreach capability and has defined setup times (45–120 minutes).\",\n    \"specific\": \"Each recommendation names the target segment (SP-state buyers who went silent in week 4, 2025-12-22–29), a time window (14-day campaign or test window), and a framing detail — Rec 1 uses 10% single-use voucher with 14-day expiry, Rec 2 uses a >20% order-count trigger with branching thresholds and 14-day cooldown, Rec 3 uses a three-way split of ~1,400 buyers each with a Chi-square p<0.05 success criterion.\",\n    \"impact_sized\": \"Rec 1 provides a concrete rangeUsd of $28k–$56k over 14 days with an explicit calculation (4,200 buyers × 10–20% reactivation × $165 AOV × margin adjustment), satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 68210,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast re-engagement email campaign to SP lapsed buyers, a SP-scoped voucher pool with explicit redemption caps and pause logic, and a 2-week A/B experiment on fulfillment-transparency messaging — each is a real platform capability, not a platform rebuild.",
+          "specific": "Every recommendation names the target segment (SP-state buyers who lapsed in week 4, 2025-12-22 to 2025-12-29), a time window (7-day, 14-day, or 2-week run), and a concrete threshold or framing (≥10% reactivation rate, ≥15% voucher redemption, ≥15% relative CVR lift with p<0.05), satisfying the segment + window/threshold bar across the set.",
+          "impact_sized": "Recommendation #1 provides a numeric rangeUsd of low: $52,500 / high: $105,000 with an explicit assumption (1,050 gap buyers × 10–20% reactivation × $50 AOV), qualifying as a concrete magnitude estimate."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast re-engagement email campaign to SP lapsed buyers, a SP-scoped voucher pool with explicit redemption caps and pause logic, and a 2-week A/B experiment on fulfillment-transparency messaging — each is a real platform capability, not a platform rebuild.\",\n    \"specific\": \"Every recommendation names the target segment (SP-state buyers who lapsed in week 4, 2025-12-22 to 2025-12-29), a time window (7-day, 14-day, or 2-week run), and a concrete threshold or framing (≥10% reactivation rate, ≥15% voucher redemption, ≥15% relative CVR lift with p<0.05), satisfying the segment + window/threshold bar across the set.\",\n    \"impact_sized\": \"Recommendation #1 provides a numeric rangeUsd of low: $52,500 / high: $105,000 with an explicit assumption (1,050 gap buyers × 10–20% reactivation × $50 AOV), qualifying as a concrete magnitude estimate.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 54596,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions a Brazilian e-commerce ops/CRM team could schedule this quarter: a broadcast win-back email campaign to SP lapsed buyers, a geo-restricted voucher pool with a defined redemption cap, and a 14-day A/B experiment on SP delivery-guarantee messaging — each is a real, schedulable action with named prerequisites.",
+          "specific": "Each recommendation names the target segment (SP-state buyers, lapsed during Dec 22–29), a time window (7-day send window, 10-day voucher validity, 14-day experiment), and either a threshold or A/B framing (e.g. ≥200 orders per arm, 10% off min R$150, 90% significance at ≥10% lift).",
+          "impact_sized": "Recommendation 1 gives a concrete numeric range of +R$770k–R$1.28M (rangeUsd low: 154000, high: 256000) with an explicit assumption tying it to 15–25% reactivation on ~4,200 SP buyers at stated AOV."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions a Brazilian e-commerce ops/CRM team could schedule this quarter: a broadcast win-back email campaign to SP lapsed buyers, a geo-restricted voucher pool with a defined redemption cap, and a 14-day A/B experiment on SP delivery-guarantee messaging — each is a real, schedulable action with named prerequisites.\",\n    \"specific\": \"Each recommendation names the target segment (SP-state buyers, lapsed during Dec 22–29), a time window (7-day send window, 10-day voucher validity, 14-day experiment), and either a threshold or A/B framing (e.g. ≥200 orders per arm, 10% off min R$150, 90% significance at ≥10% lift).\",\n    \"impact_sized\": \"Recommendation 1 gives a concrete numeric range of +R$770k–R$1.28M (rangeUsd low: 154000, high: 256000) with an explicit assumption tying it to 15–25% reactivation on ~4,200 SP buyers at stated AOV.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 54946,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter — a triggered win-back scenario with a 2-branch email flow, a broadcast campaign with fulfillment messaging, and a 50/50 voucher A/B experiment — all using standard Bloomreach features (scenario, campaign, experiment).",
+          "specific": "Each recommendation names the target segment (SP-state buyers with state=SP), a time window (2025-12-22 to 2025-12-29 lapsed cohort, 90-day active base, 7-14 day run windows), and either an A/B framing, a threshold (≥5pp lift, >95 orders/week), or a voucher parameter (10% off, 72-hour timer), satisfying the segment + at least one additional targeting dimension bar.",
+          "impact_sized": "Recommendation 1 provides rangeUsd {low: 53000, high: 111000} with an explicit assumption tying reactivation rate (15-30%), emailable customer count (4,200), and AOV, and recommendation 2 similarly provides rangeUsd {low: 26000, high: 69000} — both are concrete numeric magnitudes, not qualitative hand-waves."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter — a triggered win-back scenario with a 2-branch email flow, a broadcast campaign with fulfillment messaging, and a 50/50 voucher A/B experiment — all using standard Bloomreach features (scenario, campaign, experiment).\",\n    \"specific\": \"Each recommendation names the target segment (SP-state buyers with state=SP), a time window (2025-12-22 to 2025-12-29 lapsed cohort, 90-day active base, 7-14 day run windows), and either an A/B framing, a threshold (≥5pp lift, >95 orders/week), or a voucher parameter (10% off, 72-hour timer), satisfying the segment + at least one additional targeting dimension bar.\",\n    \"impact_sized\": \"Recommendation 1 provides rangeUsd {low: 53000, high: 111000} with an explicit assumption tying reactivation rate (15-30%), emailable customer count (4,200), and AOV, and recommendation 2 similarly provides rangeUsd {low: 26000, high: 69000} — both are concrete numeric magnitudes, not qualitative hand-waves.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 54256,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a win-back email campaign with a voucher to a defined lapsed-buyer cohort, an automated order-confirmation scenario triggered on SP orders, and a three-arm A/B experiment comparing free-shipping vs. discount vouchers — each maps to a real platform feature (campaign, scenario, experiment) with realistic setup times.",
+          "specific": "Each recommendation names the target segment (SP-state buyers with specific date ranges), a time window (14-day campaign, 14-day experiment, 21-day read), and at least one threshold or framing detail (e.g., ~1,050 lapsed buyers in rec 1, 33/33/33 three-arm split in rec 3, ±10% baseline guard in rec 2).",
+          "impact_sized": "Recommendation 1 provides a concrete rangeUsd of $42k–$70k with an explicit calculation (1,050 lapsed buyers × 25–40% reactivation rate × $160 AOV), satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a win-back email campaign with a voucher to a defined lapsed-buyer cohort, an automated order-confirmation scenario triggered on SP orders, and a three-arm A/B experiment comparing free-shipping vs. discount vouchers — each maps to a real platform feature (campaign, scenario, experiment) with realistic setup times.\",\n    \"specific\": \"Each recommendation names the target segment (SP-state buyers with specific date ranges), a time window (14-day campaign, 14-day experiment, 21-day read), and at least one threshold or framing detail (e.g., ~1,050 lapsed buyers in rec 1, 33/33/33 three-arm split in rec 3, ±10% baseline guard in rec 2).\",\n    \"impact_sized\": \"Recommendation 1 provides a concrete rangeUsd of $42k–$70k with an explicit calculation (1,050 lapsed buyers × 25–40% reactivation rate × $160 AOV), satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 60889,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast win-back email campaign with SMS follow-up, a time-boxed SP-only voucher pool with a capped redemption budget, and a 50/50 A/B experiment on messaging variants — each maps to a real platform capability (campaign, voucher, experiment) with defined setup times.",
+          "specific": "Each recommendation names the target segment (SP-state gap-week silent buyers, 4,200 customers), a defined time window (2026-01-05–07 send, 2026-01-06–20 voucher validity, 7-day experiment read), and concrete thresholds (10% discount, R$200 minimum order, 2,000 redemption cap, 50/50 split, p<0.05 significance bar).",
+          "impact_sized": "Recommendation 1 provides a rangeUsd of {low: 38000, high: 68000} grounded in a 14–25% reactivation rate on 4,200 customers at ~$127 AOV, and Recommendation 2 gives {low: 22000, high: 45000} net of discount cost — both are concrete numeric magnitudes."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast win-back email campaign with SMS follow-up, a time-boxed SP-only voucher pool with a capped redemption budget, and a 50/50 A/B experiment on messaging variants — each maps to a real platform capability (campaign, voucher, experiment) with defined setup times.\",\n    \"specific\": \"Each recommendation names the target segment (SP-state gap-week silent buyers, 4,200 customers), a defined time window (2026-01-05–07 send, 2026-01-06–20 voucher validity, 7-day experiment read), and concrete thresholds (10% discount, R$200 minimum order, 2,000 redemption cap, 50/50 split, p<0.05 significance bar).\",\n    \"impact_sized\": \"Recommendation 1 provides a rangeUsd of {low: 38000, high: 68000} grounded in a 14–25% reactivation rate on 4,200 customers at ~$127 AOV, and Recommendation 2 gives {low: 22000, high: 45000} net of discount cost — both are concrete numeric magnitudes.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 54285,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions schedulable this quarter: a re-engagement broadcast email with a 10% holdout, a geo-restricted SP voucher pool capped at 5,000 codes for Jan 1–10, and a 14-day A/B experiment on checkout delivery messaging — each maps to a real platform capability an e-commerce ops team could execute without re-architecting.",
+          "specific": "Each recommendation names the SP-state segment plus at least one additional anchor: rec 1 specifies the Dec 22–29 drop-week cohort and a first-week-of-January send window; rec 2 specifies R$150 minimum basket, a 10-day window (Jan 1–10), and a 5,000-code cap; rec 3 specifies a 50/50 split, 500-session minimum per variant, and a 14-day run on SP checkout/PDP.",
+          "impact_sized": "Recommendation 1 gives rangeUsd {low: 19000, high: 35000} with an explicit assumption (10–18% reactivation on ~4,200 buyers at $140 AOV); recommendation 2 gives rangeUsd {low: 25000, high: 48000} with redemption-rate arithmetic, satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions schedulable this quarter: a re-engagement broadcast email with a 10% holdout, a geo-restricted SP voucher pool capped at 5,000 codes for Jan 1–10, and a 14-day A/B experiment on checkout delivery messaging — each maps to a real platform capability an e-commerce ops team could execute without re-architecting.\",\n    \"specific\": \"Each recommendation names the SP-state segment plus at least one additional anchor: rec 1 specifies the Dec 22–29 drop-week cohort and a first-week-of-January send window; rec 2 specifies R$150 minimum basket, a 10-day window (Jan 1–10), and a 5,000-code cap; rec 3 specifies a 50/50 split, 500-session minimum per variant, and a 14-day run on SP checkout/PDP.\",\n    \"impact_sized\": \"Recommendation 1 gives rangeUsd {low: 19000, high: 35000} with an explicit assumption (10–18% reactivation on ~4,200 buyers at $140 AOV); recommendation 2 gives rangeUsd {low: 25000, high: 48000} with redemption-rate arithmetic, satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 64689,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce ops team this quarter: a targeted win-back email broadcast, an SP-exclusive voucher pool with expiry reminder, and a 50/50 A/B experiment on fulfillment messaging — none require platform re-architecture.",
+          "specific": "Each recommendation names the target segment (SP gap cohort, 4,200 customers), the time window (5–7 days), and either a threshold (≥10% redemption, ≥15% conversion lift) or A/B framing (50/50 split with a 'Guaranteed SP delivery' badge), satisfying the segment + window/threshold bar across all items.",
+          "impact_sized": "Recommendation #1 provides rangeUsd {low: 84000, high: 168000} with an explicit assumption chain (15–30% reactivation × 4,200 customers), and recommendation #2 provides rangeUsd {low: 42000, high: 105000} with redemption rate and basket size assumptions, both qualifying as concrete magnitude estimates."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce ops team this quarter: a targeted win-back email broadcast, an SP-exclusive voucher pool with expiry reminder, and a 50/50 A/B experiment on fulfillment messaging — none require platform re-architecture.\",\n    \"specific\": \"Each recommendation names the target segment (SP gap cohort, 4,200 customers), the time window (5–7 days), and either a threshold (≥10% redemption, ≥15% conversion lift) or A/B framing (50/50 split with a 'Guaranteed SP delivery' badge), satisfying the segment + window/threshold bar across all items.\",\n    \"impact_sized\": \"Recommendation #1 provides rangeUsd {low: 84000, high: 168000} with an explicit assumption chain (15–30% reactivation × 4,200 customers), and recommendation #2 provides rangeUsd {low: 42000, high: 105000} with redemption rate and basket size assumptions, both qualifying as concrete magnitude estimates.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 60615,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a broadcast win-back email/push campaign with a 7-day holdout, a capped 2,000-redemption SP-only voucher pool, and a 50/50 A/B experiment on delivery-promise messaging — each is within standard e-commerce ops and CRM capability this quarter.",
+          "specific": "Each recommendation names the target segment (SP-state buyers, filtered by last_order_date or 60-day purchase history), a time window (7-day campaign or 14-day experiment), and either a threshold or framing (≥15% redemption rate, ≥5% conversion lift, 2,000 voucher cap, 50/50 split).",
+          "impact_sized": "Recommendation 1 provides rangeUsd {low: 32000, high: 77000} with an explicit calculation (4,200 affected SP customers × 5–10% reactivation × ~$154 AOV), satisfying the concrete-magnitude requirement."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a broadcast win-back email/push campaign with a 7-day holdout, a capped 2,000-redemption SP-only voucher pool, and a 50/50 A/B experiment on delivery-promise messaging — each is within standard e-commerce ops and CRM capability this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (SP-state buyers, filtered by last_order_date or 60-day purchase history), a time window (7-day campaign or 14-day experiment), and either a threshold or framing (≥15% redemption rate, ≥5% conversion lift, 2,000 voucher cap, 50/50 split).\",\n    \"impact_sized\": \"Recommendation 1 provides rangeUsd {low: 32000, high: 77000} with an explicit calculation (4,200 affected SP customers × 5–10% reactivation × ~$154 AOV), satisfying the concrete-magnitude requirement.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 61086,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three items are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast email win-back campaign with a voucher pool, an automated triggered re-engagement scenario, and an A/B checkout-banner experiment — each maps to a real platform capability with setup times of 45–90 minutes.",
+          "specific": "Each recommendation names the SP-state segment plus at least one additional anchor: rec 1 gives the exact audience filter (state=SP, last_order_date 2025-12-22–29), voucher value (R$30 off, R$150 basket), and 7-day window; rec 2 specifies the 14-day lapse trigger and a 30-day read window; rec 3 defines a 14-day / 500-checkout-per-variant stopping rule with a ≥5% lift threshold at 90% confidence.",
+          "impact_sized": "All three recommendations carry numeric rangeUsd fields with concrete assumptions — rec 1 explicitly estimates +$11k–$22k from 15–30% reactivation of ~1,050 lost orders at ~$70 AOV, which qualifies as a concrete magnitude."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three items are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast email win-back campaign with a voucher pool, an automated triggered re-engagement scenario, and an A/B checkout-banner experiment — each maps to a real platform capability with setup times of 45–90 minutes.\",\n    \"specific\": \"Each recommendation names the SP-state segment plus at least one additional anchor: rec 1 gives the exact audience filter (state=SP, last_order_date 2025-12-22–29), voucher value (R$30 off, R$150 basket), and 7-day window; rec 2 specifies the 14-day lapse trigger and a 30-day read window; rec 3 defines a 14-day / 500-checkout-per-variant stopping rule with a ≥5% lift threshold at 90% confidence.\",\n    \"impact_sized\": \"All three recommendations carry numeric rangeUsd fields with concrete assumptions — rec 1 explicitly estimates +$11k–$22k from 15–30% reactivation of ~1,050 lost orders at ~$70 AOV, which qualifies as a concrete magnitude.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 1,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 61655,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a broadcast email reactivation campaign, a multi-touch automated win-back scenario, and a 3-arm A/B experiment — each maps to a real CRM/ops capability a Brazilian e-commerce team could execute this quarter.",
+          "specific": "Each recommendation names the target segment (customers with payment_type=voucher in weeks 1–9 who lapsed post-week 10, ~12,500 customers), a specific time window (14-day broadcast, 30-day scenario, 21-day experiment), and concrete framing (3-group split with ~3,333 per arm, Day 0/7/14 flow steps, p<0.05 decision rule).",
+          "impact_sized": "Recommendation 1 provides rangeUsd {low: 167000, high: 334000} with explicit math (10–20% reactivation × 12,500 customers × AOV), satisfying the concrete-magnitude bar."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a broadcast email reactivation campaign, a multi-touch automated win-back scenario, and a 3-arm A/B experiment — each maps to a real CRM/ops capability a Brazilian e-commerce team could execute this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (customers with payment_type=voucher in weeks 1–9 who lapsed post-week 10, ~12,500 customers), a specific time window (14-day broadcast, 30-day scenario, 21-day experiment), and concrete framing (3-group split with ~3,333 per arm, Day 0/7/14 flow steps, p<0.05 decision rule).\",\n    \"impact_sized\": \"Recommendation 1 provides rangeUsd {low: 167000, high: 334000} with explicit math (10–20% reactivation × 12,500 customers × AOV), satisfying the concrete-magnitude bar.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 62375,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a broadcast email campaign to a defined lapsed-voucher segment, an automated 3-touch win-back scenario with explicit entry/exit triggers, and a 3-arm A/B experiment with discount variants on boleto/credit-card — all within standard Brazilian e-commerce ops capability this quarter.",
+          "specific": "Each recommendation names the target segment (customers with ≥1 voucher-payment order in weeks 1–9 and zero orders post-2026-02-02, ~12,500 customers), a time window (14-day or 8-week read), and a concrete framing (broadcast campaign, triggered flow with 30-day inactivity trigger, 3-group experiment with ~4,167/group and p<0.05 threshold).",
+          "impact_sized": "Recommendation 1 cites '+R$5.8M – R$10.2M recovered over 4 weeks' with rangeUsd {low: 1160000, high: 2040000} and an explicit assumption of 20–35% reactivation × 12,500 customers × R$185 AOV, satisfying the concrete-magnitude bar."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a broadcast email campaign to a defined lapsed-voucher segment, an automated 3-touch win-back scenario with explicit entry/exit triggers, and a 3-arm A/B experiment with discount variants on boleto/credit-card — all within standard Brazilian e-commerce ops capability this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (customers with ≥1 voucher-payment order in weeks 1–9 and zero orders post-2026-02-02, ~12,500 customers), a time window (14-day or 8-week read), and a concrete framing (broadcast campaign, triggered flow with 30-day inactivity trigger, 3-group experiment with ~4,167/group and p<0.05 threshold).\",\n    \"impact_sized\": \"Recommendation 1 cites '+R$5.8M – R$10.2M recovered over 4 weeks' with rangeUsd {low: 1160000, high: 2040000} and an explicit assumption of 20–35% reactivation × 12,500 customers × R$185 AOV, satisfying the concrete-magnitude bar.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 58188,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable-this-quarter actions: a voucher pool relaunch with internal audit gate, a targeted email broadcast to the 12,500 lapsed segment, and a checkout A/B experiment — all within typical Brazilian e-commerce ops/CRM capability.",
+          "specific": "Each recommendation names the target segment (customers with voucher payment in weeks 1–9, ~12,500 affected), a time window (30-day reactivation, 14-day post-send window, 21-day experiment run), and a threshold or framing (≥50% baseline recovery, ≥750 orders, ≥5 pp lift in checkout completion).",
+          "impact_sized": "Recommendation 1 gives rangeUsd low: 107,500 / high: 161,250 with an explicit assumption (12,500 customers × 20–30% reactivation × $43 AOV), satisfying the concrete magnitude bar."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable-this-quarter actions: a voucher pool relaunch with internal audit gate, a targeted email broadcast to the 12,500 lapsed segment, and a checkout A/B experiment — all within typical Brazilian e-commerce ops/CRM capability.\",\n    \"specific\": \"Each recommendation names the target segment (customers with voucher payment in weeks 1–9, ~12,500 affected), a time window (30-day reactivation, 14-day post-send window, 21-day experiment run), and a threshold or framing (≥50% baseline recovery, ≥750 orders, ≥5 pp lift in checkout completion).\",\n    \"impact_sized\": \"Recommendation 1 gives rangeUsd low: 107,500 / high: 161,250 with an explicit assumption (12,500 customers × 20–30% reactivation × $43 AOV), satisfying the concrete magnitude bar.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 60119,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a broadcast email reactivation campaign to a defined cohort, an automated multi-step win-back scenario with specific triggers and frequency caps, and a 50/50 A/B experiment with a 10% holdout — all within typical Brazilian e-commerce CRM/ops capabilities this quarter.",
+          "specific": "Each recommendation names the target segment (12,500 lapsed voucher-payment customers from weeks 1–9), a time window (8-week recovery, 90-day scenario, 21-day test), and a threshold or A/B framing — e.g., rec 1 specifies '10–15% discount, 30-day validity, next business day broadcast'; rec 3 specifies '50/50 split, 10% holdout control, 21-day run'.",
+          "impact_sized": "Rec 1 provides a concrete rangeUsd of $46,800–$78,000 over 8 weeks with an explicit assumption (15–25% reactivation × 12,500 customers × ~$100 AOV), satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a broadcast email reactivation campaign to a defined cohort, an automated multi-step win-back scenario with specific triggers and frequency caps, and a 50/50 A/B experiment with a 10% holdout — all within typical Brazilian e-commerce CRM/ops capabilities this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (12,500 lapsed voucher-payment customers from weeks 1–9), a time window (8-week recovery, 90-day scenario, 21-day test), and a threshold or A/B framing — e.g., rec 1 specifies '10–15% discount, 30-day validity, next business day broadcast'; rec 3 specifies '50/50 split, 10% holdout control, 21-day run'.\",\n    \"impact_sized\": \"Rec 1 provides a concrete rangeUsd of $46,800–$78,000 over 8 weeks with an explicit assumption (15–25% reactivation × 12,500 customers × ~$100 AOV), satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 59552,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions — a broadcast email campaign to a defined segment, a 3-step drip scenario with clear entry/exit conditions, and a 50/50 A/B experiment with a 10% holdout — all within standard e-commerce CRM/ops capabilities this quarter.",
+          "specific": "Each recommendation names the target segment (customers with payment_type='voucher' in weeks 1-9, ~12,500 customers), a time window (4-week pilot, 30-day drip, 21-day test), and either an A/B framing or a success-metric threshold (≥50% of BRL 800k/week baseline, ≥5% conversion rate, ≥20% revenue difference between arms).",
+          "impact_sized": "All three recommendations carry numeric rangeUsd estimates — e.g. rec 1 cites '+$950k–$1.9M recovered over 4 weeks' with explicit reactivation-rate and AOV assumptions — satisfying the impact-sized criterion."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions — a broadcast email campaign to a defined segment, a 3-step drip scenario with clear entry/exit conditions, and a 50/50 A/B experiment with a 10% holdout — all within standard e-commerce CRM/ops capabilities this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (customers with payment_type='voucher' in weeks 1-9, ~12,500 customers), a time window (4-week pilot, 30-day drip, 21-day test), and either an A/B framing or a success-metric threshold (≥50% of BRL 800k/week baseline, ≥5% conversion rate, ≥20% revenue difference between arms).\",\n    \"impact_sized\": \"All three recommendations carry numeric rangeUsd estimates — e.g. rec 1 cites '+$950k–$1.9M recovered over 4 weeks' with explicit reactivation-rate and AOV assumptions — satisfying the impact-sized criterion.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 68536,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter: a broadcast email reactivation campaign to a defined lapsed-voucher segment, an automated 3-touch win-back scenario triggered by browse-no-buy behavior, and a 3-arm A/B experiment delivering split email variants with specific payment-method incentives — each within normal platform capability.",
+          "specific": "Each recommendation names the target segment (customers with payment_type=voucher in weeks 1–9, inactive since week 10, ~12,500 customers), a time window (14-day, 30-day, or 21-day read), and a concrete framing — broadcast campaign with voucher pool cap, triggered scenario with 24h/48h/72h touch cadence, or 3-arm ~4,167-customer split with an 8% MDE threshold.",
+          "impact_sized": "Recommendation 1 cites '+R$3.57M – R$8.93M BRL recovered payment volume in first 30 days' with an explicit reactivation-rate × customer-count × AOV assumption, and Recommendation 3 names a minimum detectable effect of +8% order_count lift tied to the observed decline, both qualifying as concrete magnitude estimates."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter: a broadcast email reactivation campaign to a defined lapsed-voucher segment, an automated 3-touch win-back scenario triggered by browse-no-buy behavior, and a 3-arm A/B experiment delivering split email variants with specific payment-method incentives — each within normal platform capability.\",\n    \"specific\": \"Each recommendation names the target segment (customers with payment_type=voucher in weeks 1–9, inactive since week 10, ~12,500 customers), a time window (14-day, 30-day, or 21-day read), and a concrete framing — broadcast campaign with voucher pool cap, triggered scenario with 24h/48h/72h touch cadence, or 3-arm ~4,167-customer split with an 8% MDE threshold.\",\n    \"impact_sized\": \"Recommendation 1 cites '+R$3.57M – R$8.93M BRL recovered payment volume in first 30 days' with an explicit reactivation-rate × customer-count × AOV assumption, and Recommendation 3 names a minimum detectable effect of +8% order_count lift tied to the observed decline, both qualifying as concrete magnitude estimates.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 61544,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions: a broadcast reactivation email campaign with defined suppression logic, a 3-touch automated win-back scenario with explicit voucher pool budget cap, and a 60-day A/B experiment testing backup-payment onboarding nudges — all within standard e-commerce CRM/ops capabilities this quarter.",
+          "specific": "Each recommendation names the target segment (12,500 customers with payment_type=voucher in weeks 1-9, no order since week 10), a time window (2-week conversion window, 30-day scenario, 60-day experiment), and either a threshold or A/B framing (50% baseline recovery target, 30% redemption pause trigger, 50/50/25/25 variant split).",
+          "impact_sized": "Recommendation 1 carries rangeUsd low: 1,200,000 / high: 2,400,000 with explicit assumption math (5-10% reactivation × 12,500 customers × baseline weekly run-rate), and recommendation 2 carries rangeUsd low: 480,000 / high: 960,000 — both concrete magnitude figures anchored to customer count and AOV."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions: a broadcast reactivation email campaign with defined suppression logic, a 3-touch automated win-back scenario with explicit voucher pool budget cap, and a 60-day A/B experiment testing backup-payment onboarding nudges — all within standard e-commerce CRM/ops capabilities this quarter.\",\n    \"specific\": \"Each recommendation names the target segment (12,500 customers with payment_type=voucher in weeks 1-9, no order since week 10), a time window (2-week conversion window, 30-day scenario, 60-day experiment), and either a threshold or A/B framing (50% baseline recovery target, 30% redemption pause trigger, 50/50/25/25 variant split).\",\n    \"impact_sized\": \"Recommendation 1 carries rangeUsd low: 1,200,000 / high: 2,400,000 with explicit assumption math (5-10% reactivation × 12,500 customers × baseline weekly run-rate), and recommendation 2 carries rangeUsd low: 480,000 / high: 960,000 — both concrete magnitude figures anchored to customer count and AOV.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 63313,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter: a broadcast email win-back campaign to the 12,500 lapsed voucher users, an automated 3-node re-engagement scenario with tiered incentives, and a 3-cohort A/B experiment on payment-method preference — each maps to a real platform capability with defined setup steps.",
+          "specific": "Each recommendation names the target segment (12,500 lapsed voucher users, weeks 1–9 baseline), a time window (14-day or 30-day read), and either an A/B framing (3-cohort split with p<0.05 threshold) or a discount magnitude (10–20% voucher codes), satisfying the segment + window/threshold bar for all three items.",
+          "impact_sized": "Recommendation 1 provides rangeUsd {low: 178000, high: 297000} with explicit assumptions (15–25% reactivation × 12,500 customers × $95 AOV over 4 weeks), and Recommendation 3 adds a strategic value anchor of $475K BRL/week in recoverable revenue — both qualify as concrete magnitude estimates."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete actions a Brazilian e-commerce CRM/ops team could schedule this quarter: a broadcast email win-back campaign to the 12,500 lapsed voucher users, an automated 3-node re-engagement scenario with tiered incentives, and a 3-cohort A/B experiment on payment-method preference — each maps to a real platform capability with defined setup steps.\",\n    \"specific\": \"Each recommendation names the target segment (12,500 lapsed voucher users, weeks 1–9 baseline), a time window (14-day or 30-day read), and either an A/B framing (3-cohort split with p<0.05 threshold) or a discount magnitude (10–20% voucher codes), satisfying the segment + window/threshold bar for all three items.\",\n    \"impact_sized\": \"Recommendation 1 provides rangeUsd {low: 178000, high: 297000} with explicit assumptions (15–25% reactivation × 12,500 customers × $95 AOV over 4 weeks), and Recommendation 3 adds a strategic value anchor of $475K BRL/week in recoverable revenue — both qualify as concrete magnitude estimates.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 63375,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast discount campaign to a defined 12,500-customer segment, a triggered win-back scenario with a specific 3-touch flow, and a 50/50 A/B experiment on checkout messaging — all within standard CRM/experimentation platform capabilities.",
+          "specific": "Each recommendation names the target segment (customers with voucher payment events in weeks 1–9 and no orders since week 10), a time window (14-day or 30-day), and either an A/B framing (Rec 3: 50/50, ≥2,000 sessions, 14-day run), a trigger condition (Rec 2: 21-day inactivity, 90-day rolling window), or a discount threshold (Rec 1: 15% off or R$30 off orders ≥R$150).",
+          "impact_sized": "Recommendation 1 provides a concrete rangeUsd (low: 9,000,000, high: 15,000,000) with an explicit assumption chain (15–25% reactivation × 12,500 customers), satisfying the impact-sized criterion despite the AOV figure appearing anomalously high."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are concrete, schedulable actions for a Brazilian e-commerce team this quarter: a broadcast discount campaign to a defined 12,500-customer segment, a triggered win-back scenario with a specific 3-touch flow, and a 50/50 A/B experiment on checkout messaging — all within standard CRM/experimentation platform capabilities.\",\n    \"specific\": \"Each recommendation names the target segment (customers with voucher payment events in weeks 1–9 and no orders since week 10), a time window (14-day or 30-day), and either an A/B framing (Rec 3: 50/50, ≥2,000 sessions, 14-day run), a trigger condition (Rec 2: 21-day inactivity, 90-day rolling window), or a discount threshold (Rec 1: 15% off or R$30 off orders ≥R$150).\",\n    \"impact_sized\": \"Recommendation 1 provides a concrete rangeUsd (low: 9,000,000, high: 15,000,000) with an explicit assumption chain (15–25% reactivation × 12,500 customers), satisfying the impact-sized criterion despite the AOV figure appearing anomalously high.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 64474,
+      "judge": {
+        "scores": {
+          "plausible": 2,
+          "specific": 2,
+          "impact_sized": 1
+        },
+        "total": 5,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "plausible": "All three recommendations are schedulable this quarter by a Brazilian e-commerce CRM/ops team: a broadcast reactivation email campaign, an automated win-back scenario with multi-step flow, and a 3-arm A/B payment-incentive experiment — each maps to a real platform capability with concrete steps.",
+          "specific": "Each recommendation names the target segment (12,500 prior voucher users, weeks 1–9 baseline), a time window (30-day voucher expiry, 60-day win-back, 4-week experiment), and either a threshold or A/B framing (≥50% baseline recovery, ≥15% re-purchase rate, p<0.05 with ≥80% conversion parity).",
+          "impact_sized": "Recommendation 1 gives rangeUsd low:38000 high:76000 with explicit math (12,500 customers × 15–30% reactivation × ~$20 AOV), and Recommendation 2 provides rangeUsd low:20000 high:50000 anchored to the ~1,000 truly churned buyers estimate."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"plausible\": 2,\n    \"specific\": 2,\n    \"impact_sized\": 1\n  },\n  \"total\": 5,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"plausible\": \"All three recommendations are schedulable this quarter by a Brazilian e-commerce CRM/ops team: a broadcast reactivation email campaign, an automated win-back scenario with multi-step flow, and a 3-arm A/B payment-incentive experiment — each maps to a real platform capability with concrete steps.\",\n    \"specific\": \"Each recommendation names the target segment (12,500 prior voucher users, weeks 1–9 baseline), a time window (30-day voucher expiry, 60-day win-back, 4-week experiment), and either a threshold or A/B framing (≥50% baseline recovery, ≥15% re-purchase rate, p<0.05 with ≥80% conversion parity).\",\n    \"impact_sized\": \"Recommendation 1 gives rangeUsd low:38000 high:76000 with explicit math (12,500 customers × 15–30% reactivation × ~$20 AOV), and Recommendation 2 provides rangeUsd low:20000 high:50000 anchored to the ~1,000 truly churned buyers estimate.\"\n  }\n}",
+        "attempts": 1
+      }
+    }
+  ]
+}
