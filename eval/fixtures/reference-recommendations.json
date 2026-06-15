@@ -1,0 +1,223 @@
+{
+  "_meta": {
+    "purpose": "Reference recommendations per seeded anomaly for the PR F judge. One valid answer shape per anomaly — the judge scores candidate recommendation arrays against the 3-criterion rubric in eval/judges/recommendation-judge.md (plausible action / specific / impact-sized), NOT literal match.",
+    "shape": "Each entry is an ARRAY (1-3 items) matching the canonical Recommendation type the agent emits (lib/mcp/types.ts + lib/mcp/validate.ts isRecommendationArray). No `id` field — the agent emits id-less; ids are assigned post-validation in production.",
+    "currency_note": "Reais (R$). The Olist DB stores monetary fields in cents; reference impact figures here are written in Reais (whole-Reais rounding) per the PR E finding that the diagnostic agent has a known cents-vs-Reais misquote bug — references are in Reais so the judge has the right unit to score `impact_sized` against."
+  },
+  "sp-revenue-drop-w4": [
+    {
+      "title": "A/B test free shipping on SP orders under R$100 for 2 weeks",
+      "rationale": "SP revenue fell ~30% in week 4 broadly across categories with volume (not price) driving the drop. A free-shipping incentive targeted at the price-sensitive small-cart segment in SP can test whether shipping cost was a friction component and recover conversion before the dip becomes a trend.",
+      "bloomreachFeature": "experiment",
+      "steps": [
+        "Define the SP-state segment of customers placing orders under R$100 in the prior 4 weeks.",
+        "Set up an A/B experiment splitting that segment 50/50 — control sees normal shipping, variant sees free shipping.",
+        "Run for 2 weeks, then read conversion rate and per-customer revenue between arms."
+      ],
+      "estimatedImpact": {
+        "range": "+R$120k - R$200k recovered if conversion lifts 5-10% on ~4,200 SP buyers/week",
+        "rangeUsd": { "low": 24000, "high": 40000 },
+        "assumption": "Assumes 5-10% conversion lift in the variant arm × ~4,200 SP buyers/week × ~R$140 AOV from the diagnosis evidence × 2-week test window."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 90,
+      "readResultInDays": 14,
+      "prerequisites": [
+        { "label": "experiment platform available", "satisfied": true },
+        { "label": "shipping-cost rule configurable per segment", "satisfied": false }
+      ],
+      "successMetric": "Conversion rate in the SP-under-R$100 segment: baseline ~6.5%, target +5-10% lift in the variant arm.",
+      "confidence": "medium"
+    },
+    {
+      "title": "Targeted voucher campaign to top-3 SP categories in week following the drop",
+      "rationale": "The week-4 SP drop was broad across categories with electronics, fashion, and home_decor all -20% to -35%. A targeted 10% voucher restoring purchase intent in those categories tests demand-side recoverability and gives a quick read on whether the dip was a one-off vs sustained.",
+      "bloomreachFeature": "voucher",
+      "steps": [
+        "Build a customer segment: SP-state buyers who purchased in the last 90 days but not in week 4.",
+        "Issue a 10% off voucher valid for electronics/fashion/home_decor purchases for 1 week.",
+        "Track redemption rate and incremental revenue against the no-voucher control cohort."
+      ],
+      "estimatedImpact": {
+        "range": "+R$80k - R$160k recovered if 15-25% redemption on ~3,000 reachable SP recent buyers",
+        "rangeUsd": { "low": 16000, "high": 32000 },
+        "assumption": "Assumes 15-25% voucher redemption × ~3,000 recent SP buyers × ~R$140 AOV × 90% net (voucher discount cost subtracted)."
+      },
+      "effort": "low",
+      "timeToSetUpMinutes": 45,
+      "readResultInDays": 7,
+      "prerequisites": [
+        { "label": "voucher pool with 10%-off codes", "satisfied": true },
+        { "label": "email channel active for SP segment", "satisfied": true }
+      ],
+      "successMetric": "Week-over-week revenue recovery in SP top-3 categories: baseline -30% in week 4, target return to within -10% of pre-drop baseline.",
+      "confidence": "medium"
+    },
+    {
+      "title": "Investigate fulfillment SLA in SP for week 4 (operational follow-up)",
+      "rationale": "The drop is isolated to SP and broad across categories, which is consistent with a local operational cause (carrier delay, warehouse outage). Before launching demand-side fixes, verify whether the upstream cause was supply-side — if a carrier or warehouse caused the dip, demand incentives are the wrong lever.",
+      "bloomreachFeature": "segment",
+      "steps": [
+        "Define a segment of SP orders placed in week 4 that experienced cancellation or > median delivery time.",
+        "Pull the carrier and warehouse for those orders from the fulfillment data; quantify share of SP volume affected.",
+        "If > 20% of SP week-4 orders show degraded SLA, route the finding to the ops team and pause demand-side interventions."
+      ],
+      "estimatedImpact": {
+        "range": "Diagnostic — clarifies whether the R$120k-200k demand-side investment above is targeting the right cause",
+        "assumption": "No direct revenue lift; this is a routing decision that determines whether subsequent demand-side spend is warranted."
+      },
+      "effort": "low",
+      "timeToSetUpMinutes": 30,
+      "readResultInDays": 3,
+      "prerequisites": [
+        { "label": "fulfillment data accessible for the SP week-4 window", "satisfied": true }
+      ],
+      "successMetric": "Share of SP week-4 orders with degraded SLA: target binary read (>20% or not) within 3 days to gate the demand-side experiments above.",
+      "confidence": "high"
+    }
+  ],
+  "electronics-spike-w2": [
+    {
+      "title": "Capture electronics demand pull with a follow-on cross-sell campaign in weeks 3-5",
+      "rationale": "Electronics order count spiked 2.5x in week 2 broadly across states with revenue scaling 1:1 with volume — a real demand event, not a vanity-metric artifact. The ~8,800 buyers who entered the funnel in week 2 are a hot cross-sell cohort; a targeted accessories campaign in the 3 weeks after captures incremental revenue at low CAC.",
+      "bloomreachFeature": "campaign",
+      "steps": [
+        "Build a segment of customers who placed an electronics order in week 2 of the dataset.",
+        "Design an email campaign featuring electronics-accessory bundles (cases, cables, warranties) at a modest discount.",
+        "Send to the segment in weeks 3, 4, 5 with frequency cap of 1 message/week; track attach-rate."
+      ],
+      "estimatedImpact": {
+        "range": "+R$350k - R$700k incremental over 3 weeks if 5-10% attach rate on ~8,800 buyers at ~R$80 accessory AOV",
+        "rangeUsd": { "low": 70000, "high": 140000 },
+        "assumption": "Assumes 5-10% accessory attach rate × ~8,800 week-2 electronics buyers × ~R$80 accessory AOV × 3-week campaign window."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 120,
+      "readResultInDays": 21,
+      "prerequisites": [
+        { "label": "email channel active", "satisfied": true },
+        { "label": "accessory catalog tagged for cross-sell", "satisfied": false },
+        { "label": "frequency policy supports 1 msg/week", "satisfied": true }
+      ],
+      "successMetric": "Accessory attach rate in the week-2 electronics-buyer cohort over the next 21 days: baseline ~3%, target 5-10%.",
+      "confidence": "medium"
+    },
+    {
+      "title": "Validate driver: identify which electronics SKUs / promotions caused the week-2 spike",
+      "rationale": "The diagnosis is consistent with an electronics-specific promotional or seasonal event but doesn't name the driver. Knowing whether it was 3 SKUs or a category-wide promotion changes whether to replicate the lever (re-run the promo) or chase the seasonal window (timing decision).",
+      "bloomreachFeature": "segment",
+      "steps": [
+        "Define a segment of electronics orders placed in week 2 and identify the top-10 SKUs by order count.",
+        "Compare those SKUs' week-2 share of category volume vs their typical share in the 12-week baseline.",
+        "If concentration > 50% in top-10, label this as a promo-driven spike; if < 30%, label seasonal pull."
+      ],
+      "estimatedImpact": {
+        "range": "Diagnostic — drives the decision between repeatable-promo investment (~R$200k+ potential) vs seasonal-timing tweak",
+        "assumption": "No direct revenue; the read gates whether the campaign above is calibrated for a one-off promotional moment or a structural seasonal pattern worth scheduling."
+      },
+      "effort": "low",
+      "timeToSetUpMinutes": 30,
+      "readResultInDays": 2,
+      "prerequisites": [
+        { "label": "SKU-level catalog and order history accessible", "satisfied": true }
+      ],
+      "successMetric": "Binary read in 2 days: top-10 SKUs share of week-2 electronics volume vs baseline share, classified as promo-driven (>50%) or seasonal (<30%).",
+      "confidence": "high"
+    },
+    {
+      "title": "A/B test electronics homepage prominence in the weeks following a future spike signal",
+      "rationale": "If the spike was driven by demand (vs supply), then surfacing electronics more prominently when the signal returns should compound the effect at near-zero marginal cost. A controlled experiment quantifies the lift and de-risks the always-on alternative.",
+      "bloomreachFeature": "experiment",
+      "steps": [
+        "Set up a 50/50 A/B variant on the homepage hero slot.",
+        "Trigger the variant (electronics-promoted hero) when daily electronics order count exceeds 1.5x baseline.",
+        "Read conversion uplift and electronics revenue per session in the variant arm over 2 weeks."
+      ],
+      "estimatedImpact": {
+        "range": "+R$150k - R$400k per future spike window if 3-8% session-conversion lift on the variant",
+        "rangeUsd": { "low": 30000, "high": 80000 },
+        "assumption": "Assumes 3-8% session-conversion lift × ~100k weekly sessions on the homepage × ~R$200 AOV × 2-week trigger windows occurring 1-2x/quarter."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 180,
+      "readResultInDays": 14,
+      "prerequisites": [
+        { "label": "homepage A/B experimentation framework live", "satisfied": false },
+        { "label": "real-time daily order-count signal accessible", "satisfied": true }
+      ],
+      "successMetric": "Session-conversion-rate uplift in the variant arm during trigger windows: target 3-8% relative lift over control.",
+      "confidence": "low"
+    }
+  ],
+  "voucher-dropoff-w10-on": [
+    {
+      "title": "Stand up a replacement incentive: 5% off boleto+credit_card for prior voucher users (4-week pilot)",
+      "rationale": "Voucher payment volume collapsed ~95% starting week 10 and order count fell ~8% — part of the lost voucher volume left the platform rather than substituting. The ~12,500 customers who previously used vouchers need a replacement incentive to retain them while the program situation is resolved.",
+      "bloomreachFeature": "campaign",
+      "steps": [
+        "Define a segment of customers who used voucher payment in weeks 1-9 but have not placed an order since week 10.",
+        "Issue a 5% discount valid on boleto or credit_card payment, communicated via email.",
+        "Pilot for 4 weeks, then read reactivation rate and incremental revenue vs a held-out 10% control cohort."
+      ],
+      "estimatedImpact": {
+        "range": "+R$700k - R$1.4M recovered over 4 weeks if 10-20% reactivation on ~12,500 dormant voucher users",
+        "rangeUsd": { "low": 140000, "high": 280000 },
+        "assumption": "Assumes 10-20% reactivation × ~12,500 affected customers × ~R$280 AOV × 95% net (5% discount cost subtracted)."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 90,
+      "readResultInDays": 28,
+      "prerequisites": [
+        { "label": "email channel active", "satisfied": true },
+        { "label": "5% discount voucher pool", "satisfied": false },
+        { "label": "control-cohort holdout supported", "satisfied": true }
+      ],
+      "successMetric": "Reactivation rate of the dormant voucher cohort over 28 days: baseline ~0%, target 10-20% placing an order.",
+      "confidence": "medium"
+    },
+    {
+      "title": "Resolve the voucher-program root cause (cross-functional ops escalation)",
+      "rationale": "The diagnosis points to a program-level change (cliff onset + sustained 17-week persistence + geographic uniformity). No marketing lever fixes a program/policy gap; the right action is to escalate to the team that owns the voucher program and confirm whether the program is paused, expired, or restricted.",
+      "bloomreachFeature": "scenario",
+      "steps": [
+        "File an escalation with the voucher-program owner including the week-10 cliff chart and the affected-customer count (~12,500).",
+        "Confirm program status: paused, expired, vendor-blocked, or fraud-restricted.",
+        "If reversible, schedule a re-enablement and target a 4-week ramp to recover the affected customers; if not, formalize the replacement-incentive pilot above as the permanent program."
+      ],
+      "estimatedImpact": {
+        "range": "Up to R$3M+ recovered annually if the voucher program is restored — bounds the upper end of the dropoff",
+        "assumption": "Bounds estimate: weekly voucher value pre-week-10 × 52 × full restoration. Conservative read assumes resolution within 4-8 weeks."
+      },
+      "effort": "high",
+      "timeToSetUpMinutes": 240,
+      "readResultInDays": 7,
+      "prerequisites": [
+        { "label": "access to voucher-program ownership / vendor", "satisfied": false }
+      ],
+      "successMetric": "Program-status answer in 7 days: paused / expired / vendor-blocked / fraud-restricted, with a re-enable date or a permanent-replacement decision.",
+      "confidence": "high"
+    },
+    {
+      "title": "Set up a monitoring scenario for payment-method volume cliffs going forward",
+      "rationale": "A 17-week un-noticed dropoff worth ~R$3M+ annually is itself a finding — there was no alert on payment-method composition. Build the monitoring so the next cliff (any payment type) is caught in week 1, not week 17.",
+      "bloomreachFeature": "scenario",
+      "steps": [
+        "Define a weekly job that compares each payment-method's order-share to its 12-week baseline.",
+        "Alert when any payment method's share drops > 50% week-over-week or sustains > 30% drop for 2 consecutive weeks.",
+        "Route alerts to the merchandising lead with the affected-customer-count and lost-volume estimate pre-computed."
+      ],
+      "estimatedImpact": {
+        "range": "Diagnostic — preventing a repeat of this 17-week silent dropoff is worth the full ~R$3M/year exposure",
+        "assumption": "No direct revenue; counterfactual is the next undetected payment-method cliff."
+      },
+      "effort": "low",
+      "timeToSetUpMinutes": 60,
+      "readResultInDays": 7,
+      "prerequisites": [
+        { "label": "weekly scheduled job runner available", "satisfied": true }
+      ],
+      "successMetric": "Time-to-detect on a simulated 50% payment-method dropoff: target < 7 days from onset (current undetected baseline: > 17 weeks).",
+      "confidence": "high"
+    }
+  ]
+}

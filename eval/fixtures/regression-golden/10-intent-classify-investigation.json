@@ -1,0 +1,22 @@
+{
+  "id": "10-intent-classify-investigation",
+  "agent": "intent",
+  "description": "Intent routing test: a free-form question that should classify as 'diagnostic' per the classifier prompt (why-did-X-happen shape). Trivial output (one of three tokens) makes this an inexpensive sanity-check that the classifier hasn't drifted across model / prompt changes.",
+  "input": {
+    "query": "Why did revenue in São Paulo drop in week 4?",
+    "notes": "This phrasing is a textbook 'diagnostic' shape per lib/agents/intent.ts's classifier system prompt ('diagnostic: why did something happen'). Captured golden should be the string 'diagnostic'."
+  },
+  "golden_output": "diagnostic",
+  "captured_at": "2026-06-15T22:57:12.034Z",
+  "captured_with": {
+    "model": "claude-haiku-4-5-20251001",
+    "prompt_hash": "sha256:8be776942f0e0f9b3244939986075c3c2cbf53e547f4a6ebbe6be826052f7cc4",
+    "notes": "Intent classifier uses Haiku (lib/agents/intent.ts CLASSIFIER_MODEL), not Sonnet. The other 9 fixtures use Sonnet via the agents' own LLM-loop infrastructure."
+  },
+  "scoring_config": {
+    "structural_required_fields": [],
+    "structural_strict": true,
+    "similarity_threshold": 1,
+    "notes": "Output is one of three tokens: 'monitoring' | 'diagnostic' | 'recommendation'. Structural diff is degenerate (no fields). Similarity judge is degenerate (strict-equal expected). The similarity judge will still report same_conclusion=true/false on the trivial string compare."
+  }
+}

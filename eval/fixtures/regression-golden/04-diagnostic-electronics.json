@@ -1,0 +1,80 @@
+{
+  "id": "04-diagnostic-electronics",
+  "agent": "diagnostic",
+  "description": "Diagnose the seeded electronics-spike anomaly. Input is the Anomaly object produced by seededToAnomaly(electronics-spike-w2) — same shape the production monitoring agent emits.",
+  "input": {
+    "anomalyId": "electronics-spike-w2",
+    "anomaly": {
+      "metric": "order_count",
+      "scope": [
+        "category:electronics"
+      ],
+      "change": {
+        "value": 150,
+        "direction": "up",
+        "baseline": "week 2 (2025-12-08 to 2025-12-15) vs 12-week baseline"
+      },
+      "severity": "warning",
+      "evidence": [],
+      "impact": "order_count for category:electronics rose ~150% in a discrete window. Investigate the root cause."
+    }
+  },
+  "golden_output": {
+    "conclusion": "The electronics order_count spike (+14,056% vs 12-week baseline, from ~4 orders/week to 588 in week of Dec 8) is part of a broad, platform-wide pre-Christmas demand surge that began sharply on 2025-12-08. Every category, state, and payment type rose simultaneously in that week — electronics simply experienced the most dramatic absolute and relative lift, likely because high-value electronics are disproportionately purchased as holiday gifts. No isolated electronics-specific promotion, regional event, or payment method change drove the spike.",
+    "evidence": [
+      "Electronics order_count jumped from a 12-week baseline avg of 4.15 orders/week to 588 in week of 2025-12-08, a +14,056% change (141×).",
+      "All other categories rose in the same week: home_decor +2,129%, toys +1,884%, fashion +1,762%, sports +1,653%, health_beauty +1,601%, food_drink +1,454% — confirming a platform-wide lift, not an electronics-specific event.",
+      "All 26 Brazilian states saw order_count increases in the anomaly week: ES +6,660%, TO +6,400%, PA +5,620%, SP +3,316%, with no state declining — ruling out a regional concentration hypothesis.",
+      "All payment types rose proportionally: boleto +3,309%, credit_card +3,019%, voucher +2,933%, debit_card +2,500% — ruling out a payment-method-driven change.",
+      "Weekly time series shows orders at 54 in week of 2025-12-01, then jumping to 588 in week of 2025-12-08 — a sudden single-week cliff consistent with an external seasonal trigger (Black Friday / pre-Christmas), not a gradual trend.",
+      "Sample orders from 2025-12-08 are all 'delivered' or 'shipped' with valid electronics items (prices ranging R$210 to R$2,041), confirming real fulfilled transactions rather than a data ingestion artifact."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Broad platform-wide pre-Christmas/holiday seasonal demand surge starting Dec 8",
+        "supported": true,
+        "reasoning": "Every category (6/6 checked), every state (26/26), and every payment type (4/4) rose sharply in the same week. The time series shows a sudden step-change on 2025-12-08 — the start of Brazil's peak holiday shopping window. Electronics, being a popular high-value gift category, led the surge in relative terms but was not isolated from broader demand acceleration."
+      },
+      {
+        "hypothesis": "Regional concentration — a specific state (e.g. SP) drove the electronics spike",
+        "supported": false,
+        "reasoning": "SP rose 33× but so did every other state, with smaller states like ES (+66.6×) and TO (+64×) growing even faster. No single region is the cause; the surge is geographically uniform across all 26 states."
+      },
+      {
+        "hypothesis": "Payment method shift — a new or promotional payment option (e.g. vouchers) drove electronics purchases",
+        "supported": false,
+        "reasoning": "All four payment types (credit_card, boleto, voucher, debit_card) rose in near-identical proportions (25×–33×). There is no payment-type that spiked disproportionately, ruling out a payment-driven mechanism."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 588,
+      "segmentDescription": "Orders in the electronics category during the week of 2025-12-08 across all Brazilian states and payment types; up from a baseline of ~4 orders/week"
+    },
+    "timeSeries": [
+      {
+        "day": "w-1",
+        "value": 54
+      },
+      {
+        "day": "this week",
+        "value": 588
+      }
+    ],
+    "confidence": "high"
+  },
+  "captured_at": "2026-06-15T22:52:57.833Z",
+  "captured_with": {
+    "model": "claude-sonnet-4-6",
+    "prompt_hash": "sha256:404931d1dbdd1df0f666a310d69ff40224afae3b149bb39cacf87f555c123e31"
+  },
+  "scoring_config": {
+    "structural_required_fields": [
+      "conclusion",
+      "evidence",
+      "hypothesesConsidered"
+    ],
+    "structural_strict": false,
+    "similarity_threshold": 0.7,
+    "notes": "PR E established this anomaly scores 6/10 (60%) on the diagnostic rubric — middle tier. Regression check anchors on the supported hypothesis."
+  }
+}

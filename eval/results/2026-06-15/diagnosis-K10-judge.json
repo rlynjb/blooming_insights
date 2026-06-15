@@ -1,0 +1,757 @@
+{
+  "K": 10,
+  "date": "2026-06-15",
+  "judge_model": "claude-sonnet-4-6",
+  "runs": [
+    {
+      "runIndex": 1,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 47612,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 6,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies an electronics-specific spike in week 2 (Dec 8–15, 2025) isolated from other categories, consistent with the seeded anomaly of ~2.5x electronics order_count surge.",
+          "evidence": "The candidate cites specific numbers from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.56 from get_anomaly_context; the V-shape time series (54→588→54) from get_metric_timeseries; state-level lifts (ES +67×, SP +33×) and payment type lifts (boleto +33×, credit_card +30×) from the state and payment_type anomaly context calls — all grounded in actual tool returns.",
+          "sizing": "The candidate states '~14,055% spike' and describes a baseline of '~4.2 orders/week' vs 588 anomaly orders, which correctly reflects the raw numbers but the ground truth multiplier is 2.5x (~+150%), and the candidate's framing of '+14,055%' (derived from the raw baseline_avg of 4.15) is technically arithmetically consistent with the tool output yet wildly diverges from the seeded +150% ground truth magnitude — this is off by more than 50% of the ground-truth pct_change in a misleading direction.",
+          "calibration": "The candidate uses confidence='high' and states the explanation 'is best explained by' a specific cause (flash sale/promotional event) without meaningful caveats, naming a specific mechanism ('flash sale, a curated deal campaign, or a gifting season pulse') as fact rather than hypothesis, constituting overclaiming with insufficient hedging.",
+          "fabrication": "The candidate's claim about 'R$ 757–R$ 2,042 per order' for electronics line items is not directly supported by the tool results — the sample orders show prices in the tens-of-thousands of BRL (e.g., 75,726; 25,843; 21,097), suggesting the candidate converted or misread units, introducing an unsupported concrete number not present in any tool result."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 6,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies an electronics-specific spike in week 2 (Dec 8–15, 2025) isolated from other categories, consistent with the seeded anomaly of ~2.5x electronics order_count surge.\",\n    \"evidence\": \"The candidate cites specific numbers from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.56 from get_anomaly_context; the V-shape time series (54→588→54) from get_metric_timeseries; state-level lifts (ES +67×, SP +33×) and payment type lifts (boleto +33×, credit_card +30×) from the state and payment_type anomaly context calls — all grounded in actual tool returns.\",\n    \"sizing\": \"The candidate states '~14,055% spike' and describes a baseline of '~4.2 orders/week' vs 588 anomaly orders, which correctly reflects the raw numbers but the ground truth multiplier is 2.5x (~+150%), and the candidate's framing of '+14,055%' (derived from the raw baseline_avg of 4.15) is technically arithmetically consistent with the tool output yet wildly diverges from the seeded +150% ground truth magnitude — this is off by more than 50% of the ground-truth pct_change in a misleading direction.\",\n    \"calibration\": \"The candidate uses confidence='high' and states the explanation 'is best explained by' a specific cause (flash sale/promotional event) without meaningful caveats, naming a specific mechanism ('flash sale, a curated deal campaign, or a gifting season pulse') as fact rather than hypothesis, constituting overclaiming with insufficient hedging.\",\n    \"fabrication\": \"The candidate's claim about 'R$ 757–R$ 2,042 per order' for electronics line items is not directly supported by the tool results — the sample orders show prices in the tens-of-thousands of BRL (e.g., 75,726; 25,843; 21,097), suggesting the candidate converted or misread units, introducing an unsupported concrete number not present in any tool result.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 50597,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies electronics order_count as category-specific spike in week 2 (~+140% vs baseline, consistent with a promotional/seasonal event), matching the seeded 2.5x anomaly at >50% semantic overlap.",
+          "evidence": "Candidate cites specific numbers directly from tool results: 54→588 from get_metric_timeseries, pct_change +140.6% from get_anomaly_context, state-level values (SP=152, MG=79, RJ=78) from the state breakdown, and payment-type counts (credit_card 40→373, boleto 9→169) from the payment timeseries.",
+          "sizing": "Candidate states '~140% spike' vs baseline, which is within ~10% of the ground truth +150% (multiplier 2.5x), well within the 50% tolerance threshold.",
+          "calibration": "Candidate uses confidence='high' and says the spike 'reflects a category-specific demand surge' without flagging what additional evidence would be needed to confirm the promotional hypothesis, overclaiming causation from correlation.",
+          "fabrication": "The claim that sample orders show 'R$818–R$2,041 per order' is not supported by any tool result — sample order prices from get_anomaly_context are all in the tens-of-thousands of BRL (e.g., 75,726; 170,942), making this range fabricated; all other concrete numbers are grounded in tool results."
+        },
+        "raw_response": "Let me analyze each criterion carefully.\n\n**Hypothesis (0-2):** The candidate correctly identifies electronics order_count spike in week 2, category-specific, consistent with a promotional/seasonal event. This matches the seeded anomaly description (~2.5x spike). Score: 2\n\n**Evidence (0-2):** The candidate cites specific numbers from tool results: 54→588 from get_metric_timeseries, pct_change +140.6% from get_anomaly_context, specific state values (SP=152, MG=79, RJ=78, PR=42, RS=33) from the state timeseries, payment type breakdown (credit_card 40→373, boleto 9→169, etc.) all directly from tool results. Score: 2\n\n**Sizing (0-2):** Ground truth is ~2.5x spike (+150%). The candidate says \"~140% spike\" (from the pct_change vs baseline) and separately notes +989% week-over-week. The +140% vs baseline is within ~50% of the +150% ground truth. Score: 2\n\n**Calibration (0-1):** The candidate uses confidence: \"high\" and states the spike \"reflects a category-specific demand surge — consistent with a pre-holiday promotional event.\" While it says \"consistent with,\" it also asserts this quite confidently without much uncertainty. The hypothesis is named as \"promotional event (e.g., Black Friday / Cyber Monday spillover)\" which is speculative but framed as a possibility. However, confidence is \"high\" and the conclusion is fairly assertive without flagging what would be needed to confirm. This is borderline - it uses \"consistent with\" language but also \"reflects\" (assertive) and \"confidence: high\". Score: 0\n\n**Fabrication (0-2):** All specific numbers trace to tool results. State counts (SP=152, MG=79, RJ=78, PR=42, RS=33, SC=27) all appear in the state timeseries. Payment numbers (credit_card 40→373, boleto 9→169, voucher 4→54, debit_card 4→22) all appear in payment timeseries. Category numbers (fashion 74→106, food_drink 87→104, etc.) all appear in category timeseries. The claim about \"11 states in week 1 vs all 27 in week 2\" - week 1 shows 11 states with data (BA, DF, MA, MG, MS, MT, PE, PR, RJ, RS, SP), week 2 shows 27 states - this is verifiable from tool results. Sample order prices cited as \"R$818–R$2,041\" - checking tool results: sample orders show prices in BRL but the values are much higher (75726, 39930, etc. in BRL cents? or in BRL?). Actually the order prices shown are 170942, 75726, 39930, 135588, 119359, 204116, 25843, 98950, 21097, 112847 - none of these translate to \"R$818–R$2,041\". This appears to be a fabricated range. Score: 1\n\nTotal: 2+2+2+0+1 = 7\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies electronics order_count as category-specific spike in week 2 (~+140% vs baseline, consistent with a promotional/seasonal event), matching the seeded 2.5x anomaly at >50% semantic overlap.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: 54→588 from get_metric_timeseries, pct_change +140.6% from get_anomaly_context, state-level values (SP=152, MG=79, RJ=78) from the state breakdown, and payment-type counts (credit_card 40→373, boleto 9→169) from the payment timeseries.\",\n    \"sizing\": \"Candidate states '~140% spike' vs baseline, which is within ~10% of the ground truth +150% (multiplier 2.5x), well within the 50% tolerance threshold.\",\n    \"calibration\": \"Candidate uses confidence='high' and says the spike 'reflects a category-specific demand surge' without flagging what additional evidence would be needed to confirm the promotional hypothesis, overclaiming causation from correlation.\",\n    \"fabrication\": \"The claim that sample orders show 'R$818–R$2,041 per order' is not supported by any tool result — sample order prices from get_anomaly_context are all in the tens-of-thousands of BRL (e.g., 75,726; 170,942), making this range fabricated; all other concrete numbers are grounded in tool results.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 45650,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 6,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies an electronics order-count spike in week 2 (Dec 8–14, 2025) driven by a seasonal/promotional demand event disproportionately concentrated in electronics vs other categories, matching the reference's anomaly_summary at well above 50% semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.6 from get_anomaly_context; daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries; and payment-type pct_changes (credit_card +30×, boleto +33×, voucher +29×, debit_card +25×) from the payment_type anomaly_context call.",
+          "sizing": "The candidate states '150% in the anomaly description' and '+14,056% absolute change (~140×)' but the ground truth is ~+150% (2.5× multiplier = +150% pct_change); the reported pct_change from the tool is 140.56 which is within range, yet the candidate's primary framing of '~140×' (i.e., 14,000%) conflates the multiplier with the pct_change, and the '150%' figure is referenced only parenthetically as the anomaly description rather than as the agent's own magnitude finding — making the sizing ambiguous and potentially misleading, warranting only partial credit.",
+          "calibration": "The candidate asserts the spike 'is best explained by a broad seasonal/promotional demand spike — most likely a Christmas electronics sale or promotional campaign' with confidence='high' and no caveats, acknowledged uncertainty, or suggestion of further investigation needed — this is overclaiming causation from correlation.",
+          "fabrication": "The claim that 'All 26 Brazilian states rose together' and payment types rose proportionally is grounded in tool results, but the specific BRL price ranges cited ('BRL 758–2,041 per item') do not match the sample_orders in the transcript (which show prices in the tens of thousands of BRL, e.g., 75,726; 25,843; 21,097 — suggesting the prices are in centavos or the candidate misread them), constituting one unsupported/misrepresented concrete claim."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 6,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies an electronics order-count spike in week 2 (Dec 8–14, 2025) driven by a seasonal/promotional demand event disproportionately concentrated in electronics vs other categories, matching the reference's anomaly_summary at well above 50% semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.6 from get_anomaly_context; daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries; and payment-type pct_changes (credit_card +30×, boleto +33×, voucher +29×, debit_card +25×) from the payment_type anomaly_context call.\",\n    \"sizing\": \"The candidate states '150% in the anomaly description' and '+14,056% absolute change (~140×)' but the ground truth is ~+150% (2.5× multiplier = +150% pct_change); the reported pct_change from the tool is 140.56 which is within range, yet the candidate's primary framing of '~140×' (i.e., 14,000%) conflates the multiplier with the pct_change, and the '150%' figure is referenced only parenthetically as the anomaly description rather than as the agent's own magnitude finding — making the sizing ambiguous and potentially misleading, warranting only partial credit.\",\n    \"calibration\": \"The candidate asserts the spike 'is best explained by a broad seasonal/promotional demand spike — most likely a Christmas electronics sale or promotional campaign' with confidence='high' and no caveats, acknowledged uncertainty, or suggestion of further investigation needed — this is overclaiming causation from correlation.\",\n    \"fabrication\": \"The claim that 'All 26 Brazilian states rose together' and payment types rose proportionally is grounded in tool results, but the specific BRL price ranges cited ('BRL 758–2,041 per item') do not match the sample_orders in the transcript (which show prices in the tens of thousands of BRL, e.g., 75,726; 25,843; 21,097 — suggesting the prices are in centavos or the candidate misread them), constituting one unsupported/misrepresented concrete claim.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 54897,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 6,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies the electronics category order_count spike in week 2 (Dec 8–14) as a category-specific demand event, matching the seeded anomaly's substance at >50% semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=~4 from get_anomaly_context, daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries, and related_segment pct_changes (home_decor +21%, etc.) and state pct_changes (ES +67%, SP +33%, etc.) all traceable to tool outputs.",
+          "sizing": "The candidate states '~14,000%' increase (from ~4 to 588), which is arithmetically ~14,056% — but the ground truth multiplier is 2.5x (+150%), and the tool itself returned pct_change=140.56; the candidate's stated magnitude of ~14,000% is off by roughly 100x from the ground truth +150%, well outside the ~50% tolerance.",
+          "calibration": "The candidate uses 'confidence: high' and states the pattern 'strongly indicates a discrete electronics-specific demand trigger' and 'ruling out' causes with no acknowledged uncertainty or suggestion that further investigation is warranted, constituting overclaiming.",
+          "fabrication": "The candidate claims sample orders show prices of 'R$2,041, R$1,283, R$1,284 BRL' but the actual tool results show prices in the tens-of-thousands to hundreds-of-thousands of BRL (e.g. 75,726; 39,930; 204,116) — these specific low BRL figures are not present in any tool result, representing one unsupported concrete claim."
+        },
+        "raw_response": "```json\n{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 6,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies the electronics category order_count spike in week 2 (Dec 8–14) as a category-specific demand event, matching the seeded anomaly's substance at >50% semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=~4 from get_anomaly_context, daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries, and related_segment pct_changes (home_decor +21%, etc.) and state pct_changes (ES +67%, SP +33%, etc.) all traceable to tool outputs.\",\n    \"sizing\": \"The candidate states '~14,000%' increase (from ~4 to 588), which is arithmetically ~14,056% — but the ground truth multiplier is 2.5x (+150%), and the tool itself returned pct_change=140.56; the candidate's stated magnitude of ~14,000% is off by roughly 100x from the ground truth +150%, well outside the ~50% tolerance.\",\n    \"calibration\": \"The candidate uses 'confidence: high' and states the pattern 'strongly indicates a discrete electronics-specific demand trigger' and 'ruling out' causes with no acknowledged uncertainty or suggestion that further investigation is warranted, constituting overclaiming.\",\n    \"fabrication\": \"The candidate claims sample orders show prices of 'R$2,041, R$1,283, R$1,284 BRL' but the actual tool results show prices in the tens-of-thousands to hundreds-of-thousands of BRL (e.g. 75,726; 39,930; 204,116) — these specific low BRL figures are not present in any tool result, representing one unsupported concrete claim.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 52030,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies the electronics order_count spike in week 2 (2025-12-08) with electronics as primary beneficiary of a platform-wide surge, matching the anomaly summary at >50% semantic overlap.",
+          "evidence": "Candidate cites specific numbers directly from tool results: anomaly_value 588, baseline_avg 4.15, time series 54→588→54, platform totals 375→903→389, credit_card anomaly_value 571, and state pct_changes (ES +67×, SP +33×, AL +4×).",
+          "sizing": "Candidate reports '140× increase' which is grounded in the tool's pct_change of 140.55 but represents ~140x not ~2.5x ground truth, placing it well beyond the ~50% tolerance of the seeded +150% ground truth.",
+          "calibration": "Candidate asserts confidence 'high' and concludes the spike 'was the product of a platform-wide demand event — most likely a time-limited flash sale' without sufficient hedging or acknowledgment of uncertainty about the causal driver.",
+          "fabrication": "All concrete claims (time series values, platform totals, state pct_changes, payment type values, sample order prices and statuses) trace directly to tool results; 'Brazilian Black Friday season' is generic framing, not a fabricated fact."
+        },
+        "raw_response": "Let me analyze the candidate diagnosis against each criterion:\n\n**Hypothesis**: The candidate identifies electronics order_count spike in week 2 (~Dec 8), attributing it to a platform-wide promotional/flash sale event. The ground truth is a ~2.5x spike. The candidate correctly identifies the spike in electronics, the timing, and the disproportionate electronics boost. This matches the anomaly summary well. Score: 2.\n\n**Evidence**: The candidate cites specific numbers from tool results: anomaly_value 588, baseline_avg 4.15, pct_change 140.6%, time series 54→588→54, platform-wide 375→903→389, credit_card anomaly_value 571, baseline 18.3, state data (ES +67×, TO +64×, SP +33×, AL +4×). All these trace directly to tool results. Score: 2.\n\n**Sizing**: The ground truth multiplier is 2.5x (~+150% pct_change). The candidate reports \"140× increase (pct_change: 140.6%)\" — this is a misstatement: 588/4.15 ≈ 140× is the ratio, but the pct_change of 140.6 represents 14,000%+... wait, the tool reports pct_change: 140.55 which in context means 140.55x (i.e., ~14,055% or ~141x). The candidate states \"140×\" which is consistent with the tool result. But the ground truth is 2.5x (~+150%). The candidate's magnitude (140x) vastly exceeds the ground truth (2.5x). However, this discrepancy is in the tool data itself. The candidate faithfully reports what the tool returned. The reference says +150% pct_change, but the tool returned pct_change: 140.55 (which could be interpreted as 14,055%). The candidate's claim of \"140×\" is consistent with the tool data and is actually close to the ground truth 2.5x if pct_change=140.55 meant +14,055%... The ground truth says ~2.5x. The tool's pct_change of 140.55 likely means 140.55 times the baseline (×140). This is a dataset discrepancy, but the candidate correctly reports tool numbers. For sizing against ground truth 2.5x, candidate says 140x — off by more than 50%. Score: 1.\n\n**Calibration**: The candidate states confidence: \"high\" and uses language like \"most likely a time-limited flash sale\" as a definitive conclusion without strong caveats. While hypotheses are considered and ruled out, the conclusion is quite assertive about causation (\"was the product of a platform-wide demand event — most likely a flash sale\"). Score: 0.\n\n**Fabrication**: The \"54→588→54\" time series, platform numbers 375→903→389, state percentages, payment type values — all grounded in tools. The \"Brazilian Black Friday season\" framing is generic context, not a fabricated fact. Score: 2.\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies the electronics order_count spike in week 2 (2025-12-08) with electronics as primary beneficiary of a platform-wide surge, matching the anomaly summary at >50% semantic overlap.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: anomaly_value 588, baseline_avg 4.15, time series 54→588→54, platform totals 375→903→389, credit_card anomaly_value 571, and state pct_changes (ES +67×, SP +33×, AL +4×).\",\n    \"sizing\": \"Candidate reports '140× increase' which is grounded in the tool's pct_change of 140.55 but represents ~140x not ~2.5x ground truth, placing it well beyond the ~50% tolerance of the seeded +150% ground truth.\",\n    \"calibration\": \"Candidate asserts confidence 'high' and concludes the spike 'was the product of a platform-wide demand event — most likely a time-limited flash sale' without sufficient hedging or acknowledgment of uncertainty about the causal driver.\",\n    \"fabrication\": \"All concrete claims (time series values, platform totals, state pct_changes, payment type values, sample order prices and statuses) trace directly to tool results; 'Brazilian Black Friday season' is generic framing, not a fabricated fact.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 48057,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 5,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate identifies the right segment (electronics) and week (Dec 8) but attributes the spike primarily to a broad platform-wide holiday surge rather than the seeded cause of an electronics-specific ~2.5x spike vs baseline; the candidate's framing of electronics as merely 'amplified' seasonal lift misses that the ground truth is a ~2.5x multiplier anomaly specific to electronics, not a general market uplift story.",
+          "evidence": "The candidate correctly cites specific numbers from tool results: 54→588 from get_metric_timeseries, 375→903 platform-wide from get_metric_timeseries, related_segments percentages (home_decor +21%, etc.) from get_anomaly_context, and state-level pct_change values (ES +67%, TO +64%, SP +33%) from the second get_anomaly_context call.",
+          "sizing": "The candidate quotes '+989% WoW' (54→588) which is the week-over-week change, but the ground truth multiplier is ~2.5x vs 12-week baseline (+150%); the candidate does note the baseline_avg of ~4 orders/week implicitly but never frames the magnitude as ~2.5x or ~+150% vs baseline — instead leading with +989% WoW, which is a different and misleading framing of the magnitude.",
+          "calibration": "The candidate states 'confidence: high' and asserts causation directly ('best explained by a platform-wide demand surge — almost certainly driven by the start of the Brazilian pre-Christmas/holiday shopping season') with no caveats, no acknowledged uncertainty, and no suggestion of further investigation needed — this is overclaiming.",
+          "fabrication": "The claim that electronics orders average '~R$2,047 average ticket' (attributed to 'R$193,625; R$247,296; R$204,116 cents') misreads the price_brl units (these are cents values from the SP sample, not electronics-only averages) and produces a fabricated average not directly calculable from any tool result; additionally, 'SP grew +33x above its baseline' is a misstatement of the SP pct_change of 33.16 (which means 33x, not 33 percentage points above baseline) — an unsupported factual claim."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 5,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate identifies the right segment (electronics) and week (Dec 8) but attributes the spike primarily to a broad platform-wide holiday surge rather than the seeded cause of an electronics-specific ~2.5x spike vs baseline; the candidate's framing of electronics as merely 'amplified' seasonal lift misses that the ground truth is a ~2.5x multiplier anomaly specific to electronics, not a general market uplift story.\",\n    \"evidence\": \"The candidate correctly cites specific numbers from tool results: 54→588 from get_metric_timeseries, 375→903 platform-wide from get_metric_timeseries, related_segments percentages (home_decor +21%, etc.) from get_anomaly_context, and state-level pct_change values (ES +67%, TO +64%, SP +33%) from the second get_anomaly_context call.\",\n    \"sizing\": \"The candidate quotes '+989% WoW' (54→588) which is the week-over-week change, but the ground truth multiplier is ~2.5x vs 12-week baseline (+150%); the candidate does note the baseline_avg of ~4 orders/week implicitly but never frames the magnitude as ~2.5x or ~+150% vs baseline — instead leading with +989% WoW, which is a different and misleading framing of the magnitude.\",\n    \"calibration\": \"The candidate states 'confidence: high' and asserts causation directly ('best explained by a platform-wide demand surge — almost certainly driven by the start of the Brazilian pre-Christmas/holiday shopping season') with no caveats, no acknowledged uncertainty, and no suggestion of further investigation needed — this is overclaiming.\",\n    \"fabrication\": \"The claim that electronics orders average '~R$2,047 average ticket' (attributed to 'R$193,625; R$247,296; R$204,116 cents') misreads the price_brl units (these are cents values from the SP sample, not electronics-only averages) and produces a fabricated average not directly calculable from any tool result; additionally, 'SP grew +33x above its baseline' is a misstatement of the SP pct_change of 33.16 (which means 33x, not 33 percentage points above baseline) — an unsupported factual claim.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 55512,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies electronics order_count spiked ~150% (141×) in week 2 starting Dec 8, 2025, attributing it to a pre-Christmas seasonal surge with category-specific disproportionate lift — matching the seeded anomaly's core substance.",
+          "evidence": "The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.6× from get_anomaly_context; daily values (84–96/day) from get_metric_timeseries daily; SP pct_change=33×, ES=66×, TO=64× from the state anomaly context; payment type pct_changes (boleto +33×, credit_card +30×, voucher +29×, debit_card +25×) all traceable to the payment_type tool result.",
+          "sizing": "The candidate explicitly states '~150% (141×)' spike and '588 vs baseline_avg=4.15/week → pct_change=+140.6×', which is within ~50% of the ground truth +150% (2.5× multiplier), scoring 2.",
+          "calibration": "The candidate states confidence='high' and asserts causation directly ('was driven by a broad, platform-wide seasonal demand surge') with no acknowledged uncertainty, no suggestion of further investigation needed, and no caveats — this is overclaiming.",
+          "fabrication": "The daily platform share figures ('electronics' share rising from '~10–20% to ~62–72%') are computed ratios not directly returned by any tool result (the tool returned raw counts, not share percentages), constituting one unsupported derived claim presented as fact."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies electronics order_count spiked ~150% (141×) in week 2 starting Dec 8, 2025, attributing it to a pre-Christmas seasonal surge with category-specific disproportionate lift — matching the seeded anomaly's core substance.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: anomaly_value=588, baseline_avg=4.15, pct_change=140.6× from get_anomaly_context; daily values (84–96/day) from get_metric_timeseries daily; SP pct_change=33×, ES=66×, TO=64× from the state anomaly context; payment type pct_changes (boleto +33×, credit_card +30×, voucher +29×, debit_card +25×) all traceable to the payment_type tool result.\",\n    \"sizing\": \"The candidate explicitly states '~150% (141×)' spike and '588 vs baseline_avg=4.15/week → pct_change=+140.6×', which is within ~50% of the ground truth +150% (2.5× multiplier), scoring 2.\",\n    \"calibration\": \"The candidate states confidence='high' and asserts causation directly ('was driven by a broad, platform-wide seasonal demand surge') with no acknowledged uncertainty, no suggestion of further investigation needed, and no caveats — this is overclaiming.\",\n    \"fabrication\": \"The daily platform share figures ('electronics' share rising from '~10–20% to ~62–72%') are computed ratios not directly returned by any tool result (the tool returned raw counts, not share percentages), constituting one unsupported derived claim presented as fact.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 45526,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies electronics order_count spiked ~141% in week 2 (Dec 8–14), consistent with the seeded ~+150% anomaly, and correctly attributes it to a category-wide demand spike rather than a regional or payment artifact.",
+          "evidence": "Candidate cites specific numbers directly from tool results: pct_change=140.6% from get_anomaly_context, daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries, state breakdowns (SP=26–33, MG=9–16, RJ=6–16), and payment_type splits (credit_card ~60%, boleto ~25%) all traceable to the transcript.",
+          "sizing": "Candidate states '+140.6% pct_change' and '~141× on Dec 8' (the latter is a mis-statement of the daily ratio, not the weekly pct_change, but the weekly figure of +140.6% is clearly cited and is within ~50% of the ground truth +150%).",
+          "calibration": "Candidate asserts with confidence=high that the spike was caused by 'a platform-level electronics promotion or sale event that activated on Dec 8' — this is stated as causation with no hedging language, no caveat that a promotion cannot be confirmed from order data alone, and no suggestion of further investigation needed to verify the promotional cause.",
+          "fabrication": "The specific daily state-level ranges cited (e.g. 'SP (26–33/day), MG (9–16/day), RJ (6–16/day)') are broadly consistent with the transcript, but the claim that 'payment type mix... was stable: credit_card ~60%, boleto ~25–27%, voucher ~8%, debit_card ~4%' introduces approximate percentages not directly returned by any tool (the tool returned raw counts, not percentages), constituting one unsupported quantitative claim."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies electronics order_count spiked ~141% in week 2 (Dec 8–14), consistent with the seeded ~+150% anomaly, and correctly attributes it to a category-wide demand spike rather than a regional or payment artifact.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: pct_change=140.6% from get_anomaly_context, daily values (84, 87, 89, 78, 85, 96, 69) from get_metric_timeseries, state breakdowns (SP=26–33, MG=9–16, RJ=6–16), and payment_type splits (credit_card ~60%, boleto ~25%) all traceable to the transcript.\",\n    \"sizing\": \"Candidate states '+140.6% pct_change' and '~141× on Dec 8' (the latter is a mis-statement of the daily ratio, not the weekly pct_change, but the weekly figure of +140.6% is clearly cited and is within ~50% of the ground truth +150%).\",\n    \"calibration\": \"Candidate asserts with confidence=high that the spike was caused by 'a platform-level electronics promotion or sale event that activated on Dec 8' — this is stated as causation with no hedging language, no caveat that a promotion cannot be confirmed from order data alone, and no suggestion of further investigation needed to verify the promotional cause.\",\n    \"fabrication\": \"The specific daily state-level ranges cited (e.g. 'SP (26–33/day), MG (9–16/day), RJ (6–16/day)') are broadly consistent with the transcript, but the claim that 'payment type mix... was stable: credit_card ~60%, boleto ~25–27%, voucher ~8%, debit_card ~4%' introduces approximate percentages not directly returned by any tool (the tool returned raw counts, not percentages), constituting one unsupported quantitative claim.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 42454,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies the electronics order-count spike of ~+140% in week 2 (Dec 8–15), matching the seeded anomaly at >50% semantic overlap with the reference's anomaly_summary.",
+          "evidence": "Specific numbers from tool results appear throughout: pct_change=140.6% and anomaly_value=588 from get_anomaly_context, time-series points (54→588) from get_metric_timeseries, state pct_changes (ES +67%, TO +64%, SP +33%) from the state-level get_anomaly_context, and payment-type figures (boleto +33%, voucher +29%, debit_card +25%) all trace directly to tool results.",
+          "sizing": "Candidate states '+140%' and '54 → 588 orders,' which is within ~50% of the ground-truth ~+150% (2.5x), satisfying the criterion.",
+          "calibration": "Candidate asserts the 'best explanation' as a 'platform-wide pre-Christmas seasonal demand surge' with confidence='high' and no caveats, acknowledged uncertainty, or suggestions for further investigation — this is overclaiming causation from correlation.",
+          "fabrication": "The claim about 'price range (R$258–R$2,042)' for sample orders in the anomaly week is not supported by any tool result (sample order prices in the transcript range from ~R$21,097 to R$204,116 in BRL cents or whole BRL — the stated range does not match any returned values), constituting one unsupported concrete claim."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies the electronics order-count spike of ~+140% in week 2 (Dec 8–15), matching the seeded anomaly at >50% semantic overlap with the reference's anomaly_summary.\",\n    \"evidence\": \"Specific numbers from tool results appear throughout: pct_change=140.6% and anomaly_value=588 from get_anomaly_context, time-series points (54→588) from get_metric_timeseries, state pct_changes (ES +67%, TO +64%, SP +33%) from the state-level get_anomaly_context, and payment-type figures (boleto +33%, voucher +29%, debit_card +25%) all trace directly to tool results.\",\n    \"sizing\": \"Candidate states '+140%' and '54 → 588 orders,' which is within ~50% of the ground-truth ~+150% (2.5x), satisfying the criterion.\",\n    \"calibration\": \"Candidate asserts the 'best explanation' as a 'platform-wide pre-Christmas seasonal demand surge' with confidence='high' and no caveats, acknowledged uncertainty, or suggestions for further investigation — this is overclaiming causation from correlation.\",\n    \"fabrication\": \"The claim about 'price range (R$258–R$2,042)' for sample orders in the anomaly week is not supported by any tool result (sample order prices in the transcript range from ~R$21,097 to R$204,116 in BRL cents or whole BRL — the stated range does not match any returned values), constituting one unsupported concrete claim.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "electronics-spike-w2",
+      "durationMs": 43748,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies the electronics category order_count spike in week 2 (~mid-Dec 2025) at +141% vs baseline, matching the seeded anomaly of ~2.5x (+150%), with a plausible seasonal/holiday gift-buying driver consistent with the reference's investigation focus.",
+          "evidence": "Specific numbers from tool results appear throughout: pct_change 140.56 from get_anomaly_context, anomaly_value 588 vs baseline_avg ~4.2, week-over-week step from 54 to 588 from get_metric_timeseries, state pct_changes (ES +67%, TO +64%, SP +33%) from the state-level get_anomaly_context, and payment type pct_changes (boleto +33%, credit_card +30%, voucher +29%, debit_card +25%) from the payment_type call.",
+          "sizing": "Candidate states '+141% change (pct_change: 140.56)' which is within ~50% of the ground truth +150% (difference of ~9 percentage points), and also notes a '10.9× single-week jump' which is close to the seeded 2.5× multiplier from baseline (588 vs ~4.2 baseline avg).",
+          "calibration": "Candidate asserts 'best explained by a pre-Christmas seasonal demand surge' with confidence='high' and no caveats or acknowledgment of uncertainty — this is overclaiming causation from correlation without suggesting further investigation or differentiating 'evidence shows X' from 'this is caused by Y'.",
+          "fabrication": "All concrete claims — specific percentages, state names, payment type figures, order counts, prices, and order statuses — trace directly to values returned in the tool transcripts with no fabricated numbers or unsupported external factors."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies the electronics category order_count spike in week 2 (~mid-Dec 2025) at +141% vs baseline, matching the seeded anomaly of ~2.5x (+150%), with a plausible seasonal/holiday gift-buying driver consistent with the reference's investigation focus.\",\n    \"evidence\": \"Specific numbers from tool results appear throughout: pct_change 140.56 from get_anomaly_context, anomaly_value 588 vs baseline_avg ~4.2, week-over-week step from 54 to 588 from get_metric_timeseries, state pct_changes (ES +67%, TO +64%, SP +33%) from the state-level get_anomaly_context, and payment type pct_changes (boleto +33%, credit_card +30%, voucher +29%, debit_card +25%) from the payment_type call.\",\n    \"sizing\": \"Candidate states '+141% change (pct_change: 140.56)' which is within ~50% of the ground truth +150% (difference of ~9 percentage points), and also notes a '10.9× single-week jump' which is close to the seeded 2.5× multiplier from baseline (588 vs ~4.2 baseline avg).\",\n    \"calibration\": \"Candidate asserts 'best explained by a pre-Christmas seasonal demand surge' with confidence='high' and no caveats or acknowledgment of uncertainty — this is overclaiming causation from correlation without suggesting further investigation or differentiating 'evidence shows X' from 'this is caused by Y'.\",\n    \"fabrication\": \"All concrete claims — specific percentages, state names, payment type figures, order counts, prices, and order statuses — trace directly to values returned in the tool transcripts with no fabricated numbers or unsupported external factors.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 1,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 68833,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 6,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate identifies the correct segment (SP, week 4, ~30% drop) but reframes the seeded anomaly as a non-anomaly artifact of baseline distortion and Christmas seasonality, rather than confirming the seeded -30% revenue drop as a real structural event — this is a plausible alternative interpretation but diverges from the seeded cause (a genuine revenue multiplier of 0.7) at more than 50% semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: get_anomaly_context pct_change=+0.169, baseline_avg=2,774,969, anomaly_value=3,244,205; get_metric_timeseries weekly values (Dec 8 = 25,325,801; Dec 15 = 5,767,531; Dec 22 = 3,244,205); and category-level breakdowns from the category timeseries call — all grounded in the transcript.",
+          "sizing": "The candidate explicitly acknowledges '~30% below' the recent baseline and quantifies the anomaly_value (R$32,442 weekly, noting it is actually 17% above the long-run baseline_avg of R$27,750), satisfying the magnitude criterion even while disputing the anomaly framing.",
+          "calibration": "The candidate asserts with confidence='high' that 'there is no real structural decline' and that the anomaly is purely an 'artefact,' making a definitive causal claim with no acknowledgment of uncertainty or suggestion of further investigation — this is overclaiming.",
+          "fabrication": "The candidate states specific per-category percentage drops (fashion -53%, health_beauty -33%, sports -51%, home_decor -35%, food_drink -25%) for Dec 22 vs Dec 15, but the tool transcript only shows raw values (e.g., fashion: 596,009 → 277,534) without those percentages being computed or returned by any tool, and states MG/RJ/PR in R$K figures (e.g., 'MG fell from R$118K to R$19.7K') which don't match the tool transcript values (MG Dec 8 = 11,817,311; Dec 22 = 1,969,508) — these are fabricated conversions not explicitly in tool output."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 6,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate identifies the correct segment (SP, week 4, ~30% drop) but reframes the seeded anomaly as a non-anomaly artifact of baseline distortion and Christmas seasonality, rather than confirming the seeded -30% revenue drop as a real structural event — this is a plausible alternative interpretation but diverges from the seeded cause (a genuine revenue multiplier of 0.7) at more than 50% semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: get_anomaly_context pct_change=+0.169, baseline_avg=2,774,969, anomaly_value=3,244,205; get_metric_timeseries weekly values (Dec 8 = 25,325,801; Dec 15 = 5,767,531; Dec 22 = 3,244,205); and category-level breakdowns from the category timeseries call — all grounded in the transcript.\",\n    \"sizing\": \"The candidate explicitly acknowledges '~30% below' the recent baseline and quantifies the anomaly_value (R$32,442 weekly, noting it is actually 17% above the long-run baseline_avg of R$27,750), satisfying the magnitude criterion even while disputing the anomaly framing.\",\n    \"calibration\": \"The candidate asserts with confidence='high' that 'there is no real structural decline' and that the anomaly is purely an 'artefact,' making a definitive causal claim with no acknowledgment of uncertainty or suggestion of further investigation — this is overclaiming.\",\n    \"fabrication\": \"The candidate states specific per-category percentage drops (fashion -53%, health_beauty -33%, sports -51%, home_decor -35%, food_drink -25%) for Dec 22 vs Dec 15, but the tool transcript only shows raw values (e.g., fashion: 596,009 → 277,534) without those percentages being computed or returned by any tool, and states MG/RJ/PR in R$K figures (e.g., 'MG fell from R$118K to R$19.7K') which don't match the tool transcript values (MG Dec 8 = 11,817,311; Dec 22 = 1,969,508) — these are fabricated conversions not explicitly in tool output.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 61042,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 5,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate identifies the correct segment (SP, week 4) and correctly notes a national electronics-led spike on Dec 8 causing relative deflation, but the seeded ground truth is a genuine ~30% revenue drop vs a 12-week baseline — the candidate's core conclusion that 'the 30% drop disappears when measured correctly' and 'no customers were adversely affected' directly contradicts the seeded anomaly (multiplier 0.7, expected_severity critical), meaning the candidate argues the anomaly is a measurement artifact rather than identifying its true cause.",
+          "evidence": "The candidate cites specific numbers from tool results throughout — e.g., pct_change=+0.169 from get_anomaly_context, SP weekly values (R$4,981,273; R$25,325,801; R$5,767,531; R$3,244,205) from get_metric_timeseries, electronics pct_change=-0.888 from the second get_anomaly_context, and payment type pct_changes (credit_card -82%, voucher -80%, boleto -78%, debit_card -62%) from the third get_anomaly_context — all grounded in the transcript.",
+          "sizing": "The candidate acknowledges 'the Dec 22 value is above the Dec 1 baseline' and quotes pct_change=+17% vs the 12-week baseline, explicitly arguing there is no true decline — it never acknowledges the seeded ~30% drop as real, and instead reframes it as a post-spike reversion, so no magnitude for the actual anomaly is correctly stated.",
+          "calibration": "The candidate states with confidence='high' that 'no customers were adversely affected' and 'the entire 30% drop disappears when measured correctly,' asserting causation (promotional electronics surge) with no hedging language, no acknowledgment that the seeded anomaly baseline uses 12-week average, and no suggestion of further investigation — this is overclaiming with no caveats.",
+          "fabrication": "The candidate claims SP Dec 8 electronics revenue was R$209,252 (83% of that week's SP revenue), but the tool transcript shows SP electronics on Dec 8 was R$20,925,185 — the candidate appears to have divided by 100, misrepresenting the scale; additionally the '12-week average of R$27,750' doesn't match the tool result showing baseline_avg=2,774,969, suggesting unit confusion or fabricated summary figures."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 5,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate identifies the correct segment (SP, week 4) and correctly notes a national electronics-led spike on Dec 8 causing relative deflation, but the seeded ground truth is a genuine ~30% revenue drop vs a 12-week baseline — the candidate's core conclusion that 'the 30% drop disappears when measured correctly' and 'no customers were adversely affected' directly contradicts the seeded anomaly (multiplier 0.7, expected_severity critical), meaning the candidate argues the anomaly is a measurement artifact rather than identifying its true cause.\",\n    \"evidence\": \"The candidate cites specific numbers from tool results throughout — e.g., pct_change=+0.169 from get_anomaly_context, SP weekly values (R$4,981,273; R$25,325,801; R$5,767,531; R$3,244,205) from get_metric_timeseries, electronics pct_change=-0.888 from the second get_anomaly_context, and payment type pct_changes (credit_card -82%, voucher -80%, boleto -78%, debit_card -62%) from the third get_anomaly_context — all grounded in the transcript.\",\n    \"sizing\": \"The candidate acknowledges 'the Dec 22 value is above the Dec 1 baseline' and quotes pct_change=+17% vs the 12-week baseline, explicitly arguing there is no true decline — it never acknowledges the seeded ~30% drop as real, and instead reframes it as a post-spike reversion, so no magnitude for the actual anomaly is correctly stated.\",\n    \"calibration\": \"The candidate states with confidence='high' that 'no customers were adversely affected' and 'the entire 30% drop disappears when measured correctly,' asserting causation (promotional electronics surge) with no hedging language, no acknowledgment that the seeded anomaly baseline uses 12-week average, and no suggestion of further investigation — this is overclaiming with no caveats.\",\n    \"fabrication\": \"The candidate claims SP Dec 8 electronics revenue was R$209,252 (83% of that week's SP revenue), but the tool transcript shows SP electronics on Dec 8 was R$20,925,185 — the candidate appears to have divided by 100, misrepresenting the scale; additionally the '12-week average of R$27,750' doesn't match the tool result showing baseline_avg=2,774,969, suggesting unit confusion or fabricated summary figures.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 48174,
+      "judge": {
+        "scores": {
+          "hypothesis": 0,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 4,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate concludes the anomaly is a 'comparison artefact' from a prior electronics spike and that 'no true demand collapse occurred' and '0 customers were negatively affected' — directly contradicting the seeded ground truth that SP revenue genuinely dropped ~30% in week 4 vs the 12-week baseline; the candidate's own first tool call (get_anomaly_context with the correct 12-week baseline) returned pct_change=+0.169, showing the week 4 value was actually ABOVE baseline, yet the candidate still frames this as diagnosing a ~30% drop rather than recognizing the seeded anomaly is not confirmed by the data as framed.",
+          "evidence": "The candidate cites specific numbers from multiple tool results (e.g., electronics Dec 8 R$20,925,185 from the category timeseries, pct_change=-0.872 from the second get_anomaly_context, R$3,244,205 anomaly value, R$25,325,801 baseline_avg), and these numbers materially support the candidate's stated conclusion about the electronics spike and reversion.",
+          "sizing": "The candidate states 'Dec 22–29 revenue fell to R$32,442 — a level actually 17% above the 12-week baseline average of R$27,750' and frames the drop as approximately 30% only in relation to the inflated spike week, not acknowledging the ground-truth ~30% drop vs 12-week baseline; the stated magnitude is directionally opposite to the seeded anomaly direction.",
+          "calibration": "The candidate asserts with confidence='high' that 'no customers were negatively affected' and that the anomaly is 'entirely a comparison-period artefact', making a definitive causal claim with no acknowledgment of uncertainty or suggestion of further investigation needed.",
+          "fabrication": "The candidate states electronics revenue figures in SP as 'R$209,252' and 'R$11,825' (in thousands-scaled language) but the tool returns show R$20,925,185 and R$1,182,488 respectively — the candidate appears to have divided by 100 and presented incorrect scaled numbers as if they were the actual values, which constitutes an unsupported concrete claim not matching the tool results."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 0,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 4,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate concludes the anomaly is a 'comparison artefact' from a prior electronics spike and that 'no true demand collapse occurred' and '0 customers were negatively affected' — directly contradicting the seeded ground truth that SP revenue genuinely dropped ~30% in week 4 vs the 12-week baseline; the candidate's own first tool call (get_anomaly_context with the correct 12-week baseline) returned pct_change=+0.169, showing the week 4 value was actually ABOVE baseline, yet the candidate still frames this as diagnosing a ~30% drop rather than recognizing the seeded anomaly is not confirmed by the data as framed.\",\n    \"evidence\": \"The candidate cites specific numbers from multiple tool results (e.g., electronics Dec 8 R$20,925,185 from the category timeseries, pct_change=-0.872 from the second get_anomaly_context, R$3,244,205 anomaly value, R$25,325,801 baseline_avg), and these numbers materially support the candidate's stated conclusion about the electronics spike and reversion.\",\n    \"sizing\": \"The candidate states 'Dec 22–29 revenue fell to R$32,442 — a level actually 17% above the 12-week baseline average of R$27,750' and frames the drop as approximately 30% only in relation to the inflated spike week, not acknowledging the ground-truth ~30% drop vs 12-week baseline; the stated magnitude is directionally opposite to the seeded anomaly direction.\",\n    \"calibration\": \"The candidate asserts with confidence='high' that 'no customers were negatively affected' and that the anomaly is 'entirely a comparison-period artefact', making a definitive causal claim with no acknowledgment of uncertainty or suggestion of further investigation needed.\",\n    \"fabrication\": \"The candidate states electronics revenue figures in SP as 'R$209,252' and 'R$11,825' (in thousands-scaled language) but the tool returns show R$20,925,185 and R$1,182,488 respectively — the candidate appears to have divided by 100 and presented incorrect scaled numbers as if they were the actual values, which constitutes an unsupported concrete claim not matching the tool results.\"\n  }\n}",
+        "attempts": 2
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 62403,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 0,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 4,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate identifies the right segment (SP, week 4, electronics) but rejects the seeded ~30% drop as a 'statistical artifact,' concluding Dec 22 revenue is normal — the opposite of the seeded cause.",
+          "evidence": "Specific numbers from tool results appear throughout (pct_change=+16.9%, time series values for Dec 1/8/15/22, payment pct_changes), materially supporting the candidate's (incorrect) conclusions.",
+          "sizing": "The candidate explicitly denies the -30% magnitude, calling it a baseline artifact and asserting Dec 22 is within normal range, never acknowledging the seeded drop direction or magnitude.",
+          "calibration": "The candidate states confidence='high' and declares the anomaly 'is a statistical artifact' with no hedging, uncertainty, or suggestion of further investigation — clear overclaiming.",
+          "fabrication": "The SP-specific electronics weekly values (BRL 60,856; 72,895; 86,620) cited as evidence are not present in any tool result, as the category time series was not filtered by state=SP."
+        },
+        "raw_response": "Let me analyze each criterion carefully.\n\n**Hypothesis (0-2):** The seeded anomaly is a ~30% revenue drop in SP week 4. The candidate concludes the drop is a \"statistical artifact\" caused by a Dec 8 electronics spike inflating the baseline, making Dec 22 look like a drop when it isn't. The tool data actually shows get_anomaly_context returned pct_change = +16.9% for SP, and the time series shows Dec 8 = 25,325,801 vs Dec 22 = 3,244,205 — so the candidate's reading that Dec 22 is \"normal\" is plausible from the data. However, the seeded ground truth is that there IS a genuine -30% drop. The candidate argues it's a baseline artifact. This is a fundamentally different conclusion from the seeded cause. Score: 0-1. The candidate is in the right area (SP, week 4, electronics involved) but rejects the seeded anomaly entirely. Score: 1.\n\n**Evidence (0-2):** The candidate cites specific numbers from tool results: pct_change = +16.9% from get_anomaly_context, time series values (Dec 1 = 4,981,273; Dec 8 = 25,325,801; Dec 15 = 5,767,531; Dec 22 = 3,244,205), payment pct_changes (credit_card +65%, debit_card +216%, boleto +117%, voucher +93%). However, the candidate claims SP revenue figures in BRL hundreds (e.g., \"BRL 32,442\") when the tool returned values in cents or units of 1 (3,244,205 not 32,442). Also, the electronics baseline claim of \"BRL 775,958\" doesn't match the tool's 77,595,754. These seem to be unit conversion errors (dividing by 100). Despite the unit discrepancy, the numbers trace to tool results. The conclusions drawn materially align with what tools returned. Score: 2.\n\n**Sizing (0-2):** The candidate argues the drop is NOT -30% but rather +16.9%, claiming the -30% is a baseline artifact. The candidate explicitly says \"Dec 22 SP revenue (BRL 32,442) is normal.\" This directly contradicts the ground truth of ~-30%. The candidate doesn't acknowledge the magnitude of the seeded drop. Score: 0.\n\n**Calibration (0-1):** The candidate states confidence: \"high\" and asserts \"The reported ~30% revenue drop... is a statistical artifact\" — this is presented as definitive causation with no uncertainty. Score: 0.\n\n**Fabrication (0-2):** The electronics spike figure \"BRL 775,958\" is off by ~100x from the tool result (77,595,754) — but this appears to be a unit scaling issue, not fabrication. The candidate also claims specific per-SP electronics weekly values (BRL 60,856; 72,895; 86,620) which don't appear in the SP-filtered tool calls. The category time series wasn't filtered by state=SP, so these SP-specific electronics numbers aren't grounded. That's a fabricated claim. Score: 1.\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 0,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 4,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate identifies the right segment (SP, week 4, electronics) but rejects the seeded ~30% drop as a 'statistical artifact,' concluding Dec 22 revenue is normal — the opposite of the seeded cause.\",\n    \"evidence\": \"Specific numbers from tool results appear throughout (pct_change=+16.9%, time series values for Dec 1/8/15/22, payment pct_changes), materially supporting the candidate's (incorrect) conclusions.\",\n    \"sizing\": \"The candidate explicitly denies the -30% magnitude, calling it a baseline artifact and asserting Dec 22 is within normal range, never acknowledging the seeded drop direction or magnitude.\",\n    \"calibration\": \"The candidate states confidence='high' and declares the anomaly 'is a statistical artifact' with no hedging, uncertainty, or suggestion of further investigation — clear overclaiming.\",\n    \"fabrication\": \"The SP-specific electronics weekly values (BRL 60,856; 72,895; 86,620) cited as evidence are not present in any tool result, as the category time series was not filtered by state=SP.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 65132,
+      "judge": {
+        "scores": {
+          "hypothesis": 0,
+          "evidence": 2,
+          "sizing": 0,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 3,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate concludes the -30% drop is a 'baseline contamination artifact' from a Dec 8 spike and that no genuine anomaly exists, directly contradicting the seeded ground truth of a real ~30% SP revenue drop (multiplier 0.7).",
+          "evidence": "Specific numbers from tool results are cited throughout — pct_change=+16.9% from get_anomaly_context, credit_card -61.9% from payment type context, and the SP time series values — all traceable to actual tool returns.",
+          "sizing": "The candidate explicitly disputes the -30% magnitude, instead arguing the anomaly is +16.9% vs baseline and only ~13% below the pre-spike Dec 1 week, never acknowledging the seeded ~30% genuine drop.",
+          "calibration": "The candidate sets confidence='high' and asserts the cause is definitively 'best explained by post-spike mean reversion' with no hedging or suggestion of further investigation into whether the drop is real.",
+          "fabrication": "The candidate consistently reports SP and national revenue figures that are 1/100th of the tool-returned values (e.g., 'R$49,813' when the tool returned 4,981,273; 'R$929,006' when the tool returned 92,900,580), representing a systematic misquotation of tool results."
+        },
+        "raw_response": "Looking at each criterion carefully:\n\n**Hypothesis (0-2):** The candidate argues the -30% anomaly is a \"baseline contamination\" artifact from a Dec 8 spike, not a genuine revenue drop. The seeded ground truth is a real ~30% revenue drop (multiplier 0.7). The candidate's conclusion actively disputes the anomaly is real, which contradicts the seeded cause. This is the wrong hypothesis — the candidate found that `get_anomaly_context` returned +16.9% (because the spike inflated the baseline), and concluded no anomaly exists, missing the seeded -30% drop entirely. Score: 0.\n\n**Evidence (0-2):** The candidate does cite specific numbers from tool results — R$253,258 for Dec 8, R$32,442 for Dec 22, pct_change=+16.9%, credit card -61.9%, etc. These numbers all trace back to actual tool results. The evidence is real and cited with specific figures. Score: 2.\n\n**Sizing (0-2):** The candidate acknowledges the Dec 22 week is \"below even the pre-spike normal\" and \"only ~13% below the pre-Dec 1 week,\" but explicitly argues there is no -30% drop (the tool returned +16.9%). The candidate disputes the magnitude entirely rather than confirming ~-30%. Score: 0.\n\n**Calibration (0-1):** The candidate uses confidence: \"high\" and says the anomaly is \"best explained by\" baseline contamination with no caveats about whether the seeded drop might be real. The conclusion is stated definitively. Score: 0.\n\n**Fabrication (0-2):** The national revenue figures (R$160,379; R$929,006; R$187,406; R$186,001) — the candidate divided the tool's actual values by ~100 (tool showed 16,037,855; 92,900,580; 18,740,574; 18,600,057). The candidate reports \"R$160,379\" when the tool returned 16,037,855. This is a systematic misrepresentation of the scale (dividing by 100). Similarly SP values: tool shows 4,981,273 but candidate says \"R$49,813.\" These are not just rounding — they're wrong by a factor of 100. However, the ratios and relationships are preserved. This could be a unit conversion (cents to BRL?), but regardless the specific numbers cited don't match the tool output. That's a fabricated number claim. Score: 1.\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 0,\n    \"evidence\": 2,\n    \"sizing\": 0,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 3,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate concludes the -30% drop is a 'baseline contamination artifact' from a Dec 8 spike and that no genuine anomaly exists, directly contradicting the seeded ground truth of a real ~30% SP revenue drop (multiplier 0.7).\",\n    \"evidence\": \"Specific numbers from tool results are cited throughout — pct_change=+16.9% from get_anomaly_context, credit_card -61.9% from payment type context, and the SP time series values — all traceable to actual tool returns.\",\n    \"sizing\": \"The candidate explicitly disputes the -30% magnitude, instead arguing the anomaly is +16.9% vs baseline and only ~13% below the pre-spike Dec 1 week, never acknowledging the seeded ~30% genuine drop.\",\n    \"calibration\": \"The candidate sets confidence='high' and asserts the cause is definitively 'best explained by post-spike mean reversion' with no hedging or suggestion of further investigation into whether the drop is real.\",\n    \"fabrication\": \"The candidate consistently reports SP and national revenue figures that are 1/100th of the tool-returned values (e.g., 'R$49,813' when the tool returned 4,981,273; 'R$929,006' when the tool returned 92,900,580), representing a systematic misquotation of tool results.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 66677,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 0,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 4,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies SP week 4 as the anomaly window and correctly notes a revenue dip on specific holiday days, but fundamentally misidentifies the cause: it attributes the drop to a 'holiday demand collapse' (Christmas seasonality) rather than the seeded -30% multiplier applied to the segment, and critically the tool data shows SP weekly aggregate was actually UP +16.9% vs. baseline — the candidate acknowledges this but then contradicts itself by still concluding there is a real revenue drop driven by holiday behavior, missing the seeded causal mechanism entirely.",
+          "evidence": "The candidate cites specific numbers from both get_metric_timeseries (Dec 26 = R$82,051, Dec 28 = R$121,130, order counts of 5 and 6 on those days) and get_anomaly_context (pct_change = +16.9%, related segments AL +654%, BA +390%, payment types all positive) — the tool results are genuinely used and numbers are quoted, even if the interpretation is flawed.",
+          "sizing": "The candidate never states the week-4 SP revenue drop is ~30% below the 12-week baseline; instead it quotes +16.9% (from the tool) and focuses on intra-week daily swings of '~98%', which is not the ground-truth metric of a ~30% weekly aggregate decline vs. baseline.",
+          "calibration": "The candidate states with confidence='high' that the drop 'is driven by' Christmas holiday behavior and 'No single category, payment method, or infrastructure failure drove the drop' — this is a confident causal assertion with no hedging, no suggestion of further investigation needed, and no acknowledgment that the weekly aggregate actually shows a positive pct_change undermining the premise.",
+          "fabrication": "The candidate fabricates specific numbers not present in the tool results — e.g., 'daily revenue hit lows of R$820 on Dec 26' whereas the tool shows Dec 26 = R$82,051 (the candidate appears to have dropped zeros), and claims 'daily order count fell to 5 orders on Dec 26' which matches the tool, but also states 'revenue hit R$820–R$1,211' which are not in any tool result — the correct values are R$82,051 and R$121,130."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 0,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 4,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies SP week 4 as the anomaly window and correctly notes a revenue dip on specific holiday days, but fundamentally misidentifies the cause: it attributes the drop to a 'holiday demand collapse' (Christmas seasonality) rather than the seeded -30% multiplier applied to the segment, and critically the tool data shows SP weekly aggregate was actually UP +16.9% vs. baseline — the candidate acknowledges this but then contradicts itself by still concluding there is a real revenue drop driven by holiday behavior, missing the seeded causal mechanism entirely.\",\n    \"evidence\": \"The candidate cites specific numbers from both get_metric_timeseries (Dec 26 = R$82,051, Dec 28 = R$121,130, order counts of 5 and 6 on those days) and get_anomaly_context (pct_change = +16.9%, related segments AL +654%, BA +390%, payment types all positive) — the tool results are genuinely used and numbers are quoted, even if the interpretation is flawed.\",\n    \"sizing\": \"The candidate never states the week-4 SP revenue drop is ~30% below the 12-week baseline; instead it quotes +16.9% (from the tool) and focuses on intra-week daily swings of '~98%', which is not the ground-truth metric of a ~30% weekly aggregate decline vs. baseline.\",\n    \"calibration\": \"The candidate states with confidence='high' that the drop 'is driven by' Christmas holiday behavior and 'No single category, payment method, or infrastructure failure drove the drop' — this is a confident causal assertion with no hedging, no suggestion of further investigation needed, and no acknowledgment that the weekly aggregate actually shows a positive pct_change undermining the premise.\",\n    \"fabrication\": \"The candidate fabricates specific numbers not present in the tool results — e.g., 'daily revenue hit lows of R$820 on Dec 26' whereas the tool shows Dec 26 = R$82,051 (the candidate appears to have dropped zeros), and claims 'daily order count fell to 5 orders on Dec 26' which matches the tool, but also states 'revenue hit R$820–R$1,211' which are not in any tool result — the correct values are R$82,051 and R$121,130.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 52543,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 6,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies SP week 4 and electronics as the key driver, but argues the seeded -30% drop is a false alarm/baseline artifact rather than a real demand collapse, diverging from the seeded ground truth cause.",
+          "evidence": "Tool results are extensively cited with specific values from get_anomaly_context (pct_change=+0.169, baseline_avg=2,774,969), get_metric_timeseries by category (electronics Dec 8 = 20,925,185), and by payment_type (credit_card Dec 8 = 16,725,168), all directly matching the transcript.",
+          "sizing": "The candidate explicitly names the '~30%' apparent drop and quantifies the true change as '+17% above baseline' (R$32,442 vs R$27,750), directly addressing magnitude even while disputing its interpretation.",
+          "calibration": "The diagnosis asserts 'not a true demand collapse' with confidence='high' and 'No customers were adversely affected' with no caveats, hedges, or suggestions for further investigation — a clear overclaim.",
+          "fabrication": "The candidate states 'Credit card payments... Dec 8 = R$167,252' but the tool returns 16,725,168, and similarly quotes electronics values ~100× smaller than tool results without acknowledging any unit conversion, creating concrete numerical claims inconsistent with tool outputs."
+        },
+        "raw_response": "Looking at this carefully:\n\n**Hypothesis (0-2):** The candidate argues the -30% is a \"false alarm\" / baseline distortion artifact from a Dec 8 electronics spike, not a true demand collapse. The ground truth seeds a real -30% drop. The candidate correctly identifies the SP segment and the week 4 window, and finds the pct_change tool returns +16.9% (not -30%), which is what the tool actually shows. The candidate's conclusion that the alert is a baseline artifact driven by an electronics spike is supported by the tool data — the tool literally shows pct_change = +0.169, not -0.30. This is a legitimate, data-grounded finding that diverges from the seeded \"ground truth\" but is actually what the tools returned. However, the rubric asks whether the diagnosis identifies the seeded cause (-30% true drop). It does not — it argues the opposite. Score: 1 (right segment/metric, correctly identifies electronics as key driver, but doesn't confirm the seeded -30% real drop; instead correctly reads the data as showing no true drop).\n\n**Evidence (0-2):** Tool results are extensively cited with specific numbers — R$25,325,801 spike, R$3,244,205 week 4, pct_change=+16.9%, electronics R$20,925,185, credit card R$16,725,168 → R$2,002,108, all directly from transcript. Score: 2.\n\n**Sizing (0-2):** The candidate explicitly states the apparent drop is \"30%\" but argues the true change is +17% above baseline. The candidate addresses magnitude directly, citing the seeded -30% figure and explaining why it's an artifact. Score: 2 (acknowledges the -30% magnitude label explicitly, even though it disputes it).\n\n**Calibration (0-1):** The conclusion states \"confidence: high\" and \"not a true demand collapse\" without meaningful caveats. No acknowledgment that the spike itself might need further investigation, no \"warrants further investigation\" language — it's assertive and overclaims certainty. Score: 0.\n\n**Fabrication (0-2):** The candidate states credit card \"Dec 8 = R$167,252\" — but the tool shows credit_card Dec 8 = R$16,725,168 (in centavos? or the candidate divided by 100). Similarly \"R$209,252\" for electronics vs tool's 20,925,185. The candidate consistently uses values ~100× smaller than the tool output, suggesting unit conversion but presenting them as R$ figures with apparent precision. The claim \"R$20.9M\" for electronics spike is correct if the tool values are in centavos. But \"credit card... Dec 8 = R$167,252\" is stated as a fact contradicting the tool value of 16,725,168. This is a systematic misrepresentation. Score: 1 (systematic unit confusion creates claims that don't match tool outputs literally, though the ratios are correct).\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 6,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies SP week 4 and electronics as the key driver, but argues the seeded -30% drop is a false alarm/baseline artifact rather than a real demand collapse, diverging from the seeded ground truth cause.\",\n    \"evidence\": \"Tool results are extensively cited with specific values from get_anomaly_context (pct_change=+0.169, baseline_avg=2,774,969), get_metric_timeseries by category (electronics Dec 8 = 20,925,185), and by payment_type (credit_card Dec 8 = 16,725,168), all directly matching the transcript.\",\n    \"sizing\": \"The candidate explicitly names the '~30%' apparent drop and quantifies the true change as '+17% above baseline' (R$32,442 vs R$27,750), directly addressing magnitude even while disputing its interpretation.\",\n    \"calibration\": \"The diagnosis asserts 'not a true demand collapse' with confidence='high' and 'No customers were adversely affected' with no caveats, hedges, or suggestions for further investigation — a clear overclaim.\",\n    \"fabrication\": \"The candidate states 'Credit card payments... Dec 8 = R$167,252' but the tool returns 16,725,168, and similarly quotes electronics values ~100× smaller than tool results without acknowledging any unit conversion, creating concrete numerical claims inconsistent with tool outputs.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 54789,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 5,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies SP and the week of 2025-12-22, and the tool data does show pct_change=+0.169 vs the 12-week baseline — so the agent's 'artifact' conclusion is partially grounded — but the seeded ground truth is a genuine ~30% revenue drop (multiplier 0.7), and the candidate's conclusion that 'the Dec 22 week is not anomalously low' directly contradicts the seeded cause; this is the wrong cause, earning at most a 1 for being in the right segment area.",
+          "evidence": "The candidate cites specific numbers directly from tool results: SP anomaly_value=3,244,205, baseline_avg=2,774,969 (+16.9%), the time-series spike at Dec 8 = 25,325,801, electronics Dec 8 = 77,595,754 with pct_change=-0.888, and related_segments all positive — all of these trace cleanly to the transcript.",
+          "sizing": "The candidate acknowledges the Dec 22 week is +16.9% above the 12-week baseline (not a decline), and frames the 'drop' as -88.8% in electronics vs the spike baseline, but never quantifies the seeded ~30% drop correctly — instead arguing no drop exists, so magnitude of the actual anomaly is not acknowledged.",
+          "calibration": "The candidate asserts with confidence='high' that 'the Dec 22 week is NOT anomalously low' and 'no customers appear genuinely affected' — this is overclaiming causation with no caveats about the possibility that the seeded anomaly is real and the baseline window used by the alerting system is correct.",
+          "fabrication": "The candidate states electronics platform-wide revenues of 'R$60,856 | R$775,958 | R$72,895' in the conclusion prose, but the tool results show values in the millions (6,085,598 / 77,595,754 / 7,289,474) — these figures appear to be the tool values divided by ~100, misrepresenting the actual numbers as if they were in different units, constituting one class of unsupported/misrepresented concrete claim."
+        },
+        "raw_response": "```json\n{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 5,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies SP and the week of 2025-12-22, and the tool data does show pct_change=+0.169 vs the 12-week baseline — so the agent's 'artifact' conclusion is partially grounded — but the seeded ground truth is a genuine ~30% revenue drop (multiplier 0.7), and the candidate's conclusion that 'the Dec 22 week is not anomalously low' directly contradicts the seeded cause; this is the wrong cause, earning at most a 1 for being in the right segment area.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: SP anomaly_value=3,244,205, baseline_avg=2,774,969 (+16.9%), the time-series spike at Dec 8 = 25,325,801, electronics Dec 8 = 77,595,754 with pct_change=-0.888, and related_segments all positive — all of these trace cleanly to the transcript.\",\n    \"sizing\": \"The candidate acknowledges the Dec 22 week is +16.9% above the 12-week baseline (not a decline), and frames the 'drop' as -88.8% in electronics vs the spike baseline, but never quantifies the seeded ~30% drop correctly — instead arguing no drop exists, so magnitude of the actual anomaly is not acknowledged.\",\n    \"calibration\": \"The candidate asserts with confidence='high' that 'the Dec 22 week is NOT anomalously low' and 'no customers appear genuinely affected' — this is overclaiming causation with no caveats about the possibility that the seeded anomaly is real and the baseline window used by the alerting system is correct.\",\n    \"fabrication\": \"The candidate states electronics platform-wide revenues of 'R$60,856 | R$775,958 | R$72,895' in the conclusion prose, but the tool results show values in the millions (6,085,598 / 77,595,754 / 7,289,474) — these figures appear to be the tool values divided by ~100, misrepresenting the actual numbers as if they were in different units, constituting one class of unsupported/misrepresented concrete claim.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 53374,
+      "judge": {
+        "scores": {
+          "hypothesis": 0,
+          "evidence": 2,
+          "sizing": 0,
+          "calibration": 1,
+          "fabrication": 1
+        },
+        "total": 4,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate concludes the -30% drop is a 'statistical artifact' and SP revenue is actually UP +16.9%, directly contradicting the seeded ground truth of a genuine ~30% revenue decline in week 4.",
+          "evidence": "Tool results are cited extensively with specific numbers: pct_change +0.169 from get_anomaly_context, weekly SP revenue values (R$25,325,801 spike; R$3,244,205 anomaly; R$2,774,970 baseline avg), category pct_changes, and payment type pct_changes all grounded in transcript returns.",
+          "sizing": "The candidate claims +16.9% above baseline while the ground truth is approximately -30%, making the direction and magnitude completely opposite and well outside the ~50% tolerance.",
+          "calibration": "The candidate uses confidence 'low' and hedging language ('appears as a drop only when compared to'), but asserts 'pre-Christmas bulk/B2B purchasing surge' as a likely driver of the Dec-08 spike with no direct evidence in the tool results.",
+          "fabrication": "The candidate states 'Dec 13 alone contributed R$53,518' but the tool result shows Dec 13 value was R$5,351,810 — a 100× error — and the 'B2B purchasing surge' characterization has no backing in any tool result."
+        },
+        "raw_response": "Looking at this carefully:\n\n**Hypothesis (0-2):** The ground truth is a genuine ~30% SP revenue drop in week 4. The candidate argues this is a \"statistical artifact\" caused by comparison against an outlier spike week, and that SP revenue is actually UP +16.9% vs the true 12-week baseline. The tool transcript confirms this: `get_anomaly_context` with a proper 12-week baseline (Sep 22 – Dec 22) returns `pct_change: +0.169`, and the time series shows Dec-08 was an outlier spike (R$25.3M vs normal ~R$5M weeks). The candidate's analysis contradicts the seeded ground truth (-30%) but is actually supported by the tool data — the tools show the anomaly metadata's claimed -30% drop does NOT appear when comparing against a proper 12-week baseline. The candidate identifies a completely different cause (measurement artifact from an inflated prior week) rather than the seeded cause (genuine demand collapse). Score: 0.\n\n**Evidence (0-2):** Tool calls are used extensively with specific numbers: pct_change +0.169 from get_anomaly_context, weekly values from time series (R$25,325,801 spike, R$3,244,205 anomaly week, R$2,774,970 baseline avg), daily breakdown from Dec 8-14, category and payment pct_changes all cited with specific values from tool results. Score: 2.\n\n**Sizing (0-2):** The candidate claims +16.9% (above baseline), while ground truth is -30%. The direction and magnitude are completely opposite. However, the candidate's claim traces to the actual tool result. The seeded anomaly says -30% but the tool returned +16.9%. Regardless, the candidate's magnitude (+16.9%) is not within 50% of ground truth (-30%). Score: 0.\n\n**Calibration (0-1):** The candidate uses confidence: \"low\" and acknowledges the anomaly \"appears as a drop only when compared to the outlier Dec-08 week,\" and frames as \"statistical artifact.\" However, it asserts with some confidence that the Dec-08 spike was driven by \"pre-Christmas bulk/B2B purchasing\" — a causal claim with no direct evidence in the tool results. Overall though, it does qualify and uses language like \"appears,\" \"likely driven by.\" Score: 1.\n\n**Fabrication (0-2):** The \"pre-Christmas bulk/B2B purchasing surge\" characterization of the Dec-08 spike is an unsupported claim — no tool result mentions B2B purchasing. The daily breakdown shows the spike week had elevated but not impossibly concentrated daily values (R$4.3M to R$5.4M/day), and the candidate says \"Dec 13 alone contributed R$53,518\" — but the tool shows Dec 13 value was R$5,351,810 (not R$53,518). The candidate divided by 100, which is a fabricated/wrong number. Score: 1.\n\n```json\n{\n  \"scores\": {\n    \"hypothesis\": 0,\n    \"evidence\": 2,\n    \"sizing\": 0,\n    \"calibration\": 1,\n    \"fabrication\": 1\n  },\n  \"total\": 4,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate concludes the -30% drop is a 'statistical artifact' and SP revenue is actually UP +16.9%, directly contradicting the seeded ground truth of a genuine ~30% revenue decline in week 4.\",\n    \"evidence\": \"Tool results are cited extensively with specific numbers: pct_change +0.169 from get_anomaly_context, weekly SP revenue values (R$25,325,801 spike; R$3,244,205 anomaly; R$2,774,970 baseline avg), category pct_changes, and payment type pct_changes all grounded in transcript returns.\",\n    \"sizing\": \"The candidate claims +16.9% above baseline while the ground truth is approximately -30%, making the direction and magnitude completely opposite and well outside the ~50% tolerance.\",\n    \"calibration\": \"The candidate uses confidence 'low' and hedging language ('appears as a drop only when compared to'), but asserts 'pre-Christmas bulk/B2B purchasing surge' as a likely driver of the Dec-08 spike with no direct evidence in the tool results.\",\n    \"fabrication\": \"The candidate states 'Dec 13 alone contributed R$53,518' but the tool result shows Dec 13 value was R$5,351,810 — a 100× error — and the 'B2B purchasing surge' characterization has no backing in any tool result.\"\n  }\n}\n```",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "sp-revenue-drop-w4",
+      "durationMs": 63197,
+      "judge": {
+        "scores": {
+          "hypothesis": 1,
+          "evidence": 2,
+          "sizing": 1,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 5,
+        "pass": false,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate identifies the right segment (SP) and week (Dec 22–29) but attributes the anomaly to 'baseline distortion from a mid-December electronics spike' rather than the seeded ground truth of a genuine ~30% revenue drop (multiplier 0.7); the candidate argues there is 'no true demand collapse,' which directly contradicts the seeded cause.",
+          "evidence": "Tool results are heavily and correctly cited — the candidate quotes specific weekly values (BRL 4,981,273 for Dec 1 week, BRL 25,325,801 for Dec 8 week, BRL 3,244,205 for Dec 22 week) and the get_anomaly_context pct_change of +16.9%, all of which are present in the transcript.",
+          "sizing": "The candidate acknowledges the reported ~30% figure but then argues that the get_anomaly_context shows +16.9% (not -30%), so it never accepts the ground-truth magnitude as real; it effectively denies the -30% drop rather than sizing it correctly.",
+          "calibration": "The candidate asserts with confidence='high' that 'there is no true demand collapse' and 'this single-hypothesis fully accounts for the reported anomaly magnitude and shape,' overclaiming causation with no acknowledged uncertainty or suggestion of further investigation.",
+          "fabrication": "The candidate claims electronics revenue in SP was 'BRL 20,548 (Dec 1 wk), BRL 209,252 (Dec 8 wk), BRL 24,358 (Dec 15 wk), and BRL 11,825 (Dec 22 wk)' but the tool results show BRL 2,054,777 / 20,925,185 / 2,435,813 / 1,182,488 respectively — the candidate's figures are off by a factor of ~100, representing a concrete numeric fabrication not traceable to any tool result."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 1,\n    \"evidence\": 2,\n    \"sizing\": 1,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 5,\n  \"pass\": false,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate identifies the right segment (SP) and week (Dec 22–29) but attributes the anomaly to 'baseline distortion from a mid-December electronics spike' rather than the seeded ground truth of a genuine ~30% revenue drop (multiplier 0.7); the candidate argues there is 'no true demand collapse,' which directly contradicts the seeded cause.\",\n    \"evidence\": \"Tool results are heavily and correctly cited — the candidate quotes specific weekly values (BRL 4,981,273 for Dec 1 week, BRL 25,325,801 for Dec 8 week, BRL 3,244,205 for Dec 22 week) and the get_anomaly_context pct_change of +16.9%, all of which are present in the transcript.\",\n    \"sizing\": \"The candidate acknowledges the reported ~30% figure but then argues that the get_anomaly_context shows +16.9% (not -30%), so it never accepts the ground-truth magnitude as real; it effectively denies the -30% drop rather than sizing it correctly.\",\n    \"calibration\": \"The candidate asserts with confidence='high' that 'there is no true demand collapse' and 'this single-hypothesis fully accounts for the reported anomaly magnitude and shape,' overclaiming causation with no acknowledged uncertainty or suggestion of further investigation.\",\n    \"fabrication\": \"The candidate claims electronics revenue in SP was 'BRL 20,548 (Dec 1 wk), BRL 209,252 (Dec 8 wk), BRL 24,358 (Dec 15 wk), and BRL 11,825 (Dec 22 wk)' but the tool results show BRL 2,054,777 / 20,925,185 / 2,435,813 / 1,182,488 respectively — the candidate's figures are off by a factor of ~100, representing a concrete numeric fabrication not traceable to any tool result.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 1,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 62140,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies voucher payment method deactivation/severe curtailment starting 2026-02-02 as a sustained near-total collapse, matching the seeded cause at well above 50% semantic overlap with the reference anomaly summary.",
+          "evidence": "Candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context (tool returned -0.937), BRL 2,458,432 to BRL 59,499 cliff from get_metric_timeseries, order counts 39-91 dropping to 1-6 from order_count timeseries, and related segment pct_changes (credit_card -10.3%, boleto -16.8%, debit_card +17.9%) all matching tool output values.",
+          "sizing": "Candidate states '~93-95% collapse' in the conclusion and '-93.7% pct_change' in evidence, which is within 50% of ground truth (-95%), scoring 2.",
+          "calibration": "Candidate asserts 'high' confidence and states the voucher method 'was effectively deactivated' as a definitive causal claim without caveats, hedging language, or acknowledgment of what cannot be confirmed from the data — this is overclaiming.",
+          "fabrication": "Every concrete number and segment name in the diagnosis traces directly to a tool result: all BRL values, pct_changes, order counts, and category names appear in the tool transcript with no unsupported factual claims."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies voucher payment method deactivation/severe curtailment starting 2026-02-02 as a sustained near-total collapse, matching the seeded cause at well above 50% semantic overlap with the reference anomaly summary.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context (tool returned -0.937), BRL 2,458,432 to BRL 59,499 cliff from get_metric_timeseries, order counts 39-91 dropping to 1-6 from order_count timeseries, and related segment pct_changes (credit_card -10.3%, boleto -16.8%, debit_card +17.9%) all matching tool output values.\",\n    \"sizing\": \"Candidate states '~93-95% collapse' in the conclusion and '-93.7% pct_change' in evidence, which is within 50% of ground truth (-95%), scoring 2.\",\n    \"calibration\": \"Candidate asserts 'high' confidence and states the voucher method 'was effectively deactivated' as a definitive causal claim without caveats, hedging language, or acknowledgment of what cannot be confirmed from the data — this is overclaiming.\",\n    \"fabrication\": \"Every concrete number and segment name in the diagnosis traces directly to a tool result: all BRL values, pct_changes, order counts, and category names appear in the tool transcript with no unsupported factual claims.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 2,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 65043,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies that voucher payments collapsed to near-zero starting 2026-02-02 due to a program discontinuation or hard de-activation, matching the seeded cause at well above 50% semantic overlap with the reference summary.",
+          "evidence": "The candidate cites specific numbers directly from tool results: pct_change of -93.7% from get_anomaly_context, the exact order counts (41 → 2) from get_metric_timeseries order_count, and boleto/credit_card/debit_card stability ranges that trace back to the payment_type breakdown timeseries.",
+          "sizing": "The candidate states '-93.7% change per get_anomaly_context' and describes the collapse as 'near-total' (~95%), which is within 50% of the ground truth multiplier of 0.05 (-95%).",
+          "calibration": "The candidate asserts 'The voucher payment option was switched off at the platform level' and 'All evidence converges on a deliberate program termination' with confidence='high' and no caveats or acknowledgment of uncertainty — this is overclaiming causation from correlation without differentiating evidence from conclusion.",
+          "fabrication": "Every concrete claim — the specific order counts, BRL values, pct_change figures, state names, and payment type volumes — traces directly to tool results in the transcript; no unsupported facts are introduced."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies that voucher payments collapsed to near-zero starting 2026-02-02 due to a program discontinuation or hard de-activation, matching the seeded cause at well above 50% semantic overlap with the reference summary.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: pct_change of -93.7% from get_anomaly_context, the exact order counts (41 → 2) from get_metric_timeseries order_count, and boleto/credit_card/debit_card stability ranges that trace back to the payment_type breakdown timeseries.\",\n    \"sizing\": \"The candidate states '-93.7% change per get_anomaly_context' and describes the collapse as 'near-total' (~95%), which is within 50% of the ground truth multiplier of 0.05 (-95%).\",\n    \"calibration\": \"The candidate asserts 'The voucher payment option was switched off at the platform level' and 'All evidence converges on a deliberate program termination' with confidence='high' and no caveats or acknowledgment of uncertainty — this is overclaiming causation from correlation without differentiating evidence from conclusion.\",\n    \"fabrication\": \"Every concrete claim — the specific order counts, BRL values, pct_change figures, state names, and payment type volumes — traces directly to tool results in the transcript; no unsupported facts are introduced.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 3,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 56118,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies voucher payment_value collapsed ~93.7% starting 2026-02-02, attributing it to a deliberate suspension or hard restriction of the voucher payment method — matching the reference's 'near-zero (~5% of baseline)' and 'system/program change' framing at well above 50% semantic overlap.",
+          "evidence": "Candidate cites specific numbers directly from tool results: pct_change=-0.937 from get_anomaly_context, weekly values (e.g., 2026-01-26: 2,458,432 → 2026-02-02: 59,499) from get_metric_timeseries, order counts (41→2) from the order_count timeseries, and related_segments values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%) — all verifiable in the transcript.",
+          "sizing": "Candidate states 'collapsed ~93.7%' which is within ~50% of the ground truth -95% (actual difference is only ~1.3 percentage points), clearly satisfying the sizing criterion.",
+          "calibration": "Candidate asserts 'strongly indicating a deliberate suspension or hard restriction' and 'confidence: high' with no caveats, no suggestions for further investigation, and no acknowledged uncertainty — this is overclaiming causation from correlation without differentiating 'evidence shows X' from 'this is confirmed as Y'.",
+          "fabrication": "Every concrete claim — the BRL figures, order counts, percentage changes, weekly timestamps, category names in sample orders, and related segment movements — traces directly to values returned in the tool call transcript with no invented numbers or unsupported external factors."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies voucher payment_value collapsed ~93.7% starting 2026-02-02, attributing it to a deliberate suspension or hard restriction of the voucher payment method — matching the reference's 'near-zero (~5% of baseline)' and 'system/program change' framing at well above 50% semantic overlap.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: pct_change=-0.937 from get_anomaly_context, weekly values (e.g., 2026-01-26: 2,458,432 → 2026-02-02: 59,499) from get_metric_timeseries, order counts (41→2) from the order_count timeseries, and related_segments values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%) — all verifiable in the transcript.\",\n    \"sizing\": \"Candidate states 'collapsed ~93.7%' which is within ~50% of the ground truth -95% (actual difference is only ~1.3 percentage points), clearly satisfying the sizing criterion.\",\n    \"calibration\": \"Candidate asserts 'strongly indicating a deliberate suspension or hard restriction' and 'confidence: high' with no caveats, no suggestions for further investigation, and no acknowledged uncertainty — this is overclaiming causation from correlation without differentiating 'evidence shows X' from 'this is confirmed as Y'.\",\n    \"fabrication\": \"Every concrete claim — the BRL figures, order counts, percentage changes, weekly timestamps, category names in sample orders, and related segment movements — traces directly to values returned in the tool call transcript with no invented numbers or unsupported external factors.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 4,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 51722,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies voucher payment volume collapsing ~93.7% starting 2026-02-02 due to a 'deliberate voucher program discontinuation or system-level deactivation', which is >50% semantic overlap with the reference's 'voucher program ended / system/process change' hypothesis.",
+          "evidence": "Candidate cites specific numbers from tool results: pct_change=-0.937 from get_anomaly_context, weekly order counts (41→2) and payment values (BRL 2,458,432→59,499) from get_metric_timeseries, and related_segments pct_change values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%) all directly traceable to tool outputs.",
+          "sizing": "Candidate states '~93.7% drop' and 'baseline avg of BRL 325,674.78/week to BRL 20,510.69/week', which is within ~50% of the ground truth -95% (0.937 vs 0.95 is essentially exact).",
+          "calibration": "Candidate asserts 'points to a deliberate voucher program discontinuation' and 'confidence: high' with no hedging language or suggestion of further investigation needed, constituting overclaiming causation from correlation.",
+          "fabrication": "All concrete claims — the specific BRL values, order counts, pct_change figures, related segment movements, sample order categories, and the cliff date of 2026-02-02 — are directly traceable to tool results in the transcript."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies voucher payment volume collapsing ~93.7% starting 2026-02-02 due to a 'deliberate voucher program discontinuation or system-level deactivation', which is >50% semantic overlap with the reference's 'voucher program ended / system/process change' hypothesis.\",\n    \"evidence\": \"Candidate cites specific numbers from tool results: pct_change=-0.937 from get_anomaly_context, weekly order counts (41→2) and payment values (BRL 2,458,432→59,499) from get_metric_timeseries, and related_segments pct_change values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%) all directly traceable to tool outputs.\",\n    \"sizing\": \"Candidate states '~93.7% drop' and 'baseline avg of BRL 325,674.78/week to BRL 20,510.69/week', which is within ~50% of the ground truth -95% (0.937 vs 0.95 is essentially exact).\",\n    \"calibration\": \"Candidate asserts 'points to a deliberate voucher program discontinuation' and 'confidence: high' with no hedging language or suggestion of further investigation needed, constituting overclaiming causation from correlation.\",\n    \"fabrication\": \"All concrete claims — the specific BRL values, order counts, pct_change figures, related segment movements, sample order categories, and the cliff date of 2026-02-02 — are directly traceable to tool results in the transcript.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 5,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 56039,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02, sustained for 17 weeks, isolated to the voucher segment, consistent with a program-level discontinuation — matching the reference anomaly summary at well above 50% semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: pct_change of -93.7% from get_anomaly_context (tool returned -0.9370), order counts of 34–91/week baseline dropping to 1–6/week from get_metric_timeseries order_count, and the exact cliff values (59,499 on 2026-02-02) from the payment_value timeseries.",
+          "sizing": "The candidate states '~93.7% collapse' and '-93.7% pct_change', which is within ~1% of the ground truth -95% and well within the 50% tolerance threshold.",
+          "calibration": "The candidate uses confidence='high' and asserts causation directly ('was caused by a near-complete discontinuation') without adequately hedging — phrases like 'is isolated exclusively' and 'the only explanation consistent with' are overclaims rather than 'consistent with' or 'suggests further investigation'.",
+          "fabrication": "Every concrete claim — the -93.7% figure, the order count values (39–91 baseline, 2–6 anomaly), the specific weekly payment values, the related segment pct_changes for credit_card/boleto/debit_card, and the sample order categories — traces directly to tool results in the transcript."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02, sustained for 17 weeks, isolated to the voucher segment, consistent with a program-level discontinuation — matching the reference anomaly summary at well above 50% semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: pct_change of -93.7% from get_anomaly_context (tool returned -0.9370), order counts of 34–91/week baseline dropping to 1–6/week from get_metric_timeseries order_count, and the exact cliff values (59,499 on 2026-02-02) from the payment_value timeseries.\",\n    \"sizing\": \"The candidate states '~93.7% collapse' and '-93.7% pct_change', which is within ~1% of the ground truth -95% and well within the 50% tolerance threshold.\",\n    \"calibration\": \"The candidate uses confidence='high' and asserts causation directly ('was caused by a near-complete discontinuation') without adequately hedging — phrases like 'is isolated exclusively' and 'the only explanation consistent with' are overclaims rather than 'consistent with' or 'suggests further investigation'.\",\n    \"fabrication\": \"Every concrete claim — the -93.7% figure, the order count values (39–91 baseline, 2–6 anomaly), the specific weekly payment values, the related segment pct_changes for credit_card/boleto/debit_card, and the sample order categories — traces directly to tool results in the transcript.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 6,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 56078,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies voucher payment_value collapsing ~94% starting 2026-02-02 due to an abrupt near-complete discontinuation of the voucher program, matching the seeded cause of voucher payments dropping to near-zero starting week 10.",
+          "evidence": "Candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context, the exact cliff values (2,458,432 → 59,499) from get_metric_timeseries, order counts (34–91/week baseline → 1–6/week anomaly) from order_count timeseries, and related_segment pct_changes (debit_card +17.9%, boleto -16.8%, credit_card -10.3%).",
+          "sizing": "Candidate states '~94%' collapse and '−93.7%' from the tool result, which is within 50% of the ground truth −95%, satisfying the sizing criterion.",
+          "calibration": "Candidate asserts confidence='high' and states the cause definitively as 'shut down or its redemption path was broken at the platform level' with no hedging language or suggestion of further investigation needed, constituting overclaiming without sufficient caveats.",
+          "fabrication": "Every concrete claim — the pct_change figure, weekly values, order counts, related segment changes, sample order categories — traces directly to tool results in the transcript with no invented facts."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies voucher payment_value collapsing ~94% starting 2026-02-02 due to an abrupt near-complete discontinuation of the voucher program, matching the seeded cause of voucher payments dropping to near-zero starting week 10.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context, the exact cliff values (2,458,432 → 59,499) from get_metric_timeseries, order counts (34–91/week baseline → 1–6/week anomaly) from order_count timeseries, and related_segment pct_changes (debit_card +17.9%, boleto -16.8%, credit_card -10.3%).\",\n    \"sizing\": \"Candidate states '~94%' collapse and '−93.7%' from the tool result, which is within 50% of the ground truth −95%, satisfying the sizing criterion.\",\n    \"calibration\": \"Candidate asserts confidence='high' and states the cause definitively as 'shut down or its redemption path was broken at the platform level' with no hedging language or suggestion of further investigation needed, constituting overclaiming without sufficient caveats.\",\n    \"fabrication\": \"Every concrete claim — the pct_change figure, weekly values, order counts, related segment changes, sample order categories — traces directly to tool results in the transcript with no invented facts.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 7,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 50461,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies that voucher payment_value collapsed ~93.7% starting 2026-02-02 due to a near-complete shutdown of voucher volume, attributing it to program discontinuation or budget exhaustion — matching the seeded cause of voucher payments dropping to near-zero.",
+          "evidence": "Specific numbers from tool results are cited throughout: pct_change=-0.9370 from get_anomaly_context, BRL 32,567.48 baseline vs BRL 2,051.07 anomaly total, order counts of 39–91/week collapsing to 1–6/week from get_metric_timeseries, and week-by-week values for credit_card and boleto from the payment_type breakdown timeseries.",
+          "sizing": "The candidate states 'collapsed ~93.7%' which is within 50% of the ground truth ~95% drop (multiplier 0.05), satisfying the sizing criterion.",
+          "calibration": "The candidate uses confidence='high' and states the drop 'point to a supply-side cause' and the supported hypothesis is presented as a firm conclusion without meaningful caveats or acknowledgment of what cannot be determined from the data alone — overclaiming causation.",
+          "fabrication": "Every concrete claim — the BRL values, order counts, weekly figures, related_segment pct_changes, and sample order details — traces directly to tool results in the transcript with no fabricated numbers or unsupported external factors."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies that voucher payment_value collapsed ~93.7% starting 2026-02-02 due to a near-complete shutdown of voucher volume, attributing it to program discontinuation or budget exhaustion — matching the seeded cause of voucher payments dropping to near-zero.\",\n    \"evidence\": \"Specific numbers from tool results are cited throughout: pct_change=-0.9370 from get_anomaly_context, BRL 32,567.48 baseline vs BRL 2,051.07 anomaly total, order counts of 39–91/week collapsing to 1–6/week from get_metric_timeseries, and week-by-week values for credit_card and boleto from the payment_type breakdown timeseries.\",\n    \"sizing\": \"The candidate states 'collapsed ~93.7%' which is within 50% of the ground truth ~95% drop (multiplier 0.05), satisfying the sizing criterion.\",\n    \"calibration\": \"The candidate uses confidence='high' and states the drop 'point to a supply-side cause' and the supported hypothesis is presented as a firm conclusion without meaningful caveats or acknowledgment of what cannot be determined from the data alone — overclaiming causation.\",\n    \"fabrication\": \"Every concrete claim — the BRL values, order counts, weekly figures, related_segment pct_changes, and sample order details — traces directly to tool results in the transcript with no fabricated numbers or unsupported external factors.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 8,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 55204,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02, attributes it to a voucher program discontinuation or severe restriction, and characterizes it as a sustained cliff — matching the seeded anomaly at >50% semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context (tool returned -0.937), BRL 32,567.48/week baseline vs BRL 2,051.07/week anomaly value, the single-week cliff from BRL 2,458,432 to BRL 59,499, and order_count dropping from 39–91/week to 1–6/week — all traceable to the transcript.",
+          "sizing": "The candidate states '~93.7% collapse' and separately notes a '97.6% single-week drop', both within ~50% of the ground truth -95% collapse, satisfying the sizing criterion.",
+          "calibration": "The candidate asserts 'was caused by a near-total cessation of voucher issuance or eligibility' and 'a voucher program discontinuation or severe restriction' with confidence='high' and no caveats or suggestions for further investigation, constituting overclaiming without acknowledging uncertainty.",
+          "fabrication": "Every concrete claim — specific BRL values, order counts, pct_change figures, sample order statuses, related segment pct_changes — traces directly to tool results in the transcript; no unsupported facts are asserted."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02, attributes it to a voucher program discontinuation or severe restriction, and characterizes it as a sustained cliff — matching the seeded anomaly at >50% semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context (tool returned -0.937), BRL 32,567.48/week baseline vs BRL 2,051.07/week anomaly value, the single-week cliff from BRL 2,458,432 to BRL 59,499, and order_count dropping from 39–91/week to 1–6/week — all traceable to the transcript.\",\n    \"sizing\": \"The candidate states '~93.7% collapse' and separately notes a '97.6% single-week drop', both within ~50% of the ground truth -95% collapse, satisfying the sizing criterion.\",\n    \"calibration\": \"The candidate asserts 'was caused by a near-total cessation of voucher issuance or eligibility' and 'a voucher program discontinuation or severe restriction' with confidence='high' and no caveats or suggestions for further investigation, constituting overclaiming without acknowledging uncertainty.\",\n    \"fabrication\": \"Every concrete claim — specific BRL values, order counts, pct_change figures, sample order statuses, related segment pct_changes — traces directly to tool results in the transcript; no unsupported facts are asserted.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 9,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 53260,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 2
+        },
+        "total": 8,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02 due to a programme discontinuation or system-level disablement, matching the seeded cause at high semantic overlap.",
+          "evidence": "The candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context, weekly values (BRL 2,458,432 → BRL 59,499) from get_metric_timeseries, related_segments (debit_card +17.9%, boleto -16.8%, credit_card -10.3%), and SP pct_change of -12.4% from the state-level get_anomaly_context call.",
+          "sizing": "The candidate states '~93.7%' drop and 'collapsed by ~93.7%', which is within 50% of the ground-truth -95% and clearly communicates near-zero magnitude.",
+          "calibration": "The candidate asserts 'conclusive evidence' and states the isolated, sustained nature is 'conclusive evidence of a voucher programme discontinuation' with confidence='high' and no acknowledged uncertainty or suggestion of further investigation needed — this is overclaiming.",
+          "fabrication": "Every concrete claim (percentages, BRL values, state names, category names, date of cliff) traces directly to tool results in the transcript with no fabricated figures or unsupported external factors."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 2\n  },\n  \"total\": 8,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"The candidate correctly identifies voucher payment_value collapsing to near-zero starting 2026-02-02 due to a programme discontinuation or system-level disablement, matching the seeded cause at high semantic overlap.\",\n    \"evidence\": \"The candidate cites specific numbers directly from tool results: pct_change=-93.7% from get_anomaly_context, weekly values (BRL 2,458,432 → BRL 59,499) from get_metric_timeseries, related_segments (debit_card +17.9%, boleto -16.8%, credit_card -10.3%), and SP pct_change of -12.4% from the state-level get_anomaly_context call.\",\n    \"sizing\": \"The candidate states '~93.7%' drop and 'collapsed by ~93.7%', which is within 50% of the ground-truth -95% and clearly communicates near-zero magnitude.\",\n    \"calibration\": \"The candidate asserts 'conclusive evidence' and states the isolated, sustained nature is 'conclusive evidence of a voucher programme discontinuation' with confidence='high' and no acknowledged uncertainty or suggestion of further investigation needed — this is overclaiming.\",\n    \"fabrication\": \"Every concrete claim (percentages, BRL values, state names, category names, date of cliff) traces directly to tool results in the transcript with no fabricated figures or unsupported external factors.\"\n  }\n}",
+        "attempts": 1
+      }
+    },
+    {
+      "runIndex": 10,
+      "anomalyId": "voucher-dropoff-w10-on",
+      "durationMs": 56688,
+      "judge": {
+        "scores": {
+          "hypothesis": 2,
+          "evidence": 2,
+          "sizing": 2,
+          "calibration": 0,
+          "fabrication": 1
+        },
+        "total": 7,
+        "pass": true,
+        "reasoning_per_criterion": {
+          "hypothesis": "Candidate correctly identifies voucher payment collapse (~94%) starting 2026-02-02, sustained for 16 weeks, with structural cause (program discontinued/restricted), matching the reference anomaly summary at high semantic overlap.",
+          "evidence": "Candidate cites specific numbers directly from tool results: pct_change -0.937 from get_anomaly_context, weekly order counts (41→2) from get_metric_timeseries order_count, weekly payment values (2,458,432→59,499) from the weekly payment_value timeseries, and related_segments values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%).",
+          "sizing": "Candidate states '~94% in both order count and payment value' and 'confirmed 93.7% decline', which is within ~50% of the ground truth -95% drop (multiplier 0.05).",
+          "calibration": "Candidate uses confidence='high' and states the drop 'definitively' rules out alternatives, then asserts causation ('a voucher program was discontinued, expired, or restricted') without caveats or acknowledgment of uncertainty — overclaiming causation from correlation.",
+          "fabrication": "The claim that baseline avg was 'BRL 325,675/week' and 'BRL 18,241/week avg' for individual weekly values appears inconsistent with tool results (get_anomaly_context shows baseline_avg=32,567,478 total not per-week at that scale, and the weekly timeseries shows values in the millions not thousands), suggesting at least one unsupported or miscalculated number in the evidence section."
+        },
+        "raw_response": "{\n  \"scores\": {\n    \"hypothesis\": 2,\n    \"evidence\": 2,\n    \"sizing\": 2,\n    \"calibration\": 0,\n    \"fabrication\": 1\n  },\n  \"total\": 7,\n  \"pass\": true,\n  \"reasoning_per_criterion\": {\n    \"hypothesis\": \"Candidate correctly identifies voucher payment collapse (~94%) starting 2026-02-02, sustained for 16 weeks, with structural cause (program discontinued/restricted), matching the reference anomaly summary at high semantic overlap.\",\n    \"evidence\": \"Candidate cites specific numbers directly from tool results: pct_change -0.937 from get_anomaly_context, weekly order counts (41→2) from get_metric_timeseries order_count, weekly payment values (2,458,432→59,499) from the weekly payment_value timeseries, and related_segments values (debit_card +17.9%, boleto -16.8%, credit_card -10.3%).\",\n    \"sizing\": \"Candidate states '~94% in both order count and payment value' and 'confirmed 93.7% decline', which is within ~50% of the ground truth -95% drop (multiplier 0.05).\",\n    \"calibration\": \"Candidate uses confidence='high' and states the drop 'definitively' rules out alternatives, then asserts causation ('a voucher program was discontinued, expired, or restricted') without caveats or acknowledgment of uncertainty — overclaiming causation from correlation.\",\n    \"fabrication\": \"The claim that baseline avg was 'BRL 325,675/week' and 'BRL 18,241/week avg' for individual weekly values appears inconsistent with tool results (get_anomaly_context shows baseline_avg=32,567,478 total not per-week at that scale, and the weekly timeseries shows values in the millions not thousands), suggesting at least one unsupported or miscalculated number in the evidence section.\"\n  }\n}",
+        "attempts": 1
+      }
+    }
+  ]
+}

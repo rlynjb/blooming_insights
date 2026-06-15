@@ -1,0 +1,185 @@
+{
+  "id": "03-diagnostic-sp",
+  "agent": "diagnostic",
+  "description": "Diagnose the seeded SP revenue drop. Input is the Anomaly object produced by seededToAnomaly(sp-revenue-drop-w4) — same shape the production monitoring agent emits (this is Path C: bypass detection, isolate diagnosis behavior). PR E's diagnosis eval established that this anomaly currently scores 0/10 (0%) on the rubric; the regression check is for STABILITY of that low-rate behavior, not for high rubric scores.",
+  "input": {
+    "anomalyId": "sp-revenue-drop-w4",
+    "anomaly": {
+      "metric": "revenue",
+      "scope": [
+        "state:SP"
+      ],
+      "change": {
+        "value": 30,
+        "direction": "down",
+        "baseline": "week 4 (2025-12-22 to 2025-12-29) vs 12-week baseline"
+      },
+      "severity": "critical",
+      "evidence": [],
+      "impact": "revenue for state:SP fell ~30% in a discrete window. Investigate the root cause."
+    }
+  },
+  "golden_output": {
+    "conclusion": "The reported ~30% revenue decline in SP for week 4 (Dec 22–29) is a baseline distortion artifact caused by an extraordinary electronics-led promotional spike during the week of Dec 8–14, which inflated the 12-week rolling baseline. SP electronics revenue surged from ~R$20.9K/day to a peak of ~R$53.5K/day during Dec 8–14 (a ~10x uplift), then sharply normalized post-promotion. The Dec 22–29 SP revenue of R$32,442 (BRL, normalized) is actually +17% above the true pre-spike weekly average of R$27,750, confirming no genuine demand collapse occurred — the anomaly is a statistical artifact of the elevated baseline.",
+    "evidence": [
+      "SP daily revenue time series shows a massive spike Dec 8–14 (peak R$53,518 on Dec 13, vs ~R$5,400–R$10,000/day in the weeks before and after), then a sharp normalization Dec 15–28.",
+      "Electronics revenue in SP spiked from R$20,548 (week of Dec 1) to R$209,252 (week of Dec 8) — a ~10x increase — then collapsed to R$11,825 (week of Dec 15) and R$11,825 (week of Dec 22), making it the primary driver of the spike and the apparent dip.",
+      "get_anomaly_context for SP (Dec 22–29 vs 12-week baseline) returned pct_change = +0.169 (+17%), confirming that week 4 SP revenue was actually above the true pre-spike average, not below it.",
+      "Credit card payments in SP spiked from R$36,137 (Dec 1 week) to R$167,252 (Dec 8 week), then fell to R$20,021 (Dec 22 week) — tracking electronics demand exactly and ruling out payment disruption as a separate cause.",
+      "Vouchers in SP spiked from R$2,624 (Dec 1 week) to R$25,385 (Dec 8 week) then normalized to R$1,968 (Dec 22 week), consistent with a promotional discount event driving the Dec 8 spike.",
+      "The spike and normalization pattern is nationwide: RJ went from R$12.3M (Dec 8 wk) to R$3.2M (Dec 22 wk); MG from R$11.8M to R$2.0M; every state followed the same trajectory, ruling out any SP-specific supply or logistics disruption.",
+      "Electronics category get_anomaly_context (Dec 22–29 vs Dec 8–15 peak baseline) shows pct_change = -88.8%, with all other categories also declining 21–47%, confirming the spike in Dec 8–14 was the reference distorting the baseline."
+    ],
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Post-promotional demand normalization / baseline distortion from a Dec 8–14 electronics spike inflating the 12-week baseline",
+        "supported": true,
+        "reasoning": "The time series clearly shows SP revenue spiked ~10x during Dec 8–14 (electronics-led, with credit card and voucher payments tracking in lockstep), then reverted to pre-spike levels. The 12-week baseline was heavily skewed by this spike, making the normal post-Christmas week appear as a -30% anomaly. The get_anomaly_context tool using a proper pre-spike baseline shows SP week 4 was actually +17% above average, confirming the baseline distortion hypothesis."
+      },
+      {
+        "hypothesis": "Payment method disruption (e.g., credit card or boleto failure) blocking SP orders in Dec 22–29",
+        "supported": false,
+        "reasoning": "All payment types (credit card, boleto, debit card, voucher) moved proportionally and followed the same spike-then-normalize pattern as every other state. There is no evidence of a single payment type collapsing while others held steady, which would be the signature of a payment disruption."
+      },
+      {
+        "hypothesis": "SP-specific supply, logistics, or demand shock (e.g., weather, strike, regional event) causing a localized revenue collapse",
+        "supported": false,
+        "reasoning": "The normalized revenue pattern in Dec 22–29 is identical across all Brazilian states — RJ, MG, PR, RS, and all others show the same spike in Dec 8–14 and return to baseline in Dec 22–29. If the cause were SP-specific, other states would have maintained elevated revenue during week 4. Instead, the pattern is perfectly correlated nationally, pointing to a shared demand cycle (pre-Christmas promotional pull-forward) rather than any SP-specific disruption."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 0,
+      "segmentDescription": "No customers were adversely affected — week 4 SP revenue was +17% above true pre-spike baseline. The anomaly is a measurement artifact from a distorted 12-week rolling baseline, not a genuine demand loss."
+    },
+    "timeSeries": [
+      {
+        "day": "2025-12-01",
+        "value": 267932
+      },
+      {
+        "day": "2025-12-02",
+        "value": 621664
+      },
+      {
+        "day": "2025-12-03",
+        "value": 1066184
+      },
+      {
+        "day": "2025-12-04",
+        "value": 1007110
+      },
+      {
+        "day": "2025-12-05",
+        "value": 763903
+      },
+      {
+        "day": "2025-12-06",
+        "value": 714354
+      },
+      {
+        "day": "2025-12-07",
+        "value": 540126
+      },
+      {
+        "day": "2025-12-08",
+        "value": 4344587
+      },
+      {
+        "day": "2025-12-09",
+        "value": 3147737
+      },
+      {
+        "day": "2025-12-10",
+        "value": 3150074
+      },
+      {
+        "day": "2025-12-11",
+        "value": 1991876
+      },
+      {
+        "day": "2025-12-12",
+        "value": 4342477
+      },
+      {
+        "day": "2025-12-13",
+        "value": 5351810
+      },
+      {
+        "day": "2025-12-14",
+        "value": 2997240
+      },
+      {
+        "day": "2025-12-15",
+        "value": 939510
+      },
+      {
+        "day": "2025-12-16",
+        "value": 784120
+      },
+      {
+        "day": "2025-12-17",
+        "value": 633660
+      },
+      {
+        "day": "2025-12-18",
+        "value": 668470
+      },
+      {
+        "day": "2025-12-19",
+        "value": 767002
+      },
+      {
+        "day": "2025-12-20",
+        "value": 582638
+      },
+      {
+        "day": "2025-12-21",
+        "value": 1392131
+      },
+      {
+        "day": "2025-12-22",
+        "value": 365441
+      },
+      {
+        "day": "2025-12-23",
+        "value": 601724
+      },
+      {
+        "day": "2025-12-24",
+        "value": 746643
+      },
+      {
+        "day": "2025-12-25",
+        "value": 463010
+      },
+      {
+        "day": "2025-12-26",
+        "value": 82051
+      },
+      {
+        "day": "2025-12-27",
+        "value": 864206
+      },
+      {
+        "day": "2025-12-28",
+        "value": 121130
+      }
+    ],
+    "confidence": "high"
+  },
+  "captured_at": "2026-06-15T22:52:14.159Z",
+  "captured_with": {
+    "model": "claude-sonnet-4-6",
+    "prompt_hash": "sha256:404931d1dbdd1df0f666a310d69ff40224afae3b149bb39cacf87f555c123e31"
+  },
+  "scoring_config": {
+    "structural_required_fields": [
+      "conclusion",
+      "evidence",
+      "hypothesesConsidered"
+    ],
+    "structural_strict": false,
+    "similarity_threshold": 0.7,
+    "notes": "Required fields are the canonical Diagnosis triple from lib/mcp/types.ts. Optional fields (affectedCustomers, confidence, timeSeries) drift between runs and aren't required. The similarity judge anchors on the SUPPORTED HYPOTHESIS — that's where regression matters."
+  }
+}

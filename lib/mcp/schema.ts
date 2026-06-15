@@ -15,6 +15,15 @@ export interface WorkspaceSchema {
   totalCustomers: number;
   totalEvents: number;
   oldestTimestamp: number | null;
+  /**
+   * Inclusive `from`, exclusive `to` ISO dates bounding the data — when known.
+   * Present for synthetic datasets (Olist) where we control the seed window;
+   * `undefined` for live Bloomreach workspaces where the bound is open-ended.
+   * Prompts that interpolate `{schema}` read this to anchor `time_range`
+   * windows inside the populated horizon instead of hallucinating dates from
+   * training memory.
+   */
+  dataHorizon?: { from: string; to: string; durationDays: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -250,5 +259,15 @@ export function olistWorkspaceSchema(): WorkspaceSchema {
     totalCustomers: 0,
     totalEvents: 0,
     oldestTimestamp: null,
+    // The synthetic Olist dataset is seeded with a fixed horizon (see
+    // mcp-server-olist/scripts/seed-olist.ts: END_TS = 2026-06-01 UTC,
+    // START_TS = END_TS − 26 weeks = 2025-12-01). Hard-coded because we
+    // own the seed; agents key off this to keep `time_range` inside the
+    // populated window instead of guessing 2017–2018 Kaggle dates.
+    dataHorizon: {
+      from: '2025-12-01',
+      to: '2026-06-01',
+      durationDays: 182,
+    },
   };
 }
