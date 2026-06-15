@@ -11,6 +11,7 @@ import StreamingResponse from '@/components/chat/StreamingResponse';
 import QueryBox from '@/components/chat/QueryBox';
 import { readNdjson } from '@/lib/streaming/ndjson';
 import { useDemoCapture } from '@/lib/hooks/useDemoCapture';
+import { useReconnectPolicy, isAuthErrorButton } from '@/lib/hooks/useReconnectPolicy';
 
 // the free-form "ask anything" box is hidden for now — flip to show it again.
 const SHOW_QUERY_BOX = false;
@@ -109,8 +110,10 @@ export default function HomePage() {
   const [traceItems, setTraceItems] = useState<TraceItem[]>([]);
   // the 10-category anomaly-coverage summary (drives the coverage grid)
   const [coverage, setCoverage] = useState<CoverageReport>([]);
-  // true briefly while auto-reconnecting after the alpha server revokes the token
-  const [reconnecting, setReconnecting] = useState(false);
+  // revoked-token reconnect policy (state + one-shot guard + reset+reload).
+  // The alpha Bloomreach server revokes tokens after minutes — see
+  // lib/hooks/useReconnectPolicy.ts.
+  const reconnectPolicy = useReconnectPolicy();
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage). Demo serves the
   // cached snapshot — instant + reliable, ideal for a presentation. Live runs the
@@ -283,45 +286,18 @@ export default function HomePage() {
             case 'done':
               setInsights(collected);
               stashInsights(collected);
-              try {
-                sessionStorage.removeItem('bi:reconnecting');
-              } catch {
-                /* ignore */
-              }
+              // success path — clear the one-shot guard so the next session-
+              // expiry can fire a fresh auto-reconnect.
+              reconnectPolicy.clearFlag();
               setStatus(collected.length === 0 ? 'empty' : 'loaded');
               break;
             case 'error': {
               const msg = evt.message ?? 'something went wrong';
-              // The alpha server revokes tokens after a few minutes; its own 401
-              // says to clear tokens and reconnect ("the client should
-              // automatically re-register and obtain new tokens"). Do that ONCE
-              // automatically — guarded so it can't loop if the fresh token is
-              // also immediately revoked.
-              if (/invalid_token|unauthor|forbidden|401|session expired|reconnect/i.test(msg)) {
-                let alreadyTried = false;
-                try {
-                  alreadyTried = sessionStorage.getItem('bi:reconnecting') === '1';
-                } catch {
-                  /* ignore */
-                }
-                if (!alreadyTried) {
-                  try {
-                    sessionStorage.setItem('bi:reconnecting', '1');
-                  } catch {
-                    /* ignore */
-                  }
-                  setReconnecting(true);
-                  fetch('/api/mcp/reset', { method: 'POST' }).finally(() => {
-                    window.location.href = '/';
-                  });
-                  return;
-                }
-                try {
-                  sessionStorage.removeItem('bi:reconnecting');
-                } catch {
-                  /* ignore */
-                }
-              }
+              // The alpha server revokes tokens after a few minutes; the policy
+              // hook owns the auto-reconnect dance (auth-shaped check + one-shot
+              // guard + reset+reload). If it takes the error, bail; otherwise
+              // surface the message normally.
+              if (reconnectPolicy.handle(msg)) return;
               setErrorMessage(msg);
               setStatus('error');
               break;
@@ -467,7 +443,7 @@ export default function HomePage() {
       )}
 
       {/* auto-reconnecting after a revoked token (brief, before the redirect) */}
-      {reconnecting && (
+      {reconnectPolicy.reconnecting && (
         <p
           className="lowercase"
           style={{
@@ -489,9 +465,9 @@ export default function HomePage() {
       {/* anomaly coverage grid — the category checklist, above the cards. Tiles
           stream in one at a time as the gate reports each category; while
           loading, the not-yet-reported tiles render as pending skeletons. */}
-      <CoverageGrid coverage={coverage} insights={insights} loading={status === 'loading' && !reconnecting} />
+      <CoverageGrid coverage={coverage} insights={insights} loading={status === 'loading' && !reconnectPolicy.reconnecting} />
       {/* loading */}
-      {status === 'loading' && !reconnecting && (
+      {status === 'loading' && !reconnectPolicy.reconnecting && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <Skeleton height={96} />
           <Skeleton height={96} />
@@ -515,7 +491,7 @@ export default function HomePage() {
           >
             {errorMessage || 'something went wrong'}
           </p>
-          {/unauthor|forbidden|401|session expired/i.test(errorMessage) && (
+          {isAuthErrorButton(errorMessage) && (
             <>
               <p
                 className="lowercase"
@@ -530,15 +506,7 @@ export default function HomePage() {
               </p>
               <button
                 type="button"
-                onClick={async () => {
-                  // clear the revoked token, then reload → re-runs OAuth cleanly
-                  try {
-                    await fetch('/api/mcp/reset', { method: 'POST' });
-                  } catch {
-                    /* ignore — reload still triggers the auth check */
-                  }
-                  window.location.href = '/';
-                }}
+                onClick={reconnectPolicy.reconnect}
                 className="lowercase"
                 style={{
                   background: 'var(--bg-elevated)',

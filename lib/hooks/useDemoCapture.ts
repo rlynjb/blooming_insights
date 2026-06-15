@@ -4,6 +4,7 @@ import { useCallback, useState } from 'react';
 import type { Insight } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
 import { readNdjson } from '@/lib/streaming/ndjson';
+import { isAuthErrorAuto } from '@/lib/hooks/useReconnectPolicy';
 
 /**
  * Dev-only single-click demo-snapshot capture.
@@ -25,11 +26,6 @@ import { readNdjson } from '@/lib/streaming/ndjson';
  * The button is gated on `NODE_ENV !== 'production' && !isDemo` at the
  * call site (app/page.tsx); the hook itself is environment-agnostic.
  */
-
-// TODO: Hook C (useReconnectPolicy) will lift this regex to a shared
-// policy helper. Until then the inline copy is intentional — Hook C's
-// stub explicitly cleans this up when it ships.
-const AUTH_ERROR_RE = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
 
 /** Mirrors BriefingResponse['workspace'] in app/page.tsx — kept local so
  *  the hook doesn't import the page module. The cached snapshot the
@@ -94,7 +90,6 @@ export function useDemoCapture(
 
   const captureAll = useCallback(async () => {
     if (capturing.active) return;
-    const AUTH_RE = AUTH_ERROR_RE;
     try {
       // 1) capture the briefing now — this alone gives feed parity (real
       //    current/prior in evidence + the agent's business impact + the trace).
@@ -115,7 +110,7 @@ export function useDemoCapture(
           msg: `investigating ${n + 1}/${insights.length} · ${ins.metric}…`,
         });
         const r = await runInvestigation(ins);
-        if (!r.ok && r.error && AUTH_RE.test(r.error)) {
+        if (!r.ok && r.error && isAuthErrorAuto(r.error)) {
           stoppedFor = r.error;
           break; // token revoked mid-run — keep what's cached, let the user resume
         }
