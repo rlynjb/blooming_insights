@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
-import { redactSecrets } from '@/lib/mcp/transport';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 import { bootstrapSchema } from '@/lib/mcp/schema';
 import { MonitoringAgent } from '@/lib/agents/monitoring';
 import { schemaCapabilities, coverageReport, runnableCategories } from '@/lib/agents/categories';
@@ -71,27 +71,6 @@ const TRUNC = 4000;
 function trunc(v: unknown): unknown {
   const s = JSON.stringify(v);
   return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
-}
-
-/** Walk an error's `cause` chain into one string. `console.error(e)` formats
- *  nested causes via Node's util.inspect, but plain `String(e)` does not — so
- *  we assemble the chain ourselves before redacting, otherwise a token nested
- *  inside `e.cause.cause` would survive the redaction and reach Vercel logs. */
-function formatError(e: unknown): string {
-  const parts: string[] = [];
-  let cur: unknown = e;
-  let depth = 0;
-  while (cur && depth < 5) {
-    if (cur instanceof Error) {
-      parts.push(cur.stack ?? cur.message);
-      cur = (cur as { cause?: unknown }).cause;
-    } else {
-      parts.push(String(cur));
-      cur = null;
-    }
-    depth++;
-  }
-  return parts.join('\n  caused by: ');
 }
 
 export async function GET(req: NextRequest) {

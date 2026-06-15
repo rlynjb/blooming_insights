@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { connectMcp } from '@/lib/mcp/connect';
+import { redactSecrets, formatError } from '@/lib/mcp/transport';
 import {
   monitoringTools,
   diagnosticTools,
@@ -33,7 +34,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ result: r.result, durationMs: r.durationMs });
   } catch (e) {
     // Surface the real error as JSON so the client never sees an empty body.
-    console.error('[mcp-call] error:', e);
+    console.error('[mcp-call] error:', redactSecrets(formatError(e)));
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 500 },
