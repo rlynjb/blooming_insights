@@ -18,6 +18,7 @@ export class QueryAgent {
     private mcp: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
+    private sessionId?: string,
   ) {}
 
   /** Answer a free-form question; returns the final natural-language answer text. */
@@ -42,6 +43,7 @@ export class QueryAgent {
       synthesisInstruction:
         'You have NO more tool calls available. Now answer the user question directly and concisely ' +
         'in plain prose, citing the key numbers you found. Do not say you need more queries.',
+      sessionId: this.sessionId,
     });
 
     return finalText.trim() || 'I was unable to find enough data to answer that question.';

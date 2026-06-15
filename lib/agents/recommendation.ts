@@ -31,6 +31,7 @@ export class RecommendationAgent {
     private mcp: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
+    private sessionId?: string,
   ) {}
 
   async propose(
@@ -60,6 +61,7 @@ export class RecommendationAgent {
         'Respond with ONLY a JSON array of at most 3 recommendation objects in a ```json fence ' +
         '(or [] if you cannot propose grounded actions), based on the diagnosis and the data you ' +
         'have already gathered. Do NOT include an id field. Do not say you need more queries.',
+      sessionId: this.sessionId,
     });
 
     // The agent often keeps "wanting to query" instead of emitting JSON. If the
@@ -120,8 +122,7 @@ export class RecommendationAgent {
           },
         ],
       } as Anthropic.Messages.MessageCreateParamsNonStreaming);
-      // TODO: thread sessionId once RecommendationAgent carries it (would require touching the route caller).
-      console.log(JSON.stringify({ site: 'agents/recommendation:synthesize', usage: res.usage }));
+      console.log(JSON.stringify({ site: 'agents/recommendation:synthesize', sessionId: this.sessionId, usage: res.usage }));
 
       const text = res.content
         .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')

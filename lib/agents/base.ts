@@ -59,6 +59,7 @@ export async function runAgentLoop(opts: {
   maxTokens?: number;
   maxToolCalls?: number; // hard cap on total tool calls; once hit, the model is forced to synthesize
   synthesisInstruction?: string; // appended to system on the forced-final turn to compel a structured answer
+  sessionId?: string; // optional; surfaced only in the per-turn usage log line so per-session token totals can be joined
 }): Promise<AgentRunResult> {
   const {
     anthropic,
@@ -74,6 +75,7 @@ export async function runAgentLoop(opts: {
     maxTokens = 4096,
     maxToolCalls,
     synthesisInstruction,
+    sessionId,
   } = opts;
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -100,8 +102,7 @@ export async function runAgentLoop(opts: {
     };
     if (!forceFinal) params.tools = toolSchemas;
     const res = await anthropic.messages.create(params);
-    // TODO: thread sessionId once runAgentLoop opts carry it (would require touching all 4 callers).
-    console.log(JSON.stringify({ site: 'agents/base:runAgentLoop', usage: res.usage }));
+    console.log(JSON.stringify({ site: 'agents/base:runAgentLoop', sessionId, usage: res.usage }));
 
     // Append assistant turn to message history
     messages.push({ role: 'assistant', content: res.content });

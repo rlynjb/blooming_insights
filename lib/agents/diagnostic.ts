@@ -40,6 +40,7 @@ export class DiagnosticAgent {
     private mcp: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
+    private sessionId?: string,
   ) {}
 
   async investigate(anomaly: Anomaly, hooks: AgentHooks = {}): Promise<Diagnosis> {
@@ -65,6 +66,7 @@ export class DiagnosticAgent {
         'Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape ' +
         '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
         'state your best-supported explanation, even if partial. Do not say you need more queries.',
+      sessionId: this.sessionId,
     });
 
     // The agent often keeps "wanting to query" instead of emitting JSON. If the
@@ -114,8 +116,7 @@ export class DiagnosticAgent {
           },
         ],
       } as Anthropic.Messages.MessageCreateParamsNonStreaming);
-      // TODO: thread sessionId once DiagnosticAgent carries it (would require touching the route caller).
-      console.log(JSON.stringify({ site: 'agents/diagnostic:synthesize', usage: res.usage }));
+      console.log(JSON.stringify({ site: 'agents/diagnostic:synthesize', sessionId: this.sessionId, usage: res.usage }));
 
       const text = res.content
         .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')

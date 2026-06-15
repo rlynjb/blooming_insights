@@ -225,10 +225,10 @@ export async function GET(req: NextRequest) {
         // Free-form query flow (live; never cached) — runs when only `q` is provided.
         if (q && !insightId) {
           const t_intent = performance.now();
-          const intent = await classifyIntent(anthropic, q);
+          const intent = await classifyIntent(anthropic, q, sid);
           recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
-          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools);
+          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_query = performance.now();
           const answer = await queryAgent.answer(q, intent, hooksFor('coordinator'));
           recordPhase('query_answer', t_query);
@@ -254,7 +254,7 @@ export async function GET(req: NextRequest) {
             'thought',
             `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
           );
-          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_diag = performance.now();
           diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
           recordPhase('diagnostic_investigate', t_diag);
@@ -265,7 +265,7 @@ export async function GET(req: NextRequest) {
         // Skipped on the diagnose step — the decision is NOT run until step 3.
         if (step !== 'diagnose') {
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_rec = performance.now();
           const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
           recordPhase('recommendation_propose', t_rec);

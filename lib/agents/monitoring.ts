@@ -64,6 +64,7 @@ export class MonitoringAgent {
     private mcp: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
+    private sessionId?: string,
   ) {}
 
   async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
@@ -103,6 +104,7 @@ export class MonitoringAgent {
         'You have NO more tool calls available. Stop querying now and output your final answer. ' +
         'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
         'meaningful), based on the data you have already gathered. Do not say you need more queries.',
+      sessionId: this.sessionId,
     });
 
     // Degrade gracefully: if the agent produced no parseable/valid anomaly array

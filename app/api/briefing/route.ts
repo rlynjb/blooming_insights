@@ -233,7 +233,7 @@ export async function GET(req: NextRequest) {
         recordPhase('list_tools', t_listTools);
 
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        const agent = new MonitoringAgent(anthropic, mcp, schema, allTools);
+        const agent = new MonitoringAgent(anthropic, mcp, schema, allTools, sid);
 
         step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
         const t_scan = performance.now();
