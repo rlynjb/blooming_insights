@@ -11,7 +11,7 @@ import { RecommendationAgent } from '@/lib/agents/recommendation';
 import { QueryAgent } from '@/lib/agents/query';
 import { classifyIntent } from '@/lib/agents/intent';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
-import { getAnomaly, getInsight } from '@/lib/state/insights';
+import { getAnomaly, getInsight, insightToAnomaly } from '@/lib/state/insights';
 import { getCachedInvestigation, saveInvestigation } from '@/lib/state/investigations';
 import { encodeEvent, type AgentEvent } from '@/lib/mcp/events';
 import type { AgentName, Anomaly, Diagnosis, Insight, ToolCall } from '@/lib/mcp/types';
@@ -26,10 +26,6 @@ const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
 // as two steps (diagnose on step 2, recommend on step 3); a null step is the
 // legacy combined run used by the demo-snapshot capture.
 type Step = 'diagnose' | 'recommend';
-
-function insightToAnomaly(i: Insight): Anomaly {
-  return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
-}
 
 /** Resolve the anomaly to investigate. Prefers the client-provided insight
  *  (handed from the feed via sessionStorage → `?insight=`), which is the only
