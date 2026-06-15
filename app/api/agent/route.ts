@@ -33,8 +33,8 @@ function insightToAnomaly(i: Insight): Anomaly {
 /** Resolve the anomaly to investigate. Prefers the client-provided insight
  *  (handed from the feed via sessionStorage → `?insight=`), which is the only
  *  source that survives Vercel's per-instance memory. Falls back to in-memory
- *  (same-instance / dev) then the demo snapshot. */
-function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
+ *  (same-instance / dev, scoped to the caller's session) then the demo snapshot. */
+function resolveAnomaly(sessionId: string, insightId: string, insightParam?: string | null): Anomaly | null {
   if (insightParam) {
     try {
       const i = JSON.parse(insightParam) as Insight;
@@ -45,9 +45,9 @@ function resolveAnomaly(insightId: string, insightParam?: string | null): Anomal
       /* malformed param — fall through to the server-side lookup */
     }
   }
-  const a = getAnomaly(insightId);
+  const a = getAnomaly(sessionId, insightId);
   if (a) return a;
-  const i = getInsight(insightId);
+  const i = getInsight(sessionId, insightId);
   if (i) return insightToAnomaly(i);
   try {
     if (existsSync(DEMO_FILE)) {
@@ -141,7 +141,10 @@ export async function GET(req: NextRequest) {
   }
 
   // For the investigation flow we need a resolvable anomaly; the query flow does not.
-  const anomaly = insightId ? resolveAnomaly(insightId, insightParam) : null;
+  // The lookup is scoped to the caller's session so concurrent users can't read
+  // each other's anomalies — the cookie also drives the MCP auth path below.
+  const sid = await getOrCreateSessionId();
+  const anomaly = insightId ? resolveAnomaly(sid, insightId, insightParam) : null;
   if (insightId && !anomaly) {
     return NextResponse.json({ error: 'insight not found' }, { status: 404 });
   }
@@ -154,7 +157,6 @@ export async function GET(req: NextRequest) {
   // encryption in production) returns the real message instead of a bare 500.
   let conn: Awaited<ReturnType<typeof connectMcp>>;
   try {
-    const sid = await getOrCreateSessionId();
     conn = await connectMcp(sid);
   } catch (e) {
     console.error('[agent] setup error:', e);

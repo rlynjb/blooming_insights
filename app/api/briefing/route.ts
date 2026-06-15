@@ -159,8 +159,9 @@ export async function GET(req: NextRequest) {
   // missing AUTH_SECRET breaking cookie encryption in production) returns the
   // real message instead of a bare 500.
   let conn: Awaited<ReturnType<typeof connectMcp>>;
+  let sid: string;
   try {
-    const sid = await getOrCreateSessionId();
+    sid = await getOrCreateSessionId();
     conn = await connectMcp(sid);
   } catch (e) {
     console.error('[briefing] setup error:', e);
@@ -240,8 +241,8 @@ export async function GET(req: NextRequest) {
         }, runnable);
 
         const insights = anomalies.map(anomalyToInsight);
-        putInsights(insights, anomalies);
-        for (const insight of listInsights()) send({ type: 'insight', insight });
+        putInsights(sid, insights, anomalies);
+        for (const insight of listInsights(sid)) send({ type: 'insight', insight });
 
         send({ type: 'done' });
       } catch (e) {
