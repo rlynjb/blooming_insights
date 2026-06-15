@@ -16,6 +16,8 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { readNdjson } from '../../lib/streaming/ndjson';
 import { AGENT_MODEL } from '../../lib/agents/base';
 import { McpToolError } from '../../lib/mcp/client';
+import { putInsights, anomalyToInsight } from '../../lib/state/insights';
+import type { Anomaly, Insight } from '../../lib/mcp/types';
 
 // ---------------------------------------------------------------------------
 // 1. Anthropic SDK mock
@@ -217,12 +219,20 @@ function makeBootstrapCallTool() {
 
 function makeMonitoringToolList() {
   // listTools returns the raw transport shape: `{ tools: [...] }`.
-  // We hand back a minimal McpToolDef set covering the monitoring agent's
-  // allowlist — enough that `filterToolSchemas(allTools, monitoringTools)`
-  // produces a non-empty array (the Anthropic call would otherwise reject
-  // an empty `tools` field).
+  // We hand back a minimal McpToolDef set that overlaps the monitoring,
+  // diagnostic, recommendation, AND query allowlists in `lib/mcp/tools.ts`,
+  // so `filterToolSchemas(allTools, <any-allowlist>)` produces a non-empty
+  // array regardless of which agent is firing. The mocked Anthropic SDK
+  // doesn't validate `tools`, but the agent routes call `filterToolSchemas`
+  // before the SDK call and we want the resulting schemas to be realistic.
+  const obj = {
+    type: 'object',
+    properties: { project_id: { type: 'string' } },
+    required: ['project_id'],
+  } as const;
   return {
     tools: [
+      // Monitoring + diagnostic + query — analytics execution tools.
       {
         name: 'execute_analytics_eql',
         description: 'Run an EQL analytics query.',
@@ -241,6 +251,12 @@ function makeMonitoringToolList() {
           required: ['project_id'],
         },
       },
+      // Diagnostic + query — segmentation / customer lookups.
+      { name: 'list_segmentations', description: 'List segmentations.', inputSchema: obj },
+      { name: 'list_email_campaigns', description: 'List email campaigns.', inputSchema: obj },
+      // Recommendation + query — scenarios / vouchers.
+      { name: 'list_scenarios', description: 'List scenarios.', inputSchema: obj },
+      { name: 'list_voucher_pools', description: 'List voucher pools.', inputSchema: obj },
     ],
   };
 }
@@ -373,4 +389,39 @@ export async function collectEvents<E>(response: Response): Promise<E[]> {
   if (!response.body) return events;
   await readNdjson<E>(response.body, (e) => events.push(e));
   return events;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Insight feed seeding (agent route only)
+// ---------------------------------------------------------------------------
+//
+// `/api/agent?step=diagnose&insightId=X` resolves the anomaly via
+// `getAnomaly(sessionId, X)` against the session-keyed Map in
+// `lib/state/insights.ts`. Agent tests need to PRE-SEED that map so the route
+// finds the anomaly instead of falling to 404. We wrap `putInsights` rather
+// than touching the Map directly so the contract matches what the briefing
+// route would write at end-of-scan.
+//
+// Returns the synthesized insight (with its assigned id) so tests can use it
+// directly as the `?insightId=` value.
+
+/** A minimal Anomaly with sensible defaults. Tests can override any field. */
+export function makeAnomaly(overrides: Partial<Anomaly> = {}): Anomaly {
+  return {
+    metric: 'purchase_revenue',
+    scope: ['mobile', 'checkout'],
+    change: { value: 18, direction: 'down', baseline: 'prior 4 weeks' },
+    severity: 'warning',
+    evidence: [],
+    ...overrides,
+  };
+}
+
+/** Seed one anomaly into the session-scoped insights map and return the
+ *  resulting Insight (with its assigned id). Tests pass `insight.id` as the
+ *  route's `?insightId=` query param so `getAnomaly(sid, id)` resolves it. */
+export function seedInsight(sessionId: string, anomaly: Anomaly = makeAnomaly()): Insight {
+  const insight = anomalyToInsight(anomaly);
+  putInsights(sessionId, [insight], [anomaly]);
+  return insight;
 }
