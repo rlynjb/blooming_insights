@@ -10,9 +10,7 @@
 //   2. The 404 body reads `{ error: 'insight not found' }` (NOT
 //      `'anomaly not found'`).
 //   3. The route never inspects a `revoked` flag on the session — `unauthed`
-//      and `expired` both surface as `conn.ok === false`. The `expired`
-//      placeholder in `_helpers.ts` exists for the future reconnect-policy
-//      hook tests, not this layer.
+//      surfaces as `conn.ok === false`.
 //   4. The cached-investigation cache (`lib/state/investigations.ts`) is
 //      ALSO checked before the auth gate. Tests that use an insightId which
 //      already lives in `demo-investigations.json` would replay the cached

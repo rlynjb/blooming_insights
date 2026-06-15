@@ -337,7 +337,7 @@ export function makeMockTransport(
 // 3. Session/auth stub
 // ---------------------------------------------------------------------------
 
-export type MockSessionMode = 'authed' | 'unauthed' | 'expired';
+export type MockSessionMode = 'authed' | 'unauthed';
 
 export interface MockSession {
   sessionId: string;
@@ -356,22 +356,14 @@ export function makeMockSession(mode: MockSessionMode): MockSession {
     // `{ ok: false, authUrl: <session.authUrl> }`. `sessionId` is still
     // valid (the cookie/jar surface returns one) — the failure is in the OAuth
     // tokens, not the session id itself.
+    // Note: the routes do not distinguish never-authed from authed-but-revoked.
+    // Both surface as conn.ok === false. The revoked-token recovery is client-
+    // side (useReconnectPolicy in app/page.tsx; see design-frontend-extract-
+    // usereconnectpolicy.md).
     return {
       sessionId: 'test-session-unauthed-002',
       authed: false,
       authUrl: 'http://localhost:3000/api/mcp/start?session=test-session-unauthed-002',
-    };
-  }
-  if (mode === 'expired') {
-    // Not exercised by the /api/briefing tests in Phase 2 — the briefing route's
-    // catch only branches on `conn.ok`, it does not look for a `revoked` flag.
-    // The reconnect-on-revoked path lives in the client-side `useReconnectPolicy`
-    // hook (Phase 3 territory). Provided as a placeholder so the agent route
-    // tests can use it without re-editing this file.
-    return {
-      sessionId: 'test-session-expired-003',
-      authed: false,
-      authUrl: 'http://localhost:3000/api/mcp/start?session=test-session-expired-003',
     };
   }
   throw new Error(`makeMockSession: unknown mode '${mode as string}'`);
