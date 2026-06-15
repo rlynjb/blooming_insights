@@ -38,6 +38,7 @@ export class QueryAgent {
       onToolCall: hooks.onToolCall,
       onText: hooks.onText,
       onToolResult: hooks.onToolResult,
+      signal: hooks.signal,
       maxTurns: 8,
       maxToolCalls: 6,
       synthesisInstruction: buildSynthesisInstruction(

@@ -128,6 +128,9 @@ export async function GET(req: NextRequest) {
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         for (const e of events) {
+          // Client cancelled mid-replay — break out so we don't keep enqueuing
+          // bytes into an already-closed reader.
+          if (req.signal.aborted) break;
           controller.enqueue(encoder.encode(encodeEvent(e)));
           await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
         }
@@ -202,16 +205,23 @@ export async function GET(req: NextRequest) {
         phases.push({ phase, durationMs: Math.round(performance.now() - started) });
       };
       try {
+        // Cancellation is honored at coarse phase boundaries inside the stream
+        // AND threaded into every async layer below (bootstrapSchema, listTools,
+        // classifyIntent + the four agent classes → runAgentLoop → mcp.callTool
+        // + anthropic.messages.create). The per-call 30s MCP transport timeout
+        // still bounds any single call.
+        req.signal.throwIfAborted();
         // Bootstrap INSIDE the stream so the client sees progress immediately
         // (instead of a silent wait while we connect + read the schema).
         const leadAgent: AgentName =
           q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
         stepFor(leadAgent, 'thought', 'reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(conn.mcp);
+        const schema = await bootstrapSchema(conn.mcp, { signal: req.signal });
         recordPhase('schema_bootstrap', t_schema);
+        req.signal.throwIfAborted();
         const t_listTools = performance.now();
-        const rawTools = await conn.mcp.listTools();
+        const rawTools = await conn.mcp.listTools({ signal: req.signal });
         const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
           ? (rawTools as { tools: McpToolDef[] }).tools
           : [];
@@ -220,13 +230,14 @@ export async function GET(req: NextRequest) {
 
         // Free-form query flow (live; never cached) — runs when only `q` is provided.
         if (q && !insightId) {
+          req.signal.throwIfAborted();
           const t_intent = performance.now();
-          const intent = await classifyIntent(anthropic, q, sid);
+          const intent = await classifyIntent(anthropic, q, sid, req.signal);
           recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
           const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_query = performance.now();
-          const answer = await queryAgent.answer(q, intent, hooksFor('coordinator'));
+          const answer = await queryAgent.answer(q, intent, { ...hooksFor('coordinator'), signal: req.signal });
           recordPhase('query_answer', t_query);
           stepFor('coordinator', 'conclusion', answer);
           send({ type: 'done' });
@@ -245,6 +256,7 @@ export async function GET(req: NextRequest) {
             throw new Error('no diagnosis was handed over — open the diagnosis step first');
           }
         } else {
+          req.signal.throwIfAborted();
           stepFor(
             'diagnostic',
             'thought',
@@ -252,7 +264,7 @@ export async function GET(req: NextRequest) {
           );
           const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_diag = performance.now();
-          diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+          diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
           recordPhase('diagnostic_investigate', t_diag);
           send({ type: 'diagnosis', diagnosis });
         }
@@ -260,10 +272,11 @@ export async function GET(req: NextRequest) {
         // STEP 3 (recommend) or the combined run: run the recommendation agent.
         // Skipped on the diagnose step — the decision is NOT run until step 3.
         if (step !== 'diagnose') {
+          req.signal.throwIfAborted();
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
           const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools, sid);
           const t_rec = performance.now();
-          const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+          const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
           recordPhase('recommendation_propose', t_rec);
           for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
         }
@@ -273,6 +286,13 @@ export async function GET(req: NextRequest) {
         // handed off via the client's sessionStorage.
         if (step == null) saveInvestigation(insightId!, collected);
       } catch (e) {
+        // Client cancelled (closed tab / navigated away / unmount cleanup) —
+        // skip the error event (no consumer to read it) but still let the
+        // finally fire so the phase log records how much budget was burned
+        // before the cancel landed.
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          return;
+        }
         // full stack/cause in Vercel logs, with bearer/OAuth tokens redacted
         console.error('[agent] error:', redactSecrets(formatError(e)));
         send({
@@ -289,6 +309,7 @@ export async function GET(req: NextRequest) {
           sessionId: sid,
           totalMs: Math.round(performance.now() - t0),
           phases,
+          aborted: req.signal.aborted,
         }));
         controller.close();
       }

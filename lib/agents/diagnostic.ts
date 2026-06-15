@@ -32,6 +32,10 @@ export interface AgentHooks {
   onToolCall?: (tc: ToolCall) => void;
   onText?: (text: string) => void;
   onToolResult?: (tc: ToolCall) => void;
+  /** Cancellation signal threaded from the route's `req.signal` down through
+   *  `runAgentLoop` to Anthropic and MCP. Optional — existing callers compile
+   *  + pass unchanged. */
+  signal?: AbortSignal;
 }
 
 export class DiagnosticAgent {
@@ -59,6 +63,7 @@ export class DiagnosticAgent {
       onToolCall: hooks.onToolCall,
       onText: hooks.onText,
       onToolResult: hooks.onToolResult,
+      signal: hooks.signal,
       maxTurns: 8,
       maxToolCalls: 6,
       synthesisInstruction: buildSynthesisInstruction(
