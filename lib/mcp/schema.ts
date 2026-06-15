@@ -1,5 +1,5 @@
-import type { McpClient } from './client';
-import { McpToolError } from './client';
+import type { DataSource } from '../data-source/types';
+import { McpToolError } from '../data-source/bloomreach-data-source';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -141,12 +141,12 @@ export interface BootstrapOpts {
  *  McpToolError carrying the server's text — otherwise `unwrap` fails later with
  *  a cryptic JSON parse error that hides which tool returned what. */
 async function callOrThrow(
-  mcp: McpClient,
+  dataSource: DataSource,
   name: string,
   args: Record<string, unknown>,
   opts: BootstrapOpts = {},
 ): Promise<unknown> {
-  const { result } = await mcp.callTool(name, args, { signal: opts.signal });
+  const { result } = await dataSource.callTool(name, args, { signal: opts.signal });
   const r = result as { isError?: boolean; content?: Array<{ text?: string }> } | null;
   if (r && r.isError === true) {
     const text =
@@ -157,16 +157,16 @@ async function callOrThrow(
 }
 
 export async function resolveProject(
-  mcp: McpClient,
+  dataSource: DataSource,
   opts: BootstrapOpts = {},
 ): Promise<{ projectId: string; projectName: string }> {
   const orgs = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(mcp, 'list_cloud_organizations', {}, opts),
+    await callOrThrow(dataSource, 'list_cloud_organizations', {}, opts),
   ).data;
   if (!orgs?.length) throw new Error('no cloud organizations for this user');
 
   const projects = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }, opts),
+    await callOrThrow(dataSource, 'list_projects', { cloud_organization_id: orgs[0].id }, opts),
   ).data;
   if (!projects?.length) throw new Error('no projects in organization');
 
@@ -177,18 +177,18 @@ export async function resolveProject(
 }
 
 export async function bootstrapSchema(
-  mcp: McpClient,
+  dataSource: DataSource,
   opts: BootstrapOpts = {},
 ): Promise<WorkspaceSchema> {
   if (cached) return cached;
-  const { projectId, projectName } = await resolveProject(mcp, opts);
+  const { projectId, projectName } = await resolveProject(dataSource, opts);
   const args = { project_id: projectId };
 
-  // Sequential — the server allows ~1 req/s; McpClient already spaces calls.
-  const eventSchema = await callOrThrow(mcp, 'get_event_schema', args, opts);
-  const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args, opts);
-  const catalogs = await callOrThrow(mcp, 'list_catalogs', args, opts);
-  const overview = await callOrThrow(mcp, 'get_project_overview', args, opts);
+  // Sequential — the server allows ~1 req/s; BloomreachDataSource already spaces calls.
+  const eventSchema = await callOrThrow(dataSource, 'get_event_schema', args, opts);
+  const customerProps = await callOrThrow(dataSource, 'get_customer_property_schema', args, opts);
+  const catalogs = await callOrThrow(dataSource, 'list_catalogs', args, opts);
+  const overview = await callOrThrow(dataSource, 'get_project_overview', args, opts);
 
   cached = parseWorkspaceSchema({
     projectId,

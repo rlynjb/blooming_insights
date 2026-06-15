@@ -1,6 +1,7 @@
 // lib/agents/base.ts
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AgentName, ToolCall } from '../mcp/types';
+import type { DataSource } from '../data-source/types';
 
 /**
  * The model used for all agent loops. Chosen for low latency within the 60s
@@ -9,17 +10,18 @@ import type { AgentName, ToolCall } from '../mcp/types';
 export const AGENT_MODEL = 'claude-sonnet-4-6';
 
 /**
- * Minimal structural interface for an MCP caller so that unit tests can inject
- * a fake without depending on the concrete McpClient class or any network.
- * McpClient structurally satisfies this interface.
+ * The agent-facing subset of `DataSource` — just `callTool`. The full
+ * DataSource surface (which adds `listTools`) is implemented by adapters
+ * (BloomreachDataSource today, OlistDataSource next) and consumed by the
+ * route handlers; the agent loop never lists tools at runtime (the catalog
+ * arrives pre-fetched as `allTools` in each agent's constructor).
+ *
+ * Pre-Phase 2 this was a standalone shape; lifting it to a Pick of DataSource
+ * keeps the two surfaces aligned — any DataSource is automatically a McpCaller,
+ * and the test fakes that only implement `callTool` still satisfy the agent's
+ * requirement.
  */
-export interface McpCaller {
-  callTool(
-    name: string,
-    args: Record<string, unknown>,
-    opts?: { cacheTtlMs?: number; skipCache?: boolean; signal?: AbortSignal },
-  ): Promise<{ result: unknown; durationMs: number; fromCache: boolean }>;
-}
+export type McpCaller = Pick<DataSource, 'callTool'>;
 
 export interface AgentRunResult<T = null> {
   finalText: string;
@@ -36,7 +38,9 @@ function truncate(s: string): string {
 
 export type RunAgentLoopOpts<T> = {
   anthropic: Anthropic;
-  mcp: McpCaller;
+  /** Source of tool execution — DataSource subset (just `callTool`). Renamed
+   *  from `mcp` in Phase 2 PR A; the agent loop's internals are unchanged. */
+  dataSource: McpCaller;
   agent: AgentName;
   system: string;
   userPrompt: string;
@@ -51,9 +55,9 @@ export type RunAgentLoopOpts<T> = {
   sessionId?: string; // optional; surfaced only in the per-turn usage log line so per-session token totals can be joined
   // Optional cancel propagation: when set, the loop checks `signal.aborted`
   // between turns and threads it to `anthropic.messages.create(params)` plus to
-  // every `mcp.callTool` call so an in-flight request aborts when the route's
-  // `req.signal` fires. Optional — existing callers without a signal are
-  // unchanged.
+  // every `dataSource.callTool` call so an in-flight request aborts when the
+  // route's `req.signal` fires. Optional — existing callers without a signal
+  // are unchanged.
   signal?: AbortSignal;
   // Optional one-turn recovery: if the loop's finalText doesn't parse, the loop
   // runs ONE additional tool-less turn with `recoveryPrompt(toolCalls)` and
@@ -84,7 +88,7 @@ export async function runAgentLoop<T = null>(
 ): Promise<AgentRunResult<T>> {
   const {
     anthropic,
-    mcp,
+    dataSource,
     agent,
     system,
     userPrompt,
@@ -170,7 +174,7 @@ export async function runAgentLoop<T = null>(
       let resultContent: string;
 
       try {
-        const { result, durationMs } = await mcp.callTool(
+        const { result, durationMs } = await dataSource.callTool(
           tu.name,
           tu.input as Record<string, unknown>,
           signal ? { signal } : undefined,

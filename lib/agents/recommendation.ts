@@ -28,7 +28,7 @@ function tryParseRecommendations(text: string): IdlessRecommendation[] | null {
 export class RecommendationAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -46,7 +46,7 @@ export class RecommendationAgent {
 
     const { parsed: idless } = await runAgentLoop<IdlessRecommendation[]>({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'recommendation',
       system,
       userPrompt: 'Propose recommendations for this diagnosis and return the JSON array.',

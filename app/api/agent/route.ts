@@ -166,6 +166,11 @@ export async function GET(req: NextRequest) {
     );
   }
   if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
+  // Narrow conn.mcp (BloomreachDataSource) to the abstract DataSource surface
+  // before handing it to agents + bootstrapSchema — they consume the seam, not
+  // the adapter. The 4 short MCP routes still use the concrete adapter directly
+  // for the skipCache option (cache-bypass is Bloomreach-specific).
+  const dataSource = conn.mcp;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -207,7 +212,7 @@ export async function GET(req: NextRequest) {
       try {
         // Cancellation is honored at coarse phase boundaries inside the stream
         // AND threaded into every async layer below (bootstrapSchema, listTools,
-        // classifyIntent + the four agent classes → runAgentLoop → mcp.callTool
+        // classifyIntent + the four agent classes → runAgentLoop → dataSource.callTool
         // + anthropic.messages.create). The per-call 30s MCP transport timeout
         // still bounds any single call.
         req.signal.throwIfAborted();
@@ -217,11 +222,11 @@ export async function GET(req: NextRequest) {
           q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
         stepFor(leadAgent, 'thought', 'reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(conn.mcp, { signal: req.signal });
+        const schema = await bootstrapSchema(dataSource, { signal: req.signal });
         recordPhase('schema_bootstrap', t_schema);
         req.signal.throwIfAborted();
         const t_listTools = performance.now();
-        const rawTools = await conn.mcp.listTools({ signal: req.signal });
+        const rawTools = await dataSource.listTools({ signal: req.signal });
         const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
           ? (rawTools as { tools: McpToolDef[] }).tools
           : [];
@@ -235,7 +240,7 @@ export async function GET(req: NextRequest) {
           const intent = await classifyIntent(anthropic, q, sid, req.signal);
           recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
-          const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const queryAgent = new QueryAgent(anthropic, dataSource, schema, allTools, sid);
           const t_query = performance.now();
           const answer = await queryAgent.answer(q, intent, { ...hooksFor('coordinator'), signal: req.signal });
           recordPhase('query_answer', t_query);
@@ -262,7 +267,7 @@ export async function GET(req: NextRequest) {
             'thought',
             `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
           );
-          const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
           const t_diag = performance.now();
           diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
           recordPhase('diagnostic_investigate', t_diag);
@@ -274,7 +279,7 @@ export async function GET(req: NextRequest) {
         if (step !== 'diagnose') {
           req.signal.throwIfAborted();
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
-          const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools, sid);
+          const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
           const t_rec = performance.now();
           const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
           recordPhase('recommendation_propose', t_rec);

@@ -174,7 +174,11 @@ export async function GET(req: NextRequest) {
   if (!conn.ok) {
     return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
   }
-  const mcp = conn.mcp;
+  // Narrow conn.mcp (BloomreachDataSource) to the abstract DataSource surface
+  // before handing it to agents + bootstrapSchema — they consume the seam, not
+  // the adapter. The 4 short MCP routes still use the concrete adapter directly
+  // for the skipCache option (cache-bypass is Bloomreach-specific).
+  const dataSource = conn.mcp;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -197,14 +201,14 @@ export async function GET(req: NextRequest) {
       try {
         // Cancellation is honored at coarse phase boundaries inside the stream
         // AND threaded into every async layer below (bootstrapSchema, listTools,
-        // MonitoringAgent.scan → runAgentLoop → mcp.callTool + anthropic.messages.create).
+        // MonitoringAgent.scan → runAgentLoop → dataSource.callTool + anthropic.messages.create).
         // Whichever fires first (`req.signal` from the client, or
         // `AbortSignal.timeout(30_000)` on a per-call basis in the MCP transport)
         // cancels in-flight work.
         req.signal.throwIfAborted();
         step('reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(mcp, { signal: req.signal });
+        const schema = await bootstrapSchema(dataSource, { signal: req.signal });
         recordPhase('schema_bootstrap', t_schema);
         send({
           type: 'workspace',
@@ -234,14 +238,14 @@ export async function GET(req: NextRequest) {
 
         req.signal.throwIfAborted();
         const t_listTools = performance.now();
-        const raw = await mcp.listTools({ signal: req.signal });
+        const raw = await dataSource.listTools({ signal: req.signal });
         const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
           ? (raw as { tools: McpToolDef[] }).tools
           : [];
         recordPhase('list_tools', t_listTools);
 
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        const agent = new MonitoringAgent(anthropic, mcp, schema, allTools, sid);
+        const agent = new MonitoringAgent(anthropic, dataSource, schema, allTools, sid);
 
         req.signal.throwIfAborted();
         step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);

@@ -64,7 +64,7 @@ export interface MonitorHooks {
 export class MonitoringAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -91,7 +91,7 @@ export class MonitoringAgent {
 
     const { finalText } = await runAgentLoop({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'monitoring',
       system,
       userPrompt:

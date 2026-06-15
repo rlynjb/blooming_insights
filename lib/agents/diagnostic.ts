@@ -41,7 +41,7 @@ export interface AgentHooks {
 export class DiagnosticAgent {
   constructor(
     private anthropic: Anthropic,
-    private mcp: McpCaller,
+    private dataSource: McpCaller,
     private schema: WorkspaceSchema,
     private allTools: McpToolDef[],
     private sessionId?: string,
@@ -55,7 +55,7 @@ export class DiagnosticAgent {
 
     const { toolCalls, parsed } = await runAgentLoop<Diagnosis>({
       anthropic: this.anthropic,
-      mcp: this.mcp,
+      dataSource: this.dataSource,
       agent: 'diagnostic',
       system,
       userPrompt: 'Investigate the anomaly and return the diagnosis JSON object.',

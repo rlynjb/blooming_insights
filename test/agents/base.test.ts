@@ -126,7 +126,7 @@ describe('runAgentLoop', () => {
 
     const result = await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'monitoring',
       system: 'You are a monitoring agent.',
       userPrompt: 'Check the project.',
@@ -162,7 +162,7 @@ describe('runAgentLoop', () => {
 
     const result = await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'coordinator',
       system: 'You are a coordinator.',
       userPrompt: 'Say hello.',
@@ -199,7 +199,7 @@ describe('runAgentLoop', () => {
 
     const result = await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'diagnostic',
       system: 'You are a diagnostic agent.',
       userPrompt: 'Diagnose issues.',
@@ -238,7 +238,7 @@ describe('runAgentLoop', () => {
 
     const result = await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'recommendation',
       system: 'You are a recommendation agent.',
       userPrompt: 'Recommend actions.',
@@ -262,7 +262,7 @@ describe('runAgentLoop', () => {
 
     const result = await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'monitoring',
       system: 's',
       userPrompt: 'go',
@@ -306,7 +306,7 @@ describe('runAgentLoop', () => {
 
     await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'monitoring',
       system: 'You are a monitoring agent.',
       userPrompt: 'Check things.',
@@ -342,7 +342,7 @@ describe('runAgentLoop', () => {
 
     await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'monitoring',
       system: 'You are a monitoring agent.',
       userPrompt: 'Check.',
@@ -367,7 +367,7 @@ describe('runAgentLoop', () => {
 
     await runAgentLoop({
       anthropic: anthropic as unknown as Anthropic,
-      mcp,
+      dataSource: mcp,
       agent: 'diagnostic',
       system: 'BASE SYSTEM',
       userPrompt: 'go',

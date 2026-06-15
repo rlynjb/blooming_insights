@@ -3,9 +3,11 @@
 // Shared scaffolding for /api/briefing + /api/agent integration tests.
 //
 // Four mocking surfaces (per integration-tests plan §Architecture):
-//   1. Anthropic SDK  — scripted response queue (module-level `vi.mock`)
-//   2. MCP transport  — fake `McpClient` returning scripted tool/listTools data
-//   3. Session/auth   — stub `getOrCreateSessionId` + `connectMcp`
+//   1. Anthropic SDK   — scripted response queue (module-level `vi.mock`)
+//   2. DataSource      — fake DataSource (callTool + listTools) returning
+//                        scripted tool/listTools data (Phase 2 PR A: was
+//                        "fake McpClient" pre-seam-extraction)
+//   3. Session/auth    — stub `getOrCreateSessionId` + `connectMcp`
 //   4. NDJSON consumer — `collectEvents` reuses the production `readNdjson` kernel
 //
 // Phase 1 implements only the 'ok' / 'authed' branches needed by the smoke
@@ -15,7 +17,7 @@ import { vi } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 import { readNdjson } from '../../lib/streaming/ndjson';
 import { AGENT_MODEL } from '../../lib/agents/base';
-import { McpToolError } from '../../lib/mcp/client';
+import { McpToolError } from '../../lib/data-source/bloomreach-data-source';
 import { putInsights, anomalyToInsight } from '../../lib/state/insights';
 import type { Anomaly, Insight } from '../../lib/mcp/types';
 
@@ -138,13 +140,13 @@ export function mockAnthropicResponse(opts: {
 // ---------------------------------------------------------------------------
 //
 // The route never touches `lib/mcp/transport` directly — it goes through
-// `connectMcp()` and then operates on the returned `McpClient`. So the cheapest
-// place to intercept is `connectMcp`, and `makeMockMcp` builds the McpClient
-// surface (callTool + listTools) the route consumes downstream.
+// `connectMcp()` and then operates on the returned BloomreachDataSource. So the
+// cheapest place to intercept is `connectMcp`, and `makeMockTransport` builds
+// the DataSource surface (callTool + listTools) the route consumes downstream.
 //
-// `callTool` returns the McpClient envelope `{ result, durationMs, fromCache }`
+// `callTool` returns the DataSource envelope `{ result, durationMs, fromCache }`
 // (NOT the raw transport shape) — this is what `bootstrapSchema` and
-// `runAgentLoop` expect after the McpClient wraps the raw response.
+// `runAgentLoop` expect after the adapter wraps the raw response.
 
 export type MockMcpScenario = 'ok' | 'list-tools-fail' | 'tool-call-fail' | 'timeout';
 
@@ -261,8 +263,11 @@ function makeMonitoringToolList() {
   };
 }
 
-/** Build the fake `McpClient` the route receives from `connectMcp`. Each
- *  scenario pins a specific failure mode the route needs to handle:
+/** Build the fake DataSource the route receives from `connectMcp` (the cast
+ *  through BloomreachDataSource is just to satisfy the ConnectResult.mcp
+ *  field type — the route only consumes the abstract callTool + listTools
+ *  surface). Each scenario pins a specific failure mode the route needs to
+ *  handle:
  *    - `'ok'`             happy path — bootstrap tools + listTools succeed
  *    - `'list-tools-fail'` listTools throws an `McpToolError`; bootstrap callTool
  *                          still works (those calls fire BEFORE listTools, so
