@@ -100,6 +100,8 @@ export async function runAgentLoop(opts: {
     };
     if (!forceFinal) params.tools = toolSchemas;
     const res = await anthropic.messages.create(params);
+    // TODO: thread sessionId once runAgentLoop opts carry it (would require touching all 4 callers).
+    console.log(JSON.stringify({ site: 'agents/base:runAgentLoop', usage: res.usage }));
 
     // Append assistant turn to message history
     messages.push({ role: 'assistant', content: res.content });
