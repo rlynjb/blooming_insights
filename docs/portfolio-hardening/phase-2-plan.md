@@ -339,6 +339,32 @@ PR C (2c):  bi:mode default flips to 'live-sql'. Prompts updated.
 
 ---
 
+## SMOKE TEST (post-PR-C merge, manual)
+
+PR C lands the wiring; this is the manual end-to-end verification path. Tests stay at
+269 because the agent suite is scripted with mocks — prompt content doesn't drive them.
+The real proof that Olist is live is the manual flow:
+
+```
+1. cd mcp-server-olist && npm run seed && npm run build     # one-time
+2. npm run dev                                              # from repo root
+3. Browser → http://localhost:3000
+4. Mode toggle → 'live · olist' (default for new sessions)
+5. Verify: full feed loads with Olist anomalies — the 3 seeded ones should
+   surface (SP-state revenue drop, electronics-category demand spike,
+   voucher-payment dropoff). The feed shows monitoring queries against
+   get_metric_timeseries / get_segments / get_anomaly_context, not EQL.
+6. Click an insight → investigate → recommend should all work end-to-end.
+   Diagnostic agent calls get_anomaly_context; recommendation agent reasons
+   from the diagnosis alone (no list_scenarios / list_segmentations under Olist).
+7. Switch to 'demo' → snapshot replay unchanged (the committed snapshot is
+   Bloomreach-shaped — that's intentional, demo proves the cache path works).
+8. Switch to 'live · bloomreach' → Bloomreach OAuth flow fires; if you have
+   no access, expect 401 + reconnect banner (correct behavior — the alpha
+   server may be revoked / unavailable).
+9. Toggle back to 'live · olist' to confirm the mode persists across reloads.
+```
+
 ## What this plan does NOT cover
 
 - **Phase 1 (Study) steps 1–7** — assumed done before PR A begins. If not, the inventory in 2a.1 surfaces gaps; complete the relevant Phase 1 step(s) before continuing.

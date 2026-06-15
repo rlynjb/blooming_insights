@@ -1,8 +1,15 @@
 // Per-agent MCP tool subsets. Each agent is granted only the tools relevant to
 // its job (monitoring detects, diagnostic investigates, recommendation proposes).
 // bootstrapTools are used once at session start for schema discovery.
+//
+// Both adapters' tool catalogs are listed in one set per agent — the agent runs
+// against whichever adapter the route picked, and `filterToolSchemas` only
+// surfaces the tools actually present in `listTools()`. Mixing names is safe:
+// the Bloomreach server will never advertise `get_metric_timeseries` and the
+// Olist server will never advertise `execute_analytics_eql`.
 
-export const monitoringTools = [
+// Bloomreach (EQL-shaped) ↓
+const monitoringToolsBloomreach = [
   'list_dashboards', 'get_dashboard',
   'list_trends', 'get_trend',
   'list_funnels', 'get_funnel',
@@ -12,7 +19,7 @@ export const monitoringTools = [
   'get_customer_prediction_score',
 ] as const;
 
-export const diagnosticTools = [
+const diagnosticToolsBloomreach = [
   'execute_analytics', 'execute_analytics_eql',
   'get_funnel', 'get_event_segmentation',
   'list_customers', 'list_customer_events',
@@ -24,7 +31,7 @@ export const diagnosticTools = [
   'get_customer_prediction_score',
 ] as const;
 
-export const recommendationTools = [
+const recommendationToolsBloomreach = [
   'list_scenarios', 'get_scenario',
   'list_initiatives', 'get_initiative_items',
   'list_recommendations', 'get_recommendation',
@@ -32,6 +39,18 @@ export const recommendationTools = [
   'list_voucher_pools',
   'get_frequency_policies',
 ] as const;
+
+// Olist (SQL-backed) — three domain tools the mcp-server-olist server exposes.
+// `get_metric_timeseries` for trends, `get_segments` for discovery,
+// `get_anomaly_context` for the diagnostic loop's evidence gathering. The
+// recommendation agent has no Olist-side tool catalog — recommendations are
+// derived from the diagnosis text alone (the existing-feature checks were a
+// Bloomreach-specific affordance).
+const olistTools = ['get_metric_timeseries', 'get_segments', 'get_anomaly_context'] as const;
+
+export const monitoringTools = [...monitoringToolsBloomreach, ...olistTools] as const;
+export const diagnosticTools = [...diagnosticToolsBloomreach, ...olistTools] as const;
+export const recommendationTools = [...recommendationToolsBloomreach, ...olistTools] as const;
 
 // Broad, de-duplicated union granted to the free-form query agent so it can
 // answer anything (monitoring + diagnostic + recommendation surfaces combined).

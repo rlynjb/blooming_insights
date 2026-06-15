@@ -155,9 +155,15 @@ export function useInvestigation(id: string | undefined, step: InvestigationStep
       try {
         let url = `/api/agent?insightId=${id}&step=${step}`;
         try {
-          const liveMode = typeof window !== 'undefined' && localStorage.getItem('bi:mode') === 'live';
+          const saved = typeof window !== 'undefined' ? localStorage.getItem('bi:mode') : null;
+          // Legacy `'live'` migrates to live-sql to match page.tsx's read site.
+          const liveMode =
+            saved === 'live' || saved === 'live-sql' || saved === 'live-bloomreach';
           if (liveMode) {
             url += '&live=1';
+            // Tag the mode so the route picks the adapter via the DataSource factory.
+            const resolved = saved === 'live' ? 'live-sql' : saved;
+            url += `&mode=${resolved}`;
             const stashed = sessionStorage.getItem(`bi:insight:${id}`);
             if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
             if (step === 'recommend' && handedDiagnosis) {

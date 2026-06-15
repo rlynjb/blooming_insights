@@ -70,7 +70,8 @@ export class DiagnosticAgent {
         'Stop investigating now and output your final answer. ' +
           'Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape ' +
           '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
-          'state your best-supported explanation, even if partial.',
+          'when the data source is the SQL-backed `get_anomaly_context` tool, ground your evidence in its ' +
+          '`pct_change` and `related_segments` fields. State your best-supported explanation, even if partial.',
       ),
       sessionId: this.sessionId,
       parseResult: tryParseDiagnosis,

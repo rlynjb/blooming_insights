@@ -3,9 +3,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
-import { connectMcp } from '@/lib/mcp/connect';
+import { makeDataSource, type LiveMode } from '@/lib/data-source';
 import { redactSecrets, formatError } from '@/lib/mcp/transport';
-import { bootstrapSchema } from '@/lib/mcp/schema';
+// `bootstrapSchema` + `olistWorkspaceSchema` are now consumed indirectly via
+// the DataSource factory's per-mode `bootstrap()` — see lib/data-source/index.ts.
 import { MonitoringAgent } from '@/lib/agents/monitoring';
 import { schemaCapabilities, coverageReport, runnableCategories } from '@/lib/agents/categories';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
@@ -155,15 +156,21 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
   }
 
-  // Connect (and surface auth) BEFORE committing to a stream, so we can still
-  // return a 401 JSON the feed redirects on. Wrapped so a setup throw (e.g. a
-  // missing AUTH_SECRET breaking cookie encryption in production) returns the
-  // real message instead of a bare 500.
-  let conn: Awaited<ReturnType<typeof connectMcp>>;
+  // Resolve the live mode from `?mode=`. Default is `'live-sql'` per PR C's
+  // bi:mode extension; tests + legacy clients with no param fall here too.
+  const modeParam = req.nextUrl.searchParams.get('mode');
+  const mode: LiveMode = modeParam === 'live-bloomreach' ? 'live-bloomreach' : 'live-sql';
+
+  // Construct the DataSource via the factory (PR C) BEFORE committing to a
+  // stream so a Bloomreach auth-gate can return 401 JSON the feed redirects on.
+  // Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking cookie
+  // encryption in production, or mcp-server-olist not built) returns the real
+  // message instead of a bare 500.
   let sid: string;
+  let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
   try {
     sid = await getOrCreateSessionId();
-    conn = await connectMcp(sid);
+    dsResult = await makeDataSource(mode, sid);
   } catch (e) {
     console.error('[briefing] setup error:', redactSecrets(formatError(e)));
     return NextResponse.json(
@@ -171,14 +178,15 @@ export async function GET(req: NextRequest) {
       { status: 500 },
     );
   }
-  if (!conn.ok) {
-    return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
+  if (!dsResult.ok) {
+    return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
   }
-  // Narrow conn.mcp (BloomreachDataSource) to the abstract DataSource surface
-  // before handing it to agents + bootstrapSchema — they consume the seam, not
-  // the adapter. The 4 short MCP routes still use the concrete adapter directly
-  // for the skipCache option (cache-bypass is Bloomreach-specific).
-  const dataSource = conn.mcp;
+  // The abstract DataSource surface is what agents + bootstrapSchema consume.
+  // The 4 short MCP routes still use the Bloomreach adapter directly for the
+  // skipCache option (cache-bypass is Bloomreach-specific).
+  const dataSource = dsResult.dataSource;
+  const bootstrap = dsResult.bootstrap;
+  const disposeDataSource = dsResult.dispose;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -208,7 +216,11 @@ export async function GET(req: NextRequest) {
         req.signal.throwIfAborted();
         step('reading the workspace schema…');
         const t_schema = performance.now();
-        const schema = await bootstrapSchema(dataSource, { signal: req.signal });
+        // The factory's per-mode bootstrap: Bloomreach runs the live
+        // orchestrator (list_cloud_organizations / get_event_schema / …);
+        // Olist returns a synthesized Brazilian-e-commerce schema because the
+        // mcp-server-olist server intentionally exposes only domain tools.
+        const schema = await bootstrap(req.signal);
         recordPhase('schema_bootstrap', t_schema);
         send({
           type: 'workspace',
@@ -292,6 +304,15 @@ export async function GET(req: NextRequest) {
           message: `/api/briefing · ${e instanceof Error ? e.message : String(e)}`,
         });
       } finally {
+        // Tear the per-request DataSource down. For Olist this kills the
+        // mcp-server-olist subprocess; for Bloomreach it's a no-op (the OAuth
+        // client outlives the request via the cookie store). Best-effort —
+        // a teardown error must NOT swallow the route-level error above.
+        try {
+          await disposeDataSource();
+        } catch (disposeErr) {
+          console.error('[briefing] dispose error:', redactSecrets(formatError(disposeErr)));
+        }
         // One summary line per request — shared shape with /api/agent so a
         // single Vercel filter (e.g. phases.phase = "schema_bootstrap") reads
         // across both routes. Fires even on error so we can see how much of the
@@ -299,6 +320,7 @@ export async function GET(req: NextRequest) {
         console.log(JSON.stringify({
           route: '/api/briefing',
           sessionId: sid,
+          mode,
           totalMs: Math.round(performance.now() - t0),
           phases,
           aborted: req.signal.aborted,

@@ -204,3 +204,51 @@ export async function bootstrapSchema(
 export function _resetSchemaCache(): void {
   cached = null;
 }
+
+/**
+ * Synthesized WorkspaceSchema for the Olist (`live-sql`) mode. The Bloomreach
+ * bootstrap path (`bootstrapSchema`) calls `list_cloud_organizations` /
+ * `get_event_schema` / etc. — tools the Olist server doesn't expose. Rather
+ * than build a parallel orchestrator over Olist's three tools, we hand the
+ * agents a fixed, prompt-shaped schema describing Brazilian e-commerce
+ * dimensions (state / category / payment_type) in the same shape the
+ * Bloomreach path produces. The numeric totals are placeholders — agents only
+ * surface them in passing copy ("X customers in the workspace"), and the
+ * `schemaSummary` formatter handles missing values gracefully.
+ *
+ * Returned NOT through the module-level `cached` slot — that slot is keyed
+ * implicitly by mode (Bloomreach uses it, Olist doesn't) and mixing them
+ * would corrupt the schema across mode toggles.
+ */
+export function olistWorkspaceSchema(): WorkspaceSchema {
+  return {
+    projectId: 'olist',
+    projectName: 'Olist · Brazilian e-commerce (local MCP)',
+    // Three "events" describe the available metric/dimension axes — the agents
+    // read these in `schemaSummary` to know what they can filter on. Names are
+    // SQL-ish (the underlying mcp-server-olist exposes get_metric_timeseries,
+    // get_segments, get_anomaly_context) so the model never reaches for EQL.
+    events: [
+      {
+        name: 'order',
+        properties: ['state', 'category', 'payment_type', 'purchase_ts', 'price_brl'],
+        eventCount: 0,
+      },
+      {
+        name: 'payment',
+        properties: ['type', 'installments', 'value_brl'],
+        eventCount: 0,
+      },
+      {
+        name: 'review',
+        properties: ['score', 'ts'],
+        eventCount: 0,
+      },
+    ],
+    customerProperties: ['state', 'city'],
+    catalogs: [],
+    totalCustomers: 0,
+    totalEvents: 0,
+    oldestTimestamp: null,
+  };
+}
