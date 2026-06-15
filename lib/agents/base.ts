@@ -207,6 +207,16 @@ export async function runAgentLoop<T = null>(
 }
 
 /**
+ * Build the forced-final synthesis prompt. The prefix and closer are
+ * owned by the loop because they reflect the loop's decision to spend
+ * the last turn without tools; the middle is role-specific and stays
+ * verbatim per agent.
+ */
+export function buildSynthesisInstruction(middle: string): string {
+  return `You have NO more tool calls available. ${middle} Do not say you need more queries.`;
+}
+
+/**
  * One additional tool-less Claude call used by `runAgentLoop` when its
  * `parseResult` returns null on the loop's finalText. Returns the assistant
  * text on success, null on any thrown error so the caller can fall back.

@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop } from './base';
+import { runAgentLoop, buildSynthesisInstruction } from './base';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { diagnosticTools } from '../mcp/tools';
@@ -61,11 +61,12 @@ export class DiagnosticAgent {
       onToolResult: hooks.onToolResult,
       maxTurns: 8,
       maxToolCalls: 6,
-      synthesisInstruction:
-        'You have NO more tool calls available. Stop investigating now and output your final answer. ' +
-        'Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape ' +
-        '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
-        'state your best-supported explanation, even if partial. Do not say you need more queries.',
+      synthesisInstruction: buildSynthesisInstruction(
+        'Stop investigating now and output your final answer. ' +
+          'Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape ' +
+          '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
+          'state your best-supported explanation, even if partial.',
+      ),
       sessionId: this.sessionId,
       parseResult: tryParseDiagnosis,
       // The agent often keeps "wanting to query" instead of emitting JSON. If

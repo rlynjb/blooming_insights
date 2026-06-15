@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop } from './base';
+import { runAgentLoop, buildSynthesisInstruction } from './base';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { monitoringTools } from '../mcp/tools';
 import type { AnomalyCategory } from './categories';
@@ -100,10 +100,11 @@ export class MonitoringAgent {
       onText: hooks?.onText,
       maxTurns: 8,
       maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
-      synthesisInstruction:
-        'You have NO more tool calls available. Stop querying now and output your final answer. ' +
-        'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
-        'meaningful), based on the data you have already gathered. Do not say you need more queries.',
+      synthesisInstruction: buildSynthesisInstruction(
+        'Stop querying now and output your final answer. ' +
+          'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
+          'meaningful), based on the data you have already gathered.',
+      ),
       sessionId: this.sessionId,
     });
 

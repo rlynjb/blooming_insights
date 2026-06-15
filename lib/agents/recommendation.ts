@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop } from './base';
+import { runAgentLoop, buildSynthesisInstruction } from './base';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { recommendationTools } from '../mcp/tools';
@@ -56,11 +56,12 @@ export class RecommendationAgent {
       onToolResult: hooks.onToolResult,
       maxTurns: 6,
       maxToolCalls: 4,
-      synthesisInstruction:
-        'You have NO more tool calls available. Stop querying now and output your final answer. ' +
-        'Respond with ONLY a JSON array of at most 3 recommendation objects in a ```json fence ' +
-        '(or [] if you cannot propose grounded actions), based on the diagnosis and the data you ' +
-        'have already gathered. Do NOT include an id field. Do not say you need more queries.',
+      synthesisInstruction: buildSynthesisInstruction(
+        'Stop querying now and output your final answer. ' +
+          'Respond with ONLY a JSON array of at most 3 recommendation objects in a ```json fence ' +
+          '(or [] if you cannot propose grounded actions), based on the diagnosis and the data you ' +
+          'have already gathered. Do NOT include an id field.',
+      ),
       sessionId: this.sessionId,
       parseResult: tryParseRecommendations,
       // The agent often keeps "wanting to query" instead of emitting JSON. If

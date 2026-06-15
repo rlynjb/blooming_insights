@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop } from './base';
+import { runAgentLoop, buildSynthesisInstruction } from './base';
 import type { AgentHooks } from './diagnostic';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
@@ -40,9 +40,10 @@ export class QueryAgent {
       onToolResult: hooks.onToolResult,
       maxTurns: 8,
       maxToolCalls: 6,
-      synthesisInstruction:
-        'You have NO more tool calls available. Now answer the user question directly and concisely ' +
-        'in plain prose, citing the key numbers you found. Do not say you need more queries.',
+      synthesisInstruction: buildSynthesisInstruction(
+        'Now answer the user question directly and concisely ' +
+          'in plain prose, citing the key numbers you found.',
+      ),
       sessionId: this.sessionId,
     });
 
