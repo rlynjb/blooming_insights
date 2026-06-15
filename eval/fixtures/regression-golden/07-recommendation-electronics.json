@@ -1,0 +1,167 @@
+{
+  "id": "07-recommendation-electronics",
+  "agent": "recommendation",
+  "description": "Propose recommendations for the seeded electronics-spike anomaly. Inputs are the Anomaly + reference Diagnosis (Path C). PR F established this fixture passes 4-5/5 on the rubric (10/10 pass; one impact-sizing FAIL caught by the BRL-cents bug).",
+  "input": {
+    "anomalyId": "electronics-spike-w2",
+    "anomaly": {
+      "metric": "order_count",
+      "scope": [
+        "category:electronics"
+      ],
+      "change": {
+        "value": 150,
+        "direction": "up",
+        "baseline": "week 2 (2025-12-08 to 2025-12-15) vs 12-week baseline"
+      },
+      "severity": "warning",
+      "evidence": [],
+      "impact": "order_count for category:electronics rose ~150% in a discrete window. Investigate the root cause."
+    },
+    "diagnosisRef": "eval/fixtures/reference-diagnoses-as-input.json#electronics-spike-w2"
+  },
+  "golden_output": [
+    {
+      "id": "34f06682-0f29-4ec4-97f7-2fb665b5a861",
+      "title": "Re-engage spike-week electronics buyers with a post-purchase cross-sell campaign",
+      "rationale": "8,800 customers bought electronics during the mid-December demand surge — likely motivated by a promotional or pre-holiday event. AOV held flat (~$264 USD) while volume was 2.5×, meaning these are genuine buyers who are now post-purchase. Reaching them within 7–14 days with a complementary-product offer (accessories, warranties, home_decor bundles) capitalises on recency while purchase intent is still warm. No other category moved with electronics, so a laser-targeted electronics cross-sell will not cannibalise broad campaigns.",
+      "bloomreachFeature": "campaign",
+      "steps": [
+        "Define an audience segment: customers who placed an 'order' event with category = 'electronics' between 2025-12-08 and 2025-12-15.",
+        "Build a broadcast email campaign titled 'Complete your setup — accessories & add-ons for your new electronics'.",
+        "Populate the email with product recommendations from complementary categories (cables, cases, smart-home, warranties) pulled from the product catalog.",
+        "Schedule the send for 7–10 days post-purchase peak (approx. 2025-12-22) — still inside the holiday gifting window.",
+        "Set a control holdout of 10% to measure incremental lift vs organic repeat purchase rate.",
+        "Track clicks → orders with UTM parameter utm_campaign=elec-spike-crossell for clean attribution."
+      ],
+      "estimatedImpact": {
+        "range": "+$139k – $232k incremental revenue",
+        "rangeUsd": {
+          "low": 139000,
+          "high": 232000
+        },
+        "assumption": "Assumes 6–10% conversion of 8,800 spike-week buyers (528–880 orders) at ~$264 USD AOV. Conversion range reflects typical post-purchase email benchmarks for electronics (5–12%)."
+      },
+      "effort": "low",
+      "timeToSetUpMinutes": 60,
+      "readResultInDays": 14,
+      "prerequisites": [
+        {
+          "label": "Email channel configured and sending verified",
+          "satisfied": true
+        },
+        {
+          "label": "Customer email addresses captured at order time",
+          "satisfied": true
+        },
+        {
+          "label": "Complementary product feed / catalog available for dynamic content",
+          "satisfied": false
+        }
+      ],
+      "successMetric": "Repeat-purchase rate among spike-week electronics buyers within 30 days. Baseline (organic): ~5%. Target: ≥10% (2× lift), equating to ≥440 additional orders.",
+      "confidence": "medium"
+    },
+    {
+      "id": "25b7fd9f-3b43-4fea-8a52-193bce485f22",
+      "title": "Launch a recurring 'Electronics Demand Spike' trigger scenario to auto-activate next surge",
+      "rationale": "The +150% order-count spike was isolated to electronics and distributed across all major Brazilian states, strongly suggesting a repeatable promotional or seasonal trigger (e.g. Black Friday, Cyber Monday, pre-holiday clearance). Without an automated scenario, the team must manually detect and react each time. A triggered flow that fires when electronics weekly order count exceeds 1.5× the 4-week rolling average will let the merchant capitalise on every future surge automatically — sending real-time acquisition pushes, adjusting ad budgets, or gating vouchers — before the peak subsides.",
+      "bloomreachFeature": "scenario",
+      "steps": [
+        "Create a new automation scenario named 'Electronics Surge Detector'.",
+        "Configure the entry trigger: aggregate 'order' events where category = 'electronics', compute a 7-day rolling count, and fire the scenario when that count exceeds 150% of the prior 4-week weekly average.",
+        "Branch 1 — New buyers (first electronics purchase): send a same-day email with top-rated electronics + social proof ('X people bought this today').",
+        "Branch 2 — Repeat buyers: send a personalised 'Back for more?' email surfacing accessories or upgrades based on prior purchase category.",
+        "Add a parallel webhook action to notify the marketing ops Slack channel so paid-media budgets can be manually boosted for electronics keywords.",
+        "Set scenario frequency cap: max 1 trigger per customer per 30 days to avoid fatigue.",
+        "A/B test subject lines (urgency vs curiosity) on 50/50 split at first activation."
+      ],
+      "estimatedImpact": {
+        "range": "+$92k – $185k per future surge event captured",
+        "rangeUsd": {
+          "low": 92000,
+          "high": 185000
+        },
+        "assumption": "Assumes 1–2 comparable surge events over the next 6 months, each yielding 3,500–7,000 incremental reachable buyers converting at 5–8% at ~$264 USD AOV. Lower bound = 1 surge × 3,500 buyers × 5% × $264; upper = 2 surges × 7,000 × 8% × $264."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 120,
+      "readResultInDays": 30,
+      "prerequisites": [
+        {
+          "label": "Email channel active",
+          "satisfied": true
+        },
+        {
+          "label": "Real-time order event stream available for scenario trigger evaluation",
+          "satisfied": true
+        },
+        {
+          "label": "Slack or webhook integration for ops notification",
+          "satisfied": false
+        }
+      ],
+      "successMetric": "Revenue generated per surge event via the scenario vs the Dec-2025 baseline (no automation). Target: ≥$92k incremental revenue at next detected spike, measurable within 7 days of trigger firing.",
+      "confidence": "medium"
+    },
+    {
+      "id": "798509ae-6614-45ac-9318-0a3835e60564",
+      "title": "A/B test a time-limited electronics voucher to quantify price-sensitivity and defend margin",
+      "rationale": "The surge diagnosis supports a promotional or clearance driver — meaning some portion of the 8,800 buyers may have been price-sensitive deal-seekers rather than brand loyalists. Before the merchant reflexively offers discounts to recover or retain this cohort, an experiment is needed to distinguish price-sensitive buyers (who need a voucher to re-purchase) from intent-driven buyers (who would repurchase anyway). A controlled voucher experiment on 50% of the spike cohort will reveal whether discounting is truly necessary, protecting margin on the 50% that convert organically.",
+      "bloomreachFeature": "experiment",
+      "steps": [
+        "Segment the 8,800 spike-week electronics buyers into two random halves (Group A: voucher, Group B: control — no voucher).",
+        "Create a voucher pool: 10% off next electronics purchase, valid for 21 days, single-use, min. order R$200.",
+        "Send Group A an email on 2025-12-18: 'Thank you for your purchase — here's 10% off your next electronics order' with the unique voucher code.",
+        "Send Group B the same email without the voucher (pure relationship/content message).",
+        "Hold experiment for 21 days (voucher validity window); measure repeat-purchase rate and revenue per recipient in both groups.",
+        "If voucher lift (Group A conversion − Group B conversion) > 3 percentage points, roll out vouchers to future surge cohorts. If lift < 3 pp, discontinue discounting for this segment."
+      ],
+      "estimatedImpact": {
+        "range": "$23k – $70k margin protected vs blanket discounting (or +$35k – $92k incremental revenue if voucher lifts conversion)",
+        "rangeUsd": {
+          "low": 23000,
+          "high": 92000
+        },
+        "assumption": "If voucher is unnecessary (lift < 3 pp): avoiding a 10% discount on ~880 organic repeat orders at $264 AOV saves ~$23k in margin. If voucher works (lift ≥ 3 pp on 8,800 buyers): 3–4% net incremental conversion = 264–352 extra orders × $264 = $70k–$93k revenue."
+      },
+      "effort": "medium",
+      "timeToSetUpMinutes": 90,
+      "readResultInDays": 21,
+      "prerequisites": [
+        {
+          "label": "Email channel active",
+          "satisfied": true
+        },
+        {
+          "label": "Voucher / promo-code infrastructure (pool creation)",
+          "satisfied": false
+        },
+        {
+          "label": "A/B split randomisation available in campaign builder",
+          "satisfied": true
+        }
+      ],
+      "successMetric": "Repeat-purchase rate: Group A (voucher) vs Group B (control) at day 21. Baseline control rate assumed ~5%. Decision threshold: proceed with vouchers if Group A rate ≥ 8% (≥3 pp lift); discontinue if below.",
+      "confidence": "medium"
+    }
+  ],
+  "captured_at": "2026-06-15T22:55:53.813Z",
+  "captured_with": {
+    "model": "claude-sonnet-4-6",
+    "prompt_hash": "sha256:db9533244beab0d4c8779b64896985eda3acc5ffb1159e23d5c9240651529da6"
+  },
+  "scoring_config": {
+    "structural_required_fields": [
+      "0.title",
+      "0.rationale",
+      "0.bloomreachFeature",
+      "0.steps",
+      "0.estimatedImpact",
+      "0.confidence"
+    ],
+    "structural_strict": false,
+    "similarity_threshold": 0.7,
+    "notes": "Same required fields as 06. PR F's BRL-cents bug (the agent treating price_brl integers as Reais and quoting BRL 131,965 AOV) is visible in the golden's estimatedImpact text — if a prompt change FIXES the bug, the similarity judge should flag it (different impact magnitude = different conclusion)."
+  }
+}
