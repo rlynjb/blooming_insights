@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { McpCaller } from './base';
-import { runAgentLoop, AGENT_MODEL } from './base';
+import { runAgentLoop } from './base';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { diagnosticTools } from '../mcp/tools';
@@ -49,7 +49,7 @@ export class DiagnosticAgent {
       .replace(/\{project_id\}/g, this.schema.projectId)
       .replace('{anomaly}', JSON.stringify(anomaly));
 
-    const { finalText, toolCalls } = await runAgentLoop({
+    const { toolCalls, parsed } = await runAgentLoop<Diagnosis>({
       anthropic: this.anthropic,
       mcp: this.mcp,
       agent: 'diagnostic',
@@ -67,14 +67,33 @@ export class DiagnosticAgent {
         '(conclusion, evidence, hypothesesConsidered). Base it on the evidence you have already gathered — ' +
         'state your best-supported explanation, even if partial. Do not say you need more queries.',
       sessionId: this.sessionId,
+      parseResult: tryParseDiagnosis,
+      // The agent often keeps "wanting to query" instead of emitting JSON. If
+      // the loop didn't produce a valid diagnosis, the loop runs one tool-less
+      // synthesis turn with this prompt — hands the model the evidence it
+      // already gathered and asks for the structured conclusion only.
+      recoveryPrompt: (tc: ToolCall[]) => {
+        const evidence =
+          tc
+            .map((c, i) => {
+              const payload = c.error ? { error: c.error } : c.result;
+              return `Query ${i + 1}: ${c.toolName} ${JSON.stringify(c.args).slice(0, 200)}\nResult: ${JSON.stringify(payload).slice(0, 900)}`;
+            })
+            .join('\n\n') || '(no successful queries were completed)';
+        return (
+          `Anomaly investigated:\n${JSON.stringify(anomaly)}\n\n` +
+          `Queries run and their results:\n${evidence}\n\n` +
+          'Based ONLY on the evidence above, output your best-supported diagnosis as a single JSON ' +
+          'object in a ```json fence: {"conclusion": string, "evidence": string[], ' +
+          '"hypothesesConsidered": [{"hypothesis": string, "supported": boolean, "reasoning": string}]}. ' +
+          'Give a concrete conclusion grounded in the numbers you actually saw. If the data was ' +
+          'inconclusive (e.g. recent windows empty / historical data), say specifically what was ' +
+          'inconclusive and what you ruled out. Do NOT request more queries.'
+        );
+      },
     });
 
-    // The agent often keeps "wanting to query" instead of emitting JSON. If the
-    // loop didn't produce a valid diagnosis, run a dedicated tool-less synthesis
-    // call that hands the model the evidence it already gathered and asks for the
-    // structured conclusion only.
-    const diag =
-      tryParseDiagnosis(finalText) ?? (await this.synthesize(anomaly, toolCalls)) ?? FALLBACK;
+    const diag = parsed ?? FALLBACK;
 
     // Derive confidence from how thoroughly hypotheses were tested; downgrade a
     // "high" to "medium" when some queries errored (rate limits) so the surfaced
@@ -82,49 +101,5 @@ export class DiagnosticAgent {
     const confidence = diagnosisConfidence(diag);
     const hadErrors = toolCalls.some((tc) => tc.error);
     return { ...diag, confidence: confidence === 'high' && hadErrors ? 'medium' : confidence };
-  }
-
-  /** Dedicated, tool-less call that turns the gathered query results into a
-   *  structured Diagnosis. Returns null on any failure (caller falls back). */
-  private async synthesize(anomaly: Anomaly, toolCalls: ToolCall[]): Promise<Diagnosis | null> {
-    try {
-      const evidence =
-        toolCalls
-          .map((tc, i) => {
-            const payload = tc.error ? { error: tc.error } : tc.result;
-            return `Query ${i + 1}: ${tc.toolName} ${JSON.stringify(tc.args).slice(0, 200)}\nResult: ${JSON.stringify(payload).slice(0, 900)}`;
-          })
-          .join('\n\n') || '(no successful queries were completed)';
-
-      const res = await this.anthropic.messages.create({
-        model: AGENT_MODEL,
-        max_tokens: 2048,
-        system:
-          'You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data.',
-        messages: [
-          {
-            role: 'user',
-            content:
-              `Anomaly investigated:\n${JSON.stringify(anomaly)}\n\n` +
-              `Queries run and their results:\n${evidence}\n\n` +
-              'Based ONLY on the evidence above, output your best-supported diagnosis as a single JSON ' +
-              'object in a ```json fence: {"conclusion": string, "evidence": string[], ' +
-              '"hypothesesConsidered": [{"hypothesis": string, "supported": boolean, "reasoning": string}]}. ' +
-              'Give a concrete conclusion grounded in the numbers you actually saw. If the data was ' +
-              'inconclusive (e.g. recent windows empty / historical data), say specifically what was ' +
-              'inconclusive and what you ruled out. Do NOT request more queries.',
-          },
-        ],
-      } as Anthropic.Messages.MessageCreateParamsNonStreaming);
-      console.log(JSON.stringify({ site: 'agents/diagnostic:synthesize', sessionId: this.sessionId, usage: res.usage }));
-
-      const text = res.content
-        .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
-        .map((b) => b.text)
-        .join('');
-      return tryParseDiagnosis(text);
-    } catch {
-      return null;
-    }
   }
 }
