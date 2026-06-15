@@ -10,23 +10,23 @@
 
 ---
 
-## Open questions — needs answers before PR A
+## Resolved decisions (2026-06-15)
 
 ```
-1. Repository: mcp-server-olist/ as a sibling dir in this repo, or a
-   separate repo (portfolio artifact on its own)?
-
-2. Olist data: commit the SQLite file (small + deterministic) or ship
-   a load script + .gitignore (smaller repo, harder onboarding)?
-
-3. Tool schema: 2-3 domain tools (recommended for safety + portfolio
-   signal), or 1 execute_sql tool (simpler but riskier model surface)?
-
-4. Phase 1 status: the source plan says "don't start the seam extraction
-   until you can explain the current Bloomreach coupling out loud." Have
-   you done the /aipe:study work on the 7 Phase-1 steps, or is the
-   inventory in 2a.1 the first pass at that?
+Q1. Repo location:  same repo, mcp-server-olist/ sibling dir
+                    all Phase 2 work on the mcp-server branch
+Q2. Olist data:     SQLite committed (small + deterministic)
+Q3. Tool schema:    Option A — 2-3 domain tools (NOT raw execute_sql)
+                    Reasoning: interview-defense signal, safety, and
+                    backend-portability (DataSource swap stays at data
+                    layer, doesn't leak SQL into prompts).
+Q4. Phase 1 study:  personal-study time; will be done manually by the
+                    user against existing study guides (.aipe/study-*).
+                    NOT a code generation activity; does NOT block PR A.
+                    The Phase 1 → Phase 2 bridge is 2a.1's inventory.
 ```
+
+PR A is unblocked. Ready to execute when scheduled.
 
 ---
 
