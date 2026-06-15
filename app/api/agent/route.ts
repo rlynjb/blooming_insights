@@ -217,25 +217,42 @@ export async function GET(req: NextRequest) {
             error: tc.error,
           }),
       });
+      // Per-phase wall-clock timings — server-side `console.log` only, emitted
+      // once per request in the `finally` so the summary still fires when a
+      // phase throws (the 300s-budget incident signal). Not on the NDJSON wire.
+      // Shape matches /api/briefing so a single Vercel filter reads both routes.
+      const t0 = performance.now();
+      const phases: Array<{ phase: string; durationMs: number }> = [];
+      const recordPhase = (phase: string, started: number) => {
+        phases.push({ phase, durationMs: Math.round(performance.now() - started) });
+      };
       try {
         // Bootstrap INSIDE the stream so the client sees progress immediately
         // (instead of a silent wait while we connect + read the schema).
         const leadAgent: AgentName =
           q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
         stepFor(leadAgent, 'thought', 'reading the workspace schema…');
+        const t_schema = performance.now();
         const schema = await bootstrapSchema(conn.mcp);
+        recordPhase('schema_bootstrap', t_schema);
+        const t_listTools = performance.now();
         const rawTools = await conn.mcp.listTools();
         const allTools: McpToolDef[] = Array.isArray((rawTools as { tools?: unknown })?.tools)
           ? (rawTools as { tools: McpToolDef[] }).tools
           : [];
+        recordPhase('list_tools', t_listTools);
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
         // Free-form query flow (live; never cached) — runs when only `q` is provided.
         if (q && !insightId) {
+          const t_intent = performance.now();
           const intent = await classifyIntent(anthropic, q);
+          recordPhase('intent_classify', t_intent);
           stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
           const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools);
+          const t_query = performance.now();
           const answer = await queryAgent.answer(q, intent, hooksFor('coordinator'));
+          recordPhase('query_answer', t_query);
           stepFor('coordinator', 'conclusion', answer);
           send({ type: 'done' });
           return;
@@ -259,7 +276,9 @@ export async function GET(req: NextRequest) {
             `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
           );
           const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+          const t_diag = performance.now();
           diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+          recordPhase('diagnostic_investigate', t_diag);
           send({ type: 'diagnosis', diagnosis });
         }
 
@@ -268,7 +287,9 @@ export async function GET(req: NextRequest) {
         if (step !== 'diagnose') {
           stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
           const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+          const t_rec = performance.now();
           const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+          recordPhase('recommendation_propose', t_rec);
           for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
         }
 
@@ -284,6 +305,16 @@ export async function GET(req: NextRequest) {
           message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,
         });
       } finally {
+        // One summary line per request — shared shape with /api/briefing so a
+        // single Vercel filter (e.g. phases.phase = "schema_bootstrap") reads
+        // across both routes. Fires even on error so we can see how much of the
+        // 300s budget was burned before the failure.
+        console.log(JSON.stringify({
+          route: '/api/agent',
+          sessionId: sid,
+          totalMs: Math.round(performance.now() - t0),
+          phases,
+        }));
         controller.close();
       }
     },

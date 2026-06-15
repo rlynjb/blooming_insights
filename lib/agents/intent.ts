@@ -23,6 +23,8 @@ export async function classifyIntent(anthropic: Anthropic, query: string): Promi
       'diagnostic (why did something happen), or recommendation (what should I do). Reply with ONLY the one word.',
     messages: [{ role: 'user', content: query }],
   });
+  // TODO: thread sessionId once classifyIntent's signature carries it (spec marks this site as hardest to thread).
+  console.log(JSON.stringify({ site: 'agents/intent:classifyIntent', usage: res.usage }));
   const text = res.content
     .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
     .map((b) => b.text)

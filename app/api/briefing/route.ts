@@ -207,9 +207,19 @@ export async function GET(req: NextRequest) {
           type: 'reasoning_step',
           step: { id: crypto.randomUUID(), agent: 'monitoring', kind: 'thought', content },
         });
+      // Per-phase wall-clock timings — server-side `console.log` only, emitted
+      // once per request in the `finally` so the summary still fires when a
+      // phase throws (the 300s-budget incident signal). Not on the NDJSON wire.
+      const t0 = performance.now();
+      const phases: Array<{ phase: string; durationMs: number }> = [];
+      const recordPhase = (phase: string, started: number) => {
+        phases.push({ phase, durationMs: Math.round(performance.now() - started) });
+      };
       try {
         step('reading the workspace schema…');
+        const t_schema = performance.now();
         const schema = await bootstrapSchema(mcp);
+        recordPhase('schema_bootstrap', t_schema);
         send({
           type: 'workspace',
           workspace: {
@@ -222,6 +232,7 @@ export async function GET(req: NextRequest) {
         // Gate the 10-category checklist against the live schema; surface the
         // coverage (runnable + skipped) and run only the runnable categories so
         // monitoring never spends EQL budget on unsupported ones.
+        const t_coverage = performance.now();
         const capabilities = schemaCapabilities(schema);
         const coverage = coverageReport(capabilities);
         const runnable = runnableCategories(capabilities);
@@ -233,16 +244,20 @@ export async function GET(req: NextRequest) {
           step(coverageLines[i]);
           send({ type: 'coverage_item', item });
         });
+        recordPhase('coverage_gate', t_coverage);
 
+        const t_listTools = performance.now();
         const raw = await mcp.listTools();
         const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
           ? (raw as { tools: McpToolDef[] }).tools
           : [];
+        recordPhase('list_tools', t_listTools);
 
         const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
         const agent = new MonitoringAgent(anthropic, mcp, schema, allTools);
 
         step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
+        const t_scan = performance.now();
         const anomalies = await agent.scan({
           onToolCall: (tc) => {
             send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'monitoring' });
@@ -261,6 +276,7 @@ export async function GET(req: NextRequest) {
             if (t.trim()) step(t.trim());
           },
         }, runnable);
+        recordPhase('monitoring_scan', t_scan);
 
         const insights = anomalies.map(anomalyToInsight);
         putInsights(sid, insights, anomalies);
@@ -275,6 +291,16 @@ export async function GET(req: NextRequest) {
           message: `/api/briefing · ${e instanceof Error ? e.message : String(e)}`,
         });
       } finally {
+        // One summary line per request — shared shape with /api/agent so a
+        // single Vercel filter (e.g. phases.phase = "schema_bootstrap") reads
+        // across both routes. Fires even on error so we can see how much of the
+        // 300s budget was burned before the failure.
+        console.log(JSON.stringify({
+          route: '/api/briefing',
+          sessionId: sid,
+          totalMs: Math.round(performance.now() - t0),
+          phases,
+        }));
         controller.close();
       }
     },

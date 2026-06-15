@@ -120,6 +120,8 @@ export class RecommendationAgent {
           },
         ],
       } as Anthropic.Messages.MessageCreateParamsNonStreaming);
+      // TODO: thread sessionId once RecommendationAgent carries it (would require touching the route caller).
+      console.log(JSON.stringify({ site: 'agents/recommendation:synthesize', usage: res.usage }));
 
       const text = res.content
         .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
