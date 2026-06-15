@@ -12,49 +12,25 @@
 
 ---
 
-## Open questions — needs answers before PR D
+## Resolved decisions (2026-06-15)
 
 ```
-1. Judge model:
-   - Haiku (cheap; biased on length/confidence; ~$0.50/run)
-   - Sonnet (balanced; ~$2/run)
-   - Opus (most calibrated; ~$5/run)
-
-   Recommendation: Sonnet (4.7). Calibrated enough for spot-checks;
-   Opus for the final reported numbers if budget allows.
-
-2. K (runs per anomaly per step):
-   - 10 (faster; higher variance)
-   - 30 (slower; tighter confidence interval)
-
-   Recommendation: start with K=10 in PR D to validate the pipeline,
-   bump to K=30 once the matching logic + judge are calibrated.
-
-3. Match strictness for detection (Step 1):
-   - LOOSE: 2 of 3 criteria (metric, dimension, time window)
-   - STRICT: 3 of 3 criteria
-
-   Recommendation: report BOTH. Loose gives optimistic ceiling; strict
-   is the recruiter-quotable number.
-
-4. Eval results in git:
-   - Committed (eval/results/2026-06-XX-detection.json) — paper trail
-     for the portfolio; lets you say "here's the score from a real run"
-   - .gitignored (CI-only) — cleaner repo
-
-   Recommendation: commit. Phase 3's whole point is that you can SHOW
-   the numbers; a committed history of runs IS the receipt.
-
-5. Live MCP integration during eval:
-   - Eval runs go through OlistDataSource (subprocess per request)
-     same as the app
-   - This costs ~150–300ms latency per agent turn; acceptable for
-     non-interactive eval batches
-
-   Recommendation: yes — eval the production path, not a stubbed one.
+Q1. Judge model:        claude-sonnet-4-6 (the working/eval/judge default)
+                        Calibrated enough for criterion scoring; affordable
+                        across all 4 PRs.
+Q2. K (runs):           start K=10 in PR D to validate pipeline.
+                        Bump to K=30 once judge spot-check passes.
+                        Scripts take --K=<n> flag with K=10 default.
+Q3. Match strictness:   report BOTH loose and strict from Step 1.
+                        Loose = optimistic ceiling; strict = recruiter
+                        number.
+Q4. Eval results:       committed to eval/results/<YYYY-MM-DD>/<step>.json.
+                        Paper trail for the portfolio defense.
+Q5. Live MCP eval:      yes — OlistDataSource subprocess per agent run,
+                        same path as production. Bounded by run script.
 ```
 
-PR D is unblocked when these resolve. Recommended defaults are sane; pick them or override.
+PR D is unblocked. Ready to execute when scheduled.
 
 ---
 
