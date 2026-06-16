@@ -3,59 +3,62 @@
 **Industry name(s):** runtime topology · execution model · process map
 **Type:** Industry standard · Project-specific instance
 
-> Three runtimes, one direction of data flow. **Client** = React 19 in a browser tab, pulling NDJSON from `fetch().body.getReader()`. **Server** = Node 20 inside a Vercel function, one process per cold start. **Providers** = Anthropic + Bloomreach MCP over HTTPS. The one rule that explains nearly every design choice in the repo: *the server runtime gets exactly one Node process per invocation and exactly 300 seconds before the platform kills it.* Everything else — the spacing gate, the bounded tool-call budget, the forced-synthesis turn, the in-process `Map`s — falls out of that constraint.
+> Four runtimes now (Phase 2). **Client** = React 19 in a browser tab, pulling NDJSON from `fetch().body.getReader()`. **Server** = Node 20 inside a Vercel function, one process per cold start. **Subprocess** (new) = `mcp-server-olist/dist/src/index.js`, a child Node process the server spawns via `StdioClientTransport` when live-sql mode is active; reused across calls within one `OlistDataSource` instance, killed on `dispose()`. **Providers** = Anthropic + Bloomreach MCP over HTTPS (only relevant in live-bloomreach mode). Plus an offline runtime: `tsx eval/scripts/run-*.ts` for the eval flywheel, each script its own Node process per `npm run eval:*`. The rule that explains nearly every design choice in the *server* runtime is still: *the server gets exactly one Node process per invocation and exactly 300 seconds before the platform kills it.* The subprocess rule is different: *exactly one child per `OlistDataSource` instance, single-flight, no per-call rate limit, cleanup-on-dispose.*
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Three bands. The **client runtime** is the V8 inside the user's browser; the only "work" it does is decode NDJSON and call `setState`. The **server runtime** is Node 20 on a Vercel function — one V8 instance, one event loop, no worker threads. The **provider runtime** is everything reached over HTTPS: Anthropic for reasoning, the Bloomreach MCP server for tools. The repo has no fourth tier — no database server, no queue worker, no background scheduler. The picture is unusually flat for an "AI app."
+**Zoom out — the bigger picture.** Four bands. The **client runtime** is the V8 inside the user's browser; the only "work" it does is decode NDJSON and call `setState`. The **server runtime** is Node 20 on a Vercel function — one V8 instance, one event loop, no worker threads. The **subprocess runtime** (new since Phase 2) is another Node 20 process — `mcp-server-olist/dist/src/index.js` spawned via `process.execPath` over a stdio pipe; its event loop processes JSON-RPC frames coming in on stdin and writes results back on stdout. Inside it, `better-sqlite3` runs queries synchronously. The **provider runtime** is everything reached over HTTPS: Anthropic for reasoning, the Bloomreach MCP server for tools (in live-bloomreach mode only). There's still no separate database server in the parent process — the SQLite store lives inside the subprocess's heap+filesystem.
 
 ```
-  Where work runs in blooming insights
+  Where work runs in blooming insights (Phase 2)
 
   ┌─ Browser (V8 · one tab) ───────────────────────────────────────────────┐
-  │                                                                        │
   │   React 19 components                                                  │
   │   useInvestigation hook  ←  pulls NDJSON line-by-line                  │
-  │                                                                        │
   └─────────────────────────────────│──────────────────────────────────────┘
-                                    │  HTTPS (chunked transfer)
-  ┌─ Vercel function (Node 20 · ONE process per invocation) ───────────────┐ ← we are here
+                                    │  HTTPS (chunked transfer · NDJSON)
+  ┌─ Vercel function (Node 20 · ONE process per invocation) ───────────────┐ ← parent
   │                                                                        │
   │   ┌──────────────────────────────────────────────────────────────────┐ │
-  │   │ Next.js route handlers (App Router)                              │ │
-  │   │   /api/briefing  /api/agent  /api/mcp/*                          │ │
-  │   │   each returns Response(new ReadableStream(...))                 │ │
-  │   └──────────────────────────────────────────────────────────────────┘ │
-  │                              │                                         │
-  │                              ▼                                         │
+  │   │ Next.js route handlers — /api/briefing /api/agent /api/mcp/*    │ │
+  │   │ each returns Response(new ReadableStream(...))                  │ │
+  │   └─────────────────────────────│────────────────────────────────────┘ │
+  │                                 ▼                                       │
   │   ┌──────────────────────────────────────────────────────────────────┐ │
-  │   │ lib/agents/* + lib/mcp/* (pure Node TS, no framework)            │ │
-  │   │   runAgentLoop · McpClient · BloomreachAuthProvider              │ │
-  │   └──────────────────────────────────────────────────────────────────┘ │
-  │                              │                                         │
-  │                              ▼                                         │
-  │   ┌──────────────────────────────────────────────────────────────────┐ │
-  │   │ Anthropic SDK + MCP SDK                                          │ │
-  │   │   fetch() out to Anthropic; StreamableHTTPClientTransport to MCP │ │
-  │   └──────────────────────────────────────────────────────────────────┘ │
-  │                                                                        │
-  └────────────────────────────────│───────────────────────────────────────┘
-                                   │  HTTPS · OAuth bearer · rate-limited
-  ┌─ Provider runtimes (external) ─┴───────────────────────────────────────┐
-  │   Anthropic                    Bloomreach loomi-connect MCP             │
-  │   (claude-sonnet-4-6)          (~1 req/s/user globally)                 │
-  └────────────────────────────────────────────────────────────────────────┘
+  │   │ lib/agents/* + lib/data-source/* + lib/mcp/*                     │ │
+  │   │   runAgentLoop · DataSource (Bloomreach OR Olist) · auth         │ │
+  │   └─────────────────────────────│────────────────────────────────────┘ │
+  │           ┌─────────────────────┴───────────────────┐                   │
+  │           ▼ live-bloomreach                        ▼ live-sql           │
+  │   ┌──────────────────────┐                  ┌──────────────────────┐   │
+  │   │ Anthropic SDK +      │                  │ Anthropic SDK +      │   │
+  │   │ MCP SDK (HTTP)       │                  │ MCP SDK (stdio)      │   │
+  │   │ StreamableHTTP       │                  │ StdioClientTransport │   │
+  │   └──────────│───────────┘                  └──────────│───────────┘   │
+  └──────────────│──────────────────────────────────────────│──────────────┘
+                 │  HTTPS · OAuth bearer · ~1 req/s          │ Unix pipe ·
+                 │                                            │ JSON-RPC 2.0
+  ┌─ Provider runtimes (external) ───────────────────────┐   ▼
+  │  Anthropic API   Bloomreach loomi-connect MCP        │  ┌─ Subprocess (Node 20 child) ─┐
+  │  (claude-sonnet-4-6)  (~1 req/s/user globally)       │  │  mcp-server-olist/dist/src/   │
+  └──────────────────────────────────────────────────────┘  │   index.js                    │
+                                                            │  StdioServerTransport          │
+                                                            │  3 tools (get_metric_*…)        │
+                                                            │  better-sqlite3 (SYNC queries) │
+                                                            │  single-flight; no rate gate    │
+                                                            │  killed by parent's dispose()  │
+                                                            └─────────────────────────────────┘
 ```
 
-**Zoom in — what this concept is.** The runtime map is just *which V8/Node process owns which line of code, and what it shares with whom*. For this repo the answer is short because the topology is flat: each Vercel invocation is its own Node process, and that process holds every cache and every state Map you'll see in the codebase. When the platform spins up a second instance (or evicts the warm one and cold-starts a new one), none of that state comes with it.
+**Zoom in — what this concept is.** The runtime map is just *which V8/Node process owns which line of code, and what it shares with whom*. The topology used to be flat (one Node process); Phase 2 added a second Node process for live-sql mode. Each Vercel invocation is still its own *parent* Node process holding every cache and state Map you'll see in `lib/state/*`. When that parent spawns an `OlistDataSource`, the *child* gets a separate V8 isolate, a separate event loop, a separate heap, and its own `better-sqlite3` handle pointing at a SQLite file on disk. Nothing in the parent's heap is visible to the child or vice versa — they only see each other through JSON-RPC frames on the stdio pipe.
 
 ---
 
 ## Structure pass
 
-**Layers.** Three: browser V8 → Node 20 on Vercel → Anthropic + Bloomreach.
+**Layers.** Four: browser V8 → Node 20 parent on Vercel → (a) Anthropic + Bloomreach over HTTPS, and (b) Node 20 child for Olist over stdio. The two branches at the bottom split on `bi:mode`.
 
 **Axis to trace: *who owns state, and how long does it live?***
 
@@ -66,25 +69,33 @@
   │  React useState + sessionStorage│  (stash on the client survives reload but not a new tab)
   └────────────────┬──────────────┘
                    │ HTTPS
-  ┌──── Node process on Vercel ──▼┐   in-process Map → cold-start lifetime
+  ┌──── Node parent on Vercel ───▼┐   in-process Map → cold-start lifetime
   │  Map<string, Insight>            │  (everything in lib/state/* + lib/mcp/schema.ts cache)
   │  AsyncLocalStorage<RequestStore> │  request lifetime (concurrency-safe per request)
-  │  Encrypted cookie (bi_auth)       │  10 days (the only thing that survives an instance swap)
+  │  Encrypted cookie (bi_auth)       │  10 days (survives instance swap; live-bloomreach only)
+  │  OlistDataSource instance         │  request lifetime; owns the child PID until dispose()
   └────────────────┬──────────────────┘
-                   │ HTTPS
-  ┌──── Provider ──▼─────────────┐   their problem, not ours
-  │  Anthropic stateless          │  no state held across calls (model is read-only)
-  │  Bloomreach session/tokens    │  OAuth bearer + their per-user rate-limit window
-  └────────────────────────────────┘
+                   │ stdio pipe        │ HTTPS
+                   ▼                   ▼
+  ┌──── Olist child Node process ──┐  ┌──── Provider ─────────────────┐
+  │  better-sqlite3 handle          │  │  Anthropic stateless           │
+  │   → SQLite file (read-only      │  │   (no state held across calls) │
+  │     for the agent's tools)      │  │  Bloomreach OAuth + rate gate  │
+  │  one-tool-at-a-time queue       │  └────────────────────────────────┘
+  │  process lifetime = parent's    │
+  │   OlistDataSource lifetime      │
+  └─────────────────────────────────┘
 
-  the answer changes at every seam — which is exactly the lesson
+  the answer changes at every seam — and Phase 2 added a new seam:
+  parent ↔ child Node process across a stdio pipe.
 ```
 
-**Seams.** Three load-bearing ones:
+**Seams.** Four load-bearing ones now:
 
-1. **The HTTPS boundary between browser and Node** — where the React state stops mattering and the Node `Map` starts. Anything written into `Map<string, Insight>` after `putInsights(...)` is invisible to any other browser session.
-2. **The HTTPS boundary between Node and Anthropic/Bloomreach** — where our 300-second budget meets their `1 req/s` budget. The spacing gate (`03`) and the cache (`05`) live here.
-3. **The Vercel-function-instance boundary** — invisible at code level, real at runtime. Two requests can land on two different warm instances; neither sees the other's `Map`. This is the seam that breaks the in-process caches.
+1. **The HTTPS boundary between browser and Node** — where React state stops mattering and the Node `Map` starts. Anything written into `Map<string, Insight>` after `putInsights(...)` is invisible to any other browser session.
+2. **The HTTPS boundary between Node and Anthropic/Bloomreach** — where the 300-second budget meets the `1 req/s` budget. The spacing gate (`03`) and the cache (`05`) live here.
+3. **The stdio boundary between Node parent and the Olist child** (new, Phase 2) — JSON-RPC 2.0 frames over a Unix pipe. The per-call timeout (`AbortSignal.timeout(30_000)` ORed with the caller-supplied signal via `composeSignals`) lives here. The lifecycle ownership lives here (parent owns the child PID; `dispose()` closes the SDK client which closes the transport which kills the child). The control-flow axis FLIPS at this seam: parent decides what tool to call, child decides how to compute it.
+4. **The Vercel-function-instance boundary** — invisible at code level, real at runtime. Two requests can land on two different warm instances; neither sees the other's `Map`, and a second parent would spawn a *second* Olist child (not share one).
 
 ---
 
@@ -194,10 +205,11 @@ What breaks without the started-ref guard: StrictMode mounts twice, two fetches 
 
 #### 4) The provider runtimes — what we depend on but don't own
 
-Two external runtimes, both stateless from our point of view but each with its own constraints:
+Two external runtimes (live-bloomreach mode) plus, since Phase 2, one *internal* runtime we DO own (the Olist child). The externals are stateless from our point of view:
 
 - **Anthropic**: the model call. No state held between calls (we send the full message history every turn). Latency is the only thing that matters; budget per call is ~2-15s.
-- **Bloomreach MCP server**: stateful in that it holds the OAuth session, stateless per tool call. The hard constraint is the **global per-user rate limit, ~1 req/s** (the server's own error text states it). This is what `McpClient.minIntervalMs = 1100` is calibrated against — we space at 1.1s to leave headroom under the window.
+- **Bloomreach MCP server**: stateful in that it holds the OAuth session, stateless per tool call. Hard constraint: ~1 req/s/user — `McpClient.minIntervalMs = 1100`.
+- **Olist subprocess (live-sql)**: a Node child we spawn and own. SQLite queries return in <10ms — there's no rate gate. The constraint instead is *single-flight* (`OlistDataSource.callTool` holds the SDK Client which serializes one in-flight call at a time). See `02` for the process-model details and `04` for why single-flight makes the sync SQLite calls safe in the child loop.
 
 ```
   Provider boundary — what they enforce, what we send
@@ -278,6 +290,7 @@ The full runtime topology, with state ownership and the lifetimes that matter:
 - `GET /api/briefing` (`app/api/briefing/route.ts`) — full route handler, one stream, one MonitoringAgent run.
 - `GET /api/agent?insightId=…&step=diagnose` (`app/api/agent/route.ts`) — same shape, but with replay-from-cache and per-step filtering.
 - Every page that uses `useInvestigation` (`lib/hooks/useInvestigation.ts`) — the client side of the runtime, NDJSON reader.
+- `npm run eval:detection|diagnosis|recommendation|regression` (`eval/scripts/run-*.ts` via `tsx`) — Phase 3's offline runtime. Each script is its OWN parent Node process (not on Vercel), spawns its own `OlistDataSource` (which spawns its own subprocess), runs K iterations, writes JSON + summary.md to `eval/results/<date>/`, exits.
 
 **Code side by side.**
 
@@ -355,9 +368,12 @@ The serverless runtime is a relatively new shape and not all the textbook advice
 
 - **"One process per request" is wrong for Vercel.** It's "one process serves many requests until the platform evicts it." This is what enables module-level caches to ever work, and what makes their failures intermittent.
 - **The Node event loop on Vercel is the same Node event loop you have locally.** All the standard reasoning (microtasks, macrotasks, run-to-completion) applies — that's the subject of `03`.
-- **There is no per-process supervisor.** Vercel manages the process; we don't. We don't catch `SIGTERM`, we don't flush state on shutdown, we don't do graceful drain. When the platform decides to evict, in-flight requests get killed.
+- **There is no per-process supervisor for the PARENT.** Vercel manages the parent process; we don't. We don't catch `SIGTERM`, we don't flush state on shutdown, we don't do graceful drain.
+- **There IS a per-process supervisor for the CHILD — us.** Phase 2 made the parent the supervisor of the Olist subprocess via the SDK's `Client.close()` / `StdioClientTransport.close()`. The catch is that supervision only runs on `dispose()`; a parent crash before `dispose()` leaks the child. Node's `child_process` exposes the PID but the SDK abstraction hides it, so we can't `process.kill(pid)` directly without lifting a layer.
 
-Worth reading next: Vercel's Functions docs, especially the lifecycle/eviction section, and the Node 20 release notes on `AsyncLocalStorage` (where the cost finally dropped enough that the pattern in `auth.ts` is reasonable in a hot path).
+**Why `tsx` (not `ts-node`) for eval scripts.** `tsx` uses esbuild as the loader, which gets typescript files running in ~200ms cold vs `ts-node`'s 2-3s. For a K=10 eval that already spends 5-10 minutes in Anthropic + subprocess calls, the loader speed isn't the load-bearing factor — the build-step elimination is. `tsx eval/scripts/run-detection.ts` lets a contributor edit the script and re-run without `tsc`, which keeps the eval flywheel tight. Trade: tsx defaults to ESM-aware behavior, which the scripts handle via `fileURLToPath(import.meta.url)` for path resolution.
+
+Worth reading next: Vercel's Functions docs (lifecycle/eviction), the `@modelcontextprotocol/sdk`'s `client/stdio.js` and `server/stdio.js` (what `StdioClientTransport` does under the hood), the Node `child_process` docs for the layer underneath, and the `tsx` vs `ts-node` benchmarks.
 
 ---
 
@@ -401,8 +417,12 @@ A: `AsyncLocalStorage<RequestStore>` in `lib/mcp/auth.ts:47`. It's the only thin
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — why "one Node process" matters and why there are no threads here.
-- `03-event-loop-and-async-io.md` — what happens inside the process between `await`s.
-- `04-shared-state-races-and-synchronization.md` — the `AsyncLocalStorage` pattern in depth.
-- `07-backpressure-bounded-work-and-cancellation.md` — `maxDuration`, `maxToolCalls`, the missing `AbortController`.
+- `02-processes-threads-and-tasks.md` — now-two-Node-processes story, threads still absent.
+- `03-event-loop-and-async-io.md` — two event loops now (parent + child); JSON-RPC framing on the pipe.
+- `04-shared-state-races-and-synchronization.md` — `AsyncLocalStorage` + single-flight subprocess + `composeSignals`.
+- `06-filesystem-streams-and-resource-lifecycle.md` — `dispose()` discipline now owns a child PID.
+- `07-backpressure-bounded-work-and-cancellation.md` — `maxDuration`, `maxToolCalls`, the half-wired `AbortSignal`.
 - `.aipe/study-system-design/00-overview.md` — the architectural component view that complements this runtime view.
+
+---
+Updated: 2026-06-16 — added subprocess runtime band (Olist child, stdio, JSON-RPC), tsx/eval scripts, dispose() lifecycle.

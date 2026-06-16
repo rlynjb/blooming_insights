@@ -3,7 +3,7 @@
 **Industry name(s):** runtime risk audit · execution-model failure modes · ranked operational risks
 **Type:** Project-specific · Verdict-led ranking
 
-> **Verdict: the runtime is well-bounded but operationally naive.** The agent loop, the spacing gate, the forced-synthesis turn, the `try/finally` controller cleanup, the `AsyncLocalStorage` for auth — these are all done correctly and explain why the app works in practice. The risks are at the *seams the code doesn't cover*: process-local state on a serverless runtime, no cancellation when the client leaves, no graceful handling of `SIGTERM` / eviction, and a few "this happens to be sync today" choices that will bite if the access pattern changes. None of these are bugs at hackathon scale. All of them are landmines at production scale. Ranked below by consequence × likelihood-at-current-scale, with the actual code anchor and the move I'd make.
+> **Verdict (Phase 2): the runtime is well-bounded and getting less operationally naive — but Phase 2 introduced one genuinely new risk (orphan subprocess) and one that's a runtime-orchestration variant of an existing test-isolation risk (parallel K=10 eval scripts).** The agent loop, the spacing gate, the forced-synthesis turn, the `try/finally controller.close()`, the `AsyncLocalStorage` for auth, and the new `composeSignals` + `AbortSignal.timeout(30_000)` per-call wall are all done correctly. The risks are still at the *seams the code doesn't cover*: process-local state on serverless, the half-wired browser→route cancellation (now half-WIRED, not fully absent), and — new — no automatic subprocess cleanup on parent crash, no `process.on('exit')` reaper, no inter-script lockfile for the eval flywheel. None of these are bugs at hackathon scale. All of them are landmines at production scale (or, for the parallel-run risk, at "two agents working in the same repo" scale). Ranked below by consequence × likelihood-at-current-scale.
 
 ---
 
@@ -12,30 +12,33 @@
 **Zoom out — where the risks live.** Almost every risk in this audit sits on one of three seams the prior concepts established:
 
 ```
-  The risk surface — three seams, all in the Server runtime
+  The risk surface — four seams now (Phase 2)
 
   ┌─ Browser ─────────────────────────────────────────────────────────┐
-  │  one low-impact risk lives here: silent React leaks from           │
-  │  the no-AbortController choice (UI side only)                      │
+  │  one low-impact risk: silent React leaks from the half-wired       │
+  │  AbortController choice (UI side only)                             │
   └─────────────────────────────│─────────────────────────────────────┘
                                 │
-  ┌─ Vercel function (Node 20) ─▼─────────────────────────────────────┐  ← every other risk
+  ┌─ Vercel function (Node parent) ─▼─────────────────────────────────┐  ← most risks
   │                                                                   │
   │  seam 1: warm-instance vs cold-instance                            │
-  │   → process-local state silently empties when Vercel spins         │
-  │     up a 2nd instance                                              │
+  │   → process-local state silently empties on instance swap          │
   │                                                                   │
   │  seam 2: client lifecycle vs server lifecycle                      │
-  │   → no AbortController; client disconnect doesn't stop the work    │
+  │   → half-wired AbortController; tab close still doesn't stop run   │
   │                                                                   │
   │  seam 3: app vs platform                                           │
-  │   → no SIGTERM handler; eviction at maxDuration just kills         │
-  │     mid-work, no save                                              │
+  │   → no SIGTERM handler; eviction at maxDuration kills mid-work     │
+  │                                                                   │
+  │  seam 4 (Phase 2): parent vs Olist child process                   │
+  │   → no automatic dispose on parent crash → orphan subprocess       │
+  │   → eval scripts can spawn parallel children that clobber          │
+  │     shared eval/results/<date>/ output                              │
   └────────────────────────────│──────────────────────────────────────┘
                                │
-  ┌─ Providers ────────────────▼──────────────────────────────────────┐
-  │  Anthropic + Bloomreach — we honor their bounds, so no risks       │
-  │  originate here (just bills we keep paying after disconnect)       │
+  ┌─ Providers + Subprocess ───▼──────────────────────────────────────┐
+  │  Anthropic + Bloomreach: we honor their bounds — no risks here     │
+  │  Olist subprocess: we OWN it now; risks live at the parent seam    │
   └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -64,8 +67,10 @@
 
 - *Module-scope state on warm-instance lifetime* (`05`) → empty-Map surprises.
 - *Run-to-completion as the only synchronization* (`04`) → safe today, fragile to a future `await`.
-- *No `AbortController` anywhere* (`07`) → server can't see client disconnect.
+- *Half-wired `AbortController`* (`07`) → server can't see client disconnect; adapter has its own 30s wall.
 - *Sync I/O on the main thread* (`02`, `06`) → blocking lurks if file sizes grow.
+- *Subprocess lifecycle ownership* (`02`, `06`) → orphan child if `dispose()` is skipped.
+- *`composeSignals` duplication* (`04`) → 10 LOC copy-pasted; cleanup candidate, not a runtime risk.
 
 ---
 
@@ -97,53 +102,132 @@ The right answer right now is move (1) — name the limit honestly in the UI and
 
 ---
 
-### Risk 2 — No `AbortController` means the server doesn't stop when the client leaves
+### Risk 2 — Browser→server cancellation is HALF-WIRED — adapter signal exists, route doesn't pass one
 
-**Severity: material** (wasted compute, wasted API spend)
+**Severity: material** (wasted compute, wasted API spend on abandoned investigations)
 **Likelihood at current scale: medium** (every user who opens an investigation and navigates away)
 
-**What.** The route handler doesn't read `req.signal`. `runAgentLoop` has no `signal` parameter. The Anthropic and MCP SDKs both accept `signal`; we don't hand them one. The client `useInvestigation` hook deliberately doesn't `reader.cancel()` on effect cleanup (documented at `lib/hooks/useInvestigation.ts:32-36` — React StrictMode workaround). So when the user closes the tab three seconds into a 100-second investigation, the route keeps going: Anthropic keeps billing, MCP keeps spacing-and-calling, `saveInvestigation` runs at the end for a user who'll never see it.
+**What.** Phase 2 added `signal?: AbortSignal` to `DataSource.callTool` and wired `AbortSignal.timeout(30_000)` via `composeSignals` inside each adapter (`lib/data-source/olist-data-source.ts:151`, `lib/mcp/transport.ts:131`). So a single hung subprocess or HTTPS call now aborts after 30s. What's STILL missing: the route handler doesn't read `req.signal`, `runAgentLoop` has no `signal` parameter, and `useInvestigation` still doesn't `ac.abort()` on cleanup. So a *tab close* still doesn't stop the run — only a *single hanging tool call* does.
 
 **Where.**
-- `lib/hooks/useInvestigation.ts:32-36` — the documented "we don't abort" decision.
+- `lib/hooks/useInvestigation.ts:32-36` — the documented "we don't abort" decision (React StrictMode workaround).
 - `app/api/agent/route.ts:170-264` — `start(controller)` callback never checks `req.signal`.
 - `app/api/briefing/route.ts:179-256` — same.
 - `lib/agents/base.ts:48-176` — `runAgentLoop` has no `signal` plumbing.
+- (Good news, anchored:) `lib/data-source/types.ts:38-44` — interface accepts the signal; both adapters already use it.
 
 **Consequence when it fires.** A 100-second investigation costs:
-- ~6 Anthropic calls × ~2-15s × ~per-call tokens = a few cents of Anthropic spend per abandoned run.
-- ~6 MCP tool calls (we still hit Bloomreach's rate limit even on disconnect) = no monetary cost but real load on the provider.
+- ~6 Anthropic calls × ~2-15s × per-call tokens = a few cents of Anthropic spend per abandoned run.
+- ~6 tool calls (subprocess or Bloomreach) = no monetary cost for the subprocess; real load on Bloomreach.
 - ~1 `saveInvestigation` write for an investigation nobody will look at = trivial.
 
-At a few demo users per day, this is a rounding error. At 1000 daily users with a 30% abandon rate, this is a real bill.
+At a few demo users per day, rounding error. At 1000 daily users with a 30% abandon rate, real bill.
 
-**The move.** Thread an `AbortController` through:
+**The move (smaller than it was — the hard half is done).**
 
 ```
-  the wiring (pseudocode)
+  the wiring that REMAINS (pseudocode)
 
-  // route:
+  // route — read req.signal:
   GET(req) {
     const ac = new AbortController()
     req.signal.addEventListener('abort', () => ac.abort())
     // hand ac.signal to runAgentLoop
   }
 
-  // runAgentLoop:
+  // runAgentLoop — accept and propagate:
   function runAgentLoop({ ..., signal }) {
-    await anthropic.messages.create({ ..., signal })   ← SDK supports it
-    await mcp.callTool(name, args, { signal })         ← add signal support
+    await anthropic.messages.create({ ..., signal })       ← SDK supports it
+    await dataSource.callTool(name, args, { signal })      ← ALREADY supports it (Phase 2)
   }
 
-  // client (give up the StrictMode workaround):
+  // client — gate the abort on production:
   useEffect(() => {
     const ac = new AbortController()
     fetch(url, { signal: ac.signal })
-    return () => ac.abort()       ← only in production
+    return () => {
+      if (process.env.NODE_ENV === 'production') ac.abort()  ← keep StrictMode-safe in dev
+    }
   })
 ```
 
-The StrictMode tension is real but solvable — gate the `ac.abort()` on `process.env.NODE_ENV === 'production'`, so dev keeps the let-it-finish behavior. Effort: ~30 lines. Payoff: stop paying for invisible work.
+Effort: ~15 lines (was ~30 pre-Phase-2; the adapter half is already there). Payoff: stop paying for abandoned investigations.
+
+---
+
+### Risk 2.5 — No automatic Olist subprocess cleanup on parent crash (Phase 2, new)
+
+**Severity: material** (orphan child processes accumulate; in dev-server long-runs they leak SQLite handles + ~30-50MB each)
+**Likelihood at current scale: medium-low** (only triggers when `dispose()` doesn't run — uncaught throws, `maxDuration` SIGKILL, dev-server HMR, ungraceful interrupt of an eval script)
+
+**What.** `OlistDataSource.dispose()` is the only cleanup path that kills the child. If the parent crashes before `dispose()` runs, the child is orphaned. The OS SHOULD send EOF to the child's stdin when the parent dies (closing the parent's half of the pipe), and the child SHOULD exit on EOF — but this isn't guaranteed across all crash modes (especially `kill -9` of the parent, where the OS may take time to garbage-collect the pipe). There's no `process.on('exit', () => ds.dispose())` handler installed anywhere in the repo.
+
+**Where.**
+- `lib/data-source/olist-data-source.ts:176-196` — `dispose()` exists but is only called by callers who remember to call it.
+- `lib/data-source/index.ts:87` — the factory exposes `dispose` to the route handler; the route is responsible for the `finally`.
+- Nowhere: a `process.on('exit')` / `process.on('SIGINT')` / `process.on('SIGTERM')` reaper for in-flight OlistDataSource instances.
+
+**Consequence when it fires.** Each orphaned child holds ~30-50MB of heap + an open SQLite FD. The OS reaps them eventually (parent's pipe FDs are reclaimed by the kernel within seconds-to-minutes), but during long dev sessions with frequent HMR or repeated `npm run eval:*` interrupts, you can accumulate several orphans before noticing. `ps aux | grep mcp-server-olist` is the diagnostic; `kill <pid>` is the cure. The dev-server case is the most painful — each HMR reload of a route module can spawn a new child without disposing the old one if the cleanup discipline isn't enforced at module boundaries.
+
+**The move.**
+
+```
+  the safety net (pseudocode)
+
+  // lib/data-source/olist-data-source.ts — add a global registry:
+  const liveSources = new Set<OlistDataSource>()
+  constructor() {
+    liveSources.add(this)
+  }
+  async dispose() {
+    liveSources.delete(this)
+    // ... existing cleanup ...
+  }
+
+  // module init (once per process):
+  if (!globalThis.__olistReaperInstalled) {
+    globalThis.__olistReaperInstalled = true
+    const reap = () => liveSources.forEach(ds => ds.dispose().catch(() => {}))
+    process.on('exit', reap)
+    process.on('SIGTERM', reap)
+    process.on('SIGINT', reap)
+  }
+```
+
+Effort: ~15 lines. Caveat: `process.on('exit')` only fires on normal exits; SIGKILL bypasses it. The right belt-and-braces for SIGKILL is to add an `unref()`-style detach + `child.kill()` on parent crash inside the SDK transport — that's an upstream change.
+
+---
+
+### Risk 2.6 — Parallel eval-script runs share filesystem output dirs (Phase 3 anecdote)
+
+**Severity: material** (data corruption: two `eval:diagnosis -- --K=10` runs write to the same `eval/results/<date>/` and one silently overwrites the other)
+**Likelihood at current scale: low** (only fires when two sessions/agents trigger the same eval script same day) — but it HAPPENED in PR E development
+
+**What.** During PR E, the main session ran `npm run eval:diagnosis -- --K=10` while a sub-agent (in parallel) ran the SAME script. Both `tsx` processes were detected via `ps aux` and killed (PIDs 30039 and 30040) before either completed; if neither had been killed, the second-finishing one would have clobbered the first's results. The mitigation is `EVAL_RUN_TAG=<suffix>` — sets the output dir to `eval/results/<date>-<tag>/` — but it's opt-in.
+
+**Where.**
+- `eval/scripts/run-*.ts` — entry points; default to `eval/results/<date>/` for output.
+- `.aipe/study-testing/06-eval-flywheel.md` — the full incident report (PIDs 30039/30040, `ps aux` + `kill`, the lesson).
+
+**Consequence when it fires.** Two parallel runs of the same eval script produce one survivor's results in the shared directory. The metrics for the "lost" run are gone. At low frequency this is a few minutes of wasted Anthropic spend; if it happens during a regression-check that gates a PR, it's a real correctness gap.
+
+**The move.** Add a lockfile check at eval-script entry:
+
+```
+  the gate (pseudocode)
+
+  const lockPath = resolve('eval/results', dateStr, '.lock')
+  if (existsSync(lockPath) && !process.env.EVAL_RUN_TAG) {
+    throw new Error(
+      `eval/results/${dateStr}/ is in use by another run. ` +
+      `Set EVAL_RUN_TAG=<suffix> to write to eval/results/${dateStr}-<suffix>/ instead.`
+    )
+  }
+  writeFileSync(lockPath, String(process.pid))
+  process.on('exit', () => unlinkSync(lockPath))
+```
+
+Cheap, mechanical, prevents the next variant of this incident. Same shape as `vi.stubEnv` / `vi.unstubAllEnvs` in the test layer.
 
 ---
 
@@ -331,10 +415,11 @@ The bigger fix is just Risk 1's fix — once the cache moves off-process, the ki
 
 These would normally appear in a runtime audit but the repo doesn't have the surface, so there's no risk to report:
 
-- **Worker threads / clustering / child processes.** Not used. No risks here because there's no surface.
-- **CPU-bound work blocking the loop.** Not currently exercised — every heavy compute is offloaded to providers. A future feature with local CPU work (embeddings, image processing) would re-introduce this surface.
-- **Locks / Atomics / SharedArrayBuffer.** Not used. The repo's concurrency model (run-to-completion + one `AsyncLocalStorage`) is sufficient.
-- **`SIGTERM` / `SIGINT` handlers, graceful shutdown.** Not installed. The platform handles eviction; we don't try.
+- **Worker threads / clustering.** Not used.
+- **`child_process` via raw `spawn` from app code.** Not used — but `@modelcontextprotocol/sdk`'s `StdioClientTransport` spawns the Olist child under the hood. Risk 2.5 covers the lifecycle gap.
+- **CPU-bound work blocking the loop.** Not currently exercised in the parent — every heavy compute is offloaded to providers or the subprocess. The subprocess itself runs sync `better-sqlite3` but is single-flight so its loop block is safe.
+- **Locks / Atomics / SharedArrayBuffer.** Not used. The repo's concurrency model (run-to-completion + `AsyncLocalStorage` + single-flight subprocess) is sufficient.
+- **`SIGTERM` / `SIGINT` handlers, graceful shutdown.** Not installed in the parent. Risk 2.5 covers the subprocess reaper that should be.
 - **`process.exit` / `process.kill` from app code.** Never called.
 - **Long-running background jobs / cron.** Not present. No queue, no scheduler.
 - **File watching / `fs.watch`.** Not present.
@@ -347,26 +432,35 @@ These would normally appear in a runtime audit but the repo doesn't have the sur
 If you handed me a one-day budget and said "harden the runtime":
 
 ```
-  one-day fix priority
+  one-day fix priority (Phase 2)
 
   ┌─ ship it (high payoff, low effort) ──────────────────────────┐
-  │  1. Risk 2 — wire AbortController through agent loop          │
-  │     ~30 lines; stops paying for abandoned investigations      │
-  │  2. Risk 5 — Promise-cache the schema bootstrap                │
+  │  1. Risk 2.5 — install a SIGTERM/SIGINT/exit reaper for       │
+  │     live OlistDataSource instances                             │
+  │     ~15 lines; closes the orphan-child gap                     │
+  │  2. Risk 2 — finish wiring AbortController (route → loop →    │
+  │     adapter; adapter half is already done)                    │
+  │     ~15 lines; stops paying for abandoned investigations       │
+  │  3. Risk 2.6 — add a lockfile check at eval-script entry      │
+  │     ~10 lines; prevents the next parallel-run clobber          │
+  │  4. Risk 5 — Promise-cache the schema bootstrap                │
   │     ~10 lines; eliminates the cold-burst duplicate work       │
-  │  3. Risk 4 — LRU-cache the investigations Map                  │
+  │  5. Risk 4 — LRU-cache the investigations Map                  │
   │     ~5 lines; bounds memory growth as a side benefit          │
+  │  6. Cleanup: promote composeSignals to lib/runtime/signals.ts │
+  │     and import from both call sites                            │
+  │     ~5 LOC moved + 2 imports; zero behavior change             │
   └───────────────────────────────────────────────────────────────┘
   ┌─ measure first (could matter, could not) ────────────────────┐
-  │  4. Risk 8 — move spacing gate to module scope                │
+  │  7. Risk 8 — move spacing gate to module scope                │
   │     measure rate-limit retry frequency in production first    │
   │     before doing the global-state refactor                    │
   └───────────────────────────────────────────────────────────────┘
   ┌─ defer (right answer is bigger than the symptom) ────────────┐
-  │  5. Risk 1 — process-local state on serverless                │
+  │  8. Risk 1 — process-local state on serverless                │
   │     right answer is a real durable store (KV/Redis/DB),       │
   │     not a patch on the Map                                    │
-  │  6. Risk 6 — incremental save / SIGTERM                       │
+  │  9. Risk 6 — incremental save / SIGTERM for the parent        │
   │     subsumed by Risk 1's fix                                  │
   └───────────────────────────────────────────────────────────────┘
   ┌─ name and leave (no current cost) ───────────────────────────┐
@@ -380,8 +474,13 @@ If you handed me a one-day budget and said "harden the runtime":
 
 ## See also
 
-- `00-overview.md` — top-3 risks in the overview map onto Risks 1, 2, 8 here.
-- `01-runtime-map.md` — the runtime topology that makes the risks make sense.
-- `04-shared-state-races-and-synchronization.md` — Risk 5's race lives here.
-- `05-memory-stack-heap-gc-and-lifetimes.md` — Risks 1, 4, 7 are all lifetime risks.
-- `07-backpressure-bounded-work-and-cancellation.md` — Risk 2 + Risk 10 are the cancellation + backpressure halves of the same story.
+- `00-overview.md` — top-3 risks in the overview map onto Risks 2.5, 1, 2 here (Phase 2 re-ranked).
+- `01-runtime-map.md` — the runtime topology (four bands) that makes the risks make sense.
+- `04-shared-state-races-and-synchronization.md` — Risk 5's race; composeSignals duplication.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — Risks 1, 4, 7 are all lifetime risks; child-heap section.
+- `06-filesystem-streams-and-resource-lifecycle.md` — Risk 2.5 (orphan child) lives here as a resource-cleanup story.
+- `07-backpressure-bounded-work-and-cancellation.md` — Risk 2 (half-wired AbortController) is the cancellation half; Risk 10 is backpressure.
+- `.aipe/study-testing/06-eval-flywheel.md` — full incident report for Risk 2.6 (parallel K=10 clobber).
+
+---
+Updated: 2026-06-16 — added Risk 2.5 (orphan subprocess on parent crash) and Risk 2.6 (parallel eval-script clobber); corrected Risk 2 to "half-wired"; updated seam diagram to four seams; added composeSignals dedup to one-day priority.

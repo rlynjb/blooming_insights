@@ -1,9 +1,9 @@
 # Migrations and evolution
 
-**Industry name(s):** Schema migrations · evolution · backwards compatibility · forward-compatible reads · prompt versioning as schema-as-code
+**Industry name(s):** Schema migrations · evolution · backwards compatibility · forward-compatible reads · prompt versioning as schema-as-code · rebuild-from-seed (in lieu of migrations)
 **Type:** Industry standard · Language-agnostic
 
-> **Not yet exercised at the database layer** — there's no migration tooling, no schema-as-code, no rollback strategy because there's no database to migrate. But schema *does* evolve here, just along three softer axes: (1) the TypeScript interfaces in `lib/mcp/types.ts` evolve through git diffs with an explicit "add as optional" policy named in the comments, (2) the **agent prompts in `lib/agents/prompts/*.md` are the de-facto schema for what each agent emits**, and they're versioned through git like any other file, and (3) the demo seed JSONs (`lib/state/demo-*.json`) are stored snapshots of an older shape — they have to still validate against the current `Insight` interface. That third one is the closest the repo has to "live data under a migration," and it's solved by the "all enrichments optional" design rule. This file walks all three.
+> **The agent contract still evolves softly; the Olist DB evolves by destructive rebuild.** Four axes now. (1) The TypeScript interfaces in `lib/mcp/types.ts` evolve through git diffs with an explicit "add as optional" policy. (2) The agent prompts in `lib/agents/prompts/*.md` are the de-facto schema for what each agent emits, versioned through git. (3) The demo seed JSONs (`lib/state/demo-*.json`) are stored snapshots that have to still validate against the current `Insight` interface — solved by the "all enrichments optional" rule. (4) **NEW: the Olist SQLite schema** lives in `mcp-server-olist/scripts/seed-olist.ts` as a string constant (`SCHEMA_SQL`) and "migrations" are achieved by `unlinkSync(DB_PATH) + recreate`. There's no `ALTER TABLE`, no `up/down`, no rollback — because the DB is a deterministic synthetic dataset (`mulberry32(seed=42)`, file 09), drop-and-reseed gives byte-identical data every time. That's a legitimate "no migrations needed" design choice, NOT a gap. The day the DB starts accepting writes from real users, it stops being legitimate.
 
 ---
 
@@ -282,9 +282,51 @@ When a field is added to `Anomaly`, the prompt's `## Output` section has to be u
 
 What breaks without this discipline: an incompatible rename ships, the demo route returns invalid data, the UI crashes when no MCP is available — i.e. exactly the kind of regression an integration test would normally catch, except there's no test that validates the demo seed against the current interface. The discipline is the test.
 
+### Move 2 — Olist's "migrations": drop-and-reseed (NEW 2026-06-16)
+
+The Olist DB's schema lives in `mcp-server-olist/scripts/seed-olist.ts` as the `SCHEMA_SQL` constant. To change the schema, you edit the string and run `npm run seed`. The seeder does:
+
+```
+  the seed-as-migration pattern
+
+  1. compute DB_PATH                       (mcp-server-olist/data/olist.db)
+  2. if (existsSync(DB_PATH)) unlinkSync   ← destructive: delete the file
+  3. db = new Database(DB_PATH)             ← fresh empty file
+  4. db.exec(SCHEMA_SQL)                    ← create all tables + indexes
+  5. db.transaction(() => {                 ← all bulk inserts in one txn
+       insert customers, products,
+              orders, order_items,
+              payments, reviews,
+              seeded_anomalies
+     })()
+  6. (done — DB file is now identical across machines because
+      mulberry32(seed=42) is deterministic; see file 09)
+```
+
+**What this gives:** zero migration tooling, zero `up/down` scripts, zero rollback story — and it's correct. Because the seed is deterministic, two developers running `npm run seed` end up with byte-identical DBs. Because the schema is destructive-rebuild, "what's the current schema?" is always `SCHEMA_SQL` — no schema-version table, no checking which migrations have applied.
+
+**What this only works because of:** the DB is **read-only at runtime** (only the seeder writes), and the data is **synthetic** (no real customer data to preserve). Both invariants are load-bearing. The moment either flips — the moment a tool starts writing, or the moment the data is real — drop-and-reseed becomes destructive in the bad sense. That's when Drizzle migrations or `node-pg-migrate` would have to land.
+
+**The contrast with the agent-contract side:**
+
+```
+  Agent-contract side               Olist DB side
+  ───────────────────────────       ────────────────────────────
+  evolves softly through git        evolves destructively
+  every new field is OPTIONAL       schema is a constant string
+  old snapshots still validate      no "old data" — reseed gives
+                                     the current shape every time
+  no migration tool needed          no migration tool needed
+   (because additive only)           (because deterministic + read-only)
+  forward-compatible reads          backwards compatibility is NIL
+                                     (a SCHEMA_SQL change wipes everything)
+```
+
+Both are legitimate "no migration tooling" stories — but for opposite reasons. The agent contract preserves old data by making every change additive. The Olist DB throws away old data by making the data regenerable. Two solutions to "we don't have migrations"; both work for the constraints they live under.
+
 ### Move 3 — the principle
 
-Schema evolution is a question of who has to do what when the shape changes. In a relational system, the answer is "the DBA runs the migration, the app reads the new shape, the old data gets backfilled or upcast at read time." Here, the equivalent is "the developer edits three files (types, prompt, validator), commits, and the existing snapshots either keep working (if the change was optional/additive) or have to be re-captured (if not)." The policy that makes this scale is **always-optional, always-additive** — it lets evolution happen through the same git workflow as any other code change, without a migration layer.
+Schema evolution is a question of who has to do what when the shape changes. In a relational system with live writers and durable customer data, the answer is "the DBA runs the migration, the app reads the new shape, old data gets backfilled or upcast at read time." Here, the answer splits two ways: the agent contract evolves by **add-only with optional fields** (existing data validates against the new shape automatically), and the Olist DB evolves by **deterministic-rebuild** (no existing data to preserve because the seed regenerates it). Both are "no migration tooling" — and both are right, for the constraints they hold. The day either invariant breaks (data becomes load-bearing for the agent side; the DB starts taking real writes), the soft story stops working.
 
 ---
 
@@ -498,6 +540,11 @@ A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a 
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces that evolve, and the dual-shape `Diagnosis` as a mid-migration smell.
 - `02-normalization-and-duplication.md` — the `affectedCustomers` ghost field declared but never written is mid-migration debt.
-- `04-transactions-and-integrity.md` — why the runtime guards are deliberately permissive on optional fields (the migration story depends on it).
-- `06-access-patterns-and-storage-choice.md` — the in-memory store has no migration story because there's no persistent state; the demo seed is the only thing that crosses git commits.
+- `04-transactions-and-integrity.md` — the Olist seed transactions (the rebuild is one atomic operation).
+- `06-access-patterns-and-storage-choice.md` — the three storage layers and their durability stories.
+- `08-the-olist-relational-schema.md` — `SCHEMA_SQL` lives here.
+- `09-deterministic-synthetic-data.md` — `mulberry32(seed=42)` is what makes destructive-rebuild a legitimate migration strategy.
 - `study-software-design/audit.md#pull-complexity-downward` — the prompts owning their own output-shape schema is "pull complexity downward" applied to schema evolution.
+
+---
+Updated: 2026-06-16 — added the Olist "drop-and-reseed" pattern; named the determinism-and-read-only invariants that make it work; contrasted with the additive-evolution policy on the agent contract.

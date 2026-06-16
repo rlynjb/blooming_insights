@@ -3,7 +3,7 @@
 **Industry name(s):** replicas · shards · partition keys · quorum reads/writes · failover
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first: NOT YET EXERCISED.** blooming insights has **no replication, no partitioning, no quorum protocol, no failover mechanism** — because it has nothing to replicate. There is no database to shard, no Redis cluster to failover, no Cassandra ring to write to with quorum. Vercel runs *multiple instances of the Next.js process* horizontally, but the code treats each instance as if it were the only one — there's no cross-instance state, no leader, no consensus. That isn't a gap to fix; it's the deliberate "no database" architectural choice (see `study-system-design/audit.md#storage-choice-and-durability-boundaries`). This file walks the concepts so they're in your vocabulary, names which Bloomreach-side replication is opaque to us, and pinpoints the *first* feature that would force this whole topic to become real.
+> **Verdict-first: NOT YET EXERCISED at the app level, but the family of hazards has bitten us once already.** blooming insights has **no replication, no partitioning, no quorum protocol, no failover mechanism** — because it has nothing to replicate. There is no database to shard, no Redis cluster to failover, no Cassandra ring to write to with quorum. Vercel runs *multiple instances of the Next.js process* horizontally, but the code treats each instance as if it were the only one — there's no cross-instance state, no leader, no consensus. That isn't a gap to fix; it's the deliberate "no database" architectural choice (see `study-system-design/audit.md#storage-choice-and-durability-boundaries`). However, the **eval scripts in Phase 3 hit a real shared-mutable-state-across-processes hazard** when two K=10 runs raced to write into the same `eval/results/<date>/` directory; the `EVAL_RUN_TAG` env var is the post-hoc fix. That anecdote IS distributed-systems thinking applied to a single-host multi-process scenario, and the lesson generalises. This file walks the concepts so they're in your vocabulary, tells the parallel-run war story, names which Bloomreach-side replication is opaque to us, and pinpoints the *first* feature that would force this whole topic to become real.
 
 ---
 
@@ -183,6 +183,56 @@ Two things in the dependency graph are almost certainly replicated, but invisibl
 
 There's nothing we can do at the codebase to participate in their replication — we're a client, not a peer. The right response to their failure is the partial-failure handling in file 02.
 
+#### Part 6 — the parallel-eval K=10 race (real war story, single host, multiple processes)
+
+The Phase 3 eval pipeline writes its results into `eval/results/<YYYY-MM-DD>/` per script. Two K=10 runs on the same day — say, one from the main session and one from a sub-agent in another shell — both compute the same date string, both call `mkdirSync(... { recursive: true })`, both `JSON.stringify` per-run results, and both write `summary.md` at the end. **There is no coordination.** The faster writer's output gets clobbered by the slower writer's; the earlier `summary.md` is overwritten silently; the directory ends up with rows from two interleaved runs and no way to tell which is which.
+
+```
+  The race — two processes, one directory, no lock
+
+  process A (eval/scripts/run-detection K=10)        process B (same)
+     │                                                  │
+     ├── mkdirSync('eval/results/2026-06-15')          ├── mkdirSync('...')
+     │                                                  │
+     ├── run 1/10 (~30s)                               ├── run 1/10 (~30s)
+     ├── write summary partial                         ├── write summary partial
+     ├── run 2/10                                      ├── run 2/10
+     │   ...                                              ...
+     ├── write summary.md  ←─ A's final                ├── write summary.md
+     │                          ─ clobbered ──────────►│   ←─ B overwrites A
+     │                                                  │
+  → directory contains a mix of A's and B's per-run JSON,
+    B's summary.md, and no way to recover A's
+```
+
+This bit the team for real: the main session ran K=10 from Bash while PR E's sub-agent ALSO ran K=10 in parallel. The race was detected via `ps aux` (two `node` processes mid-eval), and the rogue PIDs were killed before they finished overwriting each other. The fix wasn't a lock or a coordinator — it was **separating the namespace**: every eval script now reads `process.env.EVAL_RUN_TAG` and appends the tag as a suffix on the date-stamped directory.
+
+```
+  The fix — namespace separation via EVAL_RUN_TAG
+
+  process A: EVAL_RUN_TAG=baseline    → eval/results/2026-06-15-baseline/
+  process B: EVAL_RUN_TAG=after-fix   → eval/results/2026-06-15-after-fix/
+                                         (different dirs; no race)
+
+  pseudocode (the actual pattern, repeated in run-detection.ts,
+              run-diagnosis.ts, run-recommendation.ts, run-regression.ts):
+
+    date = new Date().toISOString().slice(0, 10)
+    tag = process.env.EVAL_RUN_TAG          ← optional namespace
+    dirName = tag ? `${date}-${tag}` : date
+    dir = resolve(REPO_ROOT, 'eval/results', dirName)
+    if not exists(dir): mkdirSync(dir, recursive: true)
+```
+
+The distributed-systems lessons here are real even though it's a single host:
+
+- **Shared mutable state across processes is a hazard regardless of network.** Two Node processes on the same machine writing to the same path is morally identical to two replicas writing to the same key.
+- **The cheapest coordination is namespace separation.** Instead of a lock, give each writer its own directory. This is why partition keys (file's Part 3) exist as a primitive even outside multi-replica databases — partitioning is "let writers not collide" applied at any altitude.
+- **Detection > prevention when prevention is expensive.** A `flock` on the directory would prevent the race but block the second writer. The chosen fix (suffix) lets both runs proceed in parallel into separate namespaces — strictly better for the eval workflow, where comparing two runs IS the point.
+- **The hazard is invisible without observability.** No error fired. No exception. The team noticed because they could *see* two `node` processes in `ps aux`. Without that, the race would have produced a confusing summary and no debug trail.
+
+The right next move when a real cross-instance hazard arises in the Vercel app (not just the eval scripts): the same pattern applies. Namespace-separate by `bi_session` (one user, one namespace) or `sessionId` (one route invocation, one namespace), and the cross-instance hazard converts into a non-race.
+
 ### Move 3 — the principle
 
 **Replication is the answer to "what happens when this dies?" — but only when there's something durable to keep alive.** blooming insights has no durable state outside Bloomreach itself; if the Vercel instance dies, the user retries from scratch and nothing is lost (the briefing was re-derivable; the investigation was re-runnable). Replication is the right tool the moment that stops being true — when there's a feature where "the user wouldn't be able to redo the work." Until then, the right answer to "why no replication?" is "because nothing here would benefit from it" — and saying that plainly is honest distributed-systems thinking, not a confession.
@@ -234,7 +284,9 @@ There's nothing we can do at the codebase to participate in their replication �
 
 **Use cases.**
 
-There are none today. Every file path that would normally appear here — connection pools to a primary, read-replica routing, quorum-write configuration, failover handlers — does not exist. The closest thing to "instance-aware logic" is the comment in `lib/mcp/auth.ts:38-104` explaining that the encrypted cookie backend exists precisely *because* there's no cross-instance store, and the auth flow has to survive Vercel routing the connect and callback requests to different instances.
+In the Vercel app: none today. Every file path that would normally appear here — connection pools to a primary, read-replica routing, quorum-write configuration, failover handlers — does not exist. The closest thing to "instance-aware logic" is the comment in `lib/mcp/auth.ts:38-104` explaining that the encrypted cookie backend exists precisely *because* there's no cross-instance store, and the auth flow has to survive Vercel routing the connect and callback requests to different instances.
+
+In the eval scripts: the `EVAL_RUN_TAG` env var IS the codebase's only existing answer to a shared-mutable-state-across-processes hazard. Four scripts honor it (`eval/scripts/run-detection.ts`, `run-diagnosis.ts`, `run-recommendation.ts`, `run-regression.ts`); each computes its results-dir as `${date}-${tag}` if the tag is set, plain `${date}` otherwise. The fix is one-shape, repeated.
 
 **Code side by side.**
 
@@ -272,6 +324,32 @@ The only place the codebase acknowledges horizontal scaling is in the auth backe
           #1 distributed-systems risk. It's not "the wrong design"; it's
           "the right design at hackathon scale, with the cost honestly
           named." Adding replication here means adding a database first.
+```
+
+```
+  eval/scripts/run-detection.ts  (lines 87-100)
+
+  function makeResultsDir(): { dir: string; date: string } {
+    const today = new Date();
+    const date = today.toISOString().slice(0, 10);
+    // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
+    // `2026-06-15-after-fix/`) instead of overwriting the prior run's
+    // summary.md and raw audit trail.
+    const tag = process.env.EVAL_RUN_TAG;
+    const dirName = tag ? `${date}-${tag}` : date;
+    const dir = resolve(REPO_ROOT, 'eval/results', dirName);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    return { dir, date };
+  }
+       │
+       └─ namespace-separation as a coordination primitive. Without the
+          tag suffix, two parallel K=10 runs collide; with it, they
+          partition their writes by tag. Same pattern lives in
+          run-diagnosis.ts:118-127, run-recommendation.ts:136-145,
+          run-regression.ts:178-187 — four copies, deliberately
+          duplicated because each script is a standalone process and
+          the cost of factoring this out is higher than the cost of
+          one extra `const tag = process.env.EVAL_RUN_TAG`.
 ```
 
 ---
@@ -330,5 +408,9 @@ A shared workspace where two users see the same briefing. That breaks the per-bi
 - `01-distributed-system-map.md` — Seam B (the cross-instance gap) is the seam this file is about
 - `04-consistency-models-and-staleness.md` — consistency models only matter when there are multiple replicas to be consistent across
 - `07-clocks-coordination-and-leadership.md` — also NOT YET EXERCISED, for related reasons
-- `09-distributed-systems-red-flags-audit.md` — ranks "in-memory state on serverless" as the #1 risk
+- `09-distributed-systems-red-flags-audit.md` — ranks "in-memory state on serverless" as the #1 risk; the parallel-eval hazard is named in there too
+- `.aipe/study-testing/05-llm-eval-as-testing.md` — the eval pipeline + `EVAL_RUN_TAG` flywheel in detail
 - `.aipe/study-system-design/audit.md#storage-choice-and-durability-boundaries` — the architectural take on why no database
+
+---
+Updated: 2026-06-16 — Added Part 6: the K=10 parallel-eval race + EVAL_RUN_TAG fix as a real single-host multi-process distributed-systems anecdote; added the eval code side-by-side; cross-link to study-testing.

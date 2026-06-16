@@ -3,7 +3,7 @@
 **Industry name(s):** clock skew · happens-before · logical clocks (Lamport, vector) · leases · leader election · split-brain
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first: NOT YET EXERCISED at the distributed level.** blooming insights uses `Date.now()` in four places — `McpClient` cache TTLs, `McpClient` spacing tracker, `useInvestigation` UI timestamps, and `Insight.timestamp` ISO strings — and **every one of those is within a single process**. No two processes compare clock values; no logical-clock protocol exists; no lease is acquired; no leader is elected. The classical distributed-systems clock concerns (skew between nodes, happens-before across processes, split-brain when two nodes both think they're leader) do not apply because the boxes whose clocks would need to agree don't exist. The most consequential clock fact in the codebase: **`Insight.timestamp` is generated server-side per-instance**, so two instances generating insights for the same anomaly stamp them at slightly different wall-clock times — currently invisible because each instance overwrites the other (`putInsights` clears first), but it would become a real ordering question if insights were ever merged across instances.
+> **Verdict-first: NOT YET EXERCISED at the distributed level.** blooming insights uses `Date.now()` in five places — `BloomreachDataSource` cache TTLs, `BloomreachDataSource` spacing tracker, `OlistDataSource.callTool` for `durationMs`, `useInvestigation` UI timestamps, and `Insight.timestamp` ISO strings — and **every one of those is within a single process**. No two processes compare clock values; no logical-clock protocol exists; no lease is acquired; no leader is elected. The classical distributed-systems clock concerns (skew between nodes, happens-before across processes, split-brain when two nodes both think they're leader) do not apply because the boxes whose clocks would need to agree don't exist. The most consequential clock fact in the codebase: **`Insight.timestamp` is generated server-side per-instance**, so two instances generating insights for the same anomaly stamp them at slightly different wall-clock times — currently invisible because each instance overwrites the other (`putInsights` clears first), but it would become a real ordering question if insights were ever merged across instances.
 
 ---
 
@@ -112,7 +112,7 @@ Three classical responses to this:
 
 ### Move 2 — the four `Date.now()` callsites, walked
 
-#### Callsite 1 — McpClient cache TTL (`lib/mcp/client.ts:107, 143`)
+#### Callsite 1 — BloomreachDataSource cache TTL (`lib/data-source/bloomreach-data-source.ts:149, 186`)
 
 ```
   Cache TTL — within-process comparison only
@@ -131,7 +131,7 @@ Three classical responses to this:
 
 Safe. No distributed clock issue.
 
-#### Callsite 2 — McpClient spacing (`lib/mcp/client.ts:149, 155, 158`)
+#### Callsite 2 — BloomreachDataSource spacing (`lib/data-source/bloomreach-data-source.ts:191, 197, 200`)
 
 ```
   Spacing tracker — within-process comparison only
@@ -149,6 +149,26 @@ Safe. No distributed clock issue.
 ```
 
 Safe. No distributed clock issue.
+
+#### Callsite 2b — OlistDataSource durationMs (`lib/data-source/olist-data-source.ts:152, 159`)
+
+```
+  Olist durationMs — within-process comparison only
+
+  on call:  const start = Date.now()
+            ... await client.callTool(..., { signal })
+            const durationMs = Date.now() - start
+            return { result, durationMs, fromCache: false }
+
+  comparison: same process's clock at two times (start vs end)
+  skew matters? NO — same monotonic-ish clock
+  cross-process? NO — even though the call traverses a stdio pipe
+                       to a subprocess, BOTH Date.now() readings
+                       happen in the parent process; the child's
+                       clock is never read by our code
+```
+
+Safe. The interesting observation: even though this callsite is *about* an IPC round-trip, the clock comparison stays within one process — the parent measures wall-clock duration from before-send to after-receive without touching the child's clock at all. The child has its own clock and presumably writes log timestamps with it, but those are display-only (file 06, the stderr stream).
 
 #### Callsite 3 — UI TraceItem timestamps (`lib/hooks/useInvestigation.ts:107, 113`)
 
@@ -292,7 +312,7 @@ Every existing use case is within-process and safe. The interesting *non*-use ca
 **Code side by side.**
 
 ```
-  lib/mcp/client.ts  (lines 107, 143-144)
+  lib/data-source/bloomreach-data-source.ts  (lines 149-150, 185-186)
 
   if (cached && cached.expiresAt > Date.now()) {        ← read-time comparison
     return { result: cached.result as T, durationMs: 0, fromCache: true };
@@ -308,7 +328,7 @@ Every existing use case is within-process and safe. The interesting *non*-use ca
 ```
 
 ```
-  lib/mcp/client.ts  (lines 149-156)
+  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
 
   const elapsed = Date.now() - this.lastCallAt;
   if (elapsed < this.minIntervalMs) {
@@ -396,7 +416,7 @@ The lease — a lock with a TTL. A naive distributed lock without an expiration 
 ## Validate
 
 - **Reconstruct.** Without looking, list the three classical responses to cross-machine clocks (Lamport / vector / HLC) and name the failure mode each fixes.
-- **Explain.** Why is the `lastCallAt` update in `lib/mcp/client.ts:158` in the `catch` block as well as the `try` block? So the next call's spacing applies even after a failure — without this, a thrown error would leave `lastCallAt` stale, and the next call might fire too quickly.
+- **Explain.** Why is the `lastCallAt` update in `lib/data-source/bloomreach-data-source.ts:200` in the `catch` block as well as the `try` block? So the next call's spacing applies even after a failure — without this, a thrown error would leave `lastCallAt` stale, and the next call might fire too quickly.
 - **Apply.** A new feature wants "exactly one briefing per organization per day at 8am." Walk through the leader-election question. (Vercel Cron Jobs — the platform IS the leader-election protocol for this. Define the cron entry, point it at a route handler; Vercel guarantees one invocation per schedule entry. No custom consensus needed.)
 - **Defend.** Why does `Insight.timestamp = new Date().toISOString()` not need a clock-skew correction? Because the only consumer is the browser, displaying "X minutes ago" — a cosmetic computation with no data-path dependency. Cosmetic skew is acceptable; correctness skew (which doesn't exist here) wouldn't be.
 
@@ -409,3 +429,6 @@ The lease — a lock with a TTL. A naive distributed lock without an expiration 
 - `05-replication-partitioning-and-quorums.md` — replication is the other "not yet exercised" that would force this topic
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — workflows often need timestamps; the step 2 → step 3 flow doesn't
 - `.aipe/study-runtime-systems/` — event loop within one Vercel instance (when generated)
+
+---
+Updated: 2026-06-16 — Added Callsite 2b (Olist durationMs); migrated line refs to `lib/data-source/bloomreach-data-source.ts`.

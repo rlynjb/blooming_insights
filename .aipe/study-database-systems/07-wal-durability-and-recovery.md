@@ -29,14 +29,28 @@ How a database survives a crash and how it gets restored when it doesn't · Indu
 
 ### Verdict for this codebase
 
-**Not yet exercised.**
+**Exercised — `mcp-server-olist/src/db.ts` L40 sets `PRAGMA journal_mode = WAL`. Main app is unchanged.**
 
-Nothing here is durable enough to need a WAL. The state hierarchy:
+The state hierarchy now has a real WAL in it:
 
-- **Maps** — wiped on every cold start and every deploy. No durability claim, none expected.
-- **`.investigation-cache.json` and `.auth-cache.json`** — dev-only JSON files, atomic-replace by `writeFileSync`. No fsync, no rotation, no crash-safety story. If the process dies mid-write, the file is partially written and the next `JSON.parse` throws — caught and treated as empty (`lib/state/investigations.ts` L17 / `lib/mcp/auth.ts` L120).
-- **`bi_auth` cookie** — durable for ~10 days, AES-GCM encrypted. The "WAL" is the browser's cookie jar, written by the user's browser, not us. Recovery is "user re-authenticates" — which is the only "rebuild from log" we have, and it's done by hand.
-- **Committed JSON fixtures** (`lib/state/demo-*.json`) — durable via git. The "backup" is `git reflog`. The "PITR" is `git checkout <sha>`. Cute, but real.
+- **Main-app Maps** — wiped on every cold start and every deploy. No durability claim, none expected.
+- **`.investigation-cache.json` and `.auth-cache.json`** — dev-only JSON files, no fsync, no atomic rename. Tear-on-crash caught by `JSON.parse` try/catch (`lib/state/investigations.ts` L17 / `lib/mcp/auth.ts` L120).
+- **`bi_auth` cookie** — durable for ~10 days, AES-GCM encrypted. The "WAL" is the browser's cookie jar. Recovery is "user re-authenticates."
+- **Committed JSON fixtures** (`lib/state/demo-*.json`) — durable via git. The "backup" is `git reflog`. The "PITR" is `git checkout <sha>`.
+- **Olist SQLite WAL (NEW).** `mcp-server-olist/data/olist.db` is opened with `PRAGMA journal_mode = WAL`. The `.db-wal` and `.db-shm` files in the same directory are the real WAL artifacts. **But:** the MCP server is read-only (`new Database(path, { readonly: true })`), so it never WRITES to the WAL. The only writer is the seed script, and the WAL is created/cleaned by that process. WAL mode is set so future multi-process attachments wouldn't block each other on reads.
+
+```
+  who writes the WAL — and who doesn't
+
+  seed-olist.ts (one-shot)    →  writes to olist.db    →  WAL grows, checkpoints
+                                                           at COMMIT, eventually
+                                                           cleaned
+
+  mcp-server-olist (server)   →  opens readonly        →  reads existing pages;
+                                                           never appends to WAL
+
+  blooming_insights (main app) → never touches the DB  →  no WAL relationship
+```
 
 ### When this becomes load-bearing
 
@@ -131,7 +145,43 @@ Skipped — no codebase instance to recap.
 
 ### Use cases
 
-None. Nothing in this codebase is durable in the database sense.
+- **Olist WAL mode** is set on every DB open in `mcp-server-olist/src/db.ts` L40. Read-only callers don't touch the WAL; the seed script's `db.transaction(...)` (see 05) gets durability via WAL on COMMIT.
+- **Committed DB binary as "backup."** `mcp-server-olist/data/olist.db` is in git. PITR = `git checkout <sha>`. Restore time = `git checkout` runtime. RPO = "however stale the committed binary is" (which is fine because the DB is a fixture, not live).
+- **Main-app durability story** unchanged: cookies, JSON files, demo fixtures.
+
+### The Olist WAL
+
+```
+  mcp-server-olist/src/db.ts  (lines 32–43)
+
+  export function openDb(path = resolveDbPath()): Database.Database {
+    if (!existsSync(path)) {
+      throw new Error('olist.db not found ...');
+    }
+    const db = new Database(path, {
+      readonly: true,                          ← we never write at runtime
+      fileMustExist: true,
+    });
+    db.pragma('journal_mode = WAL');           ← enables the WAL file format
+    db.pragma('foreign_keys = ON');
+    return db;
+  }
+       │
+       └─ in WAL mode, SQLite creates two sidecar files:
+            data/olist.db-wal  (the write-ahead log, ring-buffer of pending writes)
+            data/olist.db-shm  (shared-memory index for the WAL)
+          
+          neither is committed to git (.gitignore handles them). they get
+          created lazily on first read. since we open readonly, the WAL stays
+          empty in normal operation — but the format is in place for any future
+          writer (e.g. a different seed pass, or schema migration).
+          
+          the load-bearing choice here is WAL vs the default DELETE journal_mode.
+          DELETE blocks readers during a write transaction; WAL doesn't. We use
+          readonly so write contention doesn't apply, but if we ever spawned
+          multiple subprocesses (worker pool, parallel evals), WAL is what would
+          let them all read concurrently without blocking.
+```
 
 ### The closest cousins, ranked
 
@@ -227,5 +277,10 @@ Anchor: today, no DB; this is hypothetical and I'd flag it.
 ## See also
 
 - `08-replication-and-read-consistency` — replication is WAL shipping
+- `05-transactions-isolation-and-anomalies` — the seed transaction whose COMMIT fsyncs the WAL
+- `10-embedded-sqlite-fixture` — why a committed binary DB is the "backup" here
 - `01-database-systems-map` — what little durability we do have
 - `study-distributed-systems` — log-as-truth pattern at a higher altitude
+
+---
+Updated: 2026-06-16 — Olist SQLite uses WAL mode (db.ts L40); read-only at runtime so WAL is dormant. Committed binary serves as git-managed backup.

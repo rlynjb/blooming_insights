@@ -3,33 +3,38 @@
 **Industry name(s):** partial failure handling · bounded retry · server-hint backoff · rate-limit cooperation
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** the load-bearing distributed-systems mechanism in this codebase is `McpClient`'s retry loop in `lib/mcp/client.ts:121-132`. It parses Bloomreach's *own* "Retry after ~N seconds" hint out of the 429 body, waits that long plus a 500ms cushion, and bounds itself by `maxRetries=3` and `retryCeilingMs=20_000`. This is genuine partial-failure engineering. The two real weaknesses: **no per-call timeout** (a hung MCP connection burns the route's whole 300s budget), and **no retry at all on Anthropic** or on non-429 MCP transport errors. The retry budget interacts with the route's 300s `maxDuration` — at 10s per retry × 3 retries × 6 tool calls per agent, a single agent can spend ~180s waiting on rate-limit windows alone.
+> **Verdict-first:** the load-bearing distributed-systems mechanism on the Bloomreach side is `BloomreachDataSource`'s retry loop in `lib/data-source/bloomreach-data-source.ts:164-174`. It parses Bloomreach's *own* "Retry after ~N seconds" hint out of the 429 body, waits that long plus a 500ms cushion, and bounds itself by `maxRetries=3` and `retryCeilingMs=20_000`. This is genuine partial-failure engineering. The Phase 2 addition (`OlistDataSource`) takes a **different** tack: no retry (the child can't really be rate-limited), but a per-call **30s `AbortSignal.timeout`** composed onto every `callTool` (`lib/data-source/olist-data-source.ts:151`). That asymmetry is the lesson — same `DataSource` interface, but each side picks the partial-failure tools that match its transport's failure ontology. The remaining real weaknesses: **Bloomreach side still has no per-call timeout** (a hung MCP connection burns the route's whole 300s budget), and **no retry at all on Anthropic** or on non-429 MCP transport errors.
 
 ---
 
 ## Zoom out, then zoom in
 
-Every partial-failure mechanism in this app lives at the service ↔ provider seam — specifically `McpClient`. Files 03 (idempotency), 04 (consistency), 09 (red-flags) all attach back to this box.
+Every partial-failure mechanism in this app lives at the service ↔ provider seam. Phase 2 split that into two adapters — `BloomreachDataSource` (the retry loop) and `OlistDataSource` (the per-call timeout). Files 03 (idempotency), 04 (consistency), 09 (red-flags), 10 (transport-agnostic protocol) all attach back to these boxes.
 
 ```
-  Zoom out — where retries happen
+  Zoom out — where retries and timeouts happen
 
   ┌─ UI layer ───────────────────────────────────────────┐
-  │  reconnect-once on 401 (app/page.tsx)                 │
+  │  reconnect-once on 401 (app/page.tsx) — bloomreach only│
   └─────────────────────────┬────────────────────────────┘
                             │
   ┌─ Service layer ─────────▼────────────────────────────┐
-  │  ★ McpClient.callTool — retry loop ★                  │ ← we are here
+  │  ★ BloomreachDataSource.callTool — retry loop ★       │ ← we are here
+  │       (parses 429 hint; bounded by maxRetries=3)      │
+  │       NO per-call timeout                             │
+  │  ★ OlistDataSource.callTool — per-call 30s timeout ★  │
+  │       (AbortSignal.timeout composed in; NO retry)     │
   │  agent loop: NO retry on Anthropic                    │
   └─────────────────────────┬────────────────────────────┘
                             │
   ┌─ Provider layer ────────▼────────────────────────────┐
-  │  Bloomreach MCP (429 with retry hint)                 │
-  │  Anthropic (no special handling in our code)          │
+  │  Bloomreach MCP   (429 with retry hint; network)      │
+  │  Anthropic        (no special handling in our code)   │
+  │  olist subprocess (no rate limit; can crash / EPIPE)  │
   └──────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question this file answers: *when a Bloomreach call comes back rate-limited, how does the app decide to retry, how long to wait, and when to give up?* The answer is the load-bearing distributed-systems decision in the codebase, and it's deeply shaped by one fact: **Bloomreach tells you how long to wait, in plain English, in the error body.** Cooperate with that hint and you survive; ignore it and you burn the budget.
+**Zoom in.** The question this file answers: *when an external partner fails partially, how does the app decide whether to wait, retry, or fail fast — and how long to do it for?* Two different answers for two different boundaries. On the Bloomreach side: **Bloomreach tells you how long to wait, in plain English, in the error body** — cooperate with that hint and you survive. On the Olist subprocess side: **no rate limit to negotiate, but a process can hang forever** — so the right move is a fixed per-call timeout, not a retry loop. Same `DataSource` interface, two different partial-failure stories.
 
 ---
 
@@ -37,32 +42,40 @@ Every partial-failure mechanism in this app lives at the service ↔ provider se
 
 **Layers.** Two interesting ones: the in-process retry loop (your code) and the external rate-limit window (their code). The route's 300s `maxDuration` is the outer bound on everything.
 
-**Axis: failure containment.** Hold one question across both layers: *where does a 429 get contained, and what does the layer above it see?* The MCP server emits 429 → `SdkTransport` (`lib/mcp/transport.ts:47-59`) returns it as a normal tool result with `isError: true` → `McpClient` (`lib/mcp/client.ts:122`) detects it via regex on the body and *contains* the failure inside its retry loop → the agent loop sees either a successful result or eventually an `isError: true` it surfaces as a tool error. Failure containment lives entirely inside `McpClient`. Above it, no one knows a retry happened.
+**Axis: failure containment.** Hold one question across both layers: *where does a 429 get contained, and what does the layer above it see?* The MCP server emits 429 → `SdkTransport` (`lib/mcp/transport.ts:47-59`) returns it as a normal tool result with `isError: true` → `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts:164`) detects it via regex on the body and *contains* the failure inside its retry loop → the agent loop sees either a successful result or eventually an `isError: true` it surfaces as a tool error. Failure containment lives entirely inside the adapter. Above it, no one knows a retry happened.
 
-**Seams.** Two. **Inside McpClient**, the seam between `callTool` (which retries) and `liveCall` (which spaces but doesn't retry). **Above McpClient**, the seam where retries become invisible — the agent loop never sees the retry count, only the final outcome. Below McpClient, the only seam is HTTP itself: every 429 carries a body the code reads to decide the next move.
+**Seams.** Three. **Inside BloomreachDataSource**, the seam between `callTool` (which retries) and `liveCall` (which spaces but doesn't retry). **Above the adapter**, the seam where retries become invisible — the agent loop never sees the retry count, only the final outcome. Below the adapter, the only seam is HTTP itself: every 429 carries a body the code reads to decide the next move. **In OlistDataSource**, the seam is different — it's between `callTool` (composes a 30s `AbortSignal.timeout` onto every dispatch) and the underlying `client.callTool` on the MCP SDK; failure containment is at the timeout boundary, not a retry loop.
 
 ```
-  Structure pass — failure containment
+  Structure pass — failure containment, two adapters
 
-  ┌─ agent loop ──────────────────────────────────────┐
-  │  sees: success result OR isError result            │
-  │  knows: nothing about retries                      │
-  └─────────────────────┬────────────────────────────┘
-                        │  callTool returns
-  ┌─ McpClient.callTool ▼─────────────────────────────┐
-  │  while (isRateLimited && retries < max):           │
-  │    waitMs = parseRetryAfterMs(result) ?? backoff   │
-  │    sleep(min(waitMs, ceiling))                     │
-  │    retry                                           │
-  │  ★ FAILURE CONTAINED HERE ★                        │
-  └─────────────────────┬────────────────────────────┘
-                        │  liveCall (spaces + dispatches)
-  ┌─ Bloomreach MCP ────▼─────────────────────────────┐
-  │  emits: 200 isError + body text with retry hint    │
-  └────────────────────────────────────────────────────┘
+  ┌─ agent loop ───────────────────────────────────────────┐
+  │  sees: success result OR isError result                 │
+  │  knows: nothing about which adapter / retries / timeouts │
+  └─────────────────────┬──────────────────────────────────┘
+                        │  callTool returns (uniform shape)
+            ┌───────────┴────────────┐
+            ▼                        ▼
+  ┌─ BloomreachDataSource ──┐  ┌─ OlistDataSource ──────┐
+  │ while (isRateLimited &&  │  │ signal = composeSignals( │
+  │        retries < max):   │  │   opts.signal,           │
+  │   waitMs =               │  │   AbortSignal.timeout(   │
+  │     parseRetryAfterMs ?? │  │     30_000))             │
+  │     backoff              │  │ client.callTool(...,     │
+  │   sleep(min(waitMs,      │  │   { signal })            │
+  │              ceiling))   │  │ ★ TIMEOUT CONTAINED ★    │
+  │   retry                  │  │ catch: OlistToolError    │
+  │ ★ RATE-LIMIT CONTAINED ★ │  │ no retry                 │
+  └────────┬─────────────────┘  └────────┬─────────────────┘
+           │  HTTP+SSE                   │  stdio (Unix pipe)
+           ▼                             ▼
+  ┌─ Bloomreach MCP ─────────┐  ┌─ olist subprocess ─────┐
+  │ 200 isError + body text   │  │ either responds, dies,  │
+  │ with retry hint           │  │ or hangs (timeout fires)│
+  └───────────────────────────┘  └─────────────────────────┘
 ```
 
-The containment is intentional. The agent loop is built to compose dozens of tool calls; bubbling a transient 429 up to the loop would force every agent to know about rate limits. Containing it in `McpClient` is the right altitude.
+The containment is intentional. The agent loop is built to compose dozens of tool calls; bubbling a transient 429 (or a slow subprocess) up to the loop would force every agent to know about both rate limits and subprocess health. Containing each at the adapter layer is the right altitude — and the `DataSource` interface above both adapters means the agent never has to switch on backend.
 
 ---
 
@@ -172,7 +185,7 @@ This is why proactive spacing matters — file 02 of `study-system-design/` walk
 
 #### Part 5 — the per-call spacing (separate from retry)
 
-The other half of the partial-failure story is *avoiding* the 429 in the first place. `McpClient.liveCall` (`lib/mcp/client.ts:148-163`) tracks `lastCallAt` and sleeps to ensure at least `minIntervalMs` (1100ms in production) between any two calls.
+The other half of the partial-failure story is *avoiding* the 429 in the first place. `BloomreachDataSource.liveCall` (`lib/data-source/bloomreach-data-source.ts:190-205`) tracks `lastCallAt` and sleeps to ensure at least `minIntervalMs` (1100ms in production) between any two calls.
 
 ```
   Proactive spacing — keep below the rate-limit window
@@ -198,14 +211,49 @@ The other half of the partial-failure story is *avoiding* the 429 in the first p
 
 The boundary condition: spacing is per-process. Two Vercel instances running concurrent briefings for the same user each think they're respecting the limit; together, they aren't. This is a Seam B problem (file 01) leaking into the partial-failure layer.
 
+#### Part 5b — the Olist side: per-call timeout instead of retry
+
+The Olist adapter has a fundamentally different partial-failure shape — no rate limit to negotiate (the child is local; no shared global budget), but a subprocess can hang forever (deadlocked SQLite read, blocked stdio buffer, whatever). The chosen primitive is a per-call `AbortSignal.timeout(30_000)` composed onto every dispatch (`lib/data-source/olist-data-source.ts:151`). On expiry the underlying SDK rejects with an abort error, which the adapter tags as `OlistToolError` and surfaces.
+
+```
+  Olist's partial-failure kernel — three parts
+
+  ┌─ OlistDataSource.callTool ─────────────────────────────┐
+  │  await this.connect()      ← idempotent; spawns once    │
+  │  signal = composeSignals(                               │
+  │              opts?.signal,                              │
+  │              AbortSignal.timeout(30_000)                │
+  │            )               ← compose route-cancel +     │
+  │                              per-call deadline           │
+  │  try:                                                   │
+  │    result = await this.client.callTool(                 │
+  │                  { name, arguments: args },             │
+  │                  undefined,                             │
+  │                  { signal })                            │
+  │    return { result, durationMs, fromCache: false }      │
+  │  catch (err):                                           │
+  │    throw new OlistToolError(name, ...)                  │
+  └─────────────────────────────────────────────────────────┘
+
+  three parts — remove any one and it breaks:
+    composeSignals     → caller cancel + 30s deadline unified
+    AbortSignal.timeout → the per-call ceiling (the missing piece on
+                          the Bloomreach side)
+    OlistToolError      → tagged so the agent can show which tool
+                          failed and why
+```
+
+The lesson: the *same* `DataSource.callTool` signature returns the *same* `{result, durationMs, fromCache}` envelope, but the underlying partial-failure tools differ — retry-with-parsed-window for the rate-limited HTTP partner, per-call deadline for the could-hang subprocess. The interface hides the difference; the partial-failure primitive does not.
+
 #### Part 6 — what NOT YET EXERCISED looks like
 
 Three pieces of standard partial-failure tooling are absent on purpose or by accident.
 
-- **No per-call timeout.** `transport.callTool` is awaited without a `Promise.race` against a timer. A hung MCP connection would consume the route's whole 300s budget silently. The only ceiling is `maxDuration = 300` on the route.
-- **No retry on transport errors.** A 401, 500, or network error is thrown as `McpToolError` (`lib/mcp/client.ts:68-77`) immediately, with no retry. The reasoning is sound — a 401 won't fix itself by retrying — but a transient 500 or DNS blip is also non-retried.
+- **No per-call timeout on the Bloomreach side.** `transport.callTool` in `BloomreachDataSource.liveCall` is awaited without a `Promise.race` against a timer. A hung MCP connection would consume the route's whole 300s budget silently. The only ceiling is `maxDuration = 300` on the route. The Olist side has this; the Bloomreach side does not — and it's the asymmetric gap worth closing first.
+- **No retry on transport errors.** A 401, 500, or network error is thrown as `McpToolError` (`lib/data-source/bloomreach-data-source.ts:101-110, 195-205`) immediately, with no retry. The reasoning is sound — a 401 won't fix itself by retrying — but a transient 500 or DNS blip is also non-retried.
 - **No circuit breaker.** If Bloomreach starts failing every call, the code keeps trying every call. No "open the circuit after 5 failures, fast-fail for 30 seconds" pattern. At hackathon scale this is fine; at production scale you'd add one.
 - **No retry on Anthropic.** `anthropic.messages.create()` is awaited directly in `runAgentLoop` (`lib/agents/base.ts:102`) with no wrapper. Anthropic's SDK may retry internally; the codebase doesn't add any. (Inferred — not observed in the code.)
+- **No subprocess restart on the Olist side.** If the child crashes (it shouldn't — it just reads SQLite), the adapter surfaces the error but does not respawn. The user retries by issuing the next `callTool`, which calls `connect()` again — but since `client` is non-null until `dispose()` runs, a crashed-but-not-disposed child stays "connected" from the adapter's view. Genuine restart logic is NOT YET EXERCISED.
 
 ### Move 3 — the principle
 
@@ -267,12 +315,13 @@ Three pieces of standard partial-failure tooling are absent on purpose or by acc
 **Use cases.**
 - An agent runs a long investigation that hits a `execute_analytics_eql` call right as another concurrent request bursts on the same user's token. The first call gets a 429; the retry loop parses "1 per 10 second" out of the body and waits ~10.5s; the second attempt succeeds. The agent loop sees only the eventual success.
 - The schema bootstrap (`bootstrapSchema` in `lib/mcp/schema.ts:170-192`) makes four sequential tool calls. Without spacing, the second call would 429 immediately. With ~1.1s spacing, all four succeed without ever entering the retry loop.
-- A misconfigured `BLOOMREACH_PROJECT_ID` causes `list_projects` to return a real error (not rate-limit). `McpClient` does NOT retry — it returns the `isError: true` envelope to `callOrThrow` in `schema.ts:136-149`, which throws `McpToolError` with the server's text attached.
+- A misconfigured `BLOOMREACH_PROJECT_ID` causes `list_projects` to return a real error (not rate-limit). `BloomreachDataSource` does NOT retry — it returns the `isError: true` envelope to `callOrThrow` in `schema.ts:136-149`, which throws `McpToolError` with the server's text attached.
+- A `bi:mode=live-sql` run dispatches `get_anomaly_context` to the Olist subprocess. The child gets stuck on a SQLite read (hypothetical). After 30s the per-call `AbortSignal.timeout` fires, the underlying SDK call rejects, `OlistDataSource.callTool` wraps it in `OlistToolError`, and the agent loop sees a tool error. Compare to the Bloomreach side: the same hang would burn the route's full 300s budget.
 
 **Code side by side.**
 
 ```
-  lib/mcp/client.ts  (lines 18-22, 31-38, 122-132)
+  lib/data-source/bloomreach-data-source.ts  (lines 51-55, 64-77, 164-174)
 
   function isRateLimited(result: unknown): boolean {
     if (!result || typeof result !== 'object' || (result as any).isError !== true)
@@ -302,7 +351,7 @@ Three pieces of standard partial-failure tooling are absent on purpose or by acc
       this.retryCeilingMs,                                       cap at ceiling
     );
     await sleep(waitMs);
-    result = await this.liveCall(name, args);
+    result = await this.liveCall(name, args, options.signal);
   }
        │
        └─ the five-part kernel is right here in 11 lines. The bound
@@ -312,15 +361,15 @@ Three pieces of standard partial-failure tooling are absent on purpose or by acc
 ```
 
 ```
-  lib/mcp/client.ts  (lines 148-163)
+  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
 
-  private async liveCall(name, args): Promise<unknown> {
+  private async liveCall(name, args, signal?): Promise<unknown> {
     const elapsed = Date.now() - this.lastCallAt;
     if (elapsed < this.minIntervalMs) {
       await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
     }                                                ← proactive spacing
     try {
-      const result = await this.transport.callTool(name, args);
+      const result = await this.transport.callTool(name, args, { signal });
       this.lastCallAt = Date.now();                  ← record on success
       return result;
     } catch (err) {
@@ -331,17 +380,52 @@ Three pieces of standard partial-failure tooling are absent on purpose or by acc
     }
   }
        │
-       └─ NO timeout on transport.callTool. A hung connection would
-          await forever (until the route's 300s killed everything).
-          This is the partial-failure gap most worth closing first.
+       └─ STILL no Promise.race on transport.callTool. A hung connection
+          would await forever (until the route's 300s killed everything).
+          This is the partial-failure gap most worth closing first on
+          the Bloomreach side — the Olist side already has it.
 ```
 
 ```
-  lib/mcp/connect.ts  (lines 91-96)
+  lib/data-source/olist-data-source.ts  (lines 143-167)
+
+  async callTool(name, args, opts?): Promise<DataSourceCallResult> {
+    await this.connect();                          ← idempotent lazy connect
+    if (!this.client) throw new Error(...);
+
+    const signal = composeSignals(
+      opts?.signal,
+      AbortSignal.timeout(this.toolTimeoutMs),     ← 30_000 default; the
+    );                                                per-call deadline that
+                                                      the Bloomreach side
+                                                      lacks
+    const start = Date.now();
+    try {
+      const result = await this.client.callTool(
+        { name, arguments: args },
+        undefined,
+        { signal },
+      );
+      const durationMs = Date.now() - start;
+      return { result, durationMs, fromCache: false }; ← no cache on this side
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new OlistToolError(name, detail, { cause: err });
+    }
+  }
+       │
+       └─ same `{result, durationMs, fromCache}` envelope as Bloomreach.
+          Different partial-failure tools: per-call signal/timeout instead
+          of retry-on-rate-limit. composeSignals lets the route's cancel
+          AbortSignal AND the per-call timeout both fire.
+```
+
+```
+  lib/mcp/connect.ts  (the BloomreachDataSource construction)
 
   return {
     ok: true,
-    mcp: new McpClient(new SdkTransport(client, httpErrors), {
+    mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
       minIntervalMs: 1100,             ← spacing knob
       retryDelayMs: 10_000,            ← fallback wait base
       retryCeilingMs: 20_000,          ← upper bound on any single sleep
@@ -351,7 +435,10 @@ Three pieces of standard partial-failure tooling are absent on purpose or by acc
        │
        └─ the four knobs are set HERE for the production transport.
           A different deployment (lower limit, faster window) would
-          tune these without touching McpClient.
+          tune these without touching BloomreachDataSource itself.
+          (Note: lib/mcp/client.ts is now a backwards-compat shim that
+          re-exports BloomreachDataSource as McpClient — the implementation
+          moved during Phase 2 PR A.)
 ```
 
 ---
@@ -401,7 +488,7 @@ No per-call timeout on the actual `transport.callTool`. A hung connection (TCP R
 ## Validate
 
 - **Reconstruct.** Without looking, write the five-part retry kernel: predicate, bound, wait, ceiling, rebind. Name what breaks if you remove each.
-- **Explain.** Why does `lib/mcp/client.ts:38` return `null` when no hint is parseable, rather than a default value? Because `null` lets the caller distinguish "no hint, use backoff" from "hint of 0ms" — the explicit null lets the wait calculation pick the right path.
+- **Explain.** Why does `parseRetryAfterMs` in `lib/data-source/bloomreach-data-source.ts:64-77` return `null` when no hint is parseable, rather than a default value? Because `null` lets the caller distinguish "no hint, use backoff" from "hint of 0ms" — the explicit null lets the wait calculation pick the right path.
 - **Apply.** A new external service you're integrating returns 429 with a `Retry-After` HTTP *header* (not in the body). Sketch the changes. (Add a new `parseRetryAfter` that checks response headers; `isRateLimited` checks status === 429 instead of body regex; rest of the loop is unchanged.)
 - **Defend.** Why is `minIntervalMs = 1100` and not, say, `10_000` (matching the observed 10s window)? Because 10s × 6 tool calls = 60s of spacing per investigation, on top of the 300s budget for the actual work, which doesn't fit. 1.1s spacing keeps most first attempts under the window; the retry loop handles the ones that slip through. Trades occasional retry latency for normal-case throughput.
 
@@ -409,8 +496,12 @@ No per-call timeout on the actual `transport.callTool`. A hung connection (TCP R
 
 ## See also
 
-- `01-distributed-system-map.md` — Seam C in context; why the parsed-window approach belongs here
+- `01-distributed-system-map.md` — Seam C (Bloomreach) and Seam F (Olist subprocess) in context
 - `03-idempotency-deduplication-and-delivery-semantics.md` — retrying is only safe because every MCP call is a read
 - `06-queues-streams-ordering-and-backpressure.md` — the NDJSON stream is what makes the long retry waits tolerable in the UI
+- `10-transport-agnostic-protocol-design.md` — why the two adapters have asymmetric partial-failure tools but the same interface
 - `.aipe/study-system-design/audit.md#failure-handling-and-reliability` — the failure-handling audit cross-link
 - `.aipe/study-networking/` — HTTP-level retry semantics (when generated)
+
+---
+Updated: 2026-06-16 — Verdict + structure pass cover the two-adapter shape (Bloomreach retry, Olist per-call timeout); added Part 5b on the Olist partial-failure kernel; line refs migrated from `lib/mcp/client.ts` to `lib/data-source/bloomreach-data-source.ts`; flagged that the per-call-timeout gap is now adapter-asymmetric (closed on Olist, still open on Bloomreach).

@@ -439,4 +439,8 @@ The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the even
 - `01-ndjson-agentevent-discriminated-union.md` — the typed shape the store persists.
 - `02-replay-from-snapshot-with-paced-emission.md` — the consumer of this store (the cache-first replay path).
 - `04-dual-write-send-to-stream-and-store.md` — the upstream that captures into this store.
+- `06-eval-result-paper-trail.md` — the offline cousin of this store. Both persist `AgentEvent`-shaped evidence; this store serves single-request replay, `eval/results/<date>[-<tag>]/` serves K-iteration measurement.
 - `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern (system-design angle).
+
+---
+Updated: 2026-06-16 — cross-link to `06-` added; the seed-as-fixture discipline here is the spiritual precursor to the eval-result-dir-as-fixture discipline.

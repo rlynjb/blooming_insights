@@ -3,7 +3,7 @@
 **Industry name(s):** resource lifecycle · stream controllers · file handles · NDJSON over HTTP chunked transfer · `try/finally` cleanup
 **Type:** Industry standard · Project-specific application
 
-> **Verdict: the one resource that matters here is the `ReadableStream` controller — and the repo handles it correctly with `try/finally controller.close()`.** Filesystem use is deliberately tiny: a handful of sync reads of committed demo JSON, dev-only writes to `.auth-cache.json` and `.investigation-cache.json`, and a capture-fixture script. There are no file watchers, no streams to disk, no temp directories, no descriptor leaks possible — because almost nothing opens a long-lived handle. The interesting lifecycle isn't files; it's the HTTP response stream the route opens and the agent loop drives. The `finally { controller.close(); }` in both long routes is the load-bearing cleanup; without it, a thrown error mid-loop would leave the stream open and the client tab hanging.
+> **Verdict (Phase 2): two resources matter now — the `ReadableStream` controller (unchanged) AND the Olist subprocess (`OlistDataSource.dispose()`).** Filesystem use is still tiny: sync reads of committed demo JSON, dev-only writes to `.auth-cache.json` / `.investigation-cache.json`, capture-fixture scripts. The new resource is the child Node process the parent owns: spawned lazily by `OlistDataSource.connect()`, killed by `OlistDataSource.dispose()` which calls `client.close()` → `transport.close()` → child stdin EOF → child exits. The `finally { controller.close(); }` in both long routes is still the load-bearing cleanup for the HTTP stream. The `finally { await ds.dispose(); }` pattern in the factory (`lib/data-source/index.ts`) is its new sibling — forget it and the child outlives the parent.
 
 ---
 
@@ -47,8 +47,8 @@
 
 **Layers.** Three nested scopes for resource ownership:
 1. **Per-call** — `fetch` responses, file reads. Released on return or on natural completion.
-2. **Per-request** — the `ReadableStream` controller. Must be explicitly closed.
-3. **Per-warm-instance** — none. Nothing in this repo holds a resource handle across requests (no DB pool, no persistent connection).
+2. **Per-request** — the `ReadableStream` controller AND (Phase 2) the Olist child process via `OlistDataSource.dispose()`. Both must be explicitly closed.
+3. **Per-warm-instance** — still none. Nothing in this repo holds a resource handle across requests (no DB pool, no persistent connection).
 
 **Axis traced: *how is this resource released?***
 
@@ -255,6 +255,58 @@ The two `setTimeout` patterns in the repo (the spacing-gate sleep and the replay
     // ... if you don't clearInterval, it runs forever
 ```
 
+#### 6.5) The Olist child process — the second resource the app explicitly owns (Phase 2)
+
+The new lifecycle pattern is the subprocess. `OlistDataSource` is a resource holder in the same shape as a DB pool or a file handle: cheap to construct, expensive on first use (spawns the child), reused across calls, MUST be released via `dispose()`. The release closes the SDK client which closes the stdio transport which closes the parent's pipe FDs; the child reads EOF on stdin and exits cleanly.
+
+```
+  OlistDataSource lifecycle — acquire, use, release
+
+  acquire:
+    const ds = new OlistDataSource()         ← cheap; no child yet
+    await ds.connect()                       ← spawns child via StdioClientTransport
+                                                stores client + transport on the instance
+
+  use:
+    while (need more data) {
+      await ds.callTool(name, args)          ← reuses the same child
+    }
+
+  release:
+    await ds.dispose()                       ← client.close() → transport.close()
+                                                → pipe closes → child exits
+
+  pattern in lib/data-source/index.ts factory:
+    return {
+      ok: true,
+      dataSource: ds,
+      bootstrap: ...,
+      dispose: () => ds.dispose(),           ← exposed to the route handler
+    }
+
+  pattern the caller MUST use:
+    const result = await makeDataSource('live-sql', sid)
+    try {
+      // ... use result.dataSource ...
+    } finally {
+      await result.dispose()                  ← guarantees the child dies
+    }
+```
+
+What breaks without the `finally { await dispose() }`: the child outlives the call. If the parent is a Vercel function that's about to exit, the OS closes the parent's pipe halves anyway and the child *should* exit on EOF — but if the parent crashes mid-call, dispose never runs and the child can linger until the OS reaps it. The dev-server case is worse: HMR reloads the parent module but the child Node process keeps running.
+
+**Why the factory exposes `dispose` explicitly.** The route handler is the only place that knows when "the request is done." The factory hides the construction details (which adapter, which transport) but the lifecycle has to be the caller's responsibility because only the caller knows when work is finished. The Bloomreach branch returns a no-op `dispose` (its client is session-scoped, owned by the cookie store, not the route) — same API surface, different semantics.
+
+```
+  factory dispose contract — symmetric API, asymmetric semantics
+
+  live-sql branch:        dispose: () => ds.dispose()    ← kills the child
+  live-bloomreach branch: dispose: async () => {}        ← no-op; client outlives request
+
+  the symmetric surface lets the route always call `finally await dispose()`
+  without branching on mode. that's the whole point of the factory.
+```
+
 #### 7) The MCP transport — sockets we don't see
 
 `StreamableHTTPClientTransport` (in `@modelcontextprotocol/sdk`) wraps `fetch`. Each `transport.callTool(...)` does one HTTP POST and reads one HTTP response. There's no persistent connection we manage — every call is fire-and-forget at the transport layer. The auth provider keeps its own state (tokens, code verifier), but that's data, not a resource handle.
@@ -415,9 +467,11 @@ The full resource-lifecycle picture for one investigation request:
 
 The `ReadableStream` API is the Web Streams spec, implemented by Node 20 natively (also by browsers). The `start(controller)` callback is one of three "underlying source" methods you can implement; the repo only uses `start`. Two others exist (`pull(controller)` for pull-based sources, `cancel(reason)` to handle client-cancellation) — neither is used because the repo doesn't need pull semantics and doesn't react to client cancel (see the missing-AbortController discussion in `07`).
 
-Worth knowing for future expansion: if the repo ever wanted to react to a client closing the stream early (browser tab closes), the `cancel` callback is where that logic would go. Today, the route handler is oblivious to client disconnect — it keeps running until `maxDuration` or natural completion.
+The Phase 2 subprocess pattern is the closest the repo gets to a "Disposable" abstraction. TC39's "Explicit Resource Management" proposal (`using` / `await using` syntax + `Symbol.dispose` / `Symbol.asyncDispose`) is exactly the right shape for this — call sites would read `await using ds = await makeDataSource(...)` and the dispose would fire automatically on scope exit. The proposal is at stage 3 as of this writing; Node 22+ supports it behind a flag. Today the repo uses plain `try/finally` because that's what runs everywhere unchanged.
 
-Worth reading next: the WHATWG Streams Standard, especially the controller methods, and the Node 20 fs/promises docs (for the async pattern that would replace `readFileSync` if any of these reads ever moved to a per-request hot path).
+Worth knowing for future expansion: if the repo ever wanted to react to a client closing the stream early (browser tab closes), the `cancel` callback on the `ReadableStream` is where that logic would go — AND it would be the natural site to call `ds.dispose()` to kill the child early.
+
+Worth reading next: the WHATWG Streams Standard (controller methods), the TC39 Explicit Resource Management proposal (`using` syntax), and the Node 20 fs/promises docs.
 
 ---
 
@@ -451,6 +505,11 @@ A: It's a textbook anti-pattern in the general case — sync I/O blocks the even
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — what the `await controller.enqueue` yields back to the loop.
-- `05-memory-stack-heap-gc-and-lifetimes.md` — what the stream's internal buffer holds and when it's freed.
-- `07-backpressure-bounded-work-and-cancellation.md` — the missing `AbortController` story, the streaming-backpressure lever that isn't pulled.
+- `02-processes-threads-and-tasks.md` — the subprocess as a process (this file treats it as a resource).
+- `03-event-loop-and-async-io.md` — what the `await controller.enqueue` yields back to the loop; child-loop framing.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — what the stream's internal buffer holds; child heap that `dispose()` frees.
+- `07-backpressure-bounded-work-and-cancellation.md` — the half-wired `AbortSignal` story, the streaming-backpressure lever that isn't pulled.
+- `08-runtime-systems-red-flags-audit.md` — orphan-subprocess risk, parent-crash cleanup gap.
+
+---
+Updated: 2026-06-16 — added subprocess-as-resource section (6.5) with OlistDataSource lifecycle, factory dispose contract, and the no-op vs kill-child asymmetry.

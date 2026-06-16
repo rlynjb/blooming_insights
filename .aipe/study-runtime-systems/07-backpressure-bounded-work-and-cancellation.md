@@ -3,7 +3,7 @@
 **Industry name(s):** bounded concurrency · deadline budgets · forced-synthesis turn · graceful degradation · the missing `AbortController`
 **Type:** Industry standard · Project-specific application
 
-> **Verdict: bounded work is *very* well done; cancellation is deliberately absent.** Every agent run has a hard wall: `maxDuration = 300s` (route), `maxToolCalls = 6` (agent), `maxRetries = 3` (rate-limit retry), `retryCeilingMs = 20_000` (per-retry cap), `MAX_TOOL_RESULT_CHARS = 16_000` (per-result history cap). The forced-synthesis turn — omit the `tools` parameter on the last allowed turn so the model MUST emit JSON — is the most surprising and most load-bearing of these. There is **no `AbortController` anywhere in the repo**. Browser tab close, navigation away, network drop — none stop the route. The Anthropic + MCP calls keep running until natural completion or `maxDuration`. That's a deliberate trade for React StrictMode survivability (`lib/hooks/useInvestigation.ts:32-36`) and it costs real money on every abandoned investigation.
+> **Verdict (Phase 2): bounded work is still *very* well done; cancellation is now HALF-WIRED.** Every agent run still has a hard wall: `maxDuration = 300s` (route), `maxToolCalls = 6` (agent), `maxRetries = 3` (rate-limit retry), `retryCeilingMs = 20_000` (per-retry cap), `MAX_TOOL_RESULT_CHARS = 16_000` (per-result history cap), and now a **per-call `AbortSignal.timeout(30_000)` on every subprocess tool call** (`lib/data-source/olist-data-source.ts:151`, `lib/mcp/transport.ts:131`). The forced-synthesis turn is still the most surprising and most load-bearing primitive. The big Phase 2 update: the `DataSource` interface now accepts `opts?: { signal?: AbortSignal }` (`lib/data-source/types.ts:38-44`), `SdkTransport` and `OlistDataSource` both compose that signal with the 30s timeout via `composeSignals`, and the SDKs propagate it down to `fetch` / `client.callTool`. What's STILL missing: the route handler doesn't read `req.signal`, `runAgentLoop` doesn't accept a signal parameter, and `useInvestigation` still doesn't `ac.abort()` on cleanup. So the signal chain exists *inside* the adapter but the *browser→route→loop* hops aren't connected. A subprocess call can be cancelled by its own timeout; a tab close still doesn't stop the run.
 
 ---
 
@@ -25,11 +25,17 @@
   │  agent loop:   maxTurns = 8, maxToolCalls = 6                     │
   │                forceFinal + synthesisInstruction (forced-synthesis│
   │                  turn — the surprising load-bearing piece)         │
-  │  MCP:          minIntervalMs = 1100 (spacing gate)                │
-  │                maxRetries = 3, retryDelayMs = 10_000,             │
-  │                retryCeilingMs = 20_000                            │
-  │  cancellation: NOT IMPLEMENTED. No req.signal listener, no        │
-  │                AbortController threaded through the loop.         │
+  │  MCP (Bloomreach): minIntervalMs = 1100 (spacing gate)            │
+  │                    maxRetries = 3, retryDelayMs = 10_000,         │
+  │                    retryCeilingMs = 20_000                        │
+  │  DataSource (Phase 2):                                            │
+  │    callTool(name, args, opts?: { signal?: AbortSignal })          │
+  │    per-call AbortSignal.timeout(30_000) ORed via composeSignals   │
+  │    → SdkTransport (Bloomreach) and OlistDataSource (SQL) both      │
+  │      enforce a 30s adapter-level wall on every call               │
+  │  cancellation: HALF-WIRED. Adapter accepts signal; route still    │
+  │    does NOT read req.signal nor pass anything to runAgentLoop.    │
+  │    useInvestigation still does NOT abort on cleanup.              │
   └────────────────────────│─────────────────────────────────────────┘
                            │
   ┌─ Providers ────────────▼─────────────────────────────────────────┐
@@ -249,41 +255,53 @@ Route-level: `TRUNC = 4000` (`app/api/agent/route.ts:99-103`, `app/api/briefing/
           panel without blowing layout.
 ```
 
-#### 7) Cancellation — the deliberately absent piece
+#### 7) Cancellation — the half-wired Phase 2 update
 
-There is no `AbortController` in this repo. None of the routes read `req.signal`. The agent loop has no `signal` parameter. `McpClient.callTool` has no abort option. The hook explicitly doesn't `reader.cancel()` on unmount.
+The DataSource layer now accepts a signal. The adapter layer composes it with `AbortSignal.timeout(30_000)`. The agent loop and the route still don't propagate one.
 
 ```
-  cancellation — what WOULD be wired, what isn't
+  cancellation — what's wired (Phase 2), what isn't
 
-  ┌─ wired client → server ──────────────────────────────────┐
+  ┌─ wired INSIDE the adapter (Phase 2) ─────────────────────┐
+  │   OlistDataSource.callTool(name, args, opts?) {          │
+  │     const signal = composeSignals(                        │
+  │       opts?.signal,                       ← caller's      │
+  │       AbortSignal.timeout(this.toolTimeoutMs),  ← 30s     │
+  │     );                                                    │
+  │     return this.client.callTool(..., { signal })          │
+  │   }                                                        │
+  │   SdkTransport.callTool (Bloomreach) — same pattern        │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ NOT wired client → server ──────────────────────────────┐
   │   useInvestigation effect:                                │
   │     const ac = new AbortController()                      │
   │     fetch(url, { signal: ac.signal })                     │
-  │     return () => ac.abort()       ← NOT done              │
+  │     return () => ac.abort()       ← STILL not done        │
+  │     (React StrictMode workaround at                       │
+  │      useInvestigation.ts:32-36 still in place)            │
   └───────────────────────────────────────────────────────────┘
-  ┌─ wired server → providers ───────────────────────────────┐
+  ┌─ NOT wired server → loop → adapter ──────────────────────┐
   │   GET(req) {                                              │
-  │     const signal = req.signal     ← NOT read              │
+  │     const signal = req.signal     ← STILL not read        │
   │     await runAgentLoop({ ..., signal })                   │
   │   }                                                       │
-  │   inside runAgentLoop: pass signal to anthropic/mcp        │
+  │   runAgentLoop has no `signal` parameter today;           │
+  │   even if it did, it would need to pass to                │
+  │   dataSource.callTool({ signal }) — which IS now ready    │
   └───────────────────────────────────────────────────────────┘
   ┌─ what happens TODAY when client disconnects ─────────────┐
   │   server keeps running                                    │
   │   Anthropic call still bills                              │
   │   MCP gate still sleeps and calls                         │
+  │   subprocess gets a 30s wall per tool call (only "real"   │
+  │     cancellation source today — fires on hanging child)   │
   │   saveInvestigation still runs at the end                 │
-  │   result: server thinks the work was successful;          │
-  │           client never saw the body                       │
   └───────────────────────────────────────────────────────────┘
 ```
 
-The reason for the absence is documented at `lib/hooks/useInvestigation.ts:32-36`: React StrictMode's double-mount + the `startedRef` guard interacted with cleanup-time aborts to abort the stream before the first byte arrived. The pragmatic fix was to let the fetch finish. Cost: the server can't tell the difference between "user is watching" and "user closed the tab three seconds in."
+The reason for the missing browser→route hop is still documented at `lib/hooks/useInvestigation.ts:32-36`: React StrictMode's double-mount + the `startedRef` guard interacted with cleanup-time aborts to abort the stream before the first byte arrived. The pragmatic fix was to let the fetch finish. What's NEW since the previous version of this guide: the *server-side* signal chain now exists. Half the work is done. The remaining work is two edits in `runAgentLoop` (accept `signal`, pass to `dataSource.callTool({ signal })` and to `anthropic.messages.create({ signal })`) plus one edit in each route (`const signal = req.signal; await runAgentLoop({ ..., signal })`).
 
-What this costs concretely: a user who opens an investigation, sees the first tool call complete, gets bored and closes the tab — we keep running the full 100s, calling Anthropic and MCP, billing money the user will never see the output of. At hackathon scale it's a rounding error. At production scale, it's a line item.
-
-The right fix when this matters: thread an `AbortController` from the route through `runAgentLoop`, hand `signal` to the Anthropic SDK (it supports it) and the MCP SDK transport (it supports it via `fetch` options). On the client, give up the StrictMode workaround in favor of an explicit `if (process.env.NODE_ENV === 'production') ac.abort()` on cleanup.
+What this costs concretely is unchanged: a user who opens an investigation and closes the tab three seconds in still incurs the full 100s of Anthropic + subprocess work. The new floor is "no individual subprocess call hangs more than 30s" — that's strictly better than the pre-Phase-2 state but doesn't address the abandoned-investigation cost.
 
 #### 8) Backpressure — the lever not pulled
 
@@ -514,8 +532,8 @@ A: The forced-synthesis turn (`lib/agents/base.ts:90-101`). When either `maxTurn
   → tool_use or text                  → text (which is the JSON we asked for)
 ```
 
-**Q: There's no `AbortController` anywhere. Defend that.**
-A: It's a deliberate trade documented at `lib/hooks/useInvestigation.ts:32-36`. React StrictMode mounts twice in dev — without the started-ref guard, two fetches go out. With the guard, the second mount short-circuits. But if cleanup also `abort()`s the first mount's fetch, the second mount sees the started-ref already true, doesn't refetch, and the stream is dead — empty logs in dev. The pragmatic fix was to let the fetch always complete. The cost is real: the server keeps running after a client disconnect, burning Anthropic + MCP credits for a UI nobody's watching. The right move when this becomes material: thread an `AbortController` through `runAgentLoop` to the SDKs (both accept `signal`), give up the StrictMode workaround, gate the client `ac.abort()` on `NODE_ENV === 'production'`.
+**Q: There's no `AbortController` anywhere. Defend that.** (Updated)
+A: As of Phase 2, that's no longer fully true. The DataSource layer accepts an `AbortSignal` via `callTool(name, args, opts?: { signal })`, and both adapters compose it with `AbortSignal.timeout(30_000)` via `composeSignals` — so individual subprocess and Bloomreach calls have a hard 30s wall. What's still NOT wired is the browser→route→loop chain: `useInvestigation` still doesn't `ac.abort()` on cleanup (the React StrictMode workaround at `useInvestigation.ts:32-36`), the route still doesn't read `req.signal`, and `runAgentLoop` still doesn't accept a `signal` parameter. So a tab close still doesn't stop the run. The remaining work is mechanical (3 edits) — the structural piece (adapter signal support) is done. The defense: half the work that was hard (designing the seam) is now in place; the easy half (wiring) is gated by deciding whether the StrictMode trade-off is still worth the abandoned-investigation cost.
 
 ---
 
@@ -530,8 +548,12 @@ A: It's a deliberate trade documented at `lib/hooks/useInvestigation.ts:32-36`. 
 
 ## See also
 
-- `01-runtime-map.md` — `maxDuration` is the hard wall on the runtime.
-- `03-event-loop-and-async-io.md` — why `await setTimeout` for the spacing gate is the right backpressure primitive.
+- `01-runtime-map.md` — `maxDuration` is the hard wall on the runtime; per-call 30s is the subprocess wall.
+- `03-event-loop-and-async-io.md` — why `await setTimeout` for the spacing gate is the right backpressure primitive; child-loop framing.
+- `04-shared-state-races-and-synchronization.md` — `composeSignals` as the OR-combinator and its 10-LOC duplication.
 - `05-memory-stack-heap-gc-and-lifetimes.md` — the 16KB and 4KB truncations bound the heap as well as the budget.
-- `06-filesystem-streams-and-resource-lifecycle.md` — why the absent `cancel(reason)` callback is part of the same missing-cancellation story.
-- `08-runtime-systems-red-flags-audit.md` — where the missing `AbortController` ranks against the other risks.
+- `06-filesystem-streams-and-resource-lifecycle.md` — `dispose()` as the resource-cleanup analog to `controller.close()`.
+- `08-runtime-systems-red-flags-audit.md` — where the half-wired cancellation ranks against the other risks.
+
+---
+Updated: 2026-06-16 — corrected "no AbortController anywhere" to "half-wired"; added DataSource signal support, AbortSignal.timeout(30_000), composeSignals as the adapter-level wall.

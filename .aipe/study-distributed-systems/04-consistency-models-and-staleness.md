@@ -3,7 +3,7 @@
 **Industry name(s):** consistency models · stale reads · read-your-writes · stateless server / stateful client
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** blooming insights has no shared store, so the classical consistency models (strong, eventual, causal, read-your-writes) mostly do not apply at the storage layer — there's nothing to be consistent *with*. Where consistency DOES bite is at two specific spots: **(1) the 60s TTL cache in `McpClient`** is a deliberate staleness window — any data the briefing or investigation surfaces is up to 60 seconds behind Bloomreach reality; and **(2) the cross-request handoff for investigations** uses the *client's* sessionStorage to carry state because the server has no cross-instance consistency mechanism. The stateless-server / stateful-client pattern in `useInvestigation` (`lib/hooks/useInvestigation.ts:18-19, 137-140`) is the actual consistency story — *the client is the source of truth between two route invocations*. Classical multi-replica consistency (file 05) is NOT YET EXERCISED.
+> **Verdict-first:** blooming insights has no shared store, so the classical consistency models (strong, eventual, causal, read-your-writes) mostly do not apply at the storage layer — there's nothing to be consistent *with*. Where consistency DOES bite is at three specific spots: **(1) the 60s TTL cache in `BloomreachDataSource`** is a deliberate staleness window — any data the briefing or investigation surfaces from the Bloomreach backend is up to 60 seconds behind reality (the Olist adapter has no cache, so its data is always fresh — this is an **asymmetric staleness contract across the two backends**); **(2) the cross-request handoff for investigations** uses the *client's* sessionStorage to carry state because the server has no cross-instance consistency mechanism; and **(3) the module-cached `WorkspaceSchema`** is strong-within-process for the process's lifetime. The stateless-server / stateful-client pattern in `useInvestigation` (`lib/hooks/useInvestigation.ts:18-19, 137-140`) is the actual consistency story — *the client is the source of truth between two route invocations*. Classical multi-replica consistency (file 05) is NOT YET EXERCISED.
 
 ---
 
@@ -133,9 +133,9 @@ The boundary conditions:
 - **Different browser/device.** No sharing. Opening step 3 on a phone after running step 2 on a laptop will fail the handoff.
 - **Diagnosis bigger than ~4MB.** sessionStorage limit per origin (browser-dependent, commonly 5–10MB). Hasn't been hit in practice but it's a soft ceiling.
 
-#### Part 2 — the 60s TTL as a bounded-staleness window
+#### Part 2 — the 60s TTL as a bounded-staleness window (Bloomreach side only)
 
-`McpClient.callTool` caches every successful result for 60 seconds (`lib/mcp/client.ts:103`). That's a bounded-staleness guarantee — any data returned to the caller is at most 60 seconds out of date relative to Bloomreach.
+`BloomreachDataSource.callTool` caches every successful result for 60 seconds (`lib/data-source/bloomreach-data-source.ts:145, 186`). That's a bounded-staleness guarantee — any data returned to the caller is at most 60 seconds out of date relative to Bloomreach. The Olist side has no cache (`lib/data-source/olist-data-source.ts:162` always returns `fromCache: false`), so its results are always fresh relative to the SQLite snapshot. This is an asymmetric staleness contract across the two backends: a `bi:mode=live-bloomreach` briefing sees 60-second-stale data; a `bi:mode=live-sql` briefing sees database-current data. The agent layer is told the same `fromCache: boolean` either way and doesn't care, but a UI tooltip about "last updated" would need to know which backend it asked.
 
 ```
   Bounded staleness — what 60s buys and costs
@@ -300,7 +300,7 @@ They become relevant the moment the app adds a second writer to any state. For e
 ```
 
 ```
-  lib/mcp/client.ts  (lines 88-93, 102-110)
+  lib/data-source/bloomreach-data-source.ts  (lines 130-137, 144-152)
 
   this.minIntervalMs = opts.minIntervalMs ?? 200;
   this.maxRetries = opts.maxRetries ?? 3;
@@ -320,13 +320,13 @@ They become relevant the moment the app adds a second writer to any state. For e
     }
   }
        │
-       └─ this is the bounded-staleness mechanism. Every cached read
-          is at most 60s stale relative to Bloomreach. Per-call TTL is
-          overridable (cacheTtlMs option) but no caller currently does.
-          One implication: long-running route handlers may use cached
-          values that were stored at the start of the handler and
-          serve them at the end, by which time they're older than 60s
-          from the *user's* perspective.
+       └─ this is the Bloomreach-side bounded-staleness mechanism. Every
+          cached read is at most 60s stale relative to Bloomreach. Per-call
+          TTL is overridable (cacheTtlMs option) but no caller currently
+          does. The Olist adapter has no equivalent — fromCache is always
+          false there (olist-data-source.ts:162), and the same DataSource
+          interface returns identical-shaped envelopes from both sides
+          with different freshness guarantees underneath.
 ```
 
 ```
@@ -403,7 +403,7 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 ## Validate
 
 - **Reconstruct.** Without looking, draw the read-your-writes flow from step 2 to step 3. Name every component, the write key, the read key, and the carrier (URL param vs body vs cookie).
-- **Explain.** Why is the TTL on `McpClient.cache` fixed at 60s for every tool, when `list_funnels` changes much less frequently than `execute_analytics_eql`? Because no callsite passes `cacheTtlMs` to override the default — the option exists but isn't wired up. At hackathon scale 60s for both is fine; at production scale you'd vary it per tool.
+- **Explain.** Why is the TTL on `BloomreachDataSource.cache` fixed at 60s for every tool, when `list_funnels` changes much less frequently than `execute_analytics_eql`? Because no callsite passes `cacheTtlMs` to override the default — the option exists but isn't wired up. At hackathon scale 60s for both is fine; at production scale you'd vary it per tool. (And the Olist side bypasses the question entirely — no TTL because no cache.)
 - **Apply.** A product manager asks: "Can the user re-open an old investigation tomorrow and see the same diagnosis?" Walk through the consistency layers. (Yes for cached/replayed investigations in `lib/state/investigations.ts` — those are persisted in `.investigation-cache.json` in dev or `demo-investigations.json` for the demo. No for a live investigation in production after Vercel recycles the instance — the in-memory cache is gone and the route's `getCachedInvestigation` returns null. Demo replay is the only durable path.)
 - **Defend.** Why no per-tool TTL? Because the workload doesn't demand it yet. The 60s default is comfortably below the perceived-freshness threshold for an analytics tool and comfortably above the rate-limit window. The day a real-time feature ships, the wired-but-unused `cacheTtlMs` option becomes the lever.
 
@@ -415,4 +415,8 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 - `03-idempotency-deduplication-and-delivery-semantics.md` — the same 60s TTL is also a dedup window
 - `05-replication-partitioning-and-quorums.md` — why classical consistency models don't apply (no replicas)
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the step 2 → step 3 flow as a cross-boundary workflow
+- `10-transport-agnostic-protocol-design.md` — the asymmetric staleness contract between the two adapters
 - `.aipe/study-system-design/audit.md#state-ownership-and-source-of-truth` — the architectural take on state ownership
+
+---
+Updated: 2026-06-16 — Verdict + Part 2 cover the asymmetric staleness contract (Bloomreach: 60s TTL; Olist: always fresh); line refs migrated to `lib/data-source/bloomreach-data-source.ts`.

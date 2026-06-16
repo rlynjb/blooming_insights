@@ -438,5 +438,9 @@ Two reasons. First, NDJSON is symmetric: the same `JSON.stringify(e) + '\n'` sha
 - `02-replay-from-snapshot-with-paced-emission.md` — the cache replay path that consumes the same union.
 - `03-three-rung-mem-file-seed-store.md` — the persistence layer that stores `AgentEvent[]`.
 - `04-dual-write-send-to-stream-and-store.md` — the route handler's `send` closure that emits the union to two destinations at once.
+- `06-eval-result-paper-trail.md` — the fourth observability surface; the eval transcripts post-hoc serialize this same `AgentEvent[]` shape at K-iteration scope.
 - `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` — the same union from the LLM-telemetry angle.
 - `.aipe/study-system-design/05-streaming-ndjson.md` — NDJSON as the transport (system-design angle).
+
+---
+Updated: 2026-06-16 — cross-link to `06-` (eval result paper trail) added; union still the foundational shape every observability surface consumes.

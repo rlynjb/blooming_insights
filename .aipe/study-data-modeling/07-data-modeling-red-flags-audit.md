@@ -3,7 +3,7 @@
 **Industry name(s):** Red-flag audit · data-model debt checklist · model smells
 **Type:** Capstone · Language-agnostic
 
-> The consolidated checklist. The seven concepts in this guide each name one or more red flags. This file collapses them into one ranked list, scored against THIS repo. **The model is small and the wins are real** — but the worst items (the Insight↔Anomaly leak, the missing cross-Map invariant, the dual-shape `Diagnosis`) are concentrated in three files and one design choice (the wire-format bridge). Fixing all three would take an afternoon and would retire the bulk of the data-modeling debt in the codebase.
+> The consolidated checklist, **re-ranked 2026-06-16** after the Phase 2 (Olist DB) and Phase 3 (evals) deltas. Two findings from the original audit have been resolved in code (the schema-side leak, the cross-session invariant). Several "not yet exercised" items have activated for real (FKs, indexes, transactions). One new top finding has surfaced: **the `price_brl` unit-in-name failure**, with a measured downstream cost in the recommendation judge's `impact_sized` score. The model is bigger now (two domains, two persistence layers); the wins are bigger; the debt is more focused.
 
 ---
 
@@ -12,29 +12,50 @@
 **Zoom out — the bigger picture.** A red-flag audit is the one place to step back and rank: of all the smells named across the seven concepts, which ones actually matter for this repo right now? Some are real debt (the leak, the missing invariant). Some are honest "not yet exercised" gaps (no DB constraints, no migration tooling). Some are non-issues at this scale (no normalization at the persistence layer because there's no persistence). The ranking matters: a flat list teaches less than a ranked one that says where to start.
 
 ```
-  Zoom out — the audit, by severity
+  Zoom out — the audit, by severity (2026-06-16)
 
-  ┌─ CRITICAL (real debt; data loss or invariant broken) ────┐
-  │  1. Insight↔Anomaly field-copy leak (3-place, lossy)      │
+  ┌─ CRITICAL (real debt; measured downstream cost) ──────────┐
+  │  1. price_brl unit-in-name failure                         │ ← NEW
+  │     (column name lies about units; agent reads as Reais;   │
+  │      impact_sized=0 in the recommendation judge)           │
   └────────────────────────────────────────────────────────────┘
 
-  ┌─ HIGH (real debt; will bite at scale or under change) ───┐
-  │  2. Dual-shape Diagnosis (same name, different schema)    │
-  │  3. Missing cross-Map invariant (insights ↔ anomalies)    │
-  │  4. affectedCustomers ghost field (declared, never written)│
+  ┌─ HIGH (real debt; will bite at change or scale) ──────────┐
+  │  2. Wire-format leak (?insight=<JSON> drops 4 fields)      │ ← was #1, shifted
+  │     (schema-side fix shipped; URL-side conversion remains) │
+  │  3. Dual-shape Diagnosis (same name, different schema)     │
+  │  4. seeded_anomalies description ↔ multiplier drift        │ ← NEW
+  │  5. affectedCustomers ghost field (declared, never written)│
   └────────────────────────────────────────────────────────────┘
 
-  ┌─ MEDIUM (smells, not bugs — naming / discoverability) ───┐
-  │  5. Implicit precedence on derived fields (revenueImpact) │
-  │  6. Undocumented denormalization (anomalies Map)          │
-  │  7. Spec ↔ code drift on Recommendation (the dual spec)   │
+  ┌─ MEDIUM (smells; cleanup-while-you're-in-there) ──────────┐
+  │  6. Implicit precedence on derived fields (revenueImpact)  │
+  │  7. Undocumented denormalization (anomalies sub-Map)       │
+  │  8. Spec ↔ code drift on Recommendation                    │
+  │  9. No EXPLAIN-plan check in CI for the Olist queries      │ ← NEW
   └────────────────────────────────────────────────────────────┘
 
-  ┌─ NOT YET EXERCISED (honest gaps; deferred, not violations)│
-  │  8. No DB constraints (no FKs, no UNIQUE, no NOT NULL)    │
-  │  9. No migration tooling (markdown prompts are the proxy) │
-  │  10. No query / index layer (no DB to query against)      │
-  │  11. No transaction layer (in-memory Maps; single-thread)  │
+  ┌─ RESOLVED since 2026-06-01 ────────────────────────────────┐
+  │  • Schema-side Insight↔Anomaly field-copy (was #1 CRIT)    │
+  │    → insightToAnomaly colocated in lib/state/insights.ts   │
+  │      + doc comment + round-trip test                        │
+  │  • Cross-session invariant on the in-memory store           │
+  │    → state refactored to Map<sessionId, SessionFeed>        │
+  │      + cross-session-isolation test in insights.test.ts    │
+  │  • "No DB constraints"   → Olist has FK + NOT NULL          │
+  │  • "No migration tooling" → drop-and-reseed (legitimate     │
+  │     because deterministic + read-only)                      │
+  │  • "No query / index layer" → 9 indexes against 3 tools     │
+  │  • "No transaction layer"  → SQLite transactions + WAL      │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ STILL NOT EXERCISED (honest gaps; deferred) ──────────────┐
+  │  • Migrations under live data (Olist is read-only + drop-   │
+  │    and-reseed; the day either flips, drizzle migrations    │
+  │    earn their place)                                        │
+  │  • Multi-writer concurrency on shared rows                  │
+  │  • Durable storage for UI state (`insights`, `investigations`│
+  │    still in per-session memory; cold start still wipes them)│
   └────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,38 +97,55 @@
 
 ## How it works
 
-### #1 — Insight↔Anomaly field-copy leak (CRITICAL)
+### #1 — `price_brl` unit-in-name failure (CRITICAL — NEW)
 
-**The finding.** The same field list lives in three files: `Anomaly`/`Insight` interfaces in `lib/mcp/types.ts`, `anomalyToInsight` in `lib/state/insights.ts` L8–L28, and `insightToAnomaly` in `app/api/agent/route.ts` L29–L31. `anomalyToInsight` copies 8 fields; `insightToAnomaly` copies only 4 and silently drops `evidence`, `impact`, `history`, `category`. The round-trip is lossy. TypeScript can't catch it because the dropped fields are optional.
+**The finding.** The Olist schema declares `order_items.price_brl INTEGER NOT NULL`, `payments.value_brl INTEGER NOT NULL`, and similar columns named `_brl`. The integer is **cents** — the seeder generates values in the range R$15 to R$2,500 stored as 1500..250000 cents. The agent prompts try to disclaim this (`monitoring.md`: "All BRL monetary values are returned as integer cents (e.g. 12450000 is R$ 124 500,00). Divide by 100 when narrating"), but the agent's training data overwhelmingly treats `_brl` as "Brazilian Reais the currency." The model reads the column name as authoritative and the prompt disclaimer as instruction it sometimes drops.
 
-**Where covered:** file 02 (this guide) re-frames the software-design audit's findings as a normalization problem.
+**The measured cost.** `eval/results/2026-06-15/diagnosis-summary.md` showed agent diagnoses narrating R$131,965 AOVs that should have been R$1,319.65 — a 100× scale error that propagates into the recommendation agent's `estimatedImpact`. The recommendation judge's `impact_sized` criterion (`eval/judges/recommendation-judge.md`) penalizes this exact failure mode — and the K=10 baseline run scored 0/10 on the SP-revenue and electronics-spike anomalies that depend on it.
 
-**Severity:** CRITICAL. Adding a new optional field to `Anomaly` silently drops it on every route round-trip until someone notices. The bug is invisible to tests that don't explicitly round-trip every field.
+**Severity:** CRITICAL. The downstream cost is measurable (judge scores are committed to `eval/results/`). The failure is in the schema, not in the agent's reasoning — the agent reads the column name correctly; the column name is wrong.
+
+**The fix:** see file 10. Three options:
+```
+  option A — rename the column:
+    price_brl → price_brl_cents (or price_centavos)
+    runs through every SQL file + the tool output schemas.
+
+  option B — store as decimal + currency:
+    price NUMERIC(10,2) + currency TEXT (always 'BRL')
+    invariant becomes "the unit is on the row, not in the name."
+
+  option C — return as Reais in the tool layer:
+    keep storage in cents (efficient + exact) but divide by 100 in
+    every tool's output. then the wire shape is "_brl is Reais"
+    instead of cents, matching the column name's implied semantics.
+
+  option C is the smallest diff; option A is the cleanest.
+```
+
+**Time to fix:** ~2 hours for option C. ~half a day for option A (more files touched).
+
+### #2 — Wire-format leak (HIGH, was #1 CRITICAL)
+
+**Status update.** The schema-side half of this finding shipped: `insightToAnomaly` is colocated with `anomalyToInsight` in `lib/state/insights.ts`, a doc comment names the drop, and `test/state/insights.test.ts` has the round-trip test. **What remains** is the wire format itself: the browser still ships the full `Insight` JSON via `?insight=<JSON>`, the route still calls `insightToAnomaly` on the parsed param, and the four fields (`evidence`, `impact`, `history`, `category`) still get dropped — now explicitly, intentionally, but at runtime cost. The diagnostic agent then has to re-query the evidence with an extra tool call.
+
+**Where covered:** file 02 (Move 2.5).
+
+**Severity:** HIGH. The drop is now visible (comments, tests), but the cost is still real: every investigation pays one extra tool call against the 1 req/s rate limit to recover the dropped evidence.
 
 **The fix (concrete):**
 ```
-  step 1: colocate insightToAnomaly into lib/state/insights.ts
-          alongside anomalyToInsight
+  switch the wire format from ?insight=<JSON> to ?id=<insightId>.
+  the route's resolveAnomaly already walks: wire → session.anomalies →
+  session.insights → demo seed. drop the wire-format branch entirely:
+  rely on the per-session anomalies Map (file 04 covers the integrity).
 
-  step 2: write both as inverses with a shared field-copy helper:
-          const FIELD_COPY: (keyof Anomaly & keyof Insight)[] =
-            ['metric','scope','change','severity','evidence',
-             'impact','history','category'];
-          (TypeScript checks the intersection; adding a field to
-           BOTH is now one source of truth)
-
-  step 3: write a round-trip test: for every Anomaly, expect
-          insightToAnomaly(anomalyToInsight(a)) deep-equals a
-          on the copied fields. catches drift on every future add.
-
-  step 4 (better, retires the leak entirely): change the wire format
-          so the route accepts only the insightId (not the full Insight
-          JSON), and looks it up from anomalies Map → demo seed.
-          insightToAnomaly disappears. (this requires the storage
-          choice in file 06 to be more durable, which is its own move.)
+  prerequisite: confirm the session-scoped anomalies Map is reliably
+  populated by every briefing run before the investigate page loads.
+  (it is — putInsights now writes both insights AND anomalies.)
 ```
 
-**Time to fix:** ~1 hour for steps 1–3. ~half a day for step 4 (if the storage layer becomes Postgres+Drizzle, see file 06).
+**Time to fix:** ~2 hours. The session-scoped state already makes this safe.
 
 ### #2 — Dual-shape Diagnosis (HIGH)
 
@@ -136,31 +174,32 @@
 
 **Time to fix:** ~30 min for option B. ~2 hours for option A (re-capture, replace stored data).
 
-### #3 — Missing cross-Map invariant (HIGH)
+### #4 — `seeded_anomalies` description ↔ multiplier drift (HIGH — NEW)
 
-**The finding.** `lib/state/insights.ts` keeps two parallel Maps (`insights` and `anomalies`) that should stay in lockstep — every key in `insights` should have a matching key in `anomalies` when `rawAnomalies` was passed. `putInsights` clears + inserts both non-atomically; nothing checks the invariant. Today it holds because Node is single-threaded and the loop has no I/O. The moment that changes, it doesn't.
+**The finding.** The `seeded_anomalies` table in the Olist DB stores `description TEXT NOT NULL` for each seeded anomaly. The corresponding multiplier (e.g. `_generator.value: 0.7` for SP-revenue-drop) lives **only** in the seed script's `SEEDED_ANOMALIES` constant. The DB row says "Revenue in São Paulo (SP) drops ~30% in week 4"; the seeder applies multiplier 0.7 (a 30% reduction). If a future edit changes the multiplier without updating the description, the eval keeps running against the stale description — and the recall percentage stays valid, but the human reading `seeded_anomalies` is told the wrong thing about what the ground truth means.
 
-**Where covered:** files 02 and 04.
+**Where covered:** file 09 (this guide's new file on deterministic synthetic data).
 
-**Severity:** HIGH. Today it's correct by accident. A future refactor (adding `await` between clears, splitting the put across functions, sharing the store across workers) breaks it silently.
+**Severity:** HIGH. The DB row is documentation; documentation drift in ground-truth records is a data-modeling smell because the row IS the contract — the evals read it.
 
 **The fix (concrete):**
 ```
-  option A — make the invariant testable:
-    add a debug helper assertParallelMaps() called from a test fixture
-    that runs after putInsights. catches drift in tests.
+  option A — add the multiplier as a column:
+    ALTER TABLE seeded_anomalies ADD COLUMN multiplier REAL NOT NULL;
+    populate from SEEDED_ANOMALIES[_].generator.value during seed.
+    the description becomes ONE source describing the multiplier;
+    the multiplier becomes the authoritative number.
 
-  option B — eliminate the parallel store:
-    extend Insight with the raw Anomaly as a nested field, or pull
-    the raw Anomaly out into an `evidence_raw` slot on Insight.
-    one Map, one invariant — the cross-Map invariant disappears.
-
-  option C — graduate to a real store:
-    Postgres + FK + ON DELETE CASCADE retires this completely.
-    see file 06's buildable target.
+  option B — generate the description from the multiplier:
+    SEEDED_ANOMALIES[i].description = describe(SEEDED_ANOMALIES[i].generator)
+    one source, multiple projections. drift impossible.
 ```
 
-**Time to fix:** ~1 hour for option A. ~half a day for option B. Option C is the file-06 migration.
+**Time to fix:** ~30 min. The fix is one ALTER and one description-builder.
+
+### Cross-session integrity invariant (RESOLVED — NOTE)
+
+The original audit's #3 ("Missing cross-Map invariant") has been resolved in code. The state was refactored to `Map<sessionId, SessionFeed>` and `test/state/insights.test.ts` has explicit cross-session-isolation tests. The intra-session invariant ("every insights key has a matching anomalies key when rawAnomalies was passed") is still not enforced, but the bigger bug (one session wiping another) is gone. File 04 has the updated story.
 
 ### #4 — `affectedCustomers` ghost field (HIGH)
 
@@ -262,19 +301,32 @@
 
 **Time to fix:** ~20 min for option A.
 
-### #8–11 — Not yet exercised (HONEST GAPS)
+### #9 — No EXPLAIN-plan check in CI (MEDIUM — NEW)
 
-These are not violations. They're places where the topic genuinely doesn't apply to this repo's substrate. Naming them honestly matters more than fabricating a finding.
+**The finding.** The 9 indexes in `mcp-server-olist/scripts/seed-olist.ts` are well-chosen against today's three tools. There's no test that runs `EXPLAIN QUERY PLAN` on the canonical queries and asserts they hit an index. A future schema change (a missing `CREATE INDEX` after a column rename, a join predicate added without an index) could regress silently.
 
-**#8 — No DB constraints.** No relational store, no FKs, no UNIQUE, no NOT NULL, no CHECK. The closest analogs are TypeScript at compile time and the three guards in `validate.ts` at the LLM seam. Cover in file 04.
+**Where covered:** file 03.
 
-**#9 — No migration tooling.** No `migrations/` folder, no Drizzle/Prisma, no rollback story. The closest analogs are git diffs on `types.ts` (with the "always optional" rule), the agent prompts evolving alongside the types, and the committed demo seed staying valid. Cover in file 05.
+**Severity:** MEDIUM. Today's queries are fast. The smell is the missing safety net.
 
-**#10 — No query / index layer.** No DB queries because no DB. The closest analog is the static EQL recipes in `categories.ts` (bundled multi-metric recipes) and the McpClient TTL cache (exact-match content cache). Cover in file 03.
+**The fix:** add a test that prepares each canonical query, runs `EXPLAIN QUERY PLAN`, and asserts no `SCAN TABLE` appears. ~30 min.
 
-**#11 — No transaction layer.** The in-memory Maps don't have transactions. Today this is fine because Node is single-threaded and the write path has no I/O — but it's not an enforced property. Cover in file 04.
+### Activated topics — what was "not yet exercised" in 2026-06-01
 
-**For all four:** when these stop being honest gaps and become actual needs (the user expects briefings to persist; concurrent writers appear; a new access pattern emerges), the buildable target is Postgres + Drizzle + Vercel Postgres (or Supabase, or Neon). Rein has shipped exactly that pattern in AdvntrCue. Cover in file 06.
+These were honest gaps a year ago. Most are now real. Naming the activations matters:
+
+- **DB constraints.** Olist has FKs (`order_items.order_id → orders(id)`), NOT NULL on every load-bearing column, `PRAGMA foreign_keys = ON`. Active. File 04 covers it.
+- **Migration tooling.** Still not exercised in the conventional sense (no `up/down`, no Drizzle). But Olist's "drop-and-reseed" is a legitimate alternative — file 05 names the determinism + read-only invariants that make it work.
+- **Query/index layer.** 9 indexes, 3 tools, designed-against-queries discipline. Active. File 03 maps each one.
+- **Transaction layer.** Olist seeder wraps bulk inserts in `db.transaction(() => {...})()` (better-sqlite3 sync transactions). Active. WAL gives concurrent-read durability. File 04 covers it.
+
+### Still not exercised — the new honest gaps
+
+- **Migrations under live data.** Olist is read-only at runtime and regenerable. The day the DB starts accepting writes from real users, "drop-and-reseed" stops being a legitimate strategy and Drizzle migrations earn their place.
+- **Multi-writer concurrency.** Single-writer (the seeder), many-reader (the tools). No story for "two writers contend on the same row." Out of scope today; in scope the day the DB accepts writes from anywhere but the seeder.
+- **Durable storage for UI state.** `insights` / `investigations` still live in per-session in-memory Maps; cold start still wipes them. The Phase-2 work added a relational layer (Olist) for analytics, not for UI. The buildable target named in 2026-06-01 (Postgres for UI state) has shipped only on the analytics side.
+
+When these stop being honest gaps, the buildable target is still Postgres + Drizzle + Vercel Postgres (or Supabase, or Neon) — the same playbook Rein shipped in AdvntrCue.
 
 ### The principle
 
@@ -447,11 +499,16 @@ A: Two scores: severity (impact if left in place) and concreteness (clarity of t
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the 8 interfaces audited here.
-- `02-normalization-and-duplication.md` — findings #1, #2, #4, #5, #6.
-- `03-indexing-vs-query-patterns.md` — finding #10 (no query layer; the EQL recipes as the cousin).
-- `04-transactions-and-integrity.md` — findings #3, #8, #11.
-- `05-migrations-and-evolution.md` — findings #7, #9.
-- `06-access-patterns-and-storage-choice.md` — the storage migration that retires #3, #8, #11, and reduces #1 to a triviality.
-- `study-software-design/audit.md#information-hiding-and-leakage` — the same #1 finding, framed as an information leak.
-- `study-software-design/audit.md#red-flags-audit` — the design-side capstone; this guide's capstone is the data-side complement.
+- `01-the-data-model-and-its-shape.md` — the 8 interfaces + `WorkspaceSchema` dual-derivation.
+- `02-normalization-and-duplication.md` — findings #2 (wire-format leak), #5, #6, #7.
+- `03-indexing-vs-query-patterns.md` — findings #9 (no EXPLAIN gate); the 9 indexes in detail.
+- `04-transactions-and-integrity.md` — Olist FK + WAL; session-scoped invariants.
+- `05-migrations-and-evolution.md` — finding #8; drop-and-reseed pattern.
+- `06-access-patterns-and-storage-choice.md` — three storage layers; Olist analytics warehouse.
+- `08-the-olist-relational-schema.md` — the 7-table schema in detail.
+- `09-deterministic-synthetic-data.md` — findings #4 (description ↔ multiplier drift).
+- `10-units-in-column-names.md` — finding #1, walked end-to-end with the eval evidence.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the schema-side leak.
+
+---
+Updated: 2026-06-16 — re-ranked the audit post-Phase-2; added #1 (price_brl) and #4 (description drift); promoted "not yet exercised" items #8/#10/#11 to "activated"; named the new honest gaps.

@@ -3,36 +3,44 @@
 **Industry name(s):** process model · concurrency model · single-threaded event-loop runtime
 **Type:** Industry standard (Node.js / V8) · Language-agnostic concept
 
-> **Verdict: one process, one thread, many tasks — no exceptions.** No `worker_threads`, no `cluster`, no `child_process`, no `Atomics`, no `SharedArrayBuffer` anywhere in the repo. Every "concurrent" thing in this app — four agents, multiple route handlers, the `ReadableStream` controller, the spacing-gate `setTimeout` — is a JS task on the single Node event loop. The repo earns its simplicity because all the heavy work is I/O-bound (Anthropic + MCP HTTPS calls). The day someone tries to add CPU work — a local embedding, a JSON-parse over a megabyte payload, a regex over the full Bloomreach response — the event loop blocks and every other in-flight request stops. That's the failure mode this concept covers.
+> **Verdict (Phase 2): two processes (parent + Olist child), one thread per process, many tasks per thread.** Still no `worker_threads`, no `cluster`, no `Atomics`, no `SharedArrayBuffer`. The child process IS new — `StdioClientTransport` in `lib/data-source/olist-data-source.ts:127-141` spawns `mcp-server-olist/dist/src/index.js` via `process.execPath` and the MCP SDK manages the pipe. Inside the parent, every "concurrent" thing is still a JS task on one event loop. Inside the child, every tool call is one JS task on ITS event loop. The two processes share nothing except the stdio pipe — separate heaps, separate `Date.now()`s, separate everything. The repo still earns its simplicity because all heavy work is either I/O-bound (Anthropic + Bloomreach HTTPS) or microsecond-scale (SQLite SELECTs in the child). The day someone adds CPU work to the parent's event loop, parent-side concurrency breaks; the day someone parallelizes tool calls in the child, child-side single-flight breaks. Those are the two failure modes now.
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Concurrency in this repo lives entirely in the **Server runtime** band. The browser has its own single-threaded JS environment (we don't use Web Workers, Service Workers, or any of that). Anthropic and Bloomreach are their own processes on their own machines; we don't see them. The interesting question — "what owns CPU, and what shares it?" — is answered inside one Node 20 process per Vercel invocation.
+**Zoom out — the bigger picture.** Concurrency in this repo lives in TWO process bands now. The parent (Vercel function or local `npm run dev` or a `tsx` eval script) is one Node 20 process; the Olist child is another Node 20 process the parent spawns. The browser has its own single-threaded JS environment (no Web Workers, no Service Workers). Anthropic and Bloomreach are their own processes on their own machines; we don't see them. The interesting question — "what owns CPU, and what shares it?" — is answered TWICE now: once for the parent's event loop, once for the child's.
 
 ```
-  Concurrency lives here — one band, one process
+  Concurrency lives in TWO bands now (Phase 2)
 
   ┌─ Browser (V8) ───────────────────────────────┐
   │  one thread; no Workers used                 │
   └──────────────────────│───────────────────────┘
                          │
-  ┌─ Vercel function ────▼───────────────────────┐ ← we are here
-  │                                              │
-  │  ┌────────────────────────────────────────┐  │
-  │  │ ONE Node process                       │  │
-  │  │   one V8 isolate                       │  │
-  │  │   one event loop (libuv)               │  │
-  │  │   ★ THIS CONCEPT ★ — process · thread ·│  │
-  │  │     task                                │  │
-  │  └────────────────────────────────────────┘  │
-  │                                              │
-  └──────────────────────│───────────────────────┘
-                         │
-  ┌─ Providers (their own runtimes) ─────────────┐
-  │  Anthropic · Bloomreach MCP                  │
-  └──────────────────────────────────────────────┘
+  ┌─ Vercel function — Node parent ──────────────▼┐ ← parent process
+  │                                                │
+  │  ┌────────────────────────────────────────┐    │
+  │  │ ONE Node process (the parent)          │    │
+  │  │   one V8 isolate · one event loop      │    │
+  │  │   spawns the Olist child via          │    │
+  │  │   StdioClientTransport (lib/data-     │    │
+  │  │   source/olist-data-source.ts:127)    │    │
+  │  └────────────┬───────────────────────────┘    │
+  │               │ stdio pipe (JSON-RPC 2.0)      │
+  └───────────────│────────────────────────────────┘
+                  ▼
+  ┌─ Olist child — Node 20 ────────────────────────┐ ← second process
+  │  ONE Node process (the child)                  │
+  │   one V8 isolate · one event loop              │
+  │   StdioServerTransport reads stdin, writes stdout
+  │   ★ THIS CONCEPT applies HERE TOO ★            │
+  │   single-flight: one tool call at a time       │
+  │   better-sqlite3 SYNC queries are safe         │
+  └────────────────────────────────────────────────┘
+  ┌─ Providers (their own runtimes) ────────────────┐
+  │  Anthropic · Bloomreach MCP                     │
+  └─────────────────────────────────────────────────┘
 ```
 
 **Zoom in — the concept.** *Processes* are OS-level isolation boundaries (memory, file descriptors, signals). *Threads* are execution contexts inside a process that share that memory. *Tasks* are units of work the runtime schedules onto a thread. Node has one main thread per process, runs JS on it via libuv's event loop, and offloads I/O to a separate thread pool you never touch directly. In this repo, every named thing — `MonitoringAgent.scan`, `DiagnosticAgent.investigate`, the `ReadableStream` start callback, the `await setTimeout` in `liveCall` — is a task scheduled onto that one main thread.
@@ -151,7 +159,12 @@ Node has one main thread that runs your JS. It also has a libuv thread pool (def
   │   fs.promises, DNS, crypto.pbkdf2, zlib               │
   │   the repo uses sync fs + sync crypto cipher only     │
   └───────────────────────────────────────────────────────┘
-  ┌─ Worker threads / child_process / cluster ────────────┐ ← not in the repo
+  ┌─ child_process (Phase 2 — via @modelcontextprotocol/sdk) ──┐ ← used in lib/data-source/
+  │   StdioClientTransport spawns mcp-server-olist child       │
+  │   one stdio pipe, JSON-RPC 2.0, single-flight              │
+  │   killed on OlistDataSource.dispose()                      │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ Worker threads / cluster ────────────────────────────┐ ← still not in the repo
   │   not used anywhere                                   │
   └───────────────────────────────────────────────────────┘
 ```
@@ -187,6 +200,31 @@ A "task" in this world is anything the event loop will pick up and run. Three so
 
 This matters for `03` (the event loop walkthrough). For now, the key is: **every "concurrent" thing in the agent loop is just promise continuations queued back to the loop. There's no thread doing it for you.**
 
+#### 3.5) The Olist subprocess — a second Node process the parent owns (Phase 2)
+
+When `bi:mode === 'live-sql'`, `makeDataSource` constructs an `OlistDataSource` whose first `callTool` call lazily spawns the child via `StdioClientTransport`. The SDK sets `command: process.execPath, args: [serverEntry], stderr: 'inherit'` — the OS forks Node, exec's the compiled `mcp-server-olist/dist/src/index.js`, and the parent gets two pipes (stdin/stdout). The MCP Client multiplexes JSON-RPC requests over the stdout-read / stdin-write halves.
+
+```
+  Subprocess lifecycle — spawn, reuse, dispose
+
+  1. construction: new OlistDataSource()   ← cheap; no child yet
+  2. first callTool / listTools:
+       connect() → doConnect():
+         StdioClientTransport({ command, args, stderr: 'inherit' })
+         new Client(...)
+         await client.connect(transport)   ← fork + exec + handshake
+       client + transport stored on the instance
+  3. subsequent calls: reuse the same client (one child for the instance's life)
+  4. dispose():
+       client.close()  ← polite "I'm done"
+       transport.close() ← closes pipes → child gets EOF on stdin → exits
+
+  the child's lifetime is the OlistDataSource instance's lifetime.
+  one parent ↔ one child for as long as the parent holds the reference.
+```
+
+What breaks if `dispose()` doesn't run: the child outlives the parent. The parent process exits (function returns, dev-server HMR, `tsx` script ends), the child's stdin gets closed by the OS (because the parent half of the pipe is gone), and the child *should* exit on EOF — but if the parent crashed mid-call or the OS holds the pipe open briefly, the child can linger. This is the orphan-subprocess risk that's named in `08`. The K=10 parallel-run anecdote in `.aipe/study-testing/06-eval-flywheel.md` is the most documented example of this class of bug: two `tsx` eval scripts (PIDs 30039/30040) each spawning their own Olist child, neither cleaning up before the other clobbered shared `eval/results/<date>/` files. Detected via `ps aux | grep eval` and `kill` before damage.
+
 #### 4) "Concurrent" requests on one warm instance
 
 When two users hit the warm instance at once, Node doesn't fork. Both requests run as two top-level async tasks on the same event loop. They share the heap. They share every module-scope variable. They share the `McpClient.cache` Map. They each get their own `AsyncLocalStorage` context (that's how `lib/mcp/auth.ts` keeps them apart for the auth cookie), but everything not wrapped in ALS is shared.
@@ -213,13 +251,13 @@ When two users hit the warm instance at once, Node doesn't fork. Both requests r
    └──────────────────────────────────┘
 ```
 
-Important nuance: the repo builds a *new* `McpClient` per `connectMcp` call (`lib/mcp/connect.ts:91`), so the per-instance cache and spacing gate are actually per-request, not per-warm-instance. That's a real cost (no cross-request cache reuse) the route comments don't call out.
+Important nuance: the repo builds a *new* `McpClient` per `connectMcp` call (`lib/mcp/connect.ts:91`), so the per-instance cache and spacing gate are actually per-request, not per-warm-instance. That's a real cost (no cross-request cache reuse) the route comments don't call out. Same for `OlistDataSource` — each `makeDataSource('live-sql', sid)` builds a fresh one, which means each request that uses live-sql mode *spawns its own subprocess*. At low traffic that's fine; at concurrent load the parent ends up supervising N children at once, all reading from the same SQLite file. The single-flight property is per-child, not per-parent.
 
 What breaks without the ALS scoping on auth: request B reads the cookie, sees request A's mid-flight decrypted store, the OAuth round-trip corrupts. This is exactly the failure the comment at `lib/mcp/auth.ts:41-47` describes — and is why `04` exists.
 
 ### Move 3 — the principle
 
-**Single-threaded run-to-completion gives you cheap safety on read-modify-write, but it's a contract that breaks the moment you block the loop.** A `Map.set` followed by a `Map.get` is safe across requests because no other JS can interleave. The same `Map.set` followed by a 200ms synchronous loop is a 200ms freeze for every other request on the instance. The repo gets this right today because all its work is I/O-bound — but the contract is fragile to one carelessly synchronous function.
+**Single-threaded run-to-completion gives you cheap safety on read-modify-write, but it's a contract that breaks the moment you block the loop.** A `Map.set` followed by a `Map.get` is safe across requests because no other JS can interleave. The same `Map.set` followed by a 200ms synchronous loop is a 200ms freeze for every other request on the instance. The repo gets this right in the parent today because all its work is I/O-bound — and gets it right in the Olist child by making the child *single-flight*, which is the load-bearing reason the synchronous `better-sqlite3` calls don't poison its event loop. The same `better-sqlite3` running in the parent's hot path would be a textbook anti-pattern; in a single-flight subprocess it's the right call.
 
 ---
 
@@ -330,9 +368,12 @@ The full concurrency picture for one warm Node instance handling N concurrent re
 
 ## Elaborate
 
-This is the "JS is single-threaded but async" story you've heard, with one caveat that matters for this repo: **Node's `worker_threads` exists and is good for CPU work, and the repo could legitimately reach for it later.** A future feature that, say, runs a local embedding model on each insight would be a textbook use case for a Worker. The reason it isn't here is that the heavy work is all remote — Anthropic does the reasoning, Bloomreach does the EQL — and our process really is just orchestrating I/O.
+This is the "JS is single-threaded but async" story you've heard, with two caveats that matter for this repo:
 
-Useful background reading: the Node docs on `worker_threads` (for the case we don't exercise) and the Vercel docs on function lifecycle (for what "warm vs cold" really means in cost and behavior).
+1. **Node's `worker_threads` is still not in the repo.** A future feature that runs a local embedding on each insight would be a textbook use case for a Worker. Today, heavy work is either remote (Anthropic/Bloomreach) or in a separate Node process (Olist child) — so the parent's event loop genuinely is just orchestration.
+2. **Node's `child_process` IS in the repo — via the MCP SDK abstraction.** `StdioClientTransport` calls into `node:child_process.spawn` under the hood (the SDK's `client/stdio.js`). The trade vs raw `child_process.spawn`: the SDK gives us JSON-RPC framing, request/response multiplexing, and a `Client.close()` lifecycle. Cost: we don't get the raw PID surface (no `kill -9 <pid>` from app code without lifting a layer). For the orphan-subprocess risk in `08`, that's the gap.
+
+Useful background reading: the Node docs on `worker_threads` (for the case we don't exercise), `child_process` (for what the SDK abstracts), and the Vercel docs on function lifecycle.
 
 ---
 
@@ -355,7 +396,10 @@ A: No. They're running *concurrently* on the same event loop. Both `GET` handler
 ```
 
 **Q: Why doesn't the repo use `worker_threads`?**
-A: There's no CPU-bound work in the hot path. Every heavy computation — agent reasoning, EQL — is offloaded to Anthropic or Bloomreach over HTTPS. Our process is an I/O orchestrator. Adding workers would buy nothing and add lifecycle complexity (worker pools, message-passing, the `transferList` mental model). The day we add local embedding or local re-ranking, the answer changes — and that's the correct trigger to reach for them.
+A: There's no CPU-bound work in the parent's hot path. Heavy work is either remote (Anthropic, Bloomreach) or in another process (the Olist child via stdio). Workers would buy nothing and add lifecycle complexity (pool size, message-passing, `transferList`). The day we add local embedding or local re-ranking, the answer changes.
+
+**Q: Why a subprocess instead of `worker_threads` for the Olist data source?**
+A: The boundary we needed was *protocol* (MCP) and *isolation* (separate event loop, separate filesystem handle, separate failure domain), not raw CPU offload. A subprocess speaking JSON-RPC over stdio is what the MCP spec already covers, and gives us symmetry with the HTTP MCP path (BloomreachDataSource talks HTTPS to a remote MCP server; OlistDataSource talks stdio to a local one — both go through the same `Client.callTool` API). A `worker_thread` would have required us to invent a thread-local MCP transport. The cost we pay for the subprocess choice: lifecycle ownership (the dispose() discipline named in `06`), no shared memory (everything crosses the pipe as JSON).
 
 ---
 
@@ -370,7 +414,11 @@ A: There's no CPU-bound work in the hot path. Every heavy computation — agent 
 
 ## See also
 
-- `03-event-loop-and-async-io.md` — what happens between the `await`s.
-- `04-shared-state-races-and-synchronization.md` — why the in-process `Map`s don't race despite no locks (run-to-completion) and where that breaks (`AsyncLocalStorage`).
-- `05-memory-stack-heap-gc-and-lifetimes.md` — what a "module-scope cache" actually holds.
-- `07-backpressure-bounded-work-and-cancellation.md` — `maxToolCalls` is task-budget, not thread-budget.
+- `03-event-loop-and-async-io.md` — what happens between the `await`s, in BOTH event loops.
+- `04-shared-state-races-and-synchronization.md` — why parent `Map`s don't race (run-to-completion); why single-flight makes child sync-SQLite safe.
+- `05-memory-stack-heap-gc-and-lifetimes.md` — two heaps now (parent + child).
+- `06-filesystem-streams-and-resource-lifecycle.md` — `dispose()` is the new resource cleanup.
+- `07-backpressure-bounded-work-and-cancellation.md` — `maxToolCalls` is task-budget; `AbortSignal.timeout(30_000)` is now the per-call subprocess cap.
+
+---
+Updated: 2026-06-16 — corrected the "no child_process" claim, added subprocess lifecycle section (3.5), worker_threads-vs-subprocess defense, K=10 anecdote cross-link.

@@ -3,7 +3,7 @@
 **Industry name(s):** Normalization · single source of truth · denormalization · the "same fact, two places" smell · derived data
 **Type:** Industry standard · Language-agnostic
 
-> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. This repo has neither a relational store nor migration tooling — but the *pattern* shows up clearly in the typed shapes. The worst case is the **Insight↔Anomaly field-copy list**, which lives in three files. The software-design audit already named it as a leakage finding (`study-software-design/audit.md#information-hiding-and-leakage`); this file re-frames it as a normalization problem (no single source of truth for "which fields cross between Anomaly and Insight") and adds the data-modeling moves: (1) make the conversion derive from the type, (2) fix the wire format so the conversion isn't needed.
+> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. The original framing of this file (2026-06-01) was "this repo has no relational store, but the pattern shows up in the typed shapes — the **Insight↔Anomaly field-copy list** lives in three files and the round-trip is silently lossy." Two things have changed since then. **(1) The schema-side leak has been partly fixed**: `insightToAnomaly` is now colocated with `anomalyToInsight` in `lib/state/insights.ts`, a doc comment names the drop, and `test/state/insights.test.ts` carries the round-trip. The field-copy list now lives in *two* files (the interface and the colocated functions), not three, and the drift is tested. **(2) A real relational store has shipped** — `mcp-server-olist/` — and it gives this guide a place to point at properly normalized data (3NF, file 08). The pattern's been promoted from "no relational analog here" to "two relational analogs, one in TS, one in SQL." This file still walks the schema-side story; the textbook denormalization-vs-normalization tradeoff now lives in file 08.
 
 ---
 
@@ -20,14 +20,19 @@
                              │ Anomaly[]
   ┌─ State module band ──────▼─────────────────────────────┐
   │  lib/state/insights.ts                                  │
-  │  anomalyToInsight()  ← COPY #1: 8 fields forward        │
-  │  insights: Map<id, Insight>                             │
-  │  anomalies: Map<id, Anomaly>  (parallel storage)        │
+  │  anomalyToInsight()    ← COPY #1: 8 fields forward      │
+  │  insightToAnomaly()    ← COPY #2: 4 fields back (DROPS 4│
+  │                          — now colocated, doc-commented,│
+  │                          and tested in insights.test.ts)│
+  │  Map<sessionId, { insights, anomalies, investigations }>│
   └──────────────────────────┬─────────────────────────────┘
-                             │ Insight to UI, then back to route
+                             │ Insight to UI, then over the wire as
+                             │ ?insight=<JSON>, then back to route
   ┌─ Route handler band ─────▼─────────────────────────────┐
-  │  app/api/agent/route.ts                                 │
-  │  insightToAnomaly()  ← COPY #2: 4 fields back (DROPS 4)│
+  │  app/api/agent/route.ts: resolveAnomaly()               │
+  │  → JSON.parse(?insight=) + insightToAnomaly()           │
+  │    (still drops 4 fields — the loss is now SHIPPED      │
+  │     across the URL, not just across modules)            │
   └────────────────────────────────────────────────────────┘
                   ▲
                   │  AND in the background:
@@ -35,7 +40,7 @@
                   │  (the interface itself)  ← THE TRUTH SOURCE
 ```
 
-**Zoom in — narrow to the concept.** The question this concept answers: when you add a field to `Anomaly`, how many files have to change in lock-step? In a fully normalized model, the answer is 1 (the interface). In this repo, the answer is **3** — and TypeScript only catches the first one. The two function bodies (`anomalyToInsight`, `insightToAnomaly`) drift silently.
+**Zoom in — narrow to the concept.** The question this concept answers: when you add a field to `Anomaly`, how many files have to change in lock-step? In a fully normalized model, the answer is 1 (the interface). In the 2026-06-01 version of this repo, the answer was **3** (the interface, two conversion functions in two files) and TypeScript only caught the first. **Today the answer is 2** — the interface and one file (`lib/state/insights.ts`) that holds both conversions. The two functions can still drift from each other (TypeScript still can't catch the drop because the fields are optional), but the round-trip test in `test/state/insights.test.ts` does. The remaining problem is at the wire-format boundary: the route still reads the dropped fields off the URL param, the four-field projection is still the data that reaches the diagnostic agent. The schema's not the leak source anymore; the wire format is.
 
 ---
 
@@ -97,12 +102,12 @@ In this repo:
 - The `anomalies` Map alongside the `insights` Map **(intentional denormalization)** — the route needs the raw `Anomaly` back to feed the diagnostic agent, and copying-into-Insight is lossy by design (the headline gets derived, the evidence stays opaque). Storing both is *correct*. It just isn't named as a deliberate denormalization in the code.
 - The Insight↔Anomaly field-copy across `anomalyToInsight` and `insightToAnomaly` **(leaked)** — the field list is implicitly co-owned by two functions, and TypeScript can't enforce that they agree.
 
-### Move 2 — the worst case, walked
+### Move 2 — the worst case, walked (UPDATED — fix has landed in code)
 
-The Insight↔Anomaly field-copy list. **Three locations, only one is the truth source.**
+The Insight↔Anomaly field-copy list. **Two locations now (was 3), only one is the truth source. The drift is now tested.**
 
 ```
-  the field list — three locations
+  the field list — two locations, with the test as the third enforcer
 
   ┌─ lib/mcp/types.ts ─────────────────────────┐
   │  interface Anomaly {                        │
@@ -112,52 +117,99 @@ The Insight↔Anomaly field-copy list. **Three locations, only one is the truth 
   └─────────────────────────────────────────────┘
                        │
         ┌──────────────┴───────────────┐
-        │                              │
-        ▼                              ▼
+        │                              │  both colocated in
+        ▼                              ▼  lib/state/insights.ts
   ┌─ anomalyToInsight ──┐    ┌─ insightToAnomaly ──┐
   │ COPIES ALL 8:       │    │ COPIES 4:           │
   │   severity          │    │   metric            │
   │   metric            │    │   scope             │
   │   change            │    │   change            │
   │   scope             │    │   severity          │
-  │   evidence          │    │ DROPS 4:            │
-  │   impact            │    │   evidence  ←       │
-  │   history           │    │   impact            │
-  │   category          │    │   history           │
-  │                     │    │   category          │
-  │ + derives 5 more    │    │                     │
-  └─────────────────────┘    └─────────────────────┘
-   lib/state/insights.ts        app/api/agent/route.ts
-   L8–L28                       L29–L31
+  │   evidence          │    │ DROPS 4 (deliberate│
+  │   impact            │    │   per the doc       │
+  │   history           │    │   comment on L47-52)│
+  │   category          │    │   evidence          │
+  │                     │    │   impact            │
+  │ + derives 5 more    │    │   history           │
+  │ + deriveInsightFields│   │   category          │
+  └─────────┬───────────┘    └─────────┬───────────┘
+            │                          │
+            └────────────┬─────────────┘
+                         │
+                         ▼
+              ┌─ test/state/insights.test.ts ─┐
+              │  round-trip suite — catches    │  ← THIRD ENFORCER
+              │  drift on every future change  │     (the test)
+              └────────────────────────────────┘
+   lib/state/insights.ts L25–L55 (both functions, same module)
 ```
 
-**What breaks if you add `affectedCustomers` to `Anomaly`:**
+**What breaks if you add `affectedCustomers` to `Anomaly` (updated trace):**
 
 ```
-  the change-amplification trace
+  the change-amplification trace, today
 
   1. lib/mcp/types.ts            ← interface change
      ✓ TypeScript demands every Anomaly literal include the field
      ...UNLESS the field is marked optional. If optional, the compiler
-     stays quiet. Both insightToAnomaly and anomalyToInsight pass.
+     stays quiet. Both functions still compile.
 
   2. lib/state/insights.ts       ← add copy line in anomalyToInsight
-     ✗ TypeScript does NOT enforce this. The return is `: Insight`,
-     and Insight's affectedCustomers? is already optional — leaving
-     it off is valid TypeScript.
+                                    AND in insightToAnomaly (if you
+                                    want it carried back). BOTH in
+                                    the same file now.
+     ✗ TypeScript does NOT enforce this.
+     ✓ The round-trip test in test/state/insights.test.ts WILL fail
+       if the field roundtrips lossy — drift is caught at test time
+       instead of at "two days later in production."
 
-  3. app/api/agent/route.ts      ← add copy line in insightToAnomaly
-     ✗ TypeScript does NOT enforce this. Same reason. The Anomaly
-     returned without affectedCustomers is a valid Anomaly because
-     the field is optional.
-
-  RESULT: you ship a field that's silently dropped on the round-trip.
-  Tests pass. The bug only surfaces when the downstream agent says
-  "where's the affectedCustomers value?" and you trace it back two days
-  later.
+  RESULT: the test is the integrity check the compiler can't be.
+  This is the same shape as relational integrity: a CHECK constraint
+  is what a NOT NULL constraint would be at compile time, but
+  enforced at insert time. Here the round-trip test is the CHECK
+  constraint at commit time.
 ```
 
-This is **change amplification** — the cost of a one-line schema change is a coordinated edit across three files, with two of them silent if forgotten. In a relational store with a `NOT NULL` constraint, the second and third copy paths would fail loudly. With TypeScript-as-schema and optional fields everywhere, they fail silently.
+This is still **change amplification** — but now bounded: one file's worth of edits, with a test gate. The fix is the textbook way to retire a multi-place field-copy: colocate, then assert the invariant. What it did NOT retire: the wire format still sends and receives the full `Insight` JSON via `?insight=`, the route still calls `insightToAnomaly()` on the parsed param, and the four-field projection is still what reaches the diagnostic agent. The smell moved from "schema duplicated across files" to "schema's lossy projection is the wire contract." See the next sub-section.
+
+### Move 2.5 — the wire format is now the leak source
+
+The route handler's `resolveAnomaly()` in `app/api/agent/route.ts` (L35–L60) walks four sources to find the anomaly the user clicked. The **first** source — the highest-priority one — is `?insight=<JSON>` from the browser's `sessionStorage`. The browser ships the full Insight; the route runs `JSON.parse` + the 4-field shape check + `insightToAnomaly`; the 4-field projection is what feeds the diagnostic agent. The other three sources (per-session `anomalies` Map, per-session `insights` Map, demo seed) ALL eventually call `insightToAnomaly` too when the raw Anomaly isn't available.
+
+```
+  the wire-format-as-leak — what's actually shipped vs what survives
+
+  ┌─ briefing page ───────────────────────────────────────┐
+  │  insight = { id, timestamp, severity, headline,         │
+  │              summary, metric, change, scope, source,    │
+  │              evidence:[...], impact:"...", history:[...],│
+  │              category:'revenue_drop',                   │
+  │              revenueImpact:{...}, aov:{...}, funnel:{...}}│
+  │              ← 12+ fields                               │
+  │  sessionStorage.setItem('selectedInsight', JSON(insight))│
+  │  navigate(`/investigate?id=X&insight=${encodeURIComponent(JSON(insight))}`)│
+  └──────────────────────────┬──────────────────────────────┘
+                             │ URL carries the full JSON (~500-2000 bytes)
+                             ▼
+  ┌─ route handler ───────────────────────────────────────┐
+  │  resolveAnomaly:                                        │
+  │    JSON.parse(insightParam)            ← full Insight    │
+  │    isPlausibleInsight(parsed)?         ← 4-field check   │
+  │    return insightToAnomaly(parsed)     ← DROPS 4 FIELDS │
+  │                                          (evidence,      │
+  │                                           impact, history,│
+  │                                           category)      │
+  └──────────────────────────┬──────────────────────────────┘
+                             │ Anomaly with empty evidence[]
+                             ▼
+  ┌─ diagnostic agent ────────────────────────────────────┐
+  │  sees: metric, scope, change, severity, evidence=[]    │
+  │  does NOT see: the original evidence that found this   │
+  │                anomaly. has to re-query the data.       │
+  └────────────────────────────────────────────────────────┘
+```
+
+The four dropped fields traveled across the URL, hit the route, and got thrown away. The diagnostic agent then has to re-discover the same evidence with a fresh tool call — a wasted round-trip against a 1 req/s rate limit. The schema-side fix retired the *invisible* loss; the wire-format-side loss is **visible** (the code comment names it) but still costly. The next move is to fix the wire format to ship `?id=<insightId>` and rely on the per-session `anomalies` Map for the lookup. The session-scoped state (file 04) makes that lookup safe — different users no longer share a single map.
 
 ### Move 2 — the intentional denormalization (not a bug)
 
@@ -331,15 +383,15 @@ The duplication audit, ranked.
 
 ## Implementation in codebase
 
-### The leak — both copy functions, side by side
+### Both copy functions, now colocated
 
 ```
-lib/state/insights.ts  (lines 8–28)
+lib/state/insights.ts  (lines 25–55)
 
   export function anomalyToInsight(a: Anomaly): Insight {
     const id = crypto.randomUUID();
     const sign = a.change.direction === 'down' ? '-' : '+';
-    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${...}%`.toLowerCase();
+    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
     return {
       id, timestamp: new Date().toISOString(),
       severity: a.severity,        ← COPY
@@ -356,26 +408,21 @@ lib/state/insights.ts  (lines 8–28)
       ...deriveInsightFields(a),    ← +5 derived (currently only revenueImpact)
     };
   }
-       │
-       └─ owns the FULL field list. 8 fields copied; 5 derived.
 
-
-app/api/agent/route.ts  (lines 29–31)
-
-  function insightToAnomaly(i: Insight): Anomaly {
-    return {
-      metric: i.metric,    ← COPY
-      scope: i.scope,      ← COPY
-      change: i.change,    ← COPY
-      severity: i.severity,← COPY
-      evidence: [],        ← LIE (the real evidence is on i.evidence; dropped)
-    };
+  /**
+   * Reverse mapper. Intentionally drops evidence/impact/history/category —
+   * the agent loop only needs metric/scope/change/severity to investigate;
+   * the rest is regenerated downstream. The dropped fields are tested in
+   * test/state/insights.test.ts (round-trip suite).
+   */
+  export function insightToAnomaly(i: Insight): Anomaly {
+    return { metric: i.metric, scope: i.scope, change: i.change,
+             severity: i.severity, evidence: [] };
   }
        │
-       └─ owns a SUBSET. 4 fields copied; 4 dropped (evidence, impact,
-          history, category). TypeScript accepts this because evidence
-          is required on Anomaly but [] is a valid empty array, and the
-          others are all optional. the bug is invisible to the compiler.
+       └─ both functions, one module, one doc comment naming the drop.
+          the test/state/insights.test.ts round-trip catches drift on every
+          future change. the schema-side leak is retired.
 ```
 
 ### The intentional denormalization — the parallel Maps
@@ -486,6 +533,10 @@ A: Correct when (a) there's a named single owner, (b) the denormalization is for
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces and where the truth source lives for each shape.
-- `04-transactions-and-integrity.md` — what happens when `insights` and `anomalies` Maps drift out of sync, and why the in-memory store can't enforce the cross-Map invariant.
-- `06-access-patterns-and-storage-choice.md` — the wire-format decision that forces the route-side conversion to exist at all.
-- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem. Same bug, different lens; this file adds the data-modeling fix paths.
+- `04-transactions-and-integrity.md` — the per-session sub-maps now make the cross-Map invariant safe across users; what FK + WAL do for the Olist side.
+- `06-access-patterns-and-storage-choice.md` — the wire-format decision that's now the leak source; the move to `?id=` plus per-session lookup.
+- `08-the-olist-relational-schema.md` — a properly normalized model (3NF, FKs) as the contrast case; what the typed-schema layer would look like if the field-copy were declarative.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem.
+
+---
+Updated: 2026-06-16 — schema-side leak status moved from "WORST" to "partly fixed in code"; added Move 2.5 on the wire format as the remaining leak source.

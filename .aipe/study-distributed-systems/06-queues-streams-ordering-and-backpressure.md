@@ -3,7 +3,7 @@
 **Industry name(s):** message queues · event streams · NDJSON streaming · ordering guarantees · backpressure · poison messages
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** there are **no work queues** in this codebase — no Kafka, no SQS, no Redis Streams, no BullMQ, no background workers. What IS here is **one-way NDJSON event streams** from server → client (`/api/briefing`, `/api/agent`) over HTTP chunked transfer. Ordering is "emitted-order, single-producer single-consumer per stream." Backpressure is whatever the `ReadableStream` API and the browser's `fetch().body.getReader()` give you for free — the server `enqueue`s into a controller, the network buffer pushes back, the producer awaits. No poison-message handling because there are no messages to be consumed-and-retried — every stream event is observe-only. Work queues, fan-out, ordering across producers: all NOT YET EXERCISED. The streaming pattern that IS here exists for *one* reason — long-running agent runs need to look alive while they work.
+> **Verdict-first:** there are **no work queues** in this codebase — no Kafka, no SQS, no Redis Streams, no BullMQ, no background workers. What IS here is **one-way NDJSON event streams** from server → client (`/api/briefing`, `/api/agent`) over HTTP chunked transfer. Ordering is "emitted-order, single-producer single-consumer per stream." Backpressure is whatever the `ReadableStream` API and the browser's `fetch().body.getReader()` give you for free — the server `enqueue`s into a controller, the network buffer pushes back, the producer awaits. No poison-message handling because there are no messages to be consumed-and-retried — every stream event is observe-only. **Phase 2 added a second framed-stream surface** — `OlistDataSource` sends JSON-RPC 2.0 frames to the mcp-server-olist subprocess over stdio, and reads JSON-RPC replies back. That stream is request/response shaped (not push), framed by the MCP SDK, with no backpressure concern because each call awaits its own reply. Worth knowing it exists; it's not a queue. Work queues, fan-out, ordering across producers: all NOT YET EXERCISED. The streaming pattern that IS here exists for *one* reason — long-running agent runs need to look alive while they work.
 
 ---
 
@@ -468,8 +468,12 @@ NDJSON over fetch is one-way, which is exactly what we need — the server emits
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the retry waits inside `McpClient` are absorbed *visibly* thanks to the streaming pattern; without the stream, the UI would freeze during a 20s retry sleep
+- `02-partial-failure-timeouts-and-retries.md` — the retry waits inside `BloomreachDataSource` are absorbed *visibly* thanks to the streaming pattern; without the stream, the UI would freeze during a 20s retry sleep
 - `03-idempotency-deduplication-and-delivery-semantics.md` — at-most-once-per-stream is part of the delivery story
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the cached investigation array IS a poor-man's outbox for replay
+- `10-transport-agnostic-protocol-design.md` — JSON-RPC framing over stdio (the other framed stream in the codebase, between the adapter and the subprocess)
 - `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the architectural take on the streaming pattern
 - `.aipe/study-prompt-engineering/` — the agent loop driving the events is the actual content producer
+
+---
+Updated: 2026-06-16 — Verdict line notes the second framed stream (JSON-RPC over stdio to mcp-server-olist) introduced in Phase 2; cross-link to file 10.

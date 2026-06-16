@@ -3,13 +3,13 @@
 **Industry name(s):** Node.js event loop · libuv reactor · async/await scheduling · microtasks/macrotasks
 **Type:** Industry standard (Node.js / V8)
 
-> **Verdict: the agent loop's `await` chain is one long sequence of event-loop turns, and the most load-bearing pause in the whole app is `await new Promise(r => setTimeout(r, 1100 - elapsed))` inside `McpClient.liveCall`.** Each agent run is a single long-running task that yields the loop at every `await` (Anthropic HTTP, MCP HTTP, the spacing-gate timer, the NDJSON `controller.enqueue`). The model spends most of its wall clock waiting on I/O, and that wait is what lets the route handler stream progress (`controller.enqueue(...)`) instead of going silent for 100 seconds. There's no blocking-loop hazard in the hot path *today*, because every CPU operation is JSON-shape — but it's a contract the next contributor can break with a single accidentally synchronous call.
+> **Verdict (Phase 2): there are now TWO event loops to reason about — the parent's and the Olist child's.** In the parent, the agent loop's `await` chain is one long sequence of event-loop turns; the most load-bearing pause is still `await new Promise(r => setTimeout(r, 1100 - elapsed))` inside `McpClient.liveCall` (live-bloomreach mode). In the child, the loop processes one JSON-RPC frame at a time off stdin, runs the requested tool (a synchronous `better-sqlite3` call), writes the result frame back on stdout, idles until the next frame. The child's sync SQLite calls would freeze its loop in a multi-tenant server — they're safe here because the child is single-flight. The model still spends most of its wall clock waiting on I/O (Anthropic HTTPS, MCP HTTPS or stdio), and that wait is what lets the route stream progress. There's still no blocking-loop hazard in the parent's hot path *today*, because every parent-side CPU operation is JSON-shape — but it's a contract the next contributor can break with a single accidentally synchronous call.
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** The event loop is the heartbeat of the **Server runtime**. It's not a "place" — it's the algorithm libuv runs that picks the next task, runs it until it returns or `await`s, then picks the next one. Everything in `runAgentLoop` is one task. Every `await` inside it is a yield. The route handler's `ReadableStream.start` callback is another task. The browser-side `reader.read()` callback is yet another (in browser V8). They never block each other; they just take turns.
+**Zoom out — the bigger picture.** The event loop is the heartbeat of any Node process. It's not a "place" — it's the algorithm libuv runs that picks the next task, runs it until it returns or `await`s, then picks the next one. Phase 2 added a SECOND Node process (the Olist child), which means a SECOND event loop running in parallel with the parent's. Everything in `runAgentLoop` is one task on the parent loop. Every `await` inside it is a yield. The route handler's `ReadableStream.start` callback is another task on the parent loop. The browser-side `reader.read()` callback is yet another (in browser V8). The child's task per inbound frame is yet another (in its own loop). They never block each other within a single process; across processes they communicate by the OS scheduling stdio reads/writes.
 
 ```
   Where the event loop sits
@@ -218,6 +218,53 @@ The MCP transport (`@modelcontextprotocol/sdk/client/streamableHttp.js`) wraps N
 
 What breaks: nothing, in practice. The only ways async I/O goes wrong here are at the HTTP layer (timeouts, 429s — handled in `client.ts:122-132`) or at the route-budget layer (a slow Anthropic call eats into the 300s wall — handled by `maxToolCalls`/`maxRetries`/`retryCeilingMs`).
 
+#### 4.5) The stdio pipe to the Olist child — JSON-RPC framing on TWO event loops (Phase 2)
+
+When the parent calls `OlistDataSource.callTool(...)`, the MCP SDK's `Client` serializes a JSON-RPC 2.0 request frame, writes it to the child's stdin via `StdioClientTransport`, and awaits a Promise that resolves when a matching response frame arrives on the child's stdout. The frame format is line-oriented JSON over the pipe (one frame per line, no length-prefix). The parent's event loop yields on the `await client.callTool(...)`; libuv watches the pipe FD for incoming bytes; when the child writes a response, libuv's I/O callback fires, the SDK parses the frame, matches it to the pending request by `id`, and resolves the Promise.
+
+```
+  parent ↔ child: one tool call across two event loops
+
+  PARENT event loop:                            CHILD event loop:
+    await client.callTool(name, args, opts)
+      └─ SDK encodes JSON-RPC request frame
+         and writes it to child's stdin pipe
+      └─ Promise pending; parent loop yields    ← idle, polling stdin
+                                                ← read() returns: frame received!
+                                                ← decode frame
+                                                ← dispatch to tool handler (3 of them):
+                                                    get_metric_timeseries / get_segments /
+                                                    get_anomaly_context
+                                                ← run better-sqlite3 SELECT (SYNC, <10ms)
+                                                ← child loop is FROZEN during the query
+                                                  (safe — single-flight; nobody else is
+                                                  waiting on it)
+                                                ← encode JSON-RPC response frame
+                                                ← write to stdout pipe
+    libuv I/O callback: stdout has new bytes
+      └─ SDK parses response frame
+      └─ resolves the awaited Promise
+      └─ continuation runs as microtask
+    callTool returns { result, durationMs, fromCache: false }
+
+  the seam is the pipe; the contract is "one request → one response,
+  matched by JSON-RPC id; ordering preserved by single-flight."
+```
+
+What breaks if the child stops responding (frozen, crashed, in a SQLite deadlock): the parent's `await client.callTool(...)` hangs forever — there's no built-in timeout in the SDK. That's exactly what the `composeSignals` + `AbortSignal.timeout(this.toolTimeoutMs)` pattern at `lib/data-source/olist-data-source.ts:151, 172` solves: each call is wrapped in a 30s timeout via `AbortSignal.timeout(30_000)`, ORed with whatever the caller passed. If 30s elapses, the SDK gets an abort, the awaited Promise rejects, the OlistToolError propagates up. The child stays alive (we didn't kill it) — the next `callTool` will try again.
+
+What breaks if the child writes non-JSON bytes to stdout: the SDK's frame parser throws on the bad chunk and the awaited Promise rejects with a parse error. That's why `mcp-server-olist/src/index.ts` writes logs to **stderr** (`process.stderr.write('[mcp-server-olist] ready (stdio)\n')`) — stdout is reserved for protocol frames.
+
+#### 4.6) `better-sqlite3` as a synchronous library — safe in the child, unsafe in the parent
+
+`better-sqlite3` is the bottom layer of the Olist child's stack and it's *synchronous on purpose*: `db.prepare(sql).all(args)` returns rows directly, no Promise. This blocks the child's event loop for the query duration. In the child it's fine because:
+
+1. The child runs one tool call at a time (SDK transport queues frames serially).
+2. The queries are point lookups + small aggregates on a seeded ~1MB SQLite file — typically sub-millisecond, never more than ~10ms.
+3. No other concurrent work needs the loop while the query runs.
+
+If the same `better-sqlite3` handle were used in the parent (a Next.js route reaching directly into SQLite), it would freeze EVERY concurrent request on the warm instance for the query duration. That's the exact failure mode this concept covers — and it's the structural reason the SQLite store lives in a subprocess, not in the parent. The subprocess boundary turns "sync I/O blocks the loop" from a hazard into a no-op.
+
 #### 5) The two-write protocol on Next's `cookies()` — and why the event loop forced an ALS solution
 
 This is a subtle one worth knowing because it's documented inline at `lib/mcp/auth.ts:41-47`. Next's `cookies()` API returns a request-scoped store, but reads return the *original* request cookie, while writes go to the *response* cookie. Inside one request, if you `set` then `get`, you get the OLD value. The MCP SDK's `OAuthClientProvider` reads and writes synchronously many times during one connect. Without ALS, every read would see stale data; with ALS, all the reads/writes hit an in-memory `Store` that's seeded once at the start of the request and flushed once at the end.
@@ -419,4 +466,7 @@ A: `await setTimeout(...)` schedules a macrotask and yields the loop — other t
 
 - `02-processes-threads-and-tasks.md` — what "task" means at this level (every async function call).
 - `04-shared-state-races-and-synchronization.md` — why the `Map`s are safe without locks (run-to-completion) and why `AsyncLocalStorage` was needed where they weren't.
-- `07-backpressure-bounded-work-and-cancellation.md` — `maxDuration = 300` is the hard wall the loop runs against.
+- `07-backpressure-bounded-work-and-cancellation.md` — `maxDuration = 300` is the parent's hard wall; `AbortSignal.timeout(30_000)` is the subprocess per-call wall.
+
+---
+Updated: 2026-06-16 — added child-loop sections (4.5 stdio JSON-RPC framing, 4.6 better-sqlite3 sync), explained why the subprocess boundary makes sync SQLite safe.

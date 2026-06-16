@@ -1,22 +1,24 @@
 # Study — Debugging & Observability
 
-Audit-style guide for blooming insights' debugging and observability shape: what evidence exists at every layer, what doesn't, and the patterns that earned their own deep walks.
+Audit-style guide for blooming insights' debugging and observability shape: what evidence exists at every layer (four observability surfaces — three online, one offline), what doesn't, and the patterns that earned their own deep walks.
 
 ## Reading order
 
-1. **`00-overview.md`** — the orientation, ranked verdict, and reading paths by need.
+1. **`00-overview.md`** — the orientation, ranked verdict (now nine items, with surface 4 as #6), and reading paths by need.
 2. **`audit.md`** — Pass 1: the 8-lens audit (observability-map, reproduction-and-evidence, structured-logs-and-correlation, metrics-slis-slos-and-alerts, traces-and-request-lifecycles, state-snapshots-and-debugging-boundaries, incident-analysis-and-prevention, debugging-observability-red-flags-audit). One `##` per lens, ending with the Top 3 ranked findings.
 3. **Pass 2 — the discovered pattern files (most foundational first):**
-   - `01-ndjson-agentevent-discriminated-union.md` — the 8-line typed event union every layer speaks. `lib/mcp/events.ts:4–17`.
+   - `01-ndjson-agentevent-discriminated-union.md` — the 8-line typed event union every online layer speaks. `lib/mcp/events.ts:4–17`.
    - `02-replay-from-snapshot-with-paced-emission.md` — the cache-first short-circuit that re-emits captured events at 180ms ticks. `app/api/agent/route.ts:127–141`.
    - `03-three-rung-mem-file-seed-store.md` — the mem → dev file → committed seed cache that survives different scopes. `lib/state/investigations.ts:7–41`.
    - `04-dual-write-send-to-stream-and-store.md` — the two-line closure that writes every event to both the wire and the snapshot buffer. `app/api/agent/route.ts:172–175`.
-   - `05-auth-secret-flake-postmortem.md` — the one documented incident as a reusable post-mortem template. Commit `e83a8e0`; `test/mcp/auth.test.ts:117–122`.
+   - `05-auth-secret-flake-postmortem.md` — the documented test-level incident as a reusable post-mortem template. Commit `e83a8e0`; `test/mcp/auth.test.ts:117–122`.
+   - `06-eval-result-paper-trail.md` — the fourth observability surface. Committed eval result dirs under `eval/results/<date>[-<tag>]/`; `EVAL_RUN_TAG` for sibling-dir naming; LLM-as-judge as a debug signal; the measure → debug → fix → re-measure flywheel as the model-level debugging methodology.
 
 ## Pick by need
 
 - **Understand the trace as substrate** → `01-` then `04-`.
-- **A real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-`.
+- **A real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-` (test-level) or `06-` (model-level) depending on the bug class.
+- **The bug is in agent quality, not wiring** → `06-` first (eval flywheel + judge as signal).
 - **Doing a triage / hand-off** → `audit.md` Top 3 ranked findings.
 - **Why the metrics section is so short** → `audit.md` (metrics-slis-slos-and-alerts) — read it precisely *because* it names what isn't here.
 
@@ -39,3 +41,8 @@ Named honestly in `audit.md` (metrics-slis-slos-and-alerts, incident-analysis-an
 - backend trace sink (OpenTelemetry / Langfuse / Datadog export)
 - error monitoring (Sentry, Bugsnag)
 - runbooks
+- `compare-evals.ts` (adjacent eval result-dir auto-comparison; today manual diff)
+- `.eval.lock` (parallel-run race guard; today `ps aux` + `kill PID` only)
+
+---
+Updated: 2026-06-16 — added `06-eval-result-paper-trail.md` to reading order; refreshed pick-by-need with bug-class split (test-level vs model-level); added two `not yet exercised` rows around the eval surface.

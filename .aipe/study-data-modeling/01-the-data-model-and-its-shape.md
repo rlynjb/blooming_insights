@@ -1,9 +1,9 @@
 # The data model and its shape
 
-**Industry name(s):** Schema · entity model · data model · TypeScript interface as schema
+**Industry name(s):** Schema · entity model · data model · TypeScript interface as schema · duck-typed interface (the `WorkspaceSchema` bridge)
 **Type:** Industry standard · Language-agnostic · Project-specific (the typed-schema variant)
 
-> The model. There's no relational schema here — there's a set of 8 TypeScript interfaces in `lib/mcp/types.ts` that pin every shape the four agents pass between each other. The compiler enforces the model across module boundaries; the only seam where it can't see is the LLM output (file 04 covers that). The center of gravity is `Insight`, the enriched view of `Anomaly` the UI consumes. Everything else either feeds `Insight` (`Anomaly`, `Diagnosis`, `Recommendation`) or describes the upstream Bloomreach workspace (`WorkspaceSchema`).
+> The model. Two persistence layers now share this file. The **agent contract** is 8 TypeScript interfaces in `lib/mcp/types.ts` that pin every shape the four agents pass between each other — this section walks them. The **Olist relational schema** is 7 SQLite tables defined in `mcp-server-olist/scripts/seed-olist.ts` (`SCHEMA_SQL`) — file 08 zooms in on those. The bridge between them is `WorkspaceSchema`, one interface in `lib/mcp/schema.ts` derived two different ways: `bloomreachWorkspaceSchema(...)` from MCP introspection, and `olistWorkspaceSchema()` hand-derived from the SQLite columns. Same shape, two sources — the duck-typed-interface pattern, applied to "this is what an analyst-readable workspace looks like." The compiler enforces the model across module boundaries; the only seam where it can't see is the LLM output (file 04). The center of gravity for the agent contract is `Insight`, the enriched view of `Anomaly` the UI consumes.
 
 ---
 
@@ -126,29 +126,54 @@ You know how a DB schema is "a list of tables, each with columns and types, and 
 
 The model has 8 interfaces. Walk each by what role it plays. **One operation per part — never two interfaces at once.**
 
-#### `WorkspaceSchema` — the upstream model, projected
+#### `WorkspaceSchema` — one interface, two derivations (duck-typed bridge)
 
-The Bloomreach workspace is a large nested JSON document (the raw payload from `get_event_schema` is ~112KB). `WorkspaceSchema` is the **projection** the repo cares about: events with their property lists, customer properties, catalogs, totals, oldest timestamp. The model is flat and small — the *upstream's* shape is opaque to everything above this band.
+`WorkspaceSchema` is a single TypeScript shape that two completely different domains derive into. The **Bloomreach** domain calls `parseWorkspaceSchema(...)` on the JSON returned by `get_event_schema` + `get_project_overview` + friends (a ~112KB nested tree from MCP introspection). The **Olist** domain calls `olistWorkspaceSchema()` — a *literal constant* hand-derived from `mcp-server-olist/src/db.ts` columns plus a hard-coded `dataHorizon`. Both produce the same shape; both feed the same `schemaCapabilities()` projection; the agent loop above this seam cannot tell which one it's reading.
 
 ```
-  the projection — upstream raw → owned shape
+  the duck-typed bridge — same shape, two domains
 
-  Bloomreach raw payload (112KB JSON tree)
-        │
-        │  parseWorkspaceSchema()  ← pure function, unit-tested against fixtures
-        ▼
-  WorkspaceSchema (flat, ~5 fields + 3 arrays)
-        │
-        │  schemaCapabilities()  ← projects further into Set<string>
-        ▼
-  Set<"purchase", "view_item", "purchase.total_price", "catalog:products", ...>
-        │
-        │  coverageFor(category, set)  ← purely set membership
-        ▼
-  CategoryCoverage = 'full' | 'limited' | 'unavailable'
+  ┌─ BLOOMREACH derivation ─────────────────────────────────┐
+  │  bootstrapSchema(dataSource)                              │
+  │    list_cloud_organizations  ─┐                           │
+  │    list_projects              │  4 MCP round-trips        │
+  │    get_event_schema           ├─ parseWorkspaceSchema()   │
+  │    get_customer_property_schema│                          │
+  │    list_catalogs              │                           │
+  │    get_project_overview     ──┘                           │
+  └────────────┬────────────────────────────────────────────┘
+               │
+               ▼
+       WorkspaceSchema {
+         projectId, projectName,
+         events: { name, properties[], eventCount }[],
+         customerProperties[], catalogs[],
+         totalCustomers, totalEvents, oldestTimestamp,
+         dataHorizon?: { from, to, durationDays }      ← ★ ONLY Olist sets it
+       }
+               ▲
+               │
+  ┌─ OLIST derivation ──────────────────────────────────────┐
+  │  olistWorkspaceSchema()      ← pure, no I/O, no DB read │
+  │    3 hand-derived "events":                              │
+  │      'order'   (properties: state, category, payment_type,│
+  │                              purchase_ts, price_brl)     │
+  │      'payment' (properties: type, installments, value_brl)│
+  │      'review'  (properties: score, ts)                   │
+  │    dataHorizon: 2025-12-01 → 2026-06-01 (182 days, hard-coded)│
+  │  (totals are 0 — the agents only surface them in passing)│
+  └────────────┬────────────────────────────────────────────┘
+               │
+               ▼ both feed:
+       schemaCapabilities()  ← projects into Set<string>
+       schemaSummary()       ← interpolated into agent prompts
 ```
 
-What breaks if `WorkspaceSchema` is wrong: the prompt the agent sees (`schemaSummary` interpolates this shape) becomes inconsistent with what the EQL recipes can actually query. The agent then writes EQL against events that don't exist.
+The interesting part is `dataHorizon` — present on the Olist branch, absent on Bloomreach. The Olist seed window is known (we own the seeder); the Bloomreach branch is open-ended (live workspace, data flows in). The agent prompts read `dataHorizon` if present and anchor `time_range` inside it; without the field, the prompts fall back to "90-day windows of recent data." This is **forward-compatible extension** — the optional field carries domain-specific information the universal interface deliberately leaves open.
+
+What breaks if `WorkspaceSchema` is wrong: the prompt the agent sees (`schemaSummary` interpolates this shape) becomes inconsistent with what the tools can actually query. Wrong on the Bloomreach side, the agent writes EQL against events that don't exist. Wrong on the Olist side (specifically the `dataHorizon`), the agent picks `time_range` outside the seeded window and every query returns zeros — the exact failure mode the field was added to prevent.
+
+What breaks if a third derivation appears (say, a Shopify adapter): no compiler-level enforcement that the new derivation produces the same shape — only TypeScript's structural typing. Today there's no abstract base class, no Zod schema both branches conform to; the contract is "produce something with these fields." That's enough for two derivations; at three or more, the unenforced parallel structure would start to drift.
 
 #### `CategoryId`, `AnomalyCategory`, `CategoryCoverage`, `CoverageItem`, `CoverageReport` — the schema-capability layer
 
@@ -387,9 +412,9 @@ lib/agents/categories.ts  (lines 116–127)
        └──
 ```
 
-### Where the leak sits in code
+### Where the leak sits in code (UPDATED — partly retired)
 
-The `insightToAnomaly` function is in `app/api/agent/route.ts` (L29–L31); `anomalyToInsight` is in `lib/state/insights.ts` (L8–L28). Both lines covered in file 02. The point for *this* file: the `Insight` interface itself is the schema; the two functions are *implementations* of the field-copy that should derive from the interface but don't.
+Both conversion functions now live in `lib/state/insights.ts` — `anomalyToInsight` at L25–L45, `insightToAnomaly` at L53–L55. The doc comment on `insightToAnomaly` names the deliberate drop explicitly: "Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream." A round-trip test lives in `test/state/insights.test.ts`. The point for *this* file: the `Insight` interface is still the schema; the two functions are now colocated implementations of the field-copy. File 02 walks the updated status (the schema-side leak is retired; a wire-format leak is still live).
 
 ---
 
@@ -435,7 +460,12 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
 
 ## See also
 
-- `02-normalization-and-duplication.md` — re-frames the Insight↔Anomaly leak as a normalization smell, with the fix.
-- `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam, and what the in-memory `Map`s do NOT enforce.
-- `05-migrations-and-evolution.md` — how the schema evolves under git, with the spec-vs-code drift on `Recommendation` as the exemplar.
+- `02-normalization-and-duplication.md` — the Insight↔Anomaly story, now partly fixed; the wire-format leak that still lives.
+- `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam; what FK + WAL do on the Olist side; what the session-scoped `Map`s now enforce.
+- `05-migrations-and-evolution.md` — how the typed schema evolves under git + how the Olist DB rebuilds from a deterministic seed.
+- `08-the-olist-relational-schema.md` — the second domain: 7 tables, FKs, the indexes that match the tool queries.
+- `09-deterministic-synthetic-data.md` — `mulberry32(seed=42)` + the `seeded_anomalies` table as ground-truth records.
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.
+
+---
+Updated: 2026-06-16 — added `WorkspaceSchema` dual-derivation section; flagged the leak as code-fixed (colocated + tested) with the wire-format follow-on still live.

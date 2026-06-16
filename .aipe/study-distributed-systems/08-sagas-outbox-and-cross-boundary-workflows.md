@@ -492,3 +492,6 @@ Everything in this file. Each execute is a write — needs an idempotency key (a
 - `06-queues-streams-ordering-and-backpressure.md` — `collected[]` as an outbox-shaped artifact
 - `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the architectural take on the request flow
 - `.aipe/study-agent-architecture/` — the agents inside each step
+
+---
+Updated: 2026-06-16 — No mechanism drift in the two-step workflow; the workflow shape is unchanged by Phase 2 (both adapters speak the same DataSource interface, so the saga reads identically against either backend). Changelog stamp only.

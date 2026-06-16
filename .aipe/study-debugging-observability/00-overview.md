@@ -1,6 +1,6 @@
 # Study — Debugging & Observability (blooming insights)
 
-> The trace IS the product. blooming insights renders a typed NDJSON `AgentEvent` stream as the user-facing surface, snapshots the same events for replay, and times every MCP call with `durationMs`. That's an unusually strong substrate for an early-stage codebase. What's missing is everything backend-grade: no structured logger, no metrics pipeline, no Sentry/OTel/Langfuse, no on-call rotation, no SLOs. Honest about both halves.
+> The trace IS the product, and the eval results ARE the regression history. blooming insights has **four observability surfaces**: (1) the live NDJSON `AgentEvent` stream the UI renders, (2) the 269-test Vitest output, (3) the dev cache files (`.auth-cache.json`, `.investigation-cache.json` — gitignored), and (4) the committed eval result paper trail under `eval/results/<date>[-<tag>]/`. The first three are online; the fourth is offline and the unit of "one debuggable run" for model-level bugs. What's still missing is everything backend-grade: no structured logger, no metrics pipeline, no Sentry/OTel/Langfuse, no on-call rotation, no SLOs. Honest about both halves.
 
 ---
 
@@ -10,7 +10,7 @@ This is an **audit-style** guide, in two passes.
 
 **Pass 1 — `audit.md`.** One file walks the 8-lens inventory (observability-map, reproduction-and-evidence, structured-logs-and-correlation, metrics-slis-slos-and-alerts, traces-and-request-lifecycles, state-snapshots-and-debugging-boundaries, incident-analysis-and-prevention, debugging-observability-red-flags-audit). Each lens gets one `##` section: what the codebase actually does, with `file:line` grounding, or `not yet exercised` honestly. Lenses with significant findings cross-link into pattern files.
 
-**Pass 2 — the discovered-pattern files (`01-` through `05-`).** Five patterns earned their own files because they pass the three tests in `me.md`: they have a name, they're load-bearing (something specific breaks if you remove them), and a senior engineer skimming the file list recognizes each as a real architectural pattern.
+**Pass 2 — the discovered-pattern files (`01-` through `06-`).** Six patterns earned their own files because they pass the three tests in `me.md`: they have a name, they're load-bearing (something specific breaks if you remove them), and a senior engineer skimming the file list recognizes each as a real architectural pattern. `06-` is new: Phase 3's eval result paper trail is the fourth observability surface and the model-behavior debugging substrate.
 
 The file list itself is a learning artifact — read it once and you know what's interesting about how this repo handles observability.
 
@@ -19,36 +19,59 @@ The file list itself is a learning artifact — read it once and you know what's
 ## The repo's shape, observability axis first
 
 ```
-  blooming insights through the observability lens
+  blooming insights through the observability lens — four surfaces
 
-  ┌─ UI (renders the trace live) ────────────────────┐
-  │  ReasoningTrace · StatusLog · ProcessStepper      │
-  └─────────────────────────▲────────────────────────┘
-                            │  NDJSON lines
-  ┌─ Route handler (frames events) ──────────────────┐
-  │  /api/agent   · send(e) → controller.enqueue      │
-  │  /api/briefing · same shape + workspace/coverage  │
-  └─────────────────────────▲────────────────────────┘
-                            │
-  ┌─ Agent loop (emits events) ──────────────────────┐
-  │  hooks: onText / onToolCall / onToolResult        │
-  │  → reasoning_step / tool_call_start / _end        │
-  │  durationMs measured around the MCP call          │
-  └─────────────────────────▲────────────────────────┘
-                            │
-  ┌─ Provider + tools ──────┴────────────────────────┐
-  │  Anthropic · Bloomreach MCP                       │
-  │  console.error in 2 route catch blocks            │
-  └──────────────────────────────────────────────────┘
+  ┌─ ONLINE (live, request-scoped) ──────────────────────────────────┐
+  │                                                                   │
+  │  ┌─ UI (renders the trace live) ────────────────────┐            │
+  │  │  ReasoningTrace · StatusLog · ProcessStepper      │            │
+  │  └─────────────────────────▲────────────────────────┘            │
+  │                            │  NDJSON lines      surface 1: trace  │
+  │  ┌─ Route handler (frames events) ──────────────────┐            │
+  │  │  /api/agent   · send(e) → controller.enqueue      │            │
+  │  │  /api/briefing · same shape + workspace/coverage  │            │
+  │  └─────────────────────────▲────────────────────────┘            │
+  │                            │                                      │
+  │  ┌─ Agent loop (emits events) ──────────────────────┐            │
+  │  │  hooks: onText / onToolCall / onToolResult        │            │
+  │  │  → reasoning_step / tool_call_start / _end        │            │
+  │  │  durationMs measured around the MCP call          │            │
+  │  └─────────────────────────▲────────────────────────┘            │
+  │                            │                                      │
+  │  ┌─ Provider + tools ──────┴────────────────────────┐            │
+  │  │  Anthropic · Bloomreach MCP                       │            │
+  │  │  console.error in 2 route catch blocks            │            │
+  │  └──────────────────────────────────────────────────┘            │
+  │                                                                   │
+  │  surface 2: Vitest output (269 unit tests; deterministic)         │
+  │  surface 3: dev cache files (.auth-cache.json,                    │
+  │             .investigation-cache.json — gitignored)               │
+  └───────────────────────────────────────────────────────────────────┘
+
+  ┌─ OFFLINE (post-hoc, committed) ─────────────────────────────────┐
+  │                                                                  │
+  │  surface 4: Eval result paper trail                              │
+  │             eval/results/<date>[-<tag>]/                          │
+  │               detection-K10-*.json    (PR D: 5% → 25% lift)      │
+  │               diagnosis-K10-*.json + judge.json                  │
+  │               recommendation-K10-*.json + judge.json (PR E)      │
+  │               regression-*.json + regression-summary.md (PR F/G) │
+  │             EVAL_RUN_TAG → sibling dirs (no overwrite)            │
+  │             LLM-as-judge: per-criterion scores + freeform notes   │
+  │             unit of debugging: ONE date-stamped run dir           │
+  └──────────────────────────────────────────────────────────────────┘
 
   state ownership          │   the trace IS the product
   failure containment      │   try/catch in the stream's start()
   durability               │   saveInvestigation → mem→file→seed
+                           │   eval/results/ → git
   metrics                  │   durationMs only, not aggregated
+                           │   eval scores ARE aggregated per criterion
   alerts / SLOs            │   not yet exercised
+  model-behavior debug     │   eval flywheel (measure → fix → re-measure)
 ```
 
-This guide reads the codebase through that single axis: **at every layer, what evidence exists, and what doesn't?** `audit.md` walks all 8 lenses; the pattern files take the load-bearing patterns deep.
+This guide reads the codebase through that single axis: **at every layer, what evidence exists, and what doesn't?** `audit.md` walks all 8 lenses; the pattern files take the load-bearing patterns deep. The split between online (surfaces 1-3) and offline (surface 4) matters: unit tests catch *wiring* bugs, the live trace catches *what just happened*, eval results catch *model-behavior* bugs that don't surface in either of the first two.
 
 ---
 
@@ -66,11 +89,13 @@ The ranking spotlights what's load-bearing in this repo, not a generic checklist
 
 5. **The `e83a8e0` flake-fix is the canonical incident post-mortem.** `process.env.AUTH_SECRET` was mutated directly inside one test file; vitest's parallel workers leaked the var across files. Fix is `vi.stubEnv` + `vi.unstubAllEnvs` in `beforeEach`/`afterEach`. The post-mortem shape generalises to any future incident. → `05-auth-secret-flake-postmortem.md`
 
-6. **`durationMs` is the only metric primitive — and it's per-call, never aggregated.** `lib/mcp/client.ts:112,134` measures wall-clock around each MCP `liveCall`; `tool_call_end` carries it forward through the trace. It's enough to show "this tool took 340ms" in the UI. It is NOT enough to answer "what's p95 over the last hour" — there's no histogram, no time-series store, no rollup. Cited honestly in `audit.md` (metrics-slis-slos-and-alerts) as `not yet exercised` past the per-call number.
+6. **The eval result paper trail is the fourth observability surface.** Phase 3 added `eval/results/<date>[-<tag>]/` as a committed, post-hoc, structured record of model behavior under K iterations. `EVAL_RUN_TAG` is the env-var primitive that lets sibling result dirs land side by side (`2026-06-15` vs `2026-06-15-after-fix`). LLM-as-judge (`eval/judges/*.md` — Claude Haiku) emits per-criterion 0/1 scores plus a freeform `notes` field that's where the most diagnostic signal lives. The eval flywheel — measure → debug → fix → re-measure — is the model-level debugging methodology that surfaced PR D's monitoring-prompt date-framing bug (5% → 25% precision, 5x lift), PR E's BRL cents-vs-Reais bug at run 8 (judge: *"AOV BRL 131,965 is implausible"*), PR F's recurrence of the same numerical fingerprint at K=10 run 8, and PR G's 30% regression baseline that revealed conclusion-stability as the system's weakest property. → `06-eval-result-paper-trail.md`
 
-7. **Logs are unstructured and rare.** Four `console.error` calls in the entire repo — all in the two route handler catch blocks. No logger, no levels, no correlation ID, no redaction. The correlation primitive that *does* exist is the trace itself — every event in a stream belongs to one investigation, no IDs needed. Top-3 finding in `audit.md`.
+7. **`durationMs` is the only metric primitive — and it's per-call, never aggregated.** `lib/mcp/client.ts:112,134` measures wall-clock around each MCP `liveCall`; `tool_call_end` carries it forward through the trace. It's enough to show "this tool took 340ms" in the UI. It is NOT enough to answer "what's p95 over the last hour" — there's no histogram, no time-series store, no rollup. Cited honestly in `audit.md` (metrics-slis-slos-and-alerts) as `not yet exercised` past the per-call number. (Eval surface DOES aggregate per criterion across K runs — different scope from runtime metrics.)
 
-8. **Two backend-grade gaps are honest and named.** No incident tooling (no Sentry, no on-call rotation, no runbooks, no SLO definitions). No backend trace sink (no OpenTelemetry/Langfuse export, even though `@opentelemetry/api` is transitively in `node_modules` via Next.js). `audit.md` (debugging-observability-red-flags-audit lens) ranks them by consequence.
+8. **Logs are unstructured and rare.** Four `console.error` calls in the entire repo — all in the two route handler catch blocks. No logger, no levels, no correlation ID, no redaction. The correlation primitive that *does* exist is the trace itself — every event in a stream belongs to one investigation, no IDs needed. Top-3 finding in `audit.md`.
+
+9. **Two backend-grade gaps are honest and named.** No incident tooling (no Sentry, no on-call rotation, no runbooks, no SLO definitions). No backend trace sink (no OpenTelemetry/Langfuse export, even though `@opentelemetry/api` is transitively in `node_modules` via Next.js). `audit.md` (debugging-observability-red-flags-audit lens) ranks them by consequence.
 
 ---
 
@@ -81,12 +106,14 @@ The ranking spotlights what's load-bearing in this repo, not a generic checklist
 3. **`02-replay-from-snapshot-with-paced-emission.md`** — the cache-first short-circuit that makes the trace a real reproduction primitive.
 4. **`03-three-rung-mem-file-seed-store.md`** — the persistence layer; each rung serves a different scope.
 5. **`04-dual-write-send-to-stream-and-store.md`** — the two-line closure that makes the same trace serve both live and replay.
-6. **`05-auth-secret-flake-postmortem.md`** — the one documented incident, as a reusable template for future ones.
+6. **`05-auth-secret-flake-postmortem.md`** — the one documented test-level incident, as a reusable template for future ones.
+7. **`06-eval-result-paper-trail.md`** — the fourth observability surface; the eval flywheel as a debugging methodology; LLM-as-judge as a debug signal.
 
 **Then pick by need:**
 
 - **understand the trace as substrate** → start at `01-` then `04-`.
-- **a real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-` for the post-mortem template.
+- **a real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-` (test-level) or `06-` (model-level) depending on the bug class.
+- **the bug is in agent quality, not wiring** → `06-` first (eval flywheel + judge as signal).
 - **doing a triage / hand-off** → `audit.md` Top 3 ranked findings.
 - **why the metrics section is so short** → `audit.md` (metrics-slis-slos-and-alerts) — read it precisely *because* it names what isn't here.
 
@@ -107,5 +134,9 @@ The ranking spotlights what's load-bearing in this repo, not a generic checklist
 - **backend trace sink** — no OpenTelemetry/Langfuse/Datadog export; the trace lives in the UI + cache snapshot only.
 - **error monitoring** — no Sentry, no Bugsnag, no client-side error reporting.
 - **runbooks** — no `docs/runbooks/` directory, no incident response playbook past "read the trace".
+- **adjacent-eval-dir auto-comparison** — `eval/results/<date>[-<tag>]/` sibling dirs are diffable by hand (open both `summary.md` files); no `compare-evals.ts` that emits structured deltas. Surface 4 is committed but not yet self-comparing.
 
 Each is called out in the relevant `audit.md` lens, not buried.
+
+---
+Updated: 2026-06-16 — added fourth observability surface (eval result paper trail, `eval/results/<date>[-<tag>]/`, `EVAL_RUN_TAG`, LLM-as-judge as debug signal); reframed online/offline split in the layered map; new finding #6 names PR D/E/F/G as the worked eval flywheel; test count bumped 144 → 269.

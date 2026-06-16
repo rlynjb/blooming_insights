@@ -2,9 +2,23 @@
 
 ## the verdict, before anything else
 
-**blooming insights has no database.** Not a hidden one, not a "we use SQLite for dev." Zero. `package.json` lists no driver — no `pg`, `mysql2`, `sqlite3`, `redis`, `prisma`, `drizzle`, `mongoose`, `@upstash/*`. Nothing.
+**The main Next.js app still has no database.** Its own `package.json` lists no driver — no `pg`, `mysql2`, `redis`, `prisma`, `drizzle`, `mongoose`, `@upstash/*`. State lives in `Map`s in one Node process.
 
-What it has instead, ranked by how close each gets to being database-shaped:
+**BUT — Phase 2 added a sibling package, `mcp-server-olist/`, that DOES have a real database.** It's `better-sqlite3` against `mcp-server-olist/data/olist.db` (3.5 MB, committed to git), seeded deterministically with synthetic Brazilian e-commerce data (5k customers, ~10k orders, 6-month window). The main app reaches it through MCP tool calls — same shape as Bloomreach, except the data layer is **one process away, in our own repo, with a real SQL engine** behind it. That changes the verdict on half this guide.
+
+So the storage map has two altitudes now:
+
+```
+  altitude 1: the main Next.js app           altitude 2: the sibling MCP server
+  ─────────────────────────────              ─────────────────────────────
+  no DB, all in-memory                       SQLite (better-sqlite3)
+  Maps + cookies + JSON cache                7 tables, 9 indexes, WAL mode
+  → most of this guide's "not yet            committed binary DB as fixture
+     exercised" still holds                  → 02, 03, 04, 05, 07 now exercise
+                                               REAL database mechanics
+```
+
+What the main app has instead, ranked by how close each gets to being database-shaped:
 
 ```
   closest to a DB ──────────────────────────────────────► furthest from a DB
@@ -28,22 +42,28 @@ What it has instead, ranked by how close each gets to being database-shaped:
   └──────────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
 
-Bloomreach Engagement is the real data warehouse — multi-tenant, customer events, EQL query engine, the lot. We never touch it directly. We make MCP tool calls (`execute_analytics_eql`, `get_project_overview`) and stitch the results into insights. **The database concepts that matter to us are the ones that govern how we cache, dedupe, and trust those upstream responses — not how we shard tables.**
+Bloomreach Engagement is the real upstream data warehouse — multi-tenant, customer events, EQL query engine, opaque to us. The Olist MCP server is the **authored** data warehouse — we wrote the schema, we wrote the seed, we wrote the queries. Both reach the agents through MCP tool calls. The agents don't write SQL or EQL directly; they call domain tools (`execute_analytics_eql` for Bloomreach, `get_metric_timeseries` / `get_segments` / `get_anomaly_context` for Olist) and stitch the results into insights.
 
-## why this guide exists anyway
+**The database concepts that matter here fall into three buckets now:**
 
-Database-systems thinking still pays here. Three reasons:
+1. **Inside the main app** — caching, cross-instance state, rate-limit coordination. Still mostly `not yet exercised` at the engine level.
+2. **Inside `mcp-server-olist/`** — real SQL, real indexes, real prepared statements, real transactions on the seed write path. Sections 02, 03, 04, 05, 07 now have concrete code to anchor to.
+3. **At the seam between them** — schema introspection (`olistWorkspaceSchema()` in `lib/mcp/schema.ts` L232), the committed binary DB as test fixture, seeded determinism (mulberry32 seed=42). New file: `10-embedded-sqlite-fixture.md`.
 
-1. The MCP cache **is** a tiny KV with TTL — single-writer, in-process, no eviction. That's a real datastore decision; understanding what it gives up (durability, cross-instance coherence, LRU) tells you exactly when it stops being enough.
-2. The in-process `Map`s in `lib/state/insights.ts` look like state but **behave** like a single-writer table without persistence, without isolation, and without secondary indexes. Naming that shape is what tells you when "feed of insights" outgrows the file it lives in.
-3. The day a feature lands that needs to survive a cold start — saved searches, per-user history, audit logs — you'll reach for Postgres. The teaching here primes you on which engine guarantees you'd be picking up, and which ones you'd be giving up.
+## why this guide exists
 
-So most sections will read **`not yet exercised`** — and each names the trigger that flips the verdict.
+Database-systems thinking pays in two places now:
+
+1. **At the main-app altitude** — the MCP cache is a tiny KV with TTL; the in-process `Map`s in `lib/state/insights.ts` behave like a single-writer table without persistence or isolation; cross-instance divergence is real. These are still `not yet exercised` at the engine level, but the patterns are database-shaped.
+2. **At the sibling-package altitude** — `mcp-server-olist/src/db.ts` opens SQLite read-only with `journal_mode = WAL`. The seed script (`mcp-server-olist/scripts/seed-olist.ts` L508-544) wraps the bulk insert in `db.transaction(() => ...)`. The three tool queries (`mcp-server-olist/src/tools/*.ts`) hit B-tree indexes on `(purchase_ts)`, `(customer_id)`, `(order_id)`, `(category)`, etc. — real query-planner territory.
+3. The day a feature in the main app needs to survive a cold start — saved searches, per-user history, audit logs — you'll reach for Postgres. The teaching here primes you on which engine guarantees you'd be picking up, and the Olist package gives you SQL pattern shapes to point at.
+
+So sections that touch the main app still read `not yet exercised` — and each names the trigger that flips the verdict. Sections that touch SQL mechanics (02-05, 07) now have real codebase anchors via `mcp-server-olist/`.
 
 ## the storage map (such as it is)
 
 ```
-  blooming insights — every place a byte lives
+  blooming insights — every place a byte lives (Phase 2 expanded)
 
   ┌─ Browser ─────────────────────────────────────────────────────────────┐
   │  sessionStorage (insight handoff between feed → /investigate)         │
@@ -56,66 +76,99 @@ So most sections will read **`not yet exercised`** — and each names the trigge
   │  ┌─ lib/mcp/client.ts ────────────────┐  ┌─ lib/mcp/schema.ts ────────┐ │
   │  │ cache: Map<key, {result,expiresAt}>│  │ cached: WorkspaceSchema    │ │
   │  │ TTL default 60_000ms               │  │ (module global, no TTL)    │ │
-  │  │ minIntervalMs=1100 (rate limit)    │  └────────────────────────────┘ │
-  │  └────────────────────────────────────┘                                 │
-  │                                                                         │
+  │  │ minIntervalMs=1100 (rate limit)    │  │ olistWorkspaceSchema()     │ │
+  │  └────────────────────────────────────┘  │ derives from db.ts contract│ │
+  │                                          └────────────────────────────┘ │
   │  ┌─ lib/state/insights.ts ────────────┐  ┌─ lib/state/investigations.ts┐│
-  │  │ insights: Map<id, Insight>         │  │ mem: Map<id, AgentEvent[]>  ││
-  │  │ investigations: Map<id, Inv>       │  │ + .investigation-cache.json ││
-  │  │ anomalies: Map<id, Anomaly>        │  │   (dev only)                ││
-  │  │ — putInsights() does insights.clear()│ │ + demo-investigations.json  ││
-  │  │   on every briefing run            │  │   (committed seed)          ││
-  │  └────────────────────────────────────┘  └─────────────────────────────┘│
-  │                                                                         │
+  │  │ insights / investigations /         │  │ mem: Map<id, AgentEvent[]>  ││
+  │  │ anomalies Maps (no persistence)    │  │ + .investigation-cache.json ││
+  │  └────────────────────────────────────┘  │   (dev only)                ││
+  │                                          └─────────────────────────────┘│
   │  ┌─ lib/mcp/auth.ts ──────────────────────────────────────────────────┐ │
   │  │ dev: .auth-cache.json    test: memStore Map    prod: bi_auth cookie│ │
   │  │ AES-256-GCM under AUTH_SECRET (prod)                               │ │
   │  └────────────────────────────────────────────────────────────────────┘ │
   └─────────────────────────────────────┬───────────────────────────────────┘
-                                        │  every read crosses the network
-  ┌─ Bloomreach Engagement (upstream — somebody else's database) ───────────┐
-  │  customer profiles · event streams · catalogs · EQL query engine        │
-  │  exposed to us as MCP tools: execute_analytics_eql, get_event_schema… │
-  │  rate-limited globally per user: 1 req per ~1s, sometimes 1 per 10s   │
-  └─────────────────────────────────────────────────────────────────────────┘
+                                        │  MCP stdio subprocess (Olist mode)
+                                        │  OR network (Bloomreach mode)
+                  ┌─────────────────────┴─────────────────────┐
+                  ▼                                            ▼
+  ┌─ mcp-server-olist/ (sibling package, OUR DB) ──┐  ┌─ Bloomreach (upstream)┐
+  │  better-sqlite3, read-only, journal_mode=WAL    │  │  EQL engine; we never │
+  │  data/olist.db (3.5 MB, committed to git)       │  │  see schemas, plans,  │
+  │                                                  │  │  or indexes           │
+  │  Tables: customers, products, orders,            │  │                       │
+  │          order_items, payments, reviews,         │  │  rate-limited globally│
+  │          seeded_anomalies                        │  │  per user: ~1 req/s   │
+  │                                                  │  └───────────────────────┘
+  │  Indexes (9): orders.purchase_ts, orders.cust,   │
+  │   items.order, items.product, payments.order,    │
+  │   reviews.order, customers.state, products.cat,  │
+  │   payments.type                                  │
+  │                                                  │
+  │  Tools (3): get_metric_timeseries,               │
+  │             get_segments,                        │
+  │             get_anomaly_context                  │
+  │                                                  │
+  │  Seed: mulberry32 PRNG, seed=42, 5k customers,   │
+  │        ~10k orders, 6-month window               │
+  │        (2025-12-01 .. 2026-06-01)                │
+  │  3 anomalies injected as ground truth:           │
+  │   - sp-revenue-drop-w4   (×0.7, week 4, SP)      │
+  │   - electronics-spike-w2 (×2.5, week 2, electr.) │
+  │   - voucher-dropoff-w10  (×0.05, weeks 10-end)   │
+  └─────────────────────────────────────────────────┘
 ```
 
-Every persistent byte you can point at is either (a) a cookie, (b) a JSON file used in dev, or (c) committed demo fixtures. Production has nothing the next deploy doesn't reset.
+The main app has nothing the next deploy doesn't reset. The Olist package has a 3.5 MB committed binary that survives every deploy because it's in the git tree — that's a deliberate trade (large repo) for reproducibility (every clone gets the same fixture, byte for byte).
 
 ## what to read first (and why)
 
 ```
   reading order — verdict-first
 
-  01  database-systems-map           ← the only mostly-applicable section.
-                                       what's where, what's not, the seams.
+  01  database-systems-map           ← what's where across BOTH altitudes.
+                                       main app: in-memory. Olist: SQLite.
 
-  02  records-pages-and-storage-layout    not yet exercised — Map ≠ pages
-  03  btree-hash-and-secondary-indexes    not yet exercised — Map.get is O(1) hash
-                                          and there are no secondary indexes
-  04  query-planning-and-execution         not yet exercised — EQL planning happens
-                                          inside Bloomreach, not here
-  05  transactions-isolation-and-anomalies not yet exercised — no transactions exist
-  06  locks-mvcc-and-concurrency-control   not yet exercised — single-writer-per-
-                                          instance Maps; concurrent writers WILL
-                                          conflict on Vercel (named, see 06)
-  07  wal-durability-and-recovery          not yet exercised — nothing durable to log
+  02  records-pages-and-storage-layout    EXERCISED in mcp-server-olist
+                                          (SQLite pages, WAL mode, 9 indexes).
+                                          main app still has no pages.
+  03  btree-hash-and-secondary-indexes    EXERCISED in mcp-server-olist
+                                          (9 named B-tree indexes; see Move 2).
+  04  query-planning-and-execution         EXERCISED in mcp-server-olist
+                                          (SQLite planner runs the JOINs in
+                                          get_metric_timeseries; EXPLAIN works).
+  05  transactions-isolation-and-anomalies PARTIALLY EXERCISED
+                                          (seed-olist.ts wraps the bulk insert
+                                          in db.transaction(); main app has none)
+  06  locks-mvcc-and-concurrency-control   not yet exercised — main app's Maps;
+                                          SQLite is read-only single-process for us
+  07  wal-durability-and-recovery          EXERCISED in mcp-server-olist
+                                          (PRAGMA journal_mode = WAL on open;
+                                          read-only so no checkpointer pressure)
   08  replication-and-read-consistency     not yet exercised — single source upstream,
                                           per-instance caches CAN diverge (named, see 08)
-  09  database-systems-red-flags-audit    ranked risks for what IS here
+  09  database-systems-red-flags-audit    ranked risks across BOTH altitudes
+  10  embedded-sqlite-fixture             NEW — better-sqlite3 trade-offs, seeded
+                                          determinism, committed binary as fixture,
+                                          schema introspection (db→schema contract)
 ```
 
-Read **01** and **09** if you only have ten minutes — together they're the honest picture. Everything in between teaches the concept and names the trigger that would make it relevant.
+Read **01**, **10**, and **09** if you only have fifteen minutes — together they cover the honest picture across both altitudes.
 
-## the somewhat-applicable handful
+## the actually-applicable sections (post-Phase 2)
 
-Two-and-a-half sections actually have teeth here:
+The list of "what's exercised" got longer:
 
-- **01 — database-systems-map.** The full layout above is real. The MCP cache, the schema singleton, the state Maps, the auth backends — these are the storage substrate. Section 01 walks each.
-- **06 — concurrency.** No locks, no MVCC — but `putInsights()` calls `insights.clear()` then re-fills. On Vercel with >1 warm instance, two concurrent briefings interleave clear and set and you can see torn state. That's a real concurrency-control gap, named honestly.
-- **08 — replication and read consistency.** No replicas. But each warm Vercel instance has its OWN cache and its OWN `Map` of insights. Two users hitting two instances see two truths. That's not "replication lag" — it's "no shared store at all" — but it's the same family of read-consistency problem and worth naming.
-
-The rest are honest `not yet exercised` notes with a "becomes relevant when…" trigger.
+- **01 — database-systems-map.** The full layout above is real, now across two altitudes.
+- **02 — records, pages, storage layout.** `mcp-server-olist/data/olist.db` is a real B-tree-on-disk file with 8KB pages by SQLite default.
+- **03 — B-tree and secondary indexes.** Nine named indexes in `mcp-server-olist/scripts/seed-olist.ts` L236-244. Every tool query relies on at least one.
+- **04 — query planning.** The `get_metric_timeseries` tool issues real JOINs that SQLite's cost-based planner handles. `EXPLAIN QUERY PLAN` returns real output against this DB.
+- **05 — transactions.** The seed script's `db.transaction(() => { ... })` wrapper is a real ACID transaction (SQLite's default is serializable). One transaction inserts ~30k rows atomically.
+- **06 — concurrency.** Main app still has the same gaps. SQLite is opened `readonly: true` so no write contention; WAL would give MVCC if we wrote, but we don't.
+- **07 — WAL.** `mcp-server-olist/src/db.ts` L40 sets `PRAGMA journal_mode = WAL`. The `.db-wal` and `.db-shm` files in `data/` are real WAL artifacts.
+- **08 — replication.** Still no replicas. The cross-instance divergence story in the main app is unchanged.
+- **10 — embedded SQLite fixture.** The whole pattern of "data layer one process away" — what better-sqlite3 buys you that an async driver doesn't, why the binary DB is committed, how seed determinism makes the eval suite hermetic.
 
 ## when a real DB would change the calculus
 
@@ -147,12 +200,17 @@ None of these are speculation about a far future. They're the natural next steps
 
 - Every applied claim ties to a `file:line` range.
 - Every `not yet exercised` verdict names the closest cousin in this codebase and the trigger that would flip it.
-- No invented infrastructure. No "we use Postgres for…" — we don't.
+- Two altitudes named explicitly: main app (no DB), sibling MCP server (SQLite).
+- No invented infrastructure for the main app. SQLite claims tie to `mcp-server-olist/src/db.ts` and `mcp-server-olist/scripts/seed-olist.ts`.
 - Cross-links go to `study-system-design` (which engine you'd pick) and `study-data-modeling` (the shape of what you'd store), not re-taught here.
 
 ## see also
 
-- `study-data-modeling` — the SHAPE of data, were we to persist any
+- `study-data-modeling` — the SHAPE of data, including the Olist schema
 - `study-system-design` — WHICH datastore, when you reach for one
-- `study-runtime-systems` — Node process model, why `Map` is single-writer here
+- `study-runtime-systems` — Node process model; better-sqlite3 sync vs async drivers
 - `study-distributed-systems` — why per-instance caches diverge under load
+- `study-testing` — the eval suite uses the SQLite-backed fixture for hermetic agent tests
+
+---
+Updated: 2026-06-16 — Phase 2 added a sibling SQLite-backed MCP server; verdict no longer "zero DB"; new file 10-embedded-sqlite-fixture.md; sections 02/03/04/05/07 now exercise real SQL mechanics.

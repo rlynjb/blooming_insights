@@ -1,9 +1,9 @@
 # Access patterns and storage choice
 
-**Industry name(s):** Storage choice · access-pattern fit · in-memory store · key-value · document store · serverless cold-start
-**Type:** Industry standard · Language-agnostic · Project-specific (the in-memory-with-JSON-fallback variant)
+**Industry name(s):** Storage choice · access-pattern fit · in-memory store · key-value · document store · serverless cold-start · session-scoped state · relational analytics warehouse
+**Type:** Industry standard · Language-agnostic · Project-specific (the session-keyed-in-memory variant + the local SQLite analytics variant)
 
-> The storage choice question: **does the storage shape match the read/write pattern?** This repo's choice is the simplest possible — three in-memory `Map`s in `lib/state/insights.ts`, with a JSON-file fallback in dev (`.investigation-cache.json`) and a committed demo-seed (`lib/state/demo-*.json`) for offline replay. The access pattern is "write the whole briefing at once, read individual insights by id." The storage shape fits — `Map` is exactly what that pattern wants. The mismatch is **per-process memory on serverless** — Vercel's warm-instance memory means a briefing computed on one invocation may not be visible to the next one, so the route handler walks three sources (in-memory → demo seed → wire-format param) to find an anomaly. This file walks both the fit and the mismatch.
+> The storage choice question: **does the storage shape match the read/write pattern?** This repo now has **three storage layers**. (1) **Session-scoped in-memory** `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` for live UI state — by-id reads within a session, per-session isolation between users. (2) **Olist SQLite** on disk under `mcp-server-olist/data/olist.db` — a real relational analytics warehouse with FKs, indexes, NOT NULL, read-only at runtime. (3) **Committed demo seeds** (`lib/state/demo-*.json`) and **eval result snapshots** (`eval/results/<date>/*.json`) — git-tracked, durable forever. The access pattern is **layered by lifetime**: per-request UI state in (1), per-machine analytics state in (2), per-commit fixtures in (3). The classic mismatch from the 2026-06-01 version — "per-process memory on serverless" — is partly bridged by the session-scoping (multi-user safety) and by the wire-format-as-state pattern (the browser carries the data across cold starts). The mismatch hasn't been retired; it's been bounded.
 
 ---
 
@@ -126,32 +126,62 @@ You know how `localStorage.setItem(k, v)` is a key-value store that survives unt
 
 ### Move 2 — the three store layers, one at a time
 
-#### `lib/state/insights.ts` — the in-memory Maps (primary)
+#### `lib/state/insights.ts` — session-scoped in-memory (UPDATED 2026-06-16)
 
-Three `Map`s, all module-level. The Maps are *module singletons* — created once when the module is first imported, shared by every request handled by that process instance.
+The shape has been refactored from "three module-level Maps shared by all requests" to "an outer Map keyed by sessionId, with three inner Maps per session." This fixes a multi-user safety bug — a single warm Vercel instance serves many users, and module-level globals would let `putInsights().clear()` for user A wipe user B's feed mid-briefing.
 
 ```
-  the in-memory layer
+  the session-scoped layer
 
-  const insights        = new Map<string, Insight>();
-  const investigations  = new Map<string, Investigation>();
-  const anomalies       = new Map<string, Anomaly>();
+  const state = new Map<string, SessionFeed>();        ← outer, NEVER cleared
 
-  reads:  Map.get(id)        ── O(1), no validation, no cost
-  writes: Map.set(id, value) ── O(1), no validation, no cost
-  clear:  Map.clear()        ── O(1) (Node's Map clear)
+  type SessionFeed = {
+    insights:       Map<string, Insight>;              ← per-session
+    investigations: Map<string, Investigation>;        ← per-session
+    anomalies:      Map<string, Anomaly>;              ← per-session
+  };
+
+  reads:  getInsight(sessionId, id) →
+            state.get(sessionId)?.insights.get(id) ?? null
+          ── two-level hash lookup, O(1)
+  writes: putInsights(sessionId, items, raw) clears + repopulates
+          ONLY this session's sub-feed
+
+  lifetime semantics (unchanged):
+    LOCAL DEV: outer Map lives until you Ctrl-C the dev server
+    VERCEL:    outer Map lives per warm instance — minutes of idle, no longer
+               ANY cold start = empty outer Map, fall back to seed/wire-param
+
+  what's new vs 2026-06-01: cross-session isolation.
+    user A's briefing run no longer wipes user B's feed.
+    test/state/insights.test.ts has explicit isolation tests.
+```
+
+#### `mcp-server-olist/data/olist.db` — the SQLite analytics warehouse (NEW)
+
+A real relational store, on disk, owned by the repo. Read-only at runtime (only the seeder writes). Three tools query it (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`); the agent loop calls those tools when `LiveMode === 'live-sql'`.
+
+```
+  the Olist SQLite layer
+
+  reads:  prepared statements over 7 tables via better-sqlite3 (sync)
+          plans use the 9 indexes (file 03 walks them)
+          PRAGMA foreign_keys = ON, journal_mode = WAL
+
+  writes: ONLY by mcp-server-olist/scripts/seed-olist.ts
+          drop-and-rebuild pattern — the file is destroyed and recreated
+          deterministic: mulberry32(seed=42) → byte-identical every time
 
   lifetime semantics:
-    LOCAL DEV:  lives until you Ctrl-C the dev server
-    VERCEL:     lives per warm instance — minutes of idle, no longer
-                ANY cold start = empty Maps, fall back to seed/wire-param
+    file lives until git clean or manual unlink
+    every npm run seed REPLACES the file (no incremental writes)
+    survives Vercel cold starts ONLY when the file is on disk
+      (in Vercel serverless: the DB file is NOT shipped — the Olist
+       mode is local-development-and-eval only)
 
-  what breaks if the Maps don't survive a request:
-    the most common case: the user lands a briefing on instance A,
-    clicks investigate, gets routed to instance B (cold start). The
-    in-memory anomaly for the insight isn't there. resolveAnomaly()
-    falls through to the demo seed OR to the wire-format param (which
-    the browser sends to bridge this gap).
+  what this is for: Phase 3 evals (eval/scripts/run-detection.ts spawns
+  a fresh mcp-server-olist subprocess and grades the monitoring agent's
+  output against the seeded_anomalies table). NOT for production UI.
 ```
 
 #### `lib/state/investigations.ts` — the dev file cache (secondary)
@@ -405,15 +435,20 @@ The storage layers and the access pattern, recap.
 ### The three Maps
 
 ```
-lib/state/insights.ts  (lines 4–6)
+lib/state/insights.ts  (lines 8–14, UPDATED)
 
-  const insights = new Map<string, Insight>();
-  const investigations = new Map<string, Investigation>();
-  const anomalies = new Map<string, Anomaly>();
+  type SessionFeed = {
+    insights:       Map<string, Insight>;
+    investigations: Map<string, Investigation>;
+    anomalies:      Map<string, Anomaly>;
+  };
+  const state = new Map<string, SessionFeed>();
        │
-       └─ module singletons. created on first import. shared by every
-          request the process handles. die when the process dies.
-          this is the entire "primary store" of the repo.
+       └─ outer Map keyed by sessionId. each session gets its own
+          SessionFeed (three inner Maps). the outer Map is NEVER
+          cleared by a request; only the inner Maps for THIS session
+          are cleared on putInsights(sessionId, ...). multi-user safe
+          on a warm Vercel instance.
 ```
 
 ### The dev file cache
@@ -527,7 +562,7 @@ What this repo would look like with Drizzle + Vercel Postgres: schema in `lib/db
 ## Interview defense
 
 **Q: Walk me through the storage choice in this repo.**
-A: Three `Map`s in `lib/state/insights.ts` — `insights`, `anomalies`, `investigations`, all module-level singletons, all keyed by id. Reads are `Map.get(id)` (O(1)); writes are `Map.set(id, value)` or `Map.clear()` for the whole briefing. The access pattern is "write the whole briefing at once, read individual insights by id" — that's exactly what hash-keyed storage is for. The mismatch is durability: on Vercel, in-memory state is per-instance and dies on cold start. The repo bridges that with a four-source fallback chain in the route handler (wire-format param → `anomalies` Map → `insights` Map → committed demo seed) plus a `sessionStorage`-and-URL-param bridge so the browser is effectively the durability layer.
+A: Three layers. **(1) Session-scoped in-memory** in `lib/state/insights.ts` — `Map<sessionId, SessionFeed>` where each `SessionFeed` is three inner Maps (`insights`, `anomalies`, `investigations`). Per-session isolation: one user's `putInsights` clears only that session's sub-maps. Reads are two-level `state.get(sessionId)?.insights.get(id)` (O(1) hash lookups). **(2) Olist SQLite on disk** under `mcp-server-olist/data/olist.db` — real relational analytics warehouse, FKs + WAL + read-only at runtime + designed-against-queries indexes. **(3) Committed seeds** (`lib/state/demo-*.json`, `eval/results/<date>/*.json`, `eval/fixtures/regression-golden/*.json`) — git-tracked, durable forever. Durability across Vercel cold starts: layer 1 dies, layer 2 lives if the file ships, layer 3 always lives. The route's `resolveAnomaly` walks four sources (wire-format param → per-session anomalies → per-session insights → demo seed) to bridge the layer-1 ephemeral gap.
 
 **Q: What's the wire-format bridge and why does it exist?**
 A: When the user clicks an insight on the briefing, the browser puts the entire Insight JSON in `sessionStorage` AND ships it back as a `?insight=<JSON>` URL param when navigating to the investigate page. The route prefers this param over its in-memory store. It exists because Vercel cold starts mean the in-memory store can't be trusted — a briefing computed on instance A may not be visible to instance B. Letting the browser carry the state across the cold-start boundary makes the route stateless-for-correctness while keeping the in-memory Maps as a pure optimization for warm hits. The cost is a long URL (~500 bytes) and the `insightToAnomaly` leak (the route converts the lossy `Insight` back to `Anomaly`, dropping 4 fields). Net: cheap, correct, no infrastructure.
@@ -560,8 +595,13 @@ A: When the user clicks an insight on the briefing, the browser puts the entire 
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the entities stored in each of the three Maps.
-- `02-normalization-and-duplication.md` — the wire-format bridge is the *reason* the lossy conversion `insightToAnomaly` exists; the leak is downstream of the storage choice.
-- `04-transactions-and-integrity.md` — the in-memory store has no atomicity story because it doesn't need one (single-threaded, no I/O) — but the missing atomicity is inherited from this storage choice.
-- `05-migrations-and-evolution.md` — the committed demo seed is the only "live data" that crosses commits, and the "always optional" rule is what lets it keep validating.
-- `study-system-design/*` — the system-design side of this question (which datastore, scaling, replication) lives there; this file covers shape fit, not architecture.
+- `01-the-data-model-and-its-shape.md` — the entities stored in each layer.
+- `02-normalization-and-duplication.md` — the wire-format leak is now the load-bearing one (the schema-side fix shipped); session-scoped state makes a server-side lookup safe.
+- `04-transactions-and-integrity.md` — session-scoped sub-maps + Olist FK/WAL; the integrity invariants per layer.
+- `05-migrations-and-evolution.md` — drop-and-reseed is the Olist "migration"; deterministic synthesis is why it's legitimate.
+- `08-the-olist-relational-schema.md` — the schema living in `mcp-server-olist/data/olist.db`.
+- `09-deterministic-synthetic-data.md` — why the DB is regenerable + the eval result shapes that live in `eval/results/`.
+- `study-system-design/*` — the system-design side of this question (which datastore, scaling, replication).
+
+---
+Updated: 2026-06-16 — added the session-scoped state refactor and the Olist SQLite analytics layer; primary store layer count moved from 3 (in-memory / dev-file / demo-seed) to 5 (per-session in-memory / Olist SQLite / dev-file cache / committed demo seed / committed eval results).

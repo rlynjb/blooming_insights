@@ -30,37 +30,50 @@ How a database turns SQL into a sequence of physical operations · Industry stan
 
 ### Verdict for this codebase
 
-**Not yet exercised — but the upstream half is, in a way that matters.**
+**Exercised on the Olist side. We now own SQL.**
 
-We do not run a query planner. We don't write SQL. What we DO do is hand Bloomreach EQL strings (an analytics query language) through `execute_analytics_eql`, and Bloomreach's planner runs on the other side of the network. So query planning exists in our request flow — it just happens in someone else's process. The teaching that still matters: **how the agent constructs EQL, what we observe, and what an N+1 looks like at this layer.**
+Three altitudes of planning:
 
-The single thing in our codebase that looks anything like a planner: `lib/agents/monitoring.ts` decides which tools to call in which order, based on which categories the coverage gate marked runnable. That's not a query planner — it's a tool dispatcher — but it's the closest analog.
+1. **Agent layer** (`lib/agents/monitoring.ts`) — Claude decides which MCP tool to call next. Not a query planner; a tool dispatcher. Unchanged from before.
+2. **Bloomreach mode** — Bloomreach's EQL engine runs on the other side of the network. Opaque to us.
+3. **Olist mode (NEW)** — `mcp-server-olist/src/tools/get_metric_timeseries.ts` constructs SQL dynamically (JOIN list depends on metric + dimension + filter), runs `db.prepare(sql).all(params)`, and **SQLite's cost-based planner picks the index** on the other side of the prepared-statement call. We can run `EXPLAIN QUERY PLAN` against this DB and see real output.
 
-### When this becomes load-bearing
+The teaching now has three layers of anchors:
 
-The moment we own SQL: a Postgres for saved insights, a DuckDB for ad-hoc rollups, anything where we can run `EXPLAIN`. Until then, the relevant skills are:
+- the agent's dispatch loop (still an N+1 against the rate limit)
+- the dynamic JOIN construction in `get_metric_timeseries` (logical plan we write)
+- SQLite's planner output via EXPLAIN (physical plan it picks)
 
-- spotting an EQL N+1 in the agent loop (we have one — see Move 2c)
-- reading the rate-limit signal as a planner-side feedback loop
-- knowing what an EXPLAIN would tell us if we had one
+### When this still becomes load-bearing
+
+For the **main app**, query planning becomes load-bearing the day we own SQL there (Postgres for saved insights, etc.). For the **Olist DB**, it's load-bearing now — every tool call hits the planner.
 
 ## Structure pass
 
-The system has two query-planning altitudes worth distinguishing:
+The system has THREE query-planning altitudes now worth distinguishing:
 
 ```
-  axis: "who decides what query to run next?"
+  axis: "who decides what query to run next, and what physical plan executes?"
 
   ┌─ outer: monitoring/diagnostic agent loop ───────┐
-  │  Claude decides the next tool call (EQL string)  │  → LLM is the planner
+  │  Claude decides the next tool call               │  → LLM is the dispatcher
   └────────────────────┬─────────────────────────────┘
-                       │
-  ┌─ inner: Bloomreach EQL execution ────────────────┐
-  │  Bloomreach picks indexes, join order, etc.      │  → DB is the planner
+                       │  MCP tool call boundary
+                       ▼
+  ┌─ middle: dynamic SQL construction (Olist mode)  │
+  │  get_metric_timeseries.ts builds JOIN list +     │  → WE write the logical
+  │   WHERE clause from input args                    │     plan, one prepared
+  │                                                   │     statement per shape
+  └────────────────────┬─────────────────────────────┘
+                       │  db.prepare(sql).all(params)
+                       ▼
+  ┌─ inner: SQLite physical planner ─────────────────┐
+  │  picks index per JOIN, decides scan vs seek,     │  → SQLite is the
+  │  reads pages from the buffer pool                 │     physical planner
   └──────────────────────────────────────────────────┘
 ```
 
-The seam is the MCP tool call boundary. We see what Claude asked for and what came back. We never see what Bloomreach did to answer it.
+The seam at the MCP tool-call boundary changes character in Olist mode: we now own both sides of it. The agent picks the tool; we wrote the SQL; SQLite picks the index. In Bloomreach mode the second altitude doesn't exist (the tool IS the query).
 
 ## How it works
 
@@ -127,22 +140,146 @@ The codebase HAS an N+1, just at the agent layer not the DB layer:
 
 **Move 2d — EXPLAIN, the planner's window.** Every real database lets you print the chosen plan: `EXPLAIN SELECT ...`. Reading EXPLAIN output is the single most valuable skill in database performance work. Without it you're guessing at why a query is slow; with it you can see "ah, it's doing a seq scan because the index is on `(b,a)` not `(a,b)`."
 
+For Olist specifically, SQLite supports `EXPLAIN QUERY PLAN` — open `data/olist.db` in the sqlite3 CLI, prefix any tool query with it, and you'll see lines like `SEARCH orders USING INDEX idx_orders_purchase_ts (purchase_ts>? AND purchase_ts<?)` for a metric query. That's a real index range scan, the same primitive Postgres would use.
+
+**Move 2e — dynamic SQL construction (Olist mode, the new shape).**
+
+`get_metric_timeseries.ts` doesn't have ONE SQL string. It has a TEMPLATE that branches on input args — which metric, which dimension, which filter. Each unique shape becomes its own prepared statement, cached by better-sqlite3 transparently.
+
+```
+  shape — dynamic JOIN list, one prepared statement per concrete query
+
+  input:    metric='revenue', dimension='state', time_range=...
+
+  derived:  needsItems     = true   (revenue needs order_items)
+            needsCustomers = true   (state needs customers join)
+            needsPayments  = false
+            needsProducts  = false
+
+  emitted SQL:
+    SELECT o.id AS order_id, o.purchase_ts AS ts,
+           oi.price_brl AS amount, c.state AS segment
+    FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN customers c ON c.id = o.customer_id
+    WHERE o.purchase_ts >= ? AND o.purchase_ts < ?
+
+  what SQLite's planner does next:
+    1. WHERE has range predicate on purchase_ts
+        → SEARCH orders USING INDEX idx_orders_purchase_ts
+    2. JOIN order_items on o.id (PK on orders.id, FK index on items.order_id)
+        → SEARCH order_items USING INDEX idx_items_order
+    3. JOIN customers on o.customer_id (FK index)
+        → SEARCH customers USING INDEX idx_orders_customer reversed
+           (actually PK seek on customers.id since orders.customer_id is
+           the side with the FK)
+    4. bucketing happens in JS (see seed-olist.ts L132-156 comment about
+       avoiding SQLite-side date math)
+```
+
+The deliberate choice: **buckets are computed in JS, not SQL.** The comment in `get_metric_timeseries.ts` L132-135 calls this out — at ~10k orders, pulling all matching rows + `purchase_ts` and bucketing in TypeScript avoids SQLite-side `strftime`/`unixepoch` calls. At 10M orders the calculus flips and you'd push the bucketing down to SQL. Knowing where that crossover sits is the skill.
+
 ### Move 3 — the principle
 
 **Planning is where declarative meets physical.** SQL says what; the planner picks how. The whole reason SQL won as an interface is that the planner can change its mind as the data shape changes — same query, faster execution next quarter when you add an index. You give up imperative control to buy the freedom to re-tune later. The day you're hand-writing the plan (like we sort-of do in `lib/agents/monitoring.ts`), you've given up that lever.
 
 ## Primary diagram
 
-Skipped — no codebase instance to recap end-to-end.
+```
+  query path — agent → MCP tool → SQLite planner → pages
+
+  ┌─ agent ─────────────────────┐
+  │  Claude picks the next tool  │
+  │  call from the available 3:  │
+  │  - get_metric_timeseries     │
+  │  - get_segments              │
+  │  - get_anomaly_context       │
+  └──────────────┬───────────────┘
+                 │  MCP stdio JSON envelope
+                 ▼
+  ┌─ mcp-server-olist subprocess ─────────────────────────────┐
+  │  validateAgainstSchema(input)                              │
+  │      │                                                     │
+  │      ▼                                                     │
+  │  build dynamic SQL (joins, WHERE, SELECT cols)             │
+  │      │                                                     │
+  │      ▼                                                     │
+  │  db.prepare(sql).all(params)  ← prepared, cached            │
+  │      │                                                     │
+  │      ▼                                                     │
+  │  ┌─ SQLite engine ────────────────────────────────────┐   │
+  │  │  cost-based planner picks index per JOIN            │   │
+  │  │  executor walks B-tree pages from buffer pool       │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │      │                                                     │
+  │      ▼                                                     │
+  │  rows[] returned to JS                                     │
+  │      │                                                     │
+  │      ▼                                                     │
+  │  bucket by (truncated_ts, segment) IN JS                   │
+  │  return points[] to MCP envelope                           │
+  └─────────────────────────────────────────────────────────────┘
+```
 
 ## Implementation in codebase
 
 ### Use cases
 
-- **Every monitoring run** emits a sequence of EQL queries through `execute_analytics_eql`. The schema-gate decides which queries run; the order is sequential because of the rate limit.
-- **Every investigation** runs a smaller set of follow-up queries scoped to the anomaly's category.
+- **Bloomreach mode — every monitoring run** emits a sequence of EQL queries through `execute_analytics_eql`. The schema-gate decides which queries run; the order is sequential because of the rate limit.
+- **Olist mode — every monitoring run** emits a sequence of `get_metric_timeseries` / `get_segments` / `get_anomaly_context` calls; each one constructs SQL dynamically and SQLite plans it.
+- **Every investigation** runs a smaller set of follow-up queries scoped to the anomaly's category. In Olist mode, `get_anomaly_context` is the dedicated tool — it runs two windowed aggregates (anomaly window + baseline window) against the same shape.
 
-### The closest cousin (it really is just a tool dispatcher)
+### Olist — the dynamic SQL builder
+
+```
+  mcp-server-olist/src/tools/get_metric_timeseries.ts  (lines 60–158)
+
+  const needsItems =
+    input.metric === 'revenue' ||                  ← branch the join list on
+    input.metric === 'avg_order_value' ||             which fields the query
+    input.dimension === 'category' ||                 actually needs. avoids
+    input.filter?.dimension === 'category';           dragging order_items
+  const needsPayments = ...                           into a query that only
+  const needsProducts = ...                           cares about order count.
+  const needsCustomers = ...
+
+  const joins: string[] = [];
+  if (needsItems) joins.push('JOIN order_items oi ON oi.order_id = o.id');
+  if (needsProducts) joins.push('JOIN products p ON p.id = oi.product_id');
+  if (needsCustomers) joins.push('JOIN customers c ON c.id = o.customer_id');
+  if (needsPayments) joins.push('JOIN payments pay ON pay.order_id = o.id');
+
+  // metric expression also branches:
+  switch (input.metric) {
+    case 'revenue':       metricExpr = 'SUM(oi.price_brl)'; break;
+    case 'order_count':   metricExpr = 'COUNT(DISTINCT o.id)'; break;
+    case 'avg_order_value': metricExpr = 'CAST(SUM(...) AS REAL) / COUNT(DISTINCT o.id)'; break;
+    case 'payment_value': metricExpr = 'SUM(pay.value_brl)'; break;
+  }
+
+  const sql = `
+    SELECT ${selectCols.join(', ')}
+    FROM orders o
+    ${joins.join('\n      ')}
+    WHERE ${where.join(' AND ')}
+  `;
+  const rows = db.prepare(sql).all(...params);     ← better-sqlite3 caches
+                                                      the prepared statement
+                                                      by exact SQL string; each
+                                                      unique JOIN-list shape
+                                                      becomes its own cached
+                                                      prepared statement.
+       │
+       └─ the planning question this code answers is "minimum joins for this
+          metric+dimension+filter combination." Dragging in unused joins would
+          force SQLite to scan more index pages for no benefit. The branching
+          is the manual-side of what a query optimizer does automatically in
+          Postgres (where you'd JOIN everything in the FROM clause and trust
+          the planner to prune; SQLite's planner does this too but the smaller
+          the input plan tree, the faster the planner runs).
+```
+
+### The closest cousin in the main app (it really is just a tool dispatcher)
 
 ```
   lib/agents/monitoring.ts  (the scan loop, paraphrased — the real impl is
@@ -174,11 +311,11 @@ Cross-link: `study-agent-architecture` owns the agent loop. This file just notes
 ## Interview defense
 
 **Q: "How do queries get planned in your app?"**
-We don't plan SQL — we don't write any. The closest pattern is the monitoring agent's loop: it issues one EQL query per category through an MCP tool, and Bloomreach's engine plans each one on the other side of the network. The agent is the dispatcher; Bloomreach is the executor. We never see the plan. If I were debugging a slow EQL, the only signals I have are duration on the tool call and whatever Bloomreach surfaces in its response.
+Two modes. In Bloomreach mode, we don't write SQL — the agent emits EQL strings, Bloomreach's engine plans them on the other side of the network, and we never see the plan. In Olist mode (Phase 2), we own the SQL: `mcp-server-olist/src/tools/get_metric_timeseries.ts` constructs a SELECT dynamically (the JOIN list branches on metric + dimension + filter), then `db.prepare(sql).all(params)` hands it to SQLite. SQLite's cost-based planner picks the index per JOIN — you can run `EXPLAIN QUERY PLAN` against `data/olist.db` and see real output. The deliberate split: SQL pulls rows, JS does the time-bucketing (the comment in L132-135 calls out the crossover — at ~10k orders, JS-side bucketing avoids SQLite-side strftime juggling).
 
-Diagram: the two-altitude planning picture — outer LLM loop, inner Bloomreach engine, MCP boundary in between.
+Diagram: the three-altitude planning picture from the structure pass — agent dispatcher / dynamic SQL builder / SQLite physical planner.
 
-Anchor: `lib/agents/monitoring.ts` L1-120; tool calls go through `lib/mcp/client.ts` L97-146.
+Anchor: `mcp-server-olist/src/tools/get_metric_timeseries.ts` L60-158 for the dynamic build; `mcp-server-olist/scripts/seed-olist.ts` L236-244 for the indexes the planner picks from.
 
 **Q: "Is there an N+1 problem in your code?"**
 Yes, at the agent layer. The monitoring scan fires one EQL per category, sequentially, with a 1.1-second rate-limit gap between calls. Ten categories means ~11-15 seconds before the first insight surfaces. We've accepted it because the alternative (one mega-EQL with all categories) loses the schema gate's per-category fail-soft behavior, and Bloomreach doesn't expose a batch endpoint. If they did, the fix would be a single batched call.
@@ -200,5 +337,9 @@ Anchor: `lib/agents/monitoring.ts` (scan loop); `lib/mcp/client.ts` L150-156 (`m
 ## See also
 
 - `01-database-systems-map` — where the planner half of the boundary actually sits
-- `03-btree-hash-and-secondary-indexes` — the planner's choices depend on what's indexed
-- `study-agent-architecture` — the agent loop, which is the "planner" here
+- `03-btree-hash-and-secondary-indexes` — the 9 indexes the SQLite planner picks from
+- `10-embedded-sqlite-fixture` — better-sqlite3 prepared-statement caching
+- `study-agent-architecture` — the agent loop, which is the outer "planner" here
+
+---
+Updated: 2026-06-16 — Olist mode now exercises real SQL planning; added Move 2e (dynamic SQL construction) + primary diagram + L60-158 anchor in get_metric_timeseries.ts.

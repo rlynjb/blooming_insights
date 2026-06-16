@@ -3,7 +3,7 @@
 **Industry name(s):** idempotency keys · at-most-once / at-least-once / effective-once · request deduplication
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** the codebase gets idempotency *for free* because **every MCP tool it actually calls is a read** (`list_*`, `get_*`, `execute_analytics_eql`). Reads are idempotent by definition — retry as many times as you like, the world doesn't change. The 60s TTL cache in `McpClient` is the only deduplication mechanism, keyed by `${toolName}:${JSON.stringify(args)}`. There is **no idempotency key**, **no request ID**, **no Bloomreach-side dedup** because no write call is being made. The moment the app adds a write — `update_segmentation`, `create_voucher`, `trigger_campaign` — this entire chapter changes from "not a concern" to "the central concern." Recommendations are currently *proposed*, not *executed*; that boundary is the load-bearing safety.
+> **Verdict-first:** the codebase gets idempotency *for free* because **every MCP tool it actually calls is a read** (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach; `get_metric_timeseries`, `get_segments`, `get_anomaly_context` on Olist). Reads are idempotent by definition — retry as many times as you like, the world doesn't change. The 60s TTL cache in `BloomreachDataSource` is the **only** deduplication mechanism (the Olist adapter currently has none — every call hits the subprocess fresh), keyed by `${toolName}:${JSON.stringify(args)}`. There is **no idempotency key**, **no request ID**, and no server-side dedup on either backend because no write call is being made. The moment the app adds a write — `update_segmentation`, `create_voucher`, `trigger_campaign` — this entire chapter changes from "not a concern" to "the central concern." Recommendations are currently *proposed*, not *executed*; that boundary is the load-bearing safety.
 
 ---
 
@@ -18,13 +18,17 @@
   └─────────────────────────┬───────────────────────────────┘
                             │
   ┌─ Service layer ─────────▼───────────────────────────────┐
-  │  ★ McpClient cache (60s TTL, keyed by name + args) ★    │ ← we are here
+  │  ★ BloomreachDataSource cache (60s TTL, name+args) ★    │ ← we are here
+  │      (on the Bloomreach side only)                       │
+  │   OlistDataSource has NO cache — every call is fresh     │
   │  agent loop: NO request ID, NO idempotency key           │
   └─────────────────────────┬───────────────────────────────┘
                             │
   ┌─ Provider layer ────────▼───────────────────────────────┐
   │  Bloomreach MCP — every called tool is a READ            │
-  │  (writes exist in the catalog but are NOT YET EXERCISED) │
+  │  mcp-server-olist — every exposed tool is a READ         │
+  │  (writes exist in Bloomreach catalog but NOT YET         │
+  │   EXERCISED on either side)                              │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -41,7 +45,7 @@
 **Seams.** Two real, one absent.
 
 - **Seam: client effect ↔ network.** `startedRef.current = true` collapses two effect runs into one fetch. Without it, StrictMode would issue two parallel `/api/agent` requests for the same investigation, doubling MCP call cost.
-- **Seam: in-process call ↔ provider.** `McpClient.cache` collapses repeated identical calls within 60s into one network round-trip. Cache key is `${name}:${JSON.stringify(args)}`.
+- **Seam: in-process call ↔ provider.** `BloomreachDataSource.cache` (`lib/data-source/bloomreach-data-source.ts:122, 144-152`) collapses repeated identical calls within 60s into one network round-trip. Cache key is `${name}:${JSON.stringify(args)}`. `OlistDataSource` has no cache — every call dispatches afresh over stdio, since the subprocess is local and the round-trip is cheap (no rate-limit budget to absorb).
 - **Seam: idempotency key ↔ provider** — *does not exist*. No request ID is sent, no `Idempotency-Key` header. Bloomreach has no way to dedup a duplicate write even if it wanted to. Currently fine; becomes load-bearing the moment writes are added.
 
 ```
@@ -120,7 +124,7 @@ blooming insights uses pattern 0 — no writes at all. That's the load-bearing d
 The cache key includes the *serialized* args, so the same tool with different args is a different cache entry. The keys are deterministic only for objects whose property order matches between calls — which they do here because every call site is hand-written, but it's a subtle correctness coupling.
 
 Three boundary conditions:
-- **Error results are NOT cached.** `lib/mcp/client.ts:137-139` returns without writing to cache when `result.isError === true`. Without this, a transient 429 (containing `isError: true`) would poison the cache for 60s and prevent the retry from succeeding.
+- **Error results are NOT cached.** `lib/data-source/bloomreach-data-source.ts:178-181` returns without writing to cache when `result.isError === true`. Without this, a transient 429 (containing `isError: true`) would poison the cache for 60s and prevent the retry from succeeding.
 - **`skipCache: true` bypasses read but still writes.** The `/debug` "force fresh" path uses this. Write-through, not write-around.
 - **Cache is per-process.** Two Vercel instances each have their own cache. A call cached on instance A is not visible to instance B. This is the same Seam B (file 01) problem reappearing — the cache is a local optimization, not a cross-instance contract.
 
@@ -264,7 +268,7 @@ This is the right kind of NOT YET EXERCISED — explicitly named, scoped to a kn
 **Code side by side.**
 
 ```
-  lib/mcp/client.ts  (lines 102-110, 137-145)
+  lib/data-source/bloomreach-data-source.ts  (lines 144-152, 178-187)
 
   const cacheKey = `${name}:${JSON.stringify(args)}`;     ← key includes args
   const ttl = options.cacheTtlMs ?? 60_000;                 deterministically
@@ -380,7 +384,7 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 ## Validate
 
 - **Reconstruct.** Without looking, name the three idempotency patterns (natural / key / conditional) and which one would apply if `start_campaign` were called.
-- **Explain.** Why does `lib/mcp/client.ts:137-139` early-return without writing to the cache when `isError === true`? Because the result *is* a transient error that the next attempt may succeed past; caching it would prevent the retry.
+- **Explain.** Why does `lib/data-source/bloomreach-data-source.ts:178-181` early-return without writing to the cache when `isError === true`? Because the result *is* a transient error that the next attempt may succeed past; caching it would prevent the retry.
 - **Apply.** A bug report says "I refreshed the investigation page and saw the diagnosis update slightly — the second time around, one of the EQL results differed." Walk through the dedup layers to find the cause. (sessionStorage stash hits first → bypasses /api/agent entirely; if cleared, the route's `getCachedInvestigation` hits next; if missing, a fresh agent run executes — the cached 60s TTL in McpClient only helps if the bootstrap or repeated EQL calls happen within 60s. Different timestamps → genuinely different results, expected.)
 - **Defend.** Why is there no `Idempotency-Key` header on MCP calls? Because no MCP call this app makes mutates state — they're all reads. The header would be no-op overhead. The day a write is added, the header (or its MCP-protocol equivalent) becomes required.
 
@@ -391,5 +395,9 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 - `02-partial-failure-timeouts-and-retries.md` — why the cache MUST skip error results: retries depend on it
 - `04-consistency-models-and-staleness.md` — the 60s TTL is also a staleness window
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the user-driven step 2 → step 3 flow has dedup of its own
+- `10-transport-agnostic-protocol-design.md` — why the Bloomreach side has a cache and the Olist side doesn't
 - `.aipe/study-system-design/audit.md#caching-and-invalidation` — the architectural take on caching
-- `.aipe/study-testing/` — the cache + retry tests live in `test/mcp/client.test.ts`
+- `.aipe/study-testing/` — the cache + retry tests live in `test/data-source/bloomreach-data-source.test.ts` (and friends)
+
+---
+Updated: 2026-06-16 — Verdict + zoom-out cover both adapters' dedup (Bloomreach: 60s TTL; Olist: none); line refs migrated to `lib/data-source/bloomreach-data-source.ts`; flagged the asymmetric cache as a deliberate design choice tied to transport cost.

@@ -3,7 +3,7 @@
 **Industry name(s):** shared mutable state · request-scoped context · `AsyncLocalStorage` · the "two-write cookie" problem
 **Type:** Industry standard pattern (Node.js) · Project-specific application
 
-> **Verdict: only one true synchronization primitive in the whole repo — `AsyncLocalStorage<RequestStore>` in `lib/mcp/auth.ts:47`.** Everything else (`Map<string, Insight>`, `Map<string, AgentEvent[]>`, the module-scope `cached` schema, the `McpClient.cache` Map) is unsynchronized shared mutable state, and it's *correct anyway* — because JS run-to-completion gives you cheap safety on read-modify-write *within one event loop*. The auth store is the one place where the read/write pattern crossed an `await` boundary inside one request AND interacted with Next's request-vs-response cookie split, and that combination needed explicit per-request scoping. Outside of auth, the repo dodges the race problem by holding nothing across requests that needs strong consistency.
+> **Verdict (Phase 2): three synchronization primitives now, two of them new.** First (unchanged): `AsyncLocalStorage<RequestStore>` in `lib/mcp/auth.ts:47` — per-request scoping for the cookie store. Second (new in Phase 2): `composeSignals` (`lib/mcp/transport.ts:173-189`, duplicated as a local helper in `lib/data-source/olist-data-source.ts:56-76`) — combines a caller-supplied `AbortSignal` with `AbortSignal.timeout(...)` so the first source to fire cancels the in-flight call. Third (implicit, new in Phase 2): the **single-flight subprocess** — the Olist child processes one JSON-RPC request at a time, which is what makes its synchronous `better-sqlite3` calls safe even though they block the child's event loop. Everything else (`Map<string, Insight>`, `Map<string, AgentEvent[]>`, the module-scope `cached` schema, the `McpClient.cache` Map) is still unsynchronized shared mutable state, and it's correct anyway — because JS run-to-completion gives you cheap safety on read-modify-write *within one event loop*. The `composeSignals` duplication (10 LOC repeated across `lib/mcp/transport.ts` and `lib/data-source/olist-data-source.ts`) is a known cleanup candidate; the pattern is real, the cleanup is shared-module promotion.
 
 ---
 
@@ -212,20 +212,87 @@ The fix is to seed an in-memory store from the cookie ONCE at the start of the r
 
 What breaks without ALS: two simultaneous OAuth attempts on the warm instance write their PKCE verifiers to a shared `Map<sessionId, ...>` AND read from it — and the writes/reads happen across `await` boundaries inside `connect`. Request A's reads could see request B's verifier, the code exchange would fail with a PKCE mismatch, and the user sees a generic "invalid_grant."
 
-#### 5) What "synchronization" means here — and what it doesn't
+#### 5) `composeSignals` — AbortSignal OR-combinator (new in Phase 2)
 
-There are no mutexes, no semaphores, no `Atomics`, no `SharedArrayBuffer` in the repo. There's no need: every shared write that matters is either (a) one synchronous block that can't be interleaved, or (b) scoped via ALS to one request.
+`AbortSignal` is a *coordination* primitive: many sources, one channel for "this work should stop." When the route layer threads its own signal through `runAgentLoop` (not done today — see `07`) and the adapter wants to ALSO enforce a per-call timeout, you need to OR the two signals so whichever fires first cancels the call. That's what `composeSignals` does.
+
+```
+  composeSignals — the AbortSignal OR-combinator
+
+  function composeSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
+    const filtered = signals.filter((s): s is AbortSignal => !!s);
+    if (filtered.length === 0) return new AbortController().signal;  ← never aborts
+    if (filtered.length === 1) return filtered[0];                    ← passthrough
+    if (typeof AbortSignal.any === 'function') {
+      return AbortSignal.any(filtered);                               ← Node 20+ preferred
+    }
+    // fallback: glue an AbortController to forward whichever source fires
+    const ac = new AbortController();
+    for (const s of filtered) {
+      if (s.aborted) { ac.abort(s.reason); return ac.signal; }
+      s.addEventListener('abort', () => ac.abort(s.reason), { once: true });
+    }
+    return ac.signal;
+  }
+
+  used at:
+    lib/mcp/transport.ts:131       SdkTransport.callTool — composes opts.signal with timeout
+    lib/mcp/transport.ts:150       SdkTransport.listTools — same
+    lib/data-source/olist-data-source.ts:151  OlistDataSource.callTool — same shape
+    lib/data-source/olist-data-source.ts:172  OlistDataSource.listTools — same shape
+```
+
+What this is for: making the per-call timeout (`AbortSignal.timeout(30_000)`) *additive* with whatever cancellation source the caller passes in. Today the caller-supplied signal is always `undefined` (no route reads `req.signal`), so `composeSignals` effectively just returns the timeout signal. The plumbing is ready for the day the route is wired up — see `07`.
+
+**The duplication.** The function exists in two places with identical bodies. `lib/mcp/transport.ts` is the original; `lib/data-source/olist-data-source.ts` copied it inline rather than reach across the module boundary. This is documented as a cleanup candidate in the source comment (`// Same shape as composeSignals() in lib/mcp/transport.ts — kept local so this file doesn't reach across module boundaries for one helper.`). The right cleanup move is to promote it to `lib/runtime/signals.ts` (or similar) and import from both sites. Cost: 5 lines moved, 2 imports added. Won't change behavior.
+
+#### 6) Single-flight subprocess — implicit synchronization via the wire protocol
+
+The Olist child is single-flight by virtue of the MCP SDK's request/response model: the parent sends one JSON-RPC request frame, awaits one response frame, repeats. The SDK does NOT pipeline (one outstanding request at a time per client). That property is what makes the child's synchronous `better-sqlite3` calls safe.
+
+```
+  single-flight subprocess — synchronization without locks
+
+  parent calls OlistDataSource.callTool(name1, args1)  →
+                                                          │ frame 1 over stdin
+                                                          ▼
+                                              child reads frame 1
+                                              runs db.prepare(sql).all(args)  ← BLOCKS child loop
+                                                                                (safe — nobody else
+                                                                                 is waiting)
+                                              writes response frame to stdout
+                                                          ▲
+                                                          │
+  parent awaits frame 1's response  ←──── frame 1 reply
+  parent calls OlistDataSource.callTool(name2, args2)  →
+                                                          │ frame 2 over stdin
+                                                          ... (same again)
+
+  NO scenario where the child runs two queries in parallel from one client.
+  NO scenario where two clients share one child (one OlistDataSource = one child).
+```
+
+If we ever wanted parallel queries from the same parent against the same child, we'd need to add a request multiplexer in the SDK (which it doesn't ship) AND make the child's tool dispatch async (which `better-sqlite3` cannot). The single-flight property is load-bearing — drop it without changing the SQLite driver and the child's event loop deadlocks on the second concurrent query.
+
+#### 7) What "synchronization" means here — and what it doesn't
+
+There are no mutexes, no semaphores, no `Atomics`, no `SharedArrayBuffer` in the repo. There's no need: every shared write that matters is either (a) one synchronous block that can't be interleaved, (b) scoped via ALS to one request, or (c) sequenced by single-flight stdio (subprocess).
 
 ```
   Synchronization primitives — what's used vs what isn't
 
   ┌─ used ──────────────────────────────────────────────────────────┐
   │  AsyncLocalStorage<RequestStore>   lib/mcp/auth.ts:47           │
-  │    (the ONLY explicit per-request scoping in the repo)          │
+  │    (per-request scoping for the cookie store)                   │
+  │                                                                 │
+  │  composeSignals + AbortSignal.any  lib/mcp/transport.ts:173     │
+  │    (Phase 2: OR-combine cancel sources)                         │
+  │                                                                 │
+  │  single-flight subprocess          lib/data-source/olist…       │
+  │    (Phase 2: implicit serialization across the stdio pipe)      │
   │                                                                 │
   │  run-to-completion (implicit in every sync block)               │
   │    putInsights, getCachedInvestigation, parseWorkspaceSchema    │
-  │    rely on this without naming it                                │
   └─────────────────────────────────────────────────────────────────┘
   ┌─ NOT used ──────────────────────────────────────────────────────┐
   │  mutex / Lock / Semaphore                                        │
@@ -412,7 +479,11 @@ A: The OAuth flow in `lib/mcp/auth.ts`. The MCP SDK's `OAuthClientProvider` is s
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — what makes "concurrent requests on one loop" possible in the first place.
-- `03-event-loop-and-async-io.md` — the `await` boundaries that turn unsynchronized state into a race.
+- `02-processes-threads-and-tasks.md` — single-flight subprocess as the implicit synchronizer of the child loop.
+- `03-event-loop-and-async-io.md` — the `await` boundaries that turn unsynchronized state into a race, on both loops.
 - `05-memory-stack-heap-gc-and-lifetimes.md` — what those module-scope `Map`s actually hold and how big they get.
+- `07-backpressure-bounded-work-and-cancellation.md` — where `composeSignals` is half-wired and what completing the wiring would look like.
 - `.aipe/study-security/00-overview.md` — *not yet generated* — for the auth-cookie crypto + the encrypted-cookie store as a security mechanism.
+
+---
+Updated: 2026-06-16 — added composeSignals (sec 5) and single-flight subprocess (sec 6); noted 10-LOC duplication of composeSignals as a cleanup candidate.

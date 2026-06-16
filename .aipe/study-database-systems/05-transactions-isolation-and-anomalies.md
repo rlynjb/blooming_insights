@@ -25,17 +25,43 @@ How a database guarantees a group of operations behaves like one · Industry sta
 
 ### Verdict for this codebase
 
-**Not yet exercised. At all.**
+**Partially exercised — Olist seed wraps a bulk insert in `db.transaction(...)`. Main app has none.**
 
-There is no `BEGIN` / `COMMIT` anywhere — there couldn't be, there's no DB. There's nothing in the codebase that requires multi-step atomicity. Every state mutation is a single Map operation:
+Two altitudes:
 
-- `putInsights()` calls `clear()` then sets entries (not atomic, see 06)
-- `saveInvestigation()` is one `mem.set()` plus an optional file write
-- `patchState()` in auth is one `writeAll()` call
+- **Main app:** still no `BEGIN` / `COMMIT`. Every state mutation is a single Map operation:
+  - `putInsights()` calls `clear()` then sets entries (not atomic, see 06)
+  - `saveInvestigation()` is one `mem.set()` plus an optional file write
+  - `patchState()` in auth is one `writeAll()` call
+- **Olist seed** (`mcp-server-olist/scripts/seed-olist.ts` L508-544): one explicit ACID transaction wraps all ~30k inserts across 7 tables. SQLite's default isolation is **serializable** (one writer at a time, full isolation), so this is the strongest level by default.
 
-None of these wrap multiple writes in a transaction because there's no engine to provide one. Reads and writes happen on bare `Map`s — Node's single-threaded event loop is the closest thing to "isolation" we get, and that gives us only run-to-completion guarantees within a single tick, not multi-await guarantees.
+```
+  the one real transaction in this repo
+  (mcp-server-olist/scripts/seed-olist.ts L508-544)
 
-### When this becomes load-bearing
+  const allInsert = db.transaction(() => {
+    for (const c of customers) insertCustomer.run(...);    ← 5000 inserts
+    for (const p of products) insertProduct.run(...);      ← 800 inserts
+    for (const o of allOrders) {                            ← ~10000 orders
+      insertOrder.run(...);
+      for (const it of o.items) insertItem.run(...);        ← items per order
+      for (const p of o.payments) insertPayment.run(...);   ← payments per order
+      if (o.review) insertReview.run(...);
+    }
+    for (const a of SEEDED_ANOMALIES) insertAnomaly.run(...);
+  });
+  allInsert();    ← BEGIN; ... 30k inserts ...; COMMIT
+       │
+       └─ better-sqlite3's db.transaction(fn) returns a wrapped function. when
+          called, it BEGINs, runs the body, COMMITs on success, ROLLBACKs on
+          throw. ~30k inserts in one transaction is the right shape: rolling
+          back 30k separate auto-commits would be 30k fsync hits; one transaction
+          is one fsync at COMMIT. The seed takes <2s on a laptop because of this.
+```
+
+### When this becomes load-bearing for the main app
+
+### When this becomes load-bearing for the main app
 
 The trigger is **any feature where two related rows must change together or not at all.**
 
@@ -138,9 +164,48 @@ Skipped — no codebase instance.
 
 ### Use cases
 
-None. There is no transaction here.
+- **`mcp-server-olist/scripts/seed-olist.ts`** wraps the entire ~30k-row bulk insert in `db.transaction(() => { ... })()` (L508-544). One BEGIN, one COMMIT, one fsync at the end. The seed runs in <2s because of this; without the transaction it would be 30k auto-commits = 30k fsync hits = minutes.
+- **Read-only tool calls** from the MCP server are NOT wrapped in explicit transactions — SQLite gives each `db.prepare(sql).all(...)` an implicit read transaction, which under WAL mode is a consistent snapshot of the DB.
+- **Main-app cookie writes** in `lib/mcp/auth.ts` `withAuthCookies` — the closest transaction-shaped code in the main app (read-modify-write coalesced per request).
 
-### The closest cousin — Node's single-threaded "isolation"
+### The real transaction — Olist seed
+
+```
+  mcp-server-olist/scripts/seed-olist.ts  (lines 508–544)
+
+  const allInsert = db.transaction(() => {
+    for (const c of customers) insertCustomer.run(c.id, c.state, c.city);
+    for (const p of products) insertProduct.run(p.id, p.category, p.weight_g);
+    const knownCustomerIds = new Set(customers.map((c) => c.id));
+    for (const o of allOrders) {
+      if (!knownCustomerIds.has(o.customer.id)) {
+        insertCustomer.run(o.customer.id, o.customer.state, o.customer.city);
+        knownCustomerIds.add(o.customer.id);
+      }
+      insertOrder.run(o.id, o.customer.id, o.status, o.purchase_ts, o.delivered_ts);
+      for (const it of o.items) insertItem.run(...);
+      for (const p of o.payments) insertPayment.run(...);
+      if (o.review) insertReview.run(...);
+    }
+    for (const a of SEEDED_ANOMALIES) insertAnomaly.run(...);
+  });
+  allInsert();
+       │
+       └─ what each ACID property means here:
+          A (atomicity)   — if any of the 30k inserts fail (FK violation,
+                            unique constraint), ALL roll back. No half-seeded
+                            DB possible.
+          C (consistency) — FK constraints checked at COMMIT; PRAGMA foreign_keys
+                            is ON when the seed reopens the DB (db.ts L41).
+          I (isolation)   — SQLite is serializable by default. No other writer
+                            could interleave (and we have none here anyway —
+                            the seed is the only writer).
+          D (durability)  — at COMMIT, SQLite fsyncs the WAL; the DB file then
+                            gets checkpointed later. The committed binary
+                            in git captures the post-commit state.
+```
+
+### The closest cousin — Node's single-threaded "isolation" (main app)
 
 ```
   lib/state/insights.ts  (lines 30–42)
@@ -212,11 +277,11 @@ Cross-link: `06-locks-mvcc-and-concurrency-control` is the mechanism that implem
 ## Interview defense
 
 **Q: "Do you have any transactional code in this app?"**
-No. There's no database engine, so there's no `BEGIN`/`COMMIT`. The closest pattern is the `withAuthCookies` wrapper in `lib/mcp/auth.ts` — it reads the cookie once at request start, lets the OAuth provider mutate an in-memory store, and writes the cookie once at the end. That's a 2-phase shape, not ACID, but it solves the same problem: avoiding torn reads when many small writes happen in a request.
+One real one. The Olist seed script (`mcp-server-olist/scripts/seed-olist.ts` L508-544) wraps ~30k inserts across 7 tables in `db.transaction(() => { ... })`. better-sqlite3 emits BEGIN at function entry, COMMIT on return, ROLLBACK on throw. The seed runs in <2s because of this — without the transaction, 30k auto-commits would be 30k fsync hits and take minutes. SQLite's default isolation is serializable, so this is the strongest level by default. In the main Next.js app there's no engine, so no BEGIN/COMMIT — the closest pattern is the `withAuthCookies` wrapper in `lib/mcp/auth.ts` L86-104, which is 2-phase-shape (read once, mutate in memory, write once at exit) without being ACID.
 
-Diagram: the BEGIN-body-COMMIT shape, with the cookie as the durable medium.
+Diagram: the BEGIN-body-COMMIT shape, with `db.transaction(() => ...)` named explicitly.
 
-Anchor: `lib/mcp/auth.ts` L86-104.
+Anchor: `mcp-server-olist/scripts/seed-olist.ts` L508-544 (real transaction); `lib/mcp/auth.ts` L86-104 (transaction-shaped, not ACID).
 
 **Q: "If you added a save-favorites feature with Postgres, what isolation level would you pick?"**
 Read committed, the Postgres default. Save-favorites is a single-row insert per favorite — there's no multi-row invariant. If we later added "your top 10 favorites" with a hard cap, I'd reach for `SERIALIZABLE` on just the insert path (or `SELECT FOR UPDATE` on the cap check) — but I wouldn't pay the cost across all queries.
@@ -238,5 +303,9 @@ Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — how isolation actually gets enforced
-- `07-wal-durability-and-recovery` — the D in ACID
+- `07-wal-durability-and-recovery` — the D in ACID (now exercised in Olist)
+- `10-embedded-sqlite-fixture` — better-sqlite3's `db.transaction(fn)` API
 - `01-database-systems-map` — the Map state that today has neither A, C, I, nor D
+
+---
+Updated: 2026-06-16 — partially exercised; Olist seed transaction at mcp-server-olist/scripts/seed-olist.ts L508-544 named with all four ACID properties grounded. Main-app verdict unchanged.

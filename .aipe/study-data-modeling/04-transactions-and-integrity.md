@@ -1,9 +1,9 @@
 # Transactions and integrity
 
-**Industry name(s):** Transactions · atomicity · constraints · invariants · type guards as integrity check
+**Industry name(s):** Transactions · atomicity · constraints · invariants · type guards as integrity check · session isolation
 **Type:** Industry standard · Language-agnostic
 
-> **Partially applies.** There are no database constraints because there's no database — no FKs, no UNIQUE, no NOT NULL, no CHECK. What stands in for them is layered: TypeScript at compile time, three runtime guards in `lib/mcp/validate.ts` at the **LLM seam** (the one boundary the compiler can't see), and three in-memory `Map`s that have **no atomicity story at all**. The strong half of this is the LLM-seam guards — they're correctly placed, narrow, and fail closed (invalid JSON returns `[]` and the briefing degrades gracefully). The weak half is the in-memory store: `putInsights` clears and re-fills two parallel Maps with no transactional boundary, which is fine *because* it's single-process and synchronous, but the moment that assumption breaks the integrity story collapses.
+> **Three layers now.** (1) The **Olist SQLite layer** has real DB constraints — FKs with `PRAGMA foreign_keys = ON`, NOT NULL on every load-bearing column, `journal_mode = WAL` for concurrent reads. SQLite transactions wrap the seeder's bulk inserts. This activates topics that were "not yet exercised" in the original audit. (2) The **agent contract layer** still uses three runtime guards in `lib/mcp/validate.ts` at the LLM seam (the one boundary the compiler can't see) — still strong, fails closed. (3) The **in-memory UI state** has been refactored from "module-level globals with no atomicity" to **session-scoped sub-maps** (`Map<sessionId, SessionFeed>` in `lib/state/insights.ts`). The cross-session-isolation invariant — "putInsights for one session does not wipe another session" — is now testable AND tested (see `test/state/insights.test.ts`). The atomicity-within-a-session question is still "the runtime is single-threaded and the loop has no I/O," but the new invariant is real, named, and enforced.
 
 ---
 
@@ -208,40 +208,71 @@ Validates the **id-less** shape the agent emits (the system assigns ids after va
     - estimatedImpact.rangeUsd structure (loose — accepted as-is)
 ```
 
-### Move 2 — the in-memory store has no atomicity story
+### Move 2 — the in-memory store: session-scoped, with a real invariant
 
-The opposite end of the spectrum. The in-memory Maps in `lib/state/insights.ts` have **no transactional boundary**. `putInsights` clears both `insights` and `anomalies`, then iterates the new items and inserts both. If a JS exception fired mid-loop (it can't today — there's no I/O in the loop — but in principle), the store would be in a half-cleared state.
+**This sub-section was rewritten 2026-06-16.** The 2026-06-01 version said "the in-memory Maps have no atomicity story" with module-level globals; the warning was "the moment two routes call putInsights concurrently, the integrity story collapses." That collapse mode wasn't theoretical — a warm Vercel instance serves many users, and `putInsights().clear()` on a global Map would wipe another user's feed mid-briefing. The fix shipped: the state is now keyed by `sessionId`, and each session has its own sub-feed.
 
 ```
-  putInsights — what it actually does, in order
+  the new shape — Map<sessionId, SessionFeed>
 
-  1. insights.clear()       ← Map A cleared
-  2. anomalies.clear()      ← Map B cleared
-  3. for each item:
-       a. insights.set(i.id, i)
-       b. if rawAnomalies[idx]: anomalies.set(i.id, rawAnomalies[idx])
-  4. (no commit; no error path)
+  const state = new Map<string, SessionFeed>();
 
-  what's atomic:                   what's NOT atomic:
-    each Map.set call (within        the sequence of 2 clears
-    a Map: thread-safe by Node       the sequence of N inserts
-    single-thread)                   the cross-Map invariant
-                                     "every insights key has an
-                                      anomalies key"
+  type SessionFeed = {
+    insights:       Map<string, Insight>;        ← per-session
+    investigations: Map<string, Investigation>;  ← per-session
+    anomalies:      Map<string, Anomaly>;        ← per-session
+  };
+
+  putInsights(sessionId, items, rawAnomalies):
+    const s = sessionState(sessionId);    ← gets-or-creates this user's feed
+    s.insights.clear();                    ← clears ONLY this user's insights
+    s.anomalies.clear();                   ← clears ONLY this user's anomalies
+    for each item:
+      s.insights.set(i.id, i);
+      s.anomalies.set(i.id, raw[idx]);
+
+  the outer `state` map is never cleared by a request.
+  the inner sub-maps are cleared by THAT session only.
 ```
 
-In a relational store this would be:
+**What this fixes:** the cross-session bug. Two users hitting `/api/briefing` concurrently no longer wipe each other's feeds. Each gets a stable, isolated sub-feed for the duration of their session. The test (`test/state/insights.test.ts`) names the bug directly: *"Cross-session isolation: the bug this refactor fixes. Two sessions writing concurrently must not overwrite or read each other's feed state."*
+
+**What's still not atomic, within a session:** the same intra-session question remains. `putInsights` still does `s.insights.clear()` then `s.anomalies.clear()` then N pairs of `set()`. If a JS exception fired mid-loop the sub-maps would be half-populated. Today Node's event loop and the absence of I/O in the write path make this trivially safe — but it's the same "correct because the runtime model says so" story as before. The relational version would be:
 ```sql
 BEGIN;
-DELETE FROM insights;
-DELETE FROM anomalies;
-INSERT INTO insights VALUES (...);
-INSERT INTO anomalies VALUES (...);
+DELETE FROM insights WHERE session_id = ?;
+DELETE FROM anomalies WHERE session_id = ?;
+INSERT INTO insights ...;
+INSERT INTO anomalies ...;
 COMMIT;
 ```
-…with `ON DELETE CASCADE` on the FK `anomalies.insight_id → insights.id`, so the parallel store can't drift.
+…with `ON DELETE CASCADE` covering the parallel store. The session-scoping moves the question from "what about other users?" (now safe) to "what about a partial write WITHIN one session's clear-and-refill?" (still single-threaded fine).
 
-**What breaks today: nothing, because Node is single-threaded and the loop has no I/O.** A thrown exception in step 3 *would* leave the Maps half-populated, but no realistic code path throws there. The integrity story is: "the runtime model makes the invariant trivially true." That holds as long as the runtime model holds. When the runtime shifts (truly multi-worker, or any I/O in the write path), the story fails silently — the next reader sees a half-cleared store.
+### Move 2 — the Olist DB does have real transactions
+
+The Olist seeder uses real SQLite transactions for the bulk insert path. The relevant pragmas:
+
+```
+  mcp-server-olist/src/db.ts
+
+  pragma foreign_keys = ON   ← every FK is enforced at INSERT/UPDATE/DELETE
+  pragma journal_mode = WAL  ← concurrent readers don't block writers; WAL log
+                              gives crash-consistent durability
+
+  the seeder (scripts/seed-olist.ts) wraps every bulk insert in a transaction:
+    db.transaction(() => {
+      for (const customer of customers) insertCustomer.run(customer);
+      for (const product of products) insertProduct.run(product);
+      ...
+    })();
+
+  better-sqlite3's `transaction()` wraps the closure in BEGIN/COMMIT, with
+  automatic ROLLBACK on any thrown exception. atomic by construction.
+```
+
+**What this gives:** the seeder's "drop the DB and rebuild" path is atomic — either the whole dataset commits or none of it does. If the process is killed mid-seed, the next `npm run seed` rebuilds from a known-empty state. The FK + NOT NULL constraints provide the per-row integrity story: an `order_items` row that references a non-existent `order_id` would fail the insert, not silently corrupt the data.
+
+**What's not exercised:** **multi-writer transactions on shared rows.** The Olist DB is single-writer (only the seeder writes) and many-reader (the tools all read). There's no story for "two writers contend on the same row." That's not a gap; it's a deliberate scope choice (the DB is read-only at runtime).
 
 ### Move 2 — the wire-format integrity check
 
@@ -392,28 +423,63 @@ lib/agents/monitoring.ts  (lines 112–119)
           access in the UI.
 ```
 
-### The non-atomic store write
+### The session-scoped store write (UPDATED 2026-06-16)
 
 ```
-lib/state/insights.ts  (lines 30–42)
+lib/state/insights.ts  (lines 57–71)
 
-  export function putInsights(items: Insight[], rawAnomalies?: Anomaly[]): void {
-    // Replace the previous briefing — each run IS the current feed, not an
-    // addition. Without clearing, a warm serverless instance accumulates
-    // stale insights from earlier runs ...
-    insights.clear();                     ← 1
-    anomalies.clear();                    ← 2
+  export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+    // Replace the previous briefing for THIS session — each run IS the current
+    // feed, not an addition. Without clearing, a warm serverless instance (or a
+    // long-running dev server) accumulates stale insights from earlier runs, so
+    // the feed shows yesterday's anomalies alongside today's. Investigations are
+    // keyed separately and untouched here. Only this session's sub-maps are
+    // cleared — never the outer map, never another session's feed.
+    const s = sessionState(sessionId);          ← per-session sub-feed
+    s.insights.clear();                          ← clears ONLY this session
+    s.anomalies.clear();                         ← clears ONLY this session
     items.forEach((i, idx) => {
-      insights.set(i.id, i);              ← 3a
-      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);  ← 3b
+      s.insights.set(i.id, i);
+      if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
     });
   }
        │
-       └─ no transaction. holds today because: (a) Node is single-threaded,
-          (b) the loop has no I/O. if either changes, the cross-Map
-          invariant ("every insights key has an anomalies key when
-          rawAnomalies was passed") becomes a possible-violation. the
-          fix is mechanical: a real store with FK + transactional clear.
+       └─ cross-session safe: the outer Map is never cleared. test/state/
+          insights.test.ts has the explicit cross-session-isolation test.
+          intra-session: still single-threaded + no I/O, still safe by the
+          runtime model. for a real durable store the fix would be:
+            session_id INDEX + DELETE WHERE session_id=? + INSERT
+            wrapped in BEGIN/COMMIT (Postgres) or db.transaction (sqlite).
+```
+
+### The Olist FK + WAL story
+
+```
+mcp-server-olist/src/db.ts  (lines 38–43)
+
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  db.pragma('journal_mode = WAL');     ← concurrent readers don't block
+  db.pragma('foreign_keys = ON');      ← FKs enforced at runtime
+       │
+       └─ readers run against the DB the seeder produced. WAL means a future
+          writer could append without blocking these reads. foreign_keys=ON
+          is critical — SQLite's default is OFF, so a fresh DB with FK
+          DDL but no pragma will silently accept orphans.
+
+
+mcp-server-olist/scripts/seed-olist.ts  (the schema, lines 184–245)
+
+  CREATE TABLE order_items (
+    order_id    TEXT NOT NULL REFERENCES orders(id),    ← FK + NOT NULL
+    product_id  TEXT NOT NULL REFERENCES products(id),  ← FK + NOT NULL
+    price_brl   INTEGER NOT NULL,                        ← cents, NOT NULL
+    freight_brl INTEGER NOT NULL
+  );
+       │
+       └─ every join column is FK-constrained AND NOT NULL. orphan inserts
+          fail. NULL price/freight inserts fail. the schema enforces the
+          domain rule that every order_items row references a real order
+          and a real product, with real cents.
 ```
 
 ### The wire-format inline check
@@ -492,7 +558,12 @@ A: The `isAnomalyArray` guard in `lib/mcp/validate.ts` (L17–L27). The monitori
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces the guards narrow to.
-- `02-normalization-and-duplication.md` — the cross-Map invariant (`insights` ↔ `anomalies` keyed alignment) and why no current code path enforces it.
-- `05-migrations-and-evolution.md` — why the guards are deliberately permissive on optional fields (so older snapshots still validate).
-- `06-access-patterns-and-storage-choice.md` — the in-memory storage choice is what removes the transactional layer; a relational migration retires the weakness.
-- `study-software-design/audit.md#information-hiding-and-leakage` — the LLM-seam parsing logic is a strong hide (no caller knows the JSON-extraction fallback chain).
+- `02-normalization-and-duplication.md` — the cross-Map invariant within a session (`insights` ↔ `anomalies` keyed alignment); the wire-format leak that bypasses it.
+- `05-migrations-and-evolution.md` — why the guards are deliberately permissive on optional fields (so older snapshots still validate); how Olist gets "migrations" by rebuilding from a deterministic seed.
+- `06-access-patterns-and-storage-choice.md` — the three storage layers and what each enforces.
+- `08-the-olist-relational-schema.md` — the FK and NOT NULL constraints in detail.
+- `09-deterministic-synthetic-data.md` — `seeded_anomalies` as a ground-truth invariant; the determinism-vs-migrations tradeoff.
+- `study-software-design/audit.md#information-hiding-and-leakage` — the LLM-seam parsing logic is a strong hide.
+
+---
+Updated: 2026-06-16 — rewrote in-memory atomicity story for session-scoped state; added the Olist FK + WAL + transaction layer (was "not yet exercised").

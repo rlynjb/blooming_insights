@@ -3,7 +3,7 @@
 **Industry name(s):** V8 heap · garbage collection · object lifetime · TTL cache eviction · in-process state
 **Type:** Industry standard (V8 / Node.js) · Project-specific application
 
-> **Verdict: memory pressure isn't a real concern at this scale, but lifetimes are.** Every important "cache" or "state" object in the repo lives in the V8 heap of one Node process, and its lifetime is "the warm-instance lifetime" — which means *Vercel decides when it dies*. The TTL on `McpClient.cache` (60s) and the 16KB truncation guard in `runAgentLoop` are the only explicit memory-bounding primitives. Nothing else has an eviction policy: `insights` grows by `putInsights` clearing it; `investigations` grows monotonically until the process is killed; `cached` schema is one object forever. The risk isn't OOM (we'd hit `maxDuration` first); the risk is **stale state when a second warm instance spins up empty and the user sees no insights**. That's a lifetime bug masquerading as a memory bug.
+> **Verdict (Phase 2): memory pressure still isn't a real concern at this scale, but lifetimes are — and there are TWO heaps now, the parent's and the Olist child's.** The parent's V8 heap holds every "cache" or "state" object in `lib/state/*` and `lib/mcp/*`, lifetime = warm-instance lifetime. The child's V8 heap holds its `better-sqlite3` handle + per-query result rows, lifetime = the parent's `OlistDataSource` instance lifetime, which is roughly per-request. The TTL on `McpClient.cache` (60s) and the 16KB truncation guard in `runAgentLoop` are the only explicit memory-bounding primitives. Nothing else has an eviction policy. The risk isn't OOM (we'd hit `maxDuration` first); the risks are (a) **stale state when a second warm instance spins up empty and the user sees no insights**, and (b) **child-heap leak if the parent forgets `dispose()`** — the child keeps running with its SQLite handle held open. Both are lifetime bugs masquerading as memory bugs.
 
 ---
 
@@ -12,18 +12,18 @@
 **Zoom out — the bigger picture.** All app-owned memory lives in the **Server runtime** band. The browser holds React state (component lifetime) and `sessionStorage` (tab lifetime). The Node process holds the V8 heap; the V8 heap holds every `Map`, every `WorkspaceSchema`, every queued NDJSON byte. The interesting question is *not* "how much memory" — it's *"how long do these objects live, and what dies with the process?"*
 
 ```
-  Where memory lives — and what kills it
+  Where memory lives — and what kills it (Phase 2)
 
   ┌─ Browser V8 (per tab) ──────────────────────────────────────┐
   │  React state   → component unmount kills it                  │
   │  sessionStorage → tab close kills it                         │
   └─────────────────────────│───────────────────────────────────┘
                             │
-  ┌─ Vercel function (Node 20 V8) ──────────────────────────────▼┐  ← we are here
+  ┌─ Parent Node V8 (Vercel function) ──────────────────────────▼┐  ← parent heap
   │                                                              │
   │  ┌─ stack ──────────────────────────────────────────────┐    │
   │  │  function locals, async-frame state                   │    │
-  │  │  e.g. messages[] in runAgentLoop, collected[] in start │    │
+  │  │  messages[], collected[]                              │    │
   │  │  lifetime = function/await frame; GC'd on return       │    │
   │  └──────────────────────────────────────────────────────┘    │
   │                                                              │
@@ -38,7 +38,20 @@
   │  ┌─ heap (short-lived, per request) ────────────────────┐    │
   │  │  AsyncLocalStorage ctx, decrypted store               │    │
   │  │  ReadableStream internal buffer (NDJSON bytes)        │    │
+  │  │  OlistDataSource instance (live-sql)                  │    │
+  │  │    .client, .transport refs → owns the child PID      │    │
   │  │  lifetime = request lifetime                          │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  └────────────────────────│─────────────────────────────────────┘
+                           │  stdio pipe; no shared memory
+  ┌─ Child Node V8 (Olist subprocess, Phase 2) ─────────────────▼┐
+  │  ┌─ heap (per-child) ───────────────────────────────────┐    │
+  │  │  Database handle (better-sqlite3)                    │    │
+  │  │  prepared statements (cached LRU inside the driver)   │    │
+  │  │  per-query result rows (transient, GC'd after reply) │    │
+  │  │  StdioServerTransport buffers                         │    │
+  │  │  lifetime = parent's OlistDataSource lifetime         │    │
+  │  │             (child exits on stdin EOF after dispose)   │    │
   │  └──────────────────────────────────────────────────────┘    │
   └──────────────────────────────────────────────────────────────┘
 ```
@@ -230,6 +243,29 @@ What breaks: nothing yet. Worth knowing: if the app served 1000 distinct investi
   a reference. that's by design — the cost of bootstrap is too high
   to pay per-request.
 ```
+
+#### 5.5) The Olist child's heap — a SECOND V8 heap with its own lifetimes (Phase 2)
+
+The child runs its own Node process with its own V8 isolate. From the parent's perspective, none of the child's memory is reachable — no `Map.set`, no reference, no GC root crosses the pipe. The child's heap contains:
+
+- **The `better-sqlite3` Database handle.** Holds an FD to the SQLite file and an in-driver prepared-statement cache. Lifetime: from `db = new Database(...)` at child startup to child exit. The file itself stays on disk.
+- **Per-query rows.** Each `db.prepare(sql).all(args)` allocates an array of plain objects. Lifetime: until the result frame is written to stdout and the function returns. Sub-millisecond visible to GC.
+- **`StdioServerTransport` buffers.** Small input/output ring buffers for line-oriented JSON frames. Lifetime: child lifetime.
+
+The child's heap floor is ~30-50MB (Node baseline + SQLite + SDK). Per-query growth is bounded by the size of the result set — typically a few hundred rows, kilobytes total. There's no equivalent of the parent's `investigations` Map in the child — the child holds no per-call state; every tool call is stateless.
+
+```
+  Child heap — per-process baseline + transient query memory
+
+  child startup:    ~30-50MB baseline (Node + SQLite + SDK)
+  per query:        +kilobytes (result rows, GC'd after reply written)
+  steady state:     baseline + driver prepared-statement LRU
+                    no monotonic growth (no global state to leak into)
+  child eviction:   PARENT calls OlistDataSource.dispose() → transport.close()
+                    → child stdin gets EOF → child exits → all heap freed
+```
+
+What breaks if the parent NEVER calls `dispose()` (and the parent itself stays alive): the child stays alive too, holding its baseline ~30-50MB. Not catastrophic at one orphan; problematic if a long-running parent (the dev server) accumulates them across HMR reloads. This is the orphan-subprocess class of bug — see `08`.
 
 #### 6) The ReadableStream buffer — short-lived per request
 
@@ -445,7 +481,10 @@ A: At current scale (a handful of investigations per warm instance lifetime, eac
 
 ## See also
 
-- `02-processes-threads-and-tasks.md` — the process whose death frees all this memory.
-- `04-shared-state-races-and-synchronization.md` — what the module-scope `Map`s share.
-- `06-filesystem-streams-and-resource-lifecycle.md` — the OTHER kind of lifetime (file handles, stream controllers).
+- `02-processes-threads-and-tasks.md` — the two processes whose deaths free their respective heaps.
+- `04-shared-state-races-and-synchronization.md` — what the module-scope `Map`s share; single-flight subprocess.
+- `06-filesystem-streams-and-resource-lifecycle.md` — the OTHER kind of lifetime (file handles, stream controllers, child PIDs).
 - `07-backpressure-bounded-work-and-cancellation.md` — the bounds that keep `messages[]` from growing unbounded.
+
+---
+Updated: 2026-06-16 — added child-heap section (5.5) covering better-sqlite3 handle, per-query rows, baseline ~30-50MB, orphan-on-no-dispose risk.

@@ -6,20 +6,19 @@ The storage substrate — what holds bytes, for how long, with what guarantees �
 
 ## Zoom out, then zoom in
 
-Okay — here's the whole thing. You're looking at a Next.js app talking to one upstream MCP server. Forget what you know about "the database tier." There isn't one.
+Okay — here's the whole thing. You're looking at a Next.js app talking to one of two MCP servers: an upstream remote one (Bloomreach) or a sibling local subprocess (`mcp-server-olist/`) backed by SQLite. The main app has no DB; the Olist server has a real one.
 
 ```
-  Zoom out — where storage lives in blooming insights
+  Zoom out — where storage lives in blooming insights (two altitudes)
 
   ┌─ UI layer ──────────────────────────────────────────────────────────────┐
   │  feed / investigate / debug — React components, no client-side cache    │
-  │  one thing IS stored client-side: sessionStorage handoff of an insight  │
-  │  blob from feed → /investigate (survives navigation, dies on tab close) │
+  │  sessionStorage handoff of an insight blob from feed → /investigate     │
   └────────────────────────────────────┬────────────────────────────────────┘
                                        │  HTTP
   ┌─ Service layer (Vercel function) ──▼────────────────────────────────────┐
   │                                                                         │
-  │   ★ THIS GUIDE'S TERRITORY ★                                            │
+  │   ★ MAIN-APP TERRITORY ★ — Map-shaped, dies with the process            │
   │                                                                         │
   │   in-memory:     MCP response cache (Map+TTL), schema singleton,        │
   │                  insights Map, investigations Map, anomalies Map        │
@@ -28,14 +27,28 @@ Okay — here's the whole thing. You're looking at a Next.js app talking to one 
   │   committed:     lib/state/demo-*.json (read-only seed fixtures)         │
   │   browser:       bi_session cookie (uuid), bi_auth cookie (AES-GCM blob) │
   └────────────────────────────────────┬────────────────────────────────────┘
-                                       │  every read crosses the network
-  ┌─ Provider layer (someone else's DB) ▼───────────────────────────────────┐
-  │  Bloomreach Engagement — the actual customer-data warehouse             │
-  │  reached via MCP tools, rate-limited, opaque to us                      │
-  └─────────────────────────────────────────────────────────────────────────┘
+                                       │
+                  ┌────────────────────┴──────────────────────┐
+                  │ subprocess (stdio MCP)                     │ network (HTTP MCP)
+                  ▼                                            ▼
+  ┌─ Provider layer (Olist mode — OUR DB) ─────┐  ┌─ Provider layer (Bloomreach)──┐
+  │                                             │  │                                │
+  │  ★ NEW SQL TERRITORY (Phase 2) ★            │  │  upstream EQL engine; opaque   │
+  │                                             │  │  rate-limited globally per     │
+  │  mcp-server-olist/data/olist.db (3.5 MB)    │  │  user; we never see schemas,   │
+  │  better-sqlite3, readonly + WAL              │  │  plans, or indexes             │
+  │                                             │  │                                │
+  │  7 tables, 9 indexes, ~30k rows total       │  │                                │
+  │  3 domain tools query it (not raw SQL)      │  │                                │
+  └─────────────────────────────────────────────┘  └────────────────────────────────┘
 ```
 
-Now zoom in. The Service-layer band is the whole topic. Everything in it is `Map`-shaped, lives in one Node process, and goes away when that process dies. The question this section answers: **what counts as a "datastore" here, and what guarantees does each one make to its callers?** Spoiler — most of them quietly make none.
+Now zoom in. There are two database stories to tell, not one:
+
+1. **Main app — Service layer.** Everything in it is `Map`-shaped, lives in one Node process, and goes away when that process dies.
+2. **Olist mode — Provider layer.** Real SQLite, real schema, real indexes. Read-only from our side (the MCP server never writes; the seed script is the only writer). One process away (the MCP stdio subprocess), so the main app still has no driver dep — that lives in `mcp-server-olist/package.json`.
+
+The question this section answers across both: **what counts as a "datastore" here, and what guarantees does each one make to its callers?**
 
 ## Structure pass
 
@@ -248,9 +261,46 @@ What breaks when each part is missing:
 
 This is the one piece of code in the repo that acts like a small per-user durable store. Cookie-as-database is unusual but correct for a stateless serverless app with a small per-user payload.
 
-### Move 2.5 — current vs future (this whole guide is current-only)
+**Move 2e — the Olist SQLite tier (one process away).**
 
-There is no "Phase B" planned in the code or in `blooming-insights-spec.md`. The current state is the only state. If a future you adds Postgres, this file rewrites top-to-bottom — but until then there's no migration story to walk.
+The sibling package `mcp-server-olist/` is the first time this repo touches a real engine. The shape:
+
+Bridge: think of better-sqlite3 as "synchronous SQLite from Node" — `db.prepare(sql).all(args)` returns rows in one call, no `await`. Unlike `pg` or `mysql2` it doesn't queue work onto the event loop. For an in-process MCP subprocess that only handles one tool call at a time, sync is correct — there's no concurrency to multiplex.
+
+```
+  pattern — embedded read-only SQLite as MCP data source
+
+  mcp-server-olist subprocess
+       │
+       │  startup
+       ▼
+  openDb(path):
+     check file exists                          ← seed script must have run
+     new Database(path, { readonly: true,
+                          fileMustExist: true })
+     pragma('journal_mode = WAL')              ← enables MVCC-style reads if
+                                                  multiple processes ever attach
+     pragma('foreign_keys = ON')               ← enforces FK constraints
+     return db
+
+  per tool call (get_metric_timeseries / get_segments / get_anomaly_context):
+     validateInput(raw) against JSON schema
+     db.prepare(sql).all(params)               ← synchronous; prepared stmts
+                                                  cached by better-sqlite3
+     return JSON envelope to MCP client
+```
+
+What breaks when each part is missing:
+
+- **drop `readonly: true`** → the MCP server could write to the fixture. Eval determinism dies; the next run sees a mutated DB.
+- **drop the WAL pragma** → reads block writes, writes block reads (default `journal_mode = DELETE`). Doesn't matter today because we only read, but if the seed script ran while the MCP server held a connection, WAL is what would prevent the read from blocking.
+- **drop the prepared-statement caching (better-sqlite3 does this automatically)** → every tool call would re-parse the SQL. The hot query (`get_metric_timeseries`) constructs JOIN lists dynamically, so the prepared-statement key is the resolved SQL string — different join shapes get different prepared statements.
+
+### Move 2.5 — current vs future
+
+Phase 2 (the Olist tier) is real and shipped. Phase 3 (the eval suite) uses it as a hermetic fixture — see `eval/scripts/` and the `eval/results/<date>/` paper trail.
+
+There is still no plan to put a database in the MAIN app. The day a feature there needs persistence — saved searches, per-user history — the move is the same as before: external KV (Upstash) for cross-instance state, Postgres for relational queries, neither of which touches `mcp-server-olist/`. The two altitudes stay separate.
 
 ### Move 3 — the principle
 
@@ -295,16 +345,30 @@ This codebase picks all-shortest-lifetimes because none of its features yet need
   │  customer profiles · event streams · catalogs · EQL query engine       │
   │  exposed via MCP tools — we never see schemas, indexes, or plans       │
   └────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ mcp-server-olist (OUR DB; one process away) ─────────────────────────┐
+  │  better-sqlite3 readonly + WAL                                         │
+  │  data/olist.db (committed binary, 3.5 MB)                              │
+  │                                                                        │
+  │  customers · products · orders · order_items · payments · reviews     │
+  │  + seeded_anomalies (ground truth for evals)                           │
+  │  9 indexes (B-tree on purchase_ts, customer_id, FK columns, etc.)      │
+  │                                                                        │
+  │  3 MCP tools: get_metric_timeseries · get_segments · get_anomaly_ctx   │
+  │  Synchronous reads; no event-loop juggling (subprocess does one call   │
+  │  at a time)                                                            │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Implementation in codebase
 
 ### Use cases
 
-- **Every MCP tool call** goes through the `McpClient` cache first. The `/debug` page exists in part to verify cache behavior — its "force fresh" toggle sets `skipCache: true` so you can compare cached vs live results side by side.
+- **Every MCP tool call** (Bloomreach OR Olist) goes through the `McpClient` cache first. The `/debug` page exists in part to verify cache behavior — its "force fresh" toggle sets `skipCache: true` so you can compare cached vs live results side by side.
 - **Every briefing** writes to the insights Map via `putInsights()`. Every investigation reads from `getCachedInvestigation()` first, falls through to the agent run, then writes back via `saveInvestigation()`.
-- **Every OAuth flow** stages state in the auth backend appropriate to the env — PKCE verifier saved on `connect`, read on `callback`, tokens saved after exchange.
+- **Every OAuth flow** (Bloomreach mode only) stages state in the auth backend appropriate to the env — PKCE verifier saved on `connect`, read on `callback`, tokens saved after exchange. Olist mode skips OAuth entirely.
 - **Demo mode** (`?demo=cached` on `/api/briefing` and the investigation route) replays committed JSON fixtures so the live demo works without Bloomreach credentials.
+- **Olist mode (Phase 2 default for the eval suite)** spawns `mcp-server-olist` as a stdio subprocess and routes the agent's tool calls to the three SQL-backed domain tools. The eval suite at `eval/scripts/` uses this for deterministic agent benchmarking — same DB binary across runs, three seeded anomalies as ground truth.
 
 ### Code side by side
 
@@ -438,9 +502,13 @@ Anchor: `package.json` has zero database dependencies.
 
 ## See also
 
-- `02-records-pages-and-storage-layout` — Map vs page layout (`not yet exercised`)
+- `02-records-pages-and-storage-layout` — Olist SQLite uses real pages (8KB default)
 - `06-locks-mvcc-and-concurrency-control` — the concurrent-write seams named above
 - `08-replication-and-read-consistency` — the per-instance-divergence problem
 - `09-database-systems-red-flags-audit` — the ranked list of what to actually worry about
+- `10-embedded-sqlite-fixture` — better-sqlite3 trade-offs, seeded determinism, the committed binary
 - `study-system-design` (`.aipe/study-system-design/`) — which engine, when
-- `study-runtime-systems` — why module globals are per-process
+- `study-runtime-systems` — why module globals are per-process; sync vs async drivers
+
+---
+Updated: 2026-06-16 — added Olist SQLite tier (Move 2e + diagrams + use cases); main-app story unchanged.

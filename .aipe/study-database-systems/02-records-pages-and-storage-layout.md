@@ -30,19 +30,62 @@ How a database physically arranges bytes on disk · Industry standard.
 
 ### Verdict for this codebase
 
-**Not yet exercised.**
+**Exercised — but only on the Olist side. Main app still has no pages.**
 
-The closest cousin in blooming insights is a JavaScript `Map`. `Map.get(key)` is one V8 hash-table probe and a pointer dereference. There are no pages, no buffer pool, no row format, no fill factor — V8's heap is the storage engine and we don't tune it. The serialized form (when the `auth` cookie or the dev `.investigation-cache.json` flushes to disk) is one big JSON string, not a page-structured file.
+Two altitudes:
+
+- **Main app:** the closest cousin is a JavaScript `Map`. `Map.get(key)` is one V8 hash-table probe and a pointer dereference. No pages, no buffer pool, no row format. V8's heap is the storage engine and we don't tune it.
+- **`mcp-server-olist/data/olist.db`:** a real SQLite database file. SQLite uses a default page size of 4096 bytes (4KB), B-tree-organized, with each table stored in its own B-tree and each index in another. The `.db` file is 3.5 MB on disk — roughly 900 pages of data + ~9 pages × 9 indexes of index pages.
+
+When you open the file with `sqlite3 mcp-server-olist/data/olist.db` and run `PRAGMA page_size` and `PRAGMA page_count`, you get real answers. This is the first time this guide has actual page numbers to point at.
 
 ### When this becomes load-bearing
 
-The day blooming insights stores anything to a real engine — Postgres for saved insights, ClickHouse for historical anomaly trends, DuckDB for ad-hoc analysis — you'll start caring about row format (heap vs row-store vs columnar), page size (Postgres 8KB default, ClickHouse compressed parts), and locality (is "all of one user's insights" co-located on a page?).
+For the **main app**, storage layout still matters only when a query is CPU- or I/O-bound on bytes we own — none of the main app's code is that. Triggered by adding Postgres or DuckDB.
 
-The specific trigger that would force you to learn this: **a query slow enough to need EXPLAIN.** None of this code is slow because of storage layout — it's slow because of network RTTs to Bloomreach. Storage layout only matters when the query is CPU- or I/O-bound on bytes you own.
+For the **Olist DB**, layout already matters because the tool queries are real SQL with real JOINs. The teaching has concrete anchors now:
+
+```
+  axis: "which query plan benefits from row vs columnar layout for THIS data?"
+
+  get_metric_timeseries     ← row-store wins. Per-bucket SUM over (purchase_ts,
+   ('revenue', 'state')        state) — joins customers + order_items + orders,
+                               filters on purchase_ts range, groups by state.
+                               Row-store hits the index range scan, then heap
+                               fetches per row. Columnar would help if we were
+                               summing one column across millions of rows — at
+                               ~10k orders, the index seek + sequential heap
+                               scan is faster.
+
+  get_anomaly_context       ← still row-store. Two windowed aggregates over
+   (anomaly + baseline)        the same shape. Columnar would matter at 10M+
+                               rows.
+```
+
+At the size of the Olist fixture, **row-store with B-tree indexes is correct**. SQLite picks this by default; we don't tune it. The skill the file teaches is recognizing when you'd switch (columnar parquet / DuckDB / ClickHouse): hundreds of millions of rows, narrow analytical scans, no point lookups.
 
 ## Structure pass
 
-Skipped — there's nothing in this codebase to do a structure pass on. The concept doesn't exist here.
+Two altitudes; one axis flips at the boundary.
+
+```
+  axis: "what is the unit of I/O for this storage?"
+
+  ┌─ main app — Map<id, Insight> ────────────────┐
+  │  unit of I/O: one V8 hash-table probe         │  → no I/O at all; in RAM
+  │  no pages, no disk                            │
+  └────────────────────────────────────────────────┘
+              │  cross the MCP subprocess boundary
+              ▼
+  ┌─ Olist SQLite — data/olist.db ───────────────┐
+  │  unit of I/O: one 4KB page                    │  → real disk I/O; the
+  │  ~900 data pages + ~80 index pages            │     buffer pool caches
+  │  buffer pool: SQLite's default 2000-page      │     hot pages; cold pages
+  │   cache (~8 MB)                               │     come from disk
+  └────────────────────────────────────────────────┘
+```
+
+The seam is the MCP subprocess boundary. On the main-app side, "storage layout" is a non-question. On the Olist side, it's the question SQLite's planner asks every time.
 
 ## How it works
 
@@ -105,9 +148,58 @@ Skipped — no codebase instance to recap.
 
 ### Use cases
 
-None — there is no storage engine in this codebase.
+- **The Olist DB file** holds ~10k orders, 5k customers, ~30k rows total, across 7 tables. Every tool query in `mcp-server-olist/src/tools/*.ts` reads from these pages.
+- **The seed script** (`mcp-server-olist/scripts/seed-olist.ts` L508-544) writes all of them in one transaction; SQLite serializes the writes onto pages, splitting B-tree leaves as needed.
+- **The main-app Maps** still hold the in-flight briefing state (`lib/state/insights.ts` L4-6).
 
-### The closest cousin
+### The Olist DB on disk
+
+```
+  mcp-server-olist/data/olist.db  (3.5 MB, committed)
+  mcp-server-olist/src/db.ts      (L29-43)
+
+  export function openDb(path = resolveDbPath()): Database.Database {
+    if (!existsSync(path)) {
+      throw new Error('olist.db not found ...');
+    }
+    const db = new Database(path, {
+      readonly: true,                        ← page cache populated read-only;
+      fileMustExist: true,                      no risk of accidental writes
+    });
+    db.pragma('journal_mode = WAL');         ← WAL files (.db-wal, .db-shm)
+    db.pragma('foreign_keys = ON');             will be created on first read;
+    return db;                                  see 07 for why WAL matters
+  }
+       │
+       └─ SQLite's default page_size is 4096 bytes. With ~30k rows across
+          7 tables, the data B-trees occupy ~900 pages. The 9 secondary
+          indexes (see 03) add another ~80 pages. Total file: ~1000 pages
+          × 4KB ≈ 4 MB raw; compressed-on-disk varies, observed 3.5 MB.
+```
+
+### Indexes side by side (where the layout work lives)
+
+```
+  mcp-server-olist/scripts/seed-olist.ts  (lines 236–244)
+
+  CREATE INDEX idx_orders_purchase_ts ON orders(purchase_ts);
+  CREATE INDEX idx_orders_customer    ON orders(customer_id);
+  CREATE INDEX idx_items_order        ON order_items(order_id);
+  CREATE INDEX idx_items_product      ON order_items(product_id);
+  CREATE INDEX idx_payments_order     ON payments(order_id);
+  CREATE INDEX idx_reviews_order      ON reviews(order_id);
+  CREATE INDEX idx_customers_state    ON customers(state);
+  CREATE INDEX idx_products_category  ON products(category);
+  CREATE INDEX idx_payments_type      ON payments(type);
+       │
+       └─ each index is its own B-tree, stored in its own pages. INSERT into
+          orders therefore writes to TWO B-trees: the orders heap-page B-tree
+          (keyed by id PK) AND the idx_orders_purchase_ts B-tree. That's the
+          write tax discussed in 03 Move 2b. At seed time (~30k inserts wrapped
+          in one transaction), the cost is paid once and amortized.
+```
+
+### Still the cousin on the main-app side
 
 ```
   lib/state/insights.ts  (lines 4–6)
@@ -116,13 +208,10 @@ None — there is no storage engine in this codebase.
   const investigations = new Map<string, Investigation>();
   const anomalies     = new Map<string, Anomaly>();
        │
-       └─ this is the database table here. The "storage layout" is whatever
-          V8 picks for its hash-table backing store. We don't see it, we don't
-          tune it, and at the volumes we run (~10-50 insights per briefing) it
-          doesn't matter. The day this Map holds 100K insights and we want to
-          scan them by date range, the question "are they laid out for that
-          access pattern" suddenly has a real answer — and the Map's answer
-          is "no, hash tables don't preserve order."
+       └─ V8 hash table. No pages. At ~10-50 insights per briefing this is
+          correct. If this Map ever held 100K insights we'd want a real
+          engine — and the Olist server is the worked example of how to
+          stand one up locally.
 ```
 
 ## Elaborate
@@ -154,6 +243,11 @@ Anchor: `package.json` has no DB dependencies.
 
 ## See also
 
-- `01-database-systems-map` — what storage actually exists here
-- `03-btree-hash-and-secondary-indexes` — how rows are found once they're stored
+- `01-database-systems-map` — what storage actually exists here (both altitudes)
+- `03-btree-hash-and-secondary-indexes` — the 9 indexes that point AT these pages
+- `04-query-planning-and-execution` — how SQLite picks which pages to scan
+- `10-embedded-sqlite-fixture` — better-sqlite3 specifics + seed determinism
 - `study-data-modeling` — how to shape what you'd store
+
+---
+Updated: 2026-06-16 — now exercised via mcp-server-olist SQLite (4KB pages, 9 indexes, ~30k rows in 3.5 MB). Main-app verdict unchanged.

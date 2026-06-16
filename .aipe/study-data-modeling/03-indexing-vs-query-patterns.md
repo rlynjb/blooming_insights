@@ -1,48 +1,51 @@
 # Indexing vs query patterns
 
-**Industry name(s):** Indexing · query plan · N+1 · access path · the "frequent query, no index" smell
+**Industry name(s):** Indexing · query plan · N+1 · access path · the "frequent query, no index" smell · index-tuned-to-query-shape
 **Type:** Industry standard · Language-agnostic
 
-> **Not yet exercised in this repo** — the honest framing. There are no DB queries because there's no DB; the in-memory `Map`s in `lib/state/insights.ts` are accessed by key, which is constant-time by construction (no index needed). The topic still earns a file because the **upstream Bloomreach store** is a real database the repo queries against — and the access path is **EQL recipes**. That's the closest cousin. This file walks how the EQL queries are shaped, where the rate limit is the real cost (not query time), and what the repo would have to build if it ever owned a queryable store of its own.
+> **Activated for real in Phase 2.** The original framing (2026-06-01) was "not yet exercised — no DB, just `Map.get(id)`." That's now wrong. The `mcp-server-olist/` package has a SQLite database with **9 explicit indexes**, each one chosen to support a specific query that one of the three Olist tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`) actually issues. The textbook lesson "the right index is the one that matches the access path" plays out concretely here — every `CREATE INDEX` line in `mcp-server-olist/scripts/seed-olist.ts` can be pointed back to the WHERE / GROUP BY / JOIN it supports. The file also still covers the in-memory `Map`s (trivial, by-id) and the Bloomreach EQL recipes (still the rate-limited-upstream pattern).
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Two stores, two regimes. The in-memory `Map`s the repo owns are key-only — `get(id)` is the only access pattern, and `Map` is already a hash. The Bloomreach upstream is a real columnar event store accessed through EQL via the MCP layer. The repo's "queries" against it are short DSL strings constructed in `lib/agents/categories.ts` (the static recipes) and assembled live by the diagnostic and recommendation agents from prompts.
+**Zoom out — the bigger picture.** Three stores, three regimes now. (1) The in-memory per-session `Map`s the repo owns for UI state — key-only, `get(id)` is the only access pattern, `Map` is already a hash. (2) The Bloomreach upstream — a real columnar event store accessed through EQL via the MCP layer; the repo can't see its indexes, and the cost it pays is rate-limit slots, not query time. (3) **The Olist SQLite DB** — owned by the repo, schema designed in `seed-olist.ts`, 9 indexes designed against the 3 tools' query shapes; the repo CAN see the indexes here, and the cost it pays is local disk I/O and a single-process EXPLAIN-able query plan.
 
 ```
-  Zoom out — two stores, two regimes
+  Zoom out — three stores, three regimes
 
   ┌─ UI client band ─────────────────────────────────────────┐
   │  reads insights/investigations by id                       │
-  │  (no query layer in the client — typed objects only)       │
   └────────────────────────────┬─────────────────────────────┘
                                │ GET /api/agent?insight=…
   ┌─ Route handler band ───────▼─────────────────────────────┐
-  │  getInsight(id), getAnomaly(id), getInvestigation(id)     │
-  │  → Map.get(id)  ★ O(1) by construction (no index needed)  │
+  │  getInsight(sid, id), getAnomaly(sid, id)                 │
+  │  → SessionFeed.get(sid).insights.get(id)                  │
+  │  → O(1) hash, by-id only, no index needed                 │
   └────────────────────────────┬─────────────────────────────┘
                                │ agent.scan(), agent.investigate()
   ┌─ Agent loop band ──────────▼─────────────────────────────┐
-  │  monitoring agent runs the CATEGORIES recipes             │
-  │  diagnostic/recommendation construct EQL live              │
+  │  monitoring/diagnostic/recommendation construct queries   │
+  │  via mcp.callTool — abstract over BOTH stores below       │
   └────────────────────────────┬─────────────────────────────┘
-                               │ mcp.callTool('execute_analytics_eql', { eql, ...})
-  ┌─ MCP wrapper band ─────────▼─────────────────────────────┐
-  │  McpClient + spacing gate (1.1s between calls)            │
-  │  the rate limit IS the cost; query time isn't measured    │
-  └────────────────────────────┬─────────────────────────────┘
-                               │ HTTPS → Bloomreach
-  ┌─ UPSTREAM store ───────────▼─────────────────────────────┐
-  │  Bloomreach Engagement — columnar event store              │
-  │  indexes/partitions/sharding: opaque                       │
-  │  the only "access path" the repo controls is the EQL it    │
-  │  writes against it                                         │
-  └──────────────────────────────────────────────────────────┘
+                               │
+                ┌──────────────┴──────────────┐
+                │                              │
+         live-bloomreach                live-sql (Olist)
+                │                              │
+                ▼                              ▼
+  ┌─ Bloomreach upstream ──────────┐ ┌─ Olist SQLite (owned) ──────────┐
+  │ execute_analytics_eql            │ │ get_metric_timeseries           │
+  │ rate-limited 1 req/s             │ │ get_segments                    │
+  │ indexes opaque                   │ │ get_anomaly_context             │
+  │ cost = round-trip slots          │ │ cost = local I/O + plan choice  │
+  │ ★ cousin pattern                 │ │ 9 EXPLICIT INDEXES, each one    │
+  │                                  │ │   matches a known query shape   │
+  │                                  │ │ ★ TEXTBOOK CASE — visible plans │
+  └──────────────────────────────────┘ └──────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this topic asks is: do the indexes that exist support the queries actually run? **For the in-memory store, the answer is trivial — `Map.get(id)` is the only access pattern and `Map` is the index.** For the Bloomreach upstream, the answer is **the repo can't see the indexes**, and the cost it actually pays isn't query time — it's the 1-request-per-second rate limit, which makes "minimize the number of round-trips" the equivalent of "minimize the index lookups." This file unpacks both.
+**Zoom in — narrow to the concept.** The question this topic asks is: do the indexes that exist support the queries actually run? Three layers, three answers. **For the in-memory store, the answer is trivial** — `Map.get(id)` is the only access pattern and `Map` is the index. **For the Bloomreach upstream, the repo can't see the indexes**, and the cost it pays is rate-limit slots — so "minimize round-trips" replaces "minimize index lookups." **For the Olist SQLite, the answer is fully visible** — the 9 indexes in `SCHEMA_SQL` were chosen explicitly to support the three tools' query patterns, and every index can be traced back to a `WHERE` / `GROUP BY` / `JOIN` it supports.
 
 ---
 
@@ -210,14 +213,97 @@ What this models in DB terms: it's a **query-cost ceiling**. SQL has `statement_
 
 In a real query engine, the cache analog is a result cache or materialized view. This one is the dumbest possible version (exact match on a serialized key); the repo's queries are stable enough that this is plenty.
 
-### Move 2 — what's NOT here (the honest "not yet exercised")
+### Move 2 — the Olist indexes, mapped to the queries they support
 
-The classic data-modeling concerns under this heading don't apply because the substrate doesn't exist:
+The most concrete part of this file. `mcp-server-olist/scripts/seed-olist.ts` creates 9 indexes in `SCHEMA_SQL`. Each one is the answer to a specific query the three Olist tools issue. Walk them in pairs:
 
-- **No covering indexes** — there are no relational tables to add `CREATE INDEX` to.
-- **No N+1 queries** — there are no joins to N+1 over. The closest pattern would be: "for each insight, fetch its investigation." Today that's not a real read path — the investigate page receives the insight id and starts an agent run; investigations are stored by `insightId` and read individually. With a relational store, this would be the place to add an index on `Investigation.insightId` (which IS the PK in the current Map, so trivially indexed).
-- **No query plans to read** — the EQL is a DSL whose execution plan is opaque. The repo can write the EQL but can't see how Bloomreach executes it.
-- **No partial indexes / functional indexes / GIN indexes** — same reason as above.
+```
+  Olist indexes — each one matched to its query
+
+  ┌─ idx_orders_purchase_ts ──────────────────────────────────┐
+  │  ON orders(purchase_ts)                                    │
+  │                                                              │
+  │  query that uses it (get_metric_timeseries):                │
+  │    SELECT date_bucket(purchase_ts), SUM(...)                 │
+  │    FROM orders JOIN order_items ...                          │
+  │    WHERE purchase_ts BETWEEN ? AND ?                         │
+  │    GROUP BY date_bucket(purchase_ts)                         │
+  │                                                              │
+  │  what breaks without it: every time-bucket aggregation       │
+  │  becomes a full table scan of `orders` (~9,800 rows).        │
+  │  small now, painful at 10x.                                  │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_orders_customer ─────────────────────────────────────┐
+  │  ON orders(customer_id)                                    │
+  │                                                              │
+  │  query that uses it: FK join from orders → customers        │
+  │  (every time the dimension is `state`).                      │
+  │                                                              │
+  │  what breaks without it: nested-loop join becomes O(n²)      │
+  │  in the worst case (n = order count).                        │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_items_order, idx_items_product ──────────────────────┐
+  │  ON order_items(order_id), order_items(product_id)         │
+  │                                                              │
+  │  query that uses idx_items_order:                            │
+  │    every join from orders → order_items                     │
+  │  query that uses idx_items_product:                          │
+  │    every dimension='category' filter (join through products)│
+  │                                                              │
+  │  the two together cover both directions of the M:N bridge.  │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_payments_order, idx_payments_type ───────────────────┐
+  │  ON payments(order_id), payments(type)                     │
+  │                                                              │
+  │  idx_payments_order: every join orders → payments           │
+  │  idx_payments_type:  every dimension='payment_type' filter  │
+  │                                                              │
+  │  ★ idx_payments_type is the index that supports the          │
+  │     voucher-dropoff seeded anomaly's detection query        │
+  │     (file 09 covers the anomaly).                            │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_customers_state ─────────────────────────────────────┐
+  │  ON customers(state)                                       │
+  │                                                              │
+  │  query that uses it: every dimension='state' filter or      │
+  │  group-by — including the SP-revenue-drop seeded anomaly.   │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_products_category ───────────────────────────────────┐
+  │  ON products(category)                                     │
+  │                                                              │
+  │  query that uses it: every dimension='category' query —    │
+  │  including the electronics-spike seeded anomaly.            │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ idx_reviews_order ───────────────────────────────────────┐
+  │  ON reviews(order_id)                                      │
+  │                                                              │
+  │  not yet hot — no tool reaches reviews today. but pre-      │
+  │  indexed because the seeded data populates the table and a  │
+  │  future "review_score by segment" query would need it.      │
+  │  the only speculative index in the set.                     │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**The pattern:** indexes here aren't speculative-on-everything (`CREATE INDEX ON every column` would be wasteful). They're chosen by walking the three tool implementations and asking, for each WHERE / GROUP BY / JOIN: "does an index exist?" Read `mcp-server-olist/src/tools/get_metric_timeseries.ts` and `get_segments.ts` and `get_anomaly_context.ts`, list the predicates, and you can predict the index list. That's the textbook discipline — design the schema against the access path, not against the table.
+
+What's missing: **no compound indexes.** A `(state, purchase_ts)` composite would be faster than the two singletons for queries that filter both. Today the volume is small enough (single-digit milliseconds per query at 9,800 orders) that single-column indexes suffice. At 10x data this becomes the next move.
+
+What's also missing: **no covering indexes.** SQLite supports `INCLUDE`-like columns via prefix tricks, but none of the indexes here carry payload — every index hit is followed by a table lookup for the actual values. Fine at this scale.
+
+### Move 2 — what's STILL not here (the honest "not yet exercised")
+
+A few classic data-modeling concerns under this heading still don't apply:
+
+- **No query plans inspected in CI** — the schema picks the indexes correctly today, but there's no `EXPLAIN QUERY PLAN` check that runs as a test. A future schema change could regress to a full scan and nothing would catch it until the wall-clock got noticeably slower.
+- **No N+1 queries observable in the agent loop** — the agent issues one tool call per logical question, and each tool call returns aggregated data. The "N+1" failure mode (loop in app code issuing one query per row) doesn't have a place to live here — the agent is the loop, but the LLM is rate-limited by the agent budget, not by the SQL count.
+- **No relational-store layer for UI state** — the in-memory per-session `Map`s still serve insights/investigations. The buildable target named in 2026-06-01 (Postgres for `insights`/`investigations`) has been built only as Olist (analytics) — the UI layer is unchanged.
+- **No EXPLAIN-based index recommendation** — the indexes were chosen by reading the SQL, not by running a load profile. That's the right move for a 9,800-row deterministic dataset; at production scale, the discipline would shift to "watch slow query log + auto-recommend."
 
 ### Move 3 — the principle
 
@@ -392,6 +478,11 @@ A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — `WorkspaceSchema` and the capability set are the upstream schema view the EQL is constructed against.
-- `04-transactions-and-integrity.md` — the rate-limit slots are the integrity-equivalent here; an agent that ignores them corrupts everyone else's budget.
-- `06-access-patterns-and-storage-choice.md` — the in-memory Map choice is the reason there's no query layer; the JSON-file fallback is the materialized-view pattern.
-- `study-software-design/audit.md#information-hiding-and-leakage` — the McpClient cache is named as a strong-hide example; the cache-key construction is owned by one file.
+- `04-transactions-and-integrity.md` — FKs and WAL on the Olist side; the agent-contract layer's runtime guards.
+- `06-access-patterns-and-storage-choice.md` — three storage layers, three durability stories; the in-memory Maps are still by-id-only.
+- `08-the-olist-relational-schema.md` — the schema each index supports, in 3NF.
+- `09-deterministic-synthetic-data.md` — the seeded anomalies that exercise the index plans (the SP and electronics queries hit `idx_customers_state` and `idx_products_category`).
+- `study-software-design/audit.md#information-hiding-and-leakage` — the McpClient cache is named as a strong-hide example.
+
+---
+Updated: 2026-06-16 — added Olist 9-index walk; reframed "not yet exercised" as "still no EXPLAIN gates in CI"; the topic is now genuinely live for the Olist tools.
