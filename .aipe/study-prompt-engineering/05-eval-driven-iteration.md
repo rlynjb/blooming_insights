@@ -3,14 +3,14 @@
 **Industry name(s):** eval-driven development, golden-set / regression-set iteration, LLM-as-judge, offline evaluation harness
 **Type:** Industry standard · Language-agnostic
 
-> The senior-vs-junior line in prompt work is this: a junior edits a prompt, eyeballs one output, and ships; a senior runs the edited prompt against a fixed set of labeled cases and ships only if the score holds AND no critical case regressed. blooming insights has no golden set and no harness — but its prompts are visibly iterated-by-incident: the "CRITICAL: verify your windows actually contain data" and "Never report a change derived from an empty window" blocks are regression fixes encoded as prose, an informal regression suite with no runner behind it.
+> The senior-vs-junior line in prompt work is this: a junior edits a prompt, eyeballs one output, and ships; a senior runs the edited prompt against a fixed set of labeled cases and ships only if the score holds AND no critical case regressed. blooming insights now has a real 4-pillar eval suite under `eval/` — detection (precision/recall on 3 seeded Olist anomalies), diagnosis (5-criterion LLM-judge rubric), recommendation (3-criterion LLM-judge), regression (golden-set diff). The Phase 2.5 monitoring-prompt fix has receipts: loose recall lifted **6.7% → 33.3%** (5x), voucher detection went **1/10 → 10/10** — and the same eval set surfaced the honest limit: SP-revenue and electronics anomalies stayed 0/10 strict because the "recent 4w vs baseline 12w" framing is week-blind. The prompts are still visibly iterated-by-incident in prose (every "CRITICAL" block is a past production miss), but the scoring layer is now real, not aspirational.
 
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Eval-driven iteration is an *orthogonal* path that runs parallel to the request flow, not inside it. You edit a prompt at the Per-agent definitions band, but the eval harness exercises the real production path (Per-agent definitions → Shared agent loop → Provider) from a separate entry point — a `evals/` runner that injects a deterministic `McpCaller` through the same seam the unit tests use. The dataset, runner, scorer, and gate all live in a sibling layer that touches the same agent classes the request path touches, just driven by a different caller.
+**Zoom out — the bigger picture.** Eval-driven iteration is an *orthogonal* path that runs parallel to the request flow, not inside it. You edit a prompt at the Per-agent definitions band, but the eval suite exercises the real production path (Per-agent definitions → Shared agent loop → Provider) from a separate entry point — `eval/scripts/run-*.ts` runners that spawn a real `OlistDataSource` subprocess and run the actual agent classes with the production prompts. The dataset, runner, scorer, and gate all live in a sibling layer that touches the same agent classes the request path touches, just driven by a different caller.
 
 ```
   Zoom out — where eval-driven iteration lives
@@ -20,20 +20,21 @@
   └─────────────────────────┬────────────────────────┘
                             │
   ┌─ EVAL band (orthogonal) ▼─────────  ┌─ Request flow ──────┐
-  │  ★ evals/cases/*.json (dataset) ★   │ app/api/agent/route │
-  │  ★ evals/run.ts (runner) ★          │ → Pipeline coord    │
+  │  ★ eval/fixtures/* (reference) ★    │ app/api/agent/route │
+  │  ★ eval/scripts/run-*.ts (4) ★      │ → Pipeline coord    │
   │  uses REAL Per-agent definitions ──→│ → Per-agent defs    │
   │  + Shared agent loop + Provider     │ → Shared agent loop │
-  │  + injected deterministic McpCaller │ → Provider          │
+  │  + REAL OlistDataSource subprocess  │ → Provider          │
   │  ↓                                  │ ↓                   │
-  │  ★ scorer (assert | LLM-judge) ★    │ user receives result │
+  │  ★ scorer: LOOSE/STRICT (detect) ★  │ user receives result │
+  │  ★ judge: 5-crit (diag) / 3 (rec) ★ │                     │
   │  ↓                                  └─────────────────────┘
-  │  ★ gate: avg ↑ AND no regression ★   ← we are here
+  │  ★ gate: precision/recall + rubric ★ ← we are here
   └──────────────────────────────────────────────────┘
-       (not yet implemented in blooming insights)
+       (Phase 3 — eval/ ships detection + judges)
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: how do you know the edit that fixed today's bug didn't silently break a case you fixed three weeks ago? A golden set + runner + scorer + gate moves the definition of "better prompt" out of your head and onto a number, with the gate checking two things — aggregate up AND no critical case regressed. blooming insights has the misses (every CRITICAL block in the prompts is a regression fix in prose) and the injection seam (used by 169 unit tests that check shape) but has not yet turned either into a scored harness. Below, you'll see why unit tests aren't evals, what the runner has to share with production, and the LLM-judge trap to respect before trusting a score.
+**Zoom in — narrow to the concept.** The question this file answers: how do you know the edit that fixed today's bug didn't silently break a case you fixed three weeks ago? A golden set + runner + scorer + gate moves the definition of "better prompt" out of your head and onto a number, with the gate checking two things — aggregate up AND no critical case regressed. blooming insights now has the receipts: a Phase 2.5 monitoring-prompt fix scored **6.7% → 33.3% loose recall** (5x), with a real per-anomaly delta table showing voucher went 1/10 → 10/10 *and* SP-revenue went 1/10 → 0/10 (small regression). The eval is the layer that made both visible. Below, you'll see why unit tests aren't evals, what the runner has to share with production, the LLM-judge trap, and the per-anomaly diff that catches the "average up but one case regressed" failure.
 
 ---
 
@@ -41,7 +42,7 @@
 
 **Layers.** Eval-driven iteration is a four-layer loop that lives in a *dev-time* band parallel to the production request path, and the layers don't help unless you keep them at that altitude. Layer A is the *dataset* — 20–50 labeled cases accreted from real production misses, each one a bug you already paid for. Layer B is the *runner* — a script that exercises the *real* agent classes (loaded prompt, real model, real validator) against each case, with an injected deterministic `McpCaller` so the tool results are reproducible. Layer C is the *scorer* — a field assertion for JSON agents or an LLM-judge for the prose agent, turning each output into pass/fail or 0–1. Layer D is the *gate* — the two-condition ship check: aggregate up AND no critical case regressed.
 
-**Axis: lifecycle.** When does each layer fire — at dev-time (the edit), at ship-gate-time (the merge), or never (the gap)? Lifecycle is the right axis because the whole concept is a *parallel timeline* to the request flow, with one critical missing tick: the dataset is forever (Layer A), the runner is invoked on demand (Layer B), the scorer runs per case per dev-time iteration (Layer C), and the gate fires at ship-time (Layer D). Today blooming insights' lifecycle has the wrong shape entirely — the "runner" is a human re-reading one output, the "scorer" is vibes, the "gate" is whether the demo looks better. Every layer exists informally, none exists as code.
+**Axis: lifecycle.** When does each layer fire — at dev-time (the edit), at ship-gate-time (the merge), or never (the gap)? Lifecycle is the right axis because the whole concept is a *parallel timeline* to the request flow: the dataset is forever (Layer A — `eval/fixtures/`), the runner is invoked on demand (Layer B — `npm run eval:detection -- --K=10`), the scorer runs per case per dev-time iteration (Layer C — `eval/scripts/lib/scorer.ts` for detection; `eval/judges/*.md` for diagnosis/recommendation), and the gate fires at ship-time (Layer D — currently a human reading `summary.md`, not yet a CI gate). The Phase 3 build closed the first three layers; Layer D is still manual (you read the per-anomaly delta and decide), but the *evidence* the decision rests on is now numbers in a committed `summary.md`, not vibes.
 
 **Seams.** Two seams matter. Seam 1 (A↔B) — the dataset is *static-and-curated*, the runner uses the *live agent classes and the live model* (non-deterministic by nature); the deterministic injected `McpCaller` is the gate that makes the case reproducible despite the model being sampled. The load-bearing seam is Seam 2 (C↔D) — lifecycle flips from *measuring* (per-case scores) to *deciding* (ship or reject). And this is exactly where the "average went up" trap lives: a single-condition gate (only aggregate) ships silent regressions; a two-condition gate (aggregate AND zero per-case regressions) catches them. The whole value of having a harness is that this seam stops being a vibe and starts being a number.
 
@@ -169,51 +170,79 @@ The seam that makes this cheap already exists. The shared agent loop injects bot
 
 ---
 
-### Part 2.5 — current state: unit tests are not evals
+### Part 2.5 — current state: unit tests are not evals (and now the evals exist)
 
-This is the distinction the brief demands be named plainly. blooming insights has 169 Vitest tests. They are unit tests with injected fakes, and they test **shape, not answer quality.**
+This is the distinction the brief demands be named plainly. blooming insights has 269 Vitest tests **and** a real eval suite under `eval/`. The two layers do completely different jobs.
 
 ```
-UNIT TEST (exists)                  EVAL (does not exist)
+UNIT TEST (test/)                   EVAL (eval/)
 ──────────────────────────────     ──────────────────────────────
-inject fake provider + fake mcp     real provider, canned mcp results
-assert: the parser returns          assert: the diagnosis is CORRECT
-        an object of the right       for THIS anomaly given THIS data
-        shape; shape guard passes
+inject fake provider + fake mcp     REAL provider, REAL OlistDataSource
+assert: the parser returns          score: did the agent detect the
+        an object of the right       seeded anomaly? did the diagnosis
+        shape; shape guard passes    pass the 5-criterion rubric?
 ─────────────────────────────────────────────────────────────
 "does the contract hold?"           "is the answer any good?"
-deterministic, no model call        non-deterministic, real model call
+deterministic, no model call        non-deterministic, real Sonnet 4.6
+runs on every PR (CI)               runs on demand (~$1-3 / K=10)
 ```
 
-The diagnostic agent's unit tests prove that when the fake model returns fenced JSON, the investigate path returns a typed `Diagnosis`, and when it returns garbage, the chain falls to a fallback value. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 169 tests. The eval is the layer that would catch it, and it is the layer that does not exist.
+The diagnostic agent's unit tests prove that when the fake model returns fenced JSON, the investigate path returns a typed `Diagnosis`, and when it returns garbage, the chain falls to a fallback value. That is the structured-output contract (→ 02-structured-outputs.md) under test. It says nothing about whether the diagnosis is *right*. A hallucinated-but-well-shaped diagnosis passes every one of those 269 tests. **The eval suite is the layer that catches that, and as of Phase 3 it ships.**
 
-So the honest framing of the current state: the prompts ARE iterated against real failures — the dense warning blocks prove it — but the iteration loop runs in someone's head, manually, one case at a time, with no record of the case and no automated re-check. It is a regression suite with no harness. That works until the person who remembers all the edge cases changes a prompt and forgets one.
+What the eval ACTUALLY caught — a real receipt from this codebase:
+
+```
+PROMPT DELTA              Phase 2.5 monitoring.md edit:
+                          + DATA HORIZON section (anchor date range)
+                          + 3-dimension scan plan (state, category,
+                            payment_type — "skip any, miss its anomaly")
+                          + "do not spend > 2 calls on any single
+                            dimension" hard rule
+
+DETECTION EVAL (K=10):    loose recall  6.7% → 33.3%   (+26.6 pts, 5x)
+                          voucher       1/10  → 10/10
+                          sp-revenue    1/10  → 0/10   (-1, small regress)
+                          electronics   0/10  → 0/10   (unchanged)
+                          strict recall 0.0% → 0.0%    (no movement)
+                          false-pos     0.2   → 2.2    (more breadth ≈
+                                                       more false signal)
+```
+
+The eval surfaced two things vibes-iteration would not. First, the win is real and bounded — voucher went perfect because it's the easiest anomaly (sustained, large, on payment_type which the new scan plan forces). Second, the win is honestly partial — sp-revenue and electronics stay 0/10 strict because "recent 4w vs baseline 12w" framing fundamentally can't catch mid-horizon week-specific anomalies. That second sentence — "the prompt fix is the wrong tool for the rest of the job" — is the kind of finding you only earn by running real numbers. With vibes-only iteration, the voucher win would have been celebrated and the SP regression would have shipped silently.
 
 ---
 
 ### Part 3 — the scorer, and the LLM-judge trap
 
-Two case types need two scorers.
+Three case types, three scorers, all live in this codebase.
 
-For the JSON agents, scoring is mostly a code assertion because the output is structured: did the monitoring agent return `[]` for the empty-window case? Did the diagnostic conclusion avoid inventing a cause? Some of that is a substring/field check (`anomalies.length === 0`), some of it needs judgment ("does this conclusion honestly state the data was historical?").
+For the monitoring agent (detection), scoring is a code assertion against a heuristic matcher (`eval/scripts/lib/scorer.ts`): LOOSE = metric + segment match the seeded anomaly (2-of-3); STRICT = LOOSE + a time-window signal (3-of-3). Each emitted insight is matched against each of the 3 seeded anomalies; a hit increments true-positives, a miss is a false-positive.
 
-For the query agent (prose, → 07-output-mode-mismatch.md) there is no field to assert on, so you reach for an LLM-as-judge: a second model call that grades the answer against a rubric.
+For the diagnostic agent (free-form reasoning + structured fields), scoring is an LLM-as-judge against a **5-criterion rubric** that lives in `eval/judges/diagnosis-judge.md` (~350 lines of judge prompt + anchor examples): `hypothesis` (0-2), `evidence` (0-2), `sizing` (0-2), `calibration` (0-1), `fabrication` (0-2). Pass threshold ≥7/9. Each criterion failure points back to a specific prompt deficit — the judge IS the prompt engineer's feedback loop.
+
+For the recommendation agent, same shape with a 3-criterion rubric in `eval/judges/recommendation-judge.md` (~250 lines): `plausible` (0-2), `specific` (0-2), `impact_sized` (0-1). Pass ≥4/5.
 
 ```
-SCORER per output mode
+SCORER per agent
 ─────────────────────────────────────────────────────────────
- JSON agents   →  field assertions   (anomalies.length, conclusion regex)
-                  + LLM-judge for the "is this honest?" cases
- query agent   →  LLM-judge against a rubric (prose has no fields)
+ monitoring   →  detection match (LOOSE 2-of-3 / STRICT 3-of-3)
+                 eval/scripts/lib/scorer.ts (heuristic regex+constants)
+ diagnostic   →  LLM-judge, 5-criterion rubric, pass ≥7
+                 eval/judges/diagnosis-judge.md
+ recommend    →  LLM-judge, 3-criterion rubric, pass ≥4
+                 eval/judges/recommendation-judge.md
+ query        →  similarity-judge for prose (eval/judges/similarity-judge.md)
 ```
 
-The trap to name: an LLM judge is itself a model that can be wrong, and it is often wrong in a *correlated* way with the model it grades. Hamel's discipline here is non-negotiable — you must validate the judge against human labels before you trust it. If you skip that, you have replaced "I think this looks good" with "a model thinks this looks good," which is the same vibes-based iteration with extra latency.
+What the judge rubrics actually catch — a second real receipt: the diagnostic agent's `confidence` field produces **calibration=0 in 29/30 runs**. The judge anchor (`diagnosis-judge.md`) explicitly fails any output that says "likely caused by X" with `confidence: "high"` and zero hedging language, because that's overclaim, not calibrated confidence. Root cause: a prompt deficit — `diagnostic.md`'s confidence-derivation reads "3 hypotheses tested → confidence=high," which produces the binary output the rubric flags. This is the senior pattern in action: the eval names a criterion, the criterion fails on 29/30 runs, and the failure points back at one line in the prompt. That is the flywheel.
+
+The trap to name (Hamel's discipline): an LLM judge is itself a model that can be wrong, and it is often wrong in a *correlated* way with the model it grades — particularly when both are Sonnet 4.6, as here. You must validate the judge against human labels before you trust the score. The judges in `eval/judges/` ship with anchor examples (passing-anchor, failing-on-sizing-anchor, failing-on-calibration-anchor) which serves as half of that validation — the judge is anchored to specific patterns; the other half (rate-of-agreement with hand labels) is still TODO. Skipping that step replaces "I think this looks good" with "a model thinks this looks good" — same vibes-based iteration with extra latency.
 
 ---
 
 ### The principle
 
-Eval-driven iteration moves the definition of "better prompt" out of your head and into a number on a fixed dataset, and it gates every change on two conditions, not one: the aggregate improved AND no critical case regressed. The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights has the misses (they are written into the prompts as CRITICAL blocks) and the injection seam (used by 169 unit tests) but has not yet turned either into a scored harness, so it iterates by memory.
+Eval-driven iteration moves the definition of "better prompt" out of your head and into a number on a fixed dataset, and it gates every change on two conditions, not one: the aggregate improved AND no critical case regressed. The dataset — accreted one production miss at a time — is the asset; the prompt is disposable. blooming insights now has both: the misses written as CRITICAL blocks, AND the eval suite (`eval/`) that scores them. The Phase 2.5 monitoring fix has receipts — loose recall 6.7% → 33.3% — and the same suite named the honest limit (sp-revenue and electronics stay 0/10 strict because the "recent vs baseline" framing is fundamentally week-blind). That is the flywheel doing exactly what it's supposed to do: surface partial wins as partial, not as wins.
 
 ---
 
@@ -259,9 +288,41 @@ A reader who sees only this should grasp: the dataset is fixed and growing, the 
 
 ## Implementation in codebase
 
-**Not yet implemented.** There is no eval set, no eval runner, and no LLM-judge anywhere in blooming insights; the 169 Vitest tests under `test/` are unit tests that inject fake Anthropic/MCP clients and assert output *shape* (e.g. `test/agents/diagnostic.test.ts` checks that a fenced-JSON fake yields a typed `Diagnosis` and that garbage falls to `FALLBACK`) — they never score answer quality, so a hallucinated-but-well-formed output passes all of them.
+**Case A — implemented (Phase 3 ships the eval suite).** The 4-pillar suite lives under `eval/`:
 
-The closest partial analog is the prompts themselves: every "CRITICAL"/"Never"/"Do NOT" block (`monitoring.md` L31–37 and L29, `diagnostic.md` L38–50 and L35, `recommendation.md` L82) is a regression fix encoded as prose — an informal, harness-less regression suite. A real harness would live in a new `evals/` directory at the repo root, reusing the injection seam in `lib/agents/base.ts` (L48–L62) that the unit tests already exploit.
+### The suite — 4 pillars, 4 runners
+
+- **File:** `eval/scripts/run-detection.ts` · `run-diagnosis.ts` · `run-recommendation.ts` · `run-regression.ts`
+- **Function / class:** each runner spawns a fresh `OlistDataSource` subprocess per run, instantiates the real `MonitoringAgent` / `DiagnosticAgent` / `RecommendationAgent` with the production prompts, runs K=10 times, scores each run, writes per-day results to `eval/results/<YYYY-MM-DD>/`.
+- **Run with:** `npm run eval:detection -- --K=10` (~$1-3, ~5-10 min); the recruiter number.
+- **Role:** the orchestration layer; the actual production agent classes do the work, the runner just drives K independent runs and aggregates.
+
+### The scorer — detection (LOOSE / STRICT)
+
+- **File:** `eval/scripts/lib/scorer.ts`
+- **Function / class:** matchInsight() — applies a metric regex + a segment-name lookup + a time-window heuristic. LOOSE = 2-of-3 (metric + segment); STRICT = 3-of-3 (LOOSE + time window).
+- **Role:** turns each emitted insight into a hit/miss/false-positive against the 3 seeded anomalies in `mcp-server-olist/scripts/seed-olist.ts` (`sp-revenue-drop-w4`, `electronics-spike-w2`, `voucher-dropoff-w10-on`).
+
+### The LLM judges — diagnosis (5-criterion) and recommendation (3-criterion)
+
+- **File:** `eval/judges/diagnosis-judge.md` (~350 lines) · `eval/judges/recommendation-judge.md` (~250 lines) · `eval/judges/similarity-judge.md` (~280 lines)
+- **Function / class:** the judge prompt is loaded as a system prompt for a second Sonnet 4.6 call; the candidate diagnosis is passed as the user message; the judge returns a JSON score per criterion plus an overall pass/fail.
+- **Role:** turns prose + structured-field reasoning into rubric scores. Diagnosis rubric: `hypothesis` 0-2 + `evidence` 0-2 + `sizing` 0-2 + `calibration` 0-1 + `fabrication` 0-2; pass ≥7/9. Recommendation rubric: `plausible` 0-2 + `specific` 0-2 + `impact_sized` 0-1; pass ≥4/5.
+
+### The reference fixtures
+
+- **File:** `eval/fixtures/reference-diagnoses.json` · `reference-recommendations.json` · `regression-golden/`
+- **Role:** one valid-shape reference per seeded anomaly. The judge does NOT score by literal match — it uses the reference to anchor "what would a competent answer look like for THIS anomaly."
+
+### The committed results — the receipts
+
+- **File:** `eval/results/2026-06-15/summary.md` (pre Phase 2.5 fix) · `eval/results/2026-06-15-after-fix/summary.md` (post)
+- **Role:** the same K=10 detection eval run before and after the monitoring prompt's DATA HORIZON + 3-dim scan plan additions. The post-fix `summary.md` includes the per-anomaly delta table and the "Honest interpretation" section that names what worked (voucher) and what didn't (sp-revenue, electronics — the framing limit).
+
+### The informal regression suite still inside the prompts
+
+- **File:** `lib/agents/prompts/monitoring.md` · `diagnostic.md` · `recommendation.md`
+- **Role:** every "CRITICAL"/"Never"/"Do NOT" block in the prompts is still a regression fix encoded as prose — `monitoring.md`'s empty-window block, the small-baseline caution, the DATA HORIZON anchor — each one a production miss the team already paid for. The eval suite enforces detection, but the prose blocks are the broader regression set; they should accrete into the eval over time.
 
 ---
 
@@ -304,23 +365,32 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ## Project exercises
 
-### Build a golden set + runner under `evals/`
+### Lift strict detection past 0% — close the week-blind framing gap
 
-- **Exercise ID:** C3.1 / C3.2 (adapted) — stand up an offline eval harness for the agents.
-- **What to build:** a new `evals/` directory with (1) `evals/cases/` holding 20–50 JSON cases, each an input anomaly (or query) plus the canned MCP tool results that case implies plus a grader spec; (2) `evals/run.ts` that constructs `DiagnosticAgent`/`QueryAgent` with the real Anthropic client and a deterministic `McpCaller` that replays the case's canned results, runs each case, and applies the grader; (3) a results table printing aggregate pass-rate and a per-case pass/fail column. Seed the set directly from the prompts' CRITICAL blocks: the empty-90-day-window case (`monitoring.md` L31–37), the < 500-events baseline case (L29), the historical-data case (`diagnostic.md` L38–50).
-- **Why it earns its place:** it converts the informal in-prose regression suite into an executable one and gives every future prompt edit a number to gate on — the single highest-leverage thing missing from the system.
-- **Files to touch:** new `evals/cases/*.json`, new `evals/run.ts`, new `evals/grade.ts`; reuse `lib/agents/base.ts` (the injection seam), `lib/agents/diagnostic.ts`, `lib/agents/query.ts`, `lib/mcp/validate.ts`.
-- **Done when:** `tsx evals/run.ts` runs every case through the real agent path, prints an aggregate score and a per-case table, and the three seeded edge-case cases pass on `main` and fail when the corresponding CRITICAL block is deleted from the prompt.
-- **Estimated effort:** 1–2 days
+- **Exercise ID:** C3.1 (adapted) — prompt-engineering case study: a measured-partial-win → next-iteration design.
+- **What to build:** pick **Path A** (sliding-window scan plan in the monitoring prompt — multiple recent/baseline pairs covering different parts of the 26-week horizon, OR "look for the LARGEST per-week deviation across all weeks") OR **Path B** (a new `detect_outliers({ metric, dimension, horizon })` MCP tool that returns z-score outliers across the full horizon; the agent calls it once per dimension). Re-run `npm run eval:detection -- --K=10` and confirm the per-anomaly table shows sp-revenue-w4 and electronics-spike-w2 lifting above 0/10 strict.
+- **Why it earns its place:** the eval-driven flywheel is real; the next turn of the crank already has a named target. The post-fix `summary.md`'s "What this means for next iteration" section names both paths explicitly. This exercise IS the senior-pattern: measure → name the deficit → propose a fix → re-measure.
+- **Files to touch:** `lib/agents/prompts/monitoring.md` (Path A) OR `mcp-server-olist/src/tools/detect-outliers.ts` + monitoring tool catalog (Path B); rerun `eval/scripts/run-detection.ts`; write a new `eval/results/<date>/summary.md` with the delta.
+- **Done when:** sp-revenue-drop-w4 or electronics-spike-w2 detects > 0/10 strict on K=10 with no regression on voucher (10/10 → 10/10).
+- **Estimated effort:** Path A 30 min + ~$1-3; Path B 3-4 hours.
 
-### Add an LLM-judge for the query agent's prose
+### Fix the diagnostic calibration deficit (29/30 = 0)
 
-- **Exercise ID:** C3.3 (adapted) — rubric-based grading for free-form output.
-- **What to build:** a grader for the query agent's prose answer (`query.md` L49) that calls a model with a rubric ("grounded in real numbers? honest when data is missing? answers the question asked?") returning a 0–1 score, then a small validation step: hand-label 15 query answers and report the judge's agreement with your labels so the judge is trusted only after it matches humans.
-- **Why it earns its place:** demonstrates you know prose needs a different scorer than JSON and that an LLM judge is worthless until validated against human labels — the step teams skip.
-- **Files to touch:** new `evals/judge.ts`, new `evals/cases/query/*.json` (with human labels), `evals/run.ts` (wire the judge for query cases).
-- **Done when:** the judge scores a held-out set of query answers, and you report its agreement rate with your 15 hand labels before any score from it is used to gate a prompt change.
+- **Exercise ID:** C3.2 (adapted) — close one criterion failure in the judge rubric.
+- **What to build:** the diagnosis judge (`eval/judges/diagnosis-judge.md`) scores `calibration` as 0 in 29/30 runs because `diagnostic.md`'s confidence-derivation is binary ("3 hypotheses tested → high"). Rewrite the diagnostic prompt's confidence guidance to require hedging language ("appears", "suggests", "consistent with") when evidence is correlational, and to require a `confidence: 'medium'` floor unless a hypothesis is mechanistically proven. Re-run `npm run eval:diagnosis -- --K=10` and confirm calibration score lifts above 0 on a measurable fraction of runs.
+- **Why it earns its place:** turns a generic "the model overclaims" finding into a specific prompt edit traceable to a criterion in a named rubric. This IS what eval-driven means — the prompt deficit has a number on it.
+- **Files to touch:** `lib/agents/prompts/diagnostic.md` (the confidence-derivation lines + the `## Output` block's confidence field rule); rerun `eval/scripts/run-diagnosis.ts`; commit the new `eval/results/<date>/diagnosis-summary.md`.
+- **Done when:** calibration mean > 0.3 on K=10 (was 1/30 = 0.03), no regression on the other 4 criteria (hypothesis/evidence/sizing/fabrication).
 - **Estimated effort:** 1–4hr
+
+### Validate the judges against human labels
+
+- **Exercise ID:** C3.3 (adapted) — the Hamel discipline, made executable.
+- **What to build:** hand-label 15 diagnostic outputs (pass/fail per criterion) and 15 recommendation outputs against the same rubrics the judges use. Compute per-criterion agreement (Cohen's kappa or simple % agreement) between your labels and the judges' scores. Document the result in `eval/judges/validation.md`. Until that document exists, the judge scores should be read as suggestive, not decisive.
+- **Why it earns its place:** the judges in `eval/judges/*.md` are anchored (passing-anchor / failing-anchor examples in the prompt) but not yet validated. Anchoring is half of the discipline; rate-of-agreement with humans is the other half.
+- **Files to touch:** new `eval/judges/validation.md`, new `eval/fixtures/human-labels/diagnosis-*.json` and `recommendation-*.json`.
+- **Done when:** each criterion has a reported per-label agreement rate, and the validation doc honestly names any criterion where the judge disagrees with humans (this is where the rubric needs tightening, not the judge).
+- **Estimated effort:** 2-4hr.
 
 ---
 
@@ -332,32 +402,34 @@ The deep equivalence: both move correctness from "I checked once" to "the suite 
 
 ### Likely questions
 
-**[mid] "You have 169 passing tests. Why isn't that enough to iterate on prompts safely?"**
+**[mid] "You have 269 passing unit tests. Why aren't those evals?"**
 
-Because they test shape, not answer quality. `test/agents/diagnostic.test.ts` injects a fake model and asserts that fenced JSON parses to a typed `Diagnosis` and garbage falls to `FALLBACK` — that is the structured-output contract under test. A hallucinated diagnosis with the right fields passes every one of those tests. Evals are the missing layer that scores whether the answer is *correct*.
-
-```
-unit test → "is the shape right?"   (fake model, deterministic)
-eval      → "is the answer right?"  (real model, scored on a dataset)
-```
-
-**[senior] "Walk me through the failure mode of iterating without a golden set."**
-
-A prompt edit raises the average but regresses one untracked critical case. Concretely: I tighten `monitoring.md`'s happy-path phrasing, mean score goes up, every demo case looks better — but I broke the empty-90-day-window path (L31–37) and now a historical-data workspace gets a ±100% swing reported as critical. With no per-case diff, the average hid it; the merchant finds it for me. The gate has to be two conditions: average up AND no critical case down.
+Because they test shape, not answer quality. `test/agents/diagnostic.test.ts` injects a fake model and asserts that fenced JSON parses to a typed `Diagnosis` and garbage falls to `FALLBACK` — that is the structured-output contract under test. A hallucinated diagnosis with the right fields passes every one of those tests. The real eval lives under `eval/` and runs the actual agents against the seeded Olist dataset — that's the layer that scores whether the answer is *correct*.
 
 ```
-edit → avg ↑ (looks great)  ── but ──▶ empty-window case ↓ (silent)
-no per-case diff → ship the regression → merchant reports bad briefing
+unit test (test/)         → "is the shape right?"   (fake model, CI)
+eval (eval/)              → "is the answer right?"  (real Sonnet, ~$1-3)
 ```
 
-**[arch] "How would you build evals here without a ground-truth dataset to start from?"**
+**[senior] "Walk me through a real prompt-engineering iteration in this codebase, with numbers."**
 
-The dataset already exists in prose. Every CRITICAL/Never/Do-NOT block in the four prompts is a documented production miss — I write each as a case: input anomaly, the canned MCP results that trigger the edge (empty window, < 500 baseline, historical data), and a grader. I run them through the real `DiagnosticAgent` path with a deterministic injected `McpCaller` (the seam in `base.ts` L48–L62 the unit tests already use), and gate prompt edits on it. The dataset then grows from every new production miss.
+The Phase 2.5 monitoring fix is the receipt. Pre-fix loose recall on the 3 seeded anomalies: 6.7%. I added a DATA HORIZON section to `monitoring.md` (anchor the date range so the agent stops querying 2017 from training memory) and a 3-dimension scan plan ("state, category, payment_type — skip any, miss its anomaly"). Post-fix loose recall: 33.3% (5x). Voucher anomaly: 1/10 → 10/10. But the same eval named the limit: sp-revenue-w4 went 1/10 → 0/10 and electronics-spike-w2 stayed 0/10 strict, because the "recent 4w vs baseline 12w" framing fundamentally can't catch a mid-horizon week-specific anomaly. The win is real; the win is partial; both are numbers, not vibes.
 
 ```
-prompt CRITICAL block → eval case → grader
-real agent path (injected deterministic mcp) → output → score
-new prod miss → new permanent case (dataset grows)
+prompt delta → +DATA HORIZON, +3-dim scan plan
+detection eval K=10 → loose recall 6.7% → 33.3% (5x)
+                    → voucher 1/10 → 10/10
+                    → sp-revenue 1/10 → 0/10 (small regress, named)
+                    → strict 0% → 0% (framing limit, named)
+```
+
+**[arch] "How does an LLM-judge here avoid rubber-stamping the agent it grades?"**
+
+Two answers. The structural answer: the diagnosis judge (`eval/judges/diagnosis-judge.md`) is anchored — it ships with a passing-anchor and two failing-anchor examples (failing-on-sizing, failing-on-calibration), each scored line by line in the judge prompt itself, so the judge has explicit calibration before it sees the candidate. The empirical answer: I haven't validated it against human labels yet, and until I do, the judge scores are suggestive, not decisive. The discipline (Hamel's) is: hand-label 15 outputs, compute per-criterion agreement with the judge, only trust the judge on criteria where the agreement rate is high. That's the missing tier of the suite and the next exercise.
+
+```
+judge anchoring (built)    → pass-anchor + 2 fail-anchors per criterion
+judge validation (TODO)    → hand-label 15, compute kappa per criterion
 ```
 
 ### The question candidates always dodge
@@ -366,10 +438,12 @@ new prod miss → new permanent case (dataset grows)
 
 ### One-line anchors
 
-- `test/agents/diagnostic.test.ts` — unit test of shape, not quality; the gap evals fill.
-- `lib/agents/prompts/monitoring.md` L31–37 — empty-window CRITICAL block = an eval case in prose.
-- `lib/agents/prompts/diagnostic.md` L38–50 — historical-data block = an eval case in prose.
-- `lib/agents/base.ts` L48–L62 — the injection seam an eval runner would reuse.
+- `eval/scripts/run-detection.ts` — the runner; spawns a real `OlistDataSource` and runs `MonitoringAgent` K times.
+- `eval/scripts/lib/scorer.ts` — the detection scorer (LOOSE 2-of-3, STRICT 3-of-3).
+- `eval/judges/diagnosis-judge.md` — the 5-criterion rubric (hypothesis/evidence/sizing/calibration/fabrication); the receipt for "the prompt deficit has a number on it."
+- `eval/results/2026-06-15-after-fix/summary.md` — the per-anomaly delta table with the honest "what worked / what didn't" interpretation.
+- `lib/agents/prompts/monitoring.md` `## DATA HORIZON` section + 3-dim scan plan — the Phase 2.5 prompt delta that drove loose recall 6.7% → 33.3%.
+- `test/agents/diagnostic.test.ts` — unit test of shape, not quality; the layer evals complement.
 - Hamel Husain, "Your AI Product Needs Evals" — the canonical reference.
 
 ---
@@ -382,19 +456,19 @@ From memory, draw the eval loop: edit prompt → dataset → runner (real path) 
 
 ### Level 2 — Explain
 
-Out loud: why are the 169 Vitest tests (e.g. `test/agents/diagnostic.test.ts`) NOT evals? Name what they assert (shape) versus what an eval asserts (answer quality), and give an example of an output that passes all 169 tests but should fail an eval.
+Out loud: why are the 269 Vitest tests (e.g. `test/agents/diagnostic.test.ts`) NOT evals, and what does `eval/scripts/run-detection.ts` do that they cannot? Name the seam (unit tests inject fake Anthropic + fake DataSource; the eval spawns a REAL `OlistDataSource` subprocess and runs the real Sonnet 4.6 with the real production prompt).
 
 ### Level 3 — Apply
 
-Scenario: turn `monitoring.md` L31–37 (the empty-90-day-window CRITICAL block) into an eval case. Specify the input anomaly, the canned MCP tool results that make the recent window empty, the expected output (`[]` or an `execution_time`-anchored result, NOT a ±100% swing), and which class you'd run it through (`MonitoringAgent`) with which injected dependency made deterministic (the `McpCaller`).
+Scenario: you're proposing the Path A iteration from `eval/results/2026-06-15-after-fix/summary.md` (the sliding-window scan plan to lift sp-revenue-w4 above 0/10 strict). Write the prompt delta (the new scan-plan paragraph for `monitoring.md`), name which `npm run eval:*` command verifies it, and predict which per-anomaly cell in the next `summary.md` should move.
 
 ### Level 4 — Defend
 
-A reviewer says: "We have 169 green tests, we don't need evals." State the distinction between shape and quality, give the average-up-edge-case-down failure mode as the concrete risk, point to a real CRITICAL block (`diagnostic.md` L38–50) that no unit test pins for correctness, and name the breakpoint event that makes building `evals/` mandatory.
+A reviewer says: "Detection precision dropped from 0% to 0% strict and false positives doubled — that's a regression, revert the prompt." State the actual finding (loose recall +26.6, voucher 1/10 → 10/10, the framing limit named honestly), and the principle: a measured partial win + a named limit is a senior outcome; reverting because one number didn't move loses the voucher receipt and the per-anomaly visibility.
 
 ### Quick check — code reference test
 
-Which seam in `lib/agents/base.ts` would an eval runner reuse to feed deterministic tool results to the real agent, and how does its use differ from the unit tests'? (Answer: the injected `anthropic` client and `McpCaller` parameters of `runAgentLoop` — `lib/agents/base.ts` L48–L62, interface L16–L22. Unit tests inject a fake model AND a fake MCP; an eval runner keeps the REAL Anthropic client for real model behavior but injects a deterministic `McpCaller` that replays the case's canned results.)
+Which file in `eval/judges/` contains the 5-criterion diagnosis rubric, and what is the pass threshold? (Answer: `eval/judges/diagnosis-judge.md`; criteria = hypothesis 0-2 + evidence 0-2 + sizing 0-2 + calibration 0-1 + fabrication 0-2; pass ≥7/9. The judge runs as a second Sonnet 4.6 call with the rubric as its system prompt; the candidate diagnosis is the user message; it returns JSON scores per criterion.)
 
 ## See also
 
@@ -407,3 +481,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Phase 3 ships: flipped framing from "not yet implemented" to Case A. Rewrote Zoom-out, Part 2.5 (unit-tests-vs-evals), Part 3 (now references the real `eval/judges/*.md` files: 5-crit diagnosis + 3-crit recommendation + similarity), Implementation block (4-pillar runner + scorer + judges + fixtures + committed results), Project exercises (now: lift strict above 0%, fix calibration=29/30=0 deficit, validate judges vs human labels), and Interview defense. Added measured-receipt: Phase 2.5 monitoring fix drove loose recall 6.7% → 33.3% (voucher 1/10 → 10/10), with sp-revenue/electronics still 0/10 strict honestly named as a framing limit. Updated unit-test count 169 → 269.

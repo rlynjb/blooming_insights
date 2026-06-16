@@ -4,7 +4,9 @@
 
 ## Zoom out, then zoom in
 
-Every AI feature in blooming insights — diagnosis, recommendation, monitoring scan, query answer — runs Claude in a multi-turn loop with tool use. The model's output is non-deterministic. To test the *agent code that wraps* the model, you build a fake `messages.create` that returns a *queued* list of pre-written responses and inject it as the SDK. The real agent code runs end-to-end against the script; the test author controls every turn.
+Every AI feature in blooming insights — diagnosis, recommendation, monitoring scan, query answer, intent classification — runs Claude in a multi-turn loop with tool use. The model's output is non-deterministic. To test the *agent code that wraps* the model, you build a fake `messages.create` that returns a *queued* list of pre-written responses and inject it as the SDK. The real agent code runs end-to-end against the script; the test author controls every turn.
+
+This pattern was extended in the Phase 2 swap with **two new test files** that share the same shape: `synthesis-instruction.test.ts` (4 tests pinning the forced-synthesis behaviour against scripted multi-turn flows) and `tool-schemas.test.ts` (3 tests on the schema-aware tool registration that the harness depends on). 40 tests now share the buildFakeAnthropic helper, up from 31.
 
 ```
 Zoom out — where this pattern sits in the system
@@ -22,7 +24,7 @@ Zoom out — where this pattern sits in the system
   │              query}.ts                                    │
   │                                                           │ ← we are here
   │  Tested via: scripted Anthropic + fake McpCaller          │
-  │  31 tests across 5 files                                   │
+  │  40 tests across 6 files                                   │
   └─────────────────────────────────────────────────────────┘
                                 ▲ tool calls
   ┌─ External (faked at the SDK seam) ──────────────────────┐
@@ -182,9 +184,9 @@ Mock-call introspection — assertion on outbound traffic
 
 Without this, you can only test the agent's *return value*. With it, you can test the agent's *outbound behaviour* — which is where the bug-prone branches actually live.
 
-#### The McpCaller fake (the second seam)
+#### The DataSource fake (the second seam — renamed in Phase 2)
 
-The agent doesn't call the MCP SDK directly. It calls through a `McpCaller` interface — three methods, structurally typed. A test satisfies it with a 5-line object literal. No `implements` keyword required; TypeScript accepts the shape match.
+The agent doesn't call the MCP SDK directly. It calls through a `DataSource` interface (`lib/data-source/types.ts`) — three methods, structurally typed. A test satisfies it with a 5-line object literal. No `implements` keyword required; TypeScript accepts the shape match. *(Historical note: v1 of this guide called the interface `McpCaller`. The Phase 2 swap renamed it to `DataSource` when the second implementation — `OlistDataSource` — was added. Mechanics unchanged; same shape match, same five-line fake works.)*
 
 ```
 The McpCaller seam — interface is the contract
@@ -202,7 +204,9 @@ The McpCaller seam — interface is the contract
     }
 ```
 
-The compression matters: the real `McpClient` does retries, caching, rate-limit parsing, error tagging — fifty lines of behaviour. The interface narrows it to one method. The test gets to ignore all the production-side complexity and focus on what the agent *does* with the result. That's the seam.
+The compression matters: the real `BloomreachDataSource` (formerly `McpClient`, now living at `lib/data-source/bloomreach-data-source.ts`) does retries, caching, rate-limit parsing, error tagging — fifty lines of behaviour. The interface narrows it to one method. The test gets to ignore all the production-side complexity and focus on what the agent *does* with the result. That's the seam.
+
+The Phase 2 payoff: this same seam is now used by **two production implementations** (`BloomreachDataSource`, `OlistDataSource`) AND **two test paths** (the in-process fake here in Pillar 1, the real `OlistDataSource` over stdio in Pillar 2's eval suite). One interface, four consumers. The `DataSource` extraction is the load-bearing refactor that lets both pillars run against the same agents.
 
 ### Move 2 variant — the load-bearing skeleton
 
@@ -424,4 +428,8 @@ The fake / real boundary in one diagram
 - `audit.md#testing-ai-features` — the deterministic-vs-eval seam this pattern straddles
 - `02-fixture-driven-schema-parser.md` — the fixture-driven unit pattern (Level 2), one rung below this on the pyramid
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard rejection discipline that the harness's `isDiagnosis` validation step depends on
-- (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the eval-half write-up; the buildable target above this pattern's ceiling
+- `05-llm-eval-as-testing.md` — Pillar 2; uses the *real* DataSource against the same agents this harness fakes the DataSource for
+- (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the model-architecture / rubric-design deep walk
+
+---
+Updated: 2026-06-16 — Test count 31→40 (synthesis-instruction + tool-schemas added). `McpCaller` renamed to `DataSource` in Phase 2 swap — mechanics unchanged, paragraph added explaining the rename. Backwards-compat shim at `lib/mcp/client.ts` not surfaced here (lives in audit's design-pressure lens). Added See-also link to 05.

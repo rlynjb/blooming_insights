@@ -1,22 +1,22 @@
 # Agent evaluation
 
-**Industry name(s):** Trajectory evaluation, agent eval, tool-call accuracy, agent-as-judge
+**Industry name(s):** Trajectory evaluation, agent eval, tool-call accuracy, agent-as-judge, LLM-as-judge rubric
 **Type:** Industry standard · Language-agnostic
 
-> Evaluating an agent is harder than evaluating one LLM call because the unit of evaluation is the trajectory, not just the final answer. blooming insights has ~169 vitest tests TDD'd with injected fakes that check the loop's *shape* (parse failures, budget enforcement, forced-final path), and the streamed reasoning trace IS an inspectable trajectory per run — but the automated trajectory-eval harness that would grade those trajectories does not exist yet.
+> Evaluating an agent is harder than evaluating one LLM call because the unit of evaluation is the trajectory, not just the final answer. blooming insights has 269 unit tests across the app and the authored MCP server that check the loop's *shape* (parse failures, budget enforcement, forced-final path), the streamed `AgentEvent[]` is an inspectable trajectory per run — **and** Phase 3 added a four-pillar evaluation suite (detection precision/recall, diagnosis rubric, recommendation rubric, regression) under `eval/` that spends real Anthropic dollars to score real agent output against seeded ground truth. The four portfolio numbers (37% / 33.3% detection · 53.3% diagnosis · 100% recommendation · 30% regression baseline) are the honest measurement of what this codebase can defend.
 
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Agent evaluation lives *orthogonal* to the request flow — it doesn't run inside any band, it grades them. blooming insights has the orthogonal eval-time path partially wired: `lib/eval/*` runs schema validation and coverage gates against agent outputs, and the trajectory is *recorded* (tool name, args, result, duration) in the route's NDJSON stream. What's missing is the trajectory-eval *harness* that would replay those recorded runs against golden expectations and grade them automatically.
+**Zoom out — the bigger picture.** Agent evaluation lives *orthogonal* to the request flow — it doesn't run inside any band, it grades them. blooming insights now has the full eval band wired: the trajectory is *recorded* (tool name, args, result, duration) in the route's NDJSON stream, the unit tests assert loop-shape invariants with injected fakes, and Phase 3's `eval/scripts/run-*.ts` runners spend real Anthropic dollars to drive the live agents against a seeded `mcp-server-olist` subprocess and score each output against a rubric or a captured golden.
 
 ```
   Zoom out — where agent evaluation lives
 
-  ┌─ Pipeline coordinator ──────────────────────────┐
-  │  lib/agents/pipeline.ts                          │
+  ┌─ Route handler (deterministic pipeline) ────────┐
+  │  app/api/agent/route.ts                          │
   └─────────────────────────┬────────────────────────┘
                             │
   ┌─ Shared agent loop ─────▼────────────────────────┐
@@ -26,25 +26,29 @@
                             │  recorded trajectory
   Orthogonal to request flow (eval-time):
   ┌─ Eval band ─────────────┴────────────────────────┐  ← we are here
-  │  ★ lib/eval/* ★ (today: schema + coverage gates)  │
-  │  ★ trajectory-eval harness ★ (absent — would       │
-  │     replay recorded runs, grade vs golden)        │
-  │  Measures: tool-call accuracy, trajectory length, │
-  │   recovery on errors, cost per investigation      │
+  │  ★ test/* (269 unit tests, injected fakes) ★     │
+  │  ★ eval/scripts/run-detection.ts (precision/    │
+  │     recall vs 3 seeded anomalies, K=10) ★        │
+  │  ★ eval/scripts/run-diagnosis.ts (5-criterion   │
+  │     rubric, Sonnet-as-judge, ≥7 = pass) ★        │
+  │  ★ eval/scripts/run-recommendation.ts (3-       │
+  │     criterion rubric, ≥4 = pass) ★               │
+  │  ★ eval/scripts/run-regression.ts (capture +    │
+  │     score against captured goldens) ★            │
   └──────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: how do you evaluate something whose unit of work isn't a single input/output but a sequence of decisions? Final-output eval alone misses the failure modes that cost the most — an agent that returns the right answer after 12 tool calls when 4 would have done; an agent that recovers from a 429 silently; an agent that picks the wrong tool but stumbles into a right-looking answer. Trajectory-aware eval grades the path, not just the destination. Below, you'll see what blooming insights records today, what's gated by schema, and what a trajectory-eval harness would add on top.
+**Zoom in — narrow to the concept.** The question is: how do you evaluate something whose unit of work isn't a single input/output but a sequence of decisions? Final-output eval alone misses the failure modes that cost the most — an agent that returns the right answer after 12 tool calls when 4 would have done; an agent that recovers from a 429 silently; an agent that picks the wrong tool but stumbles into a right-looking answer. Trajectory-aware eval grades the path, not just the destination. Below, you'll see how each of the four eval pillars maps onto that gap — and how PR D → PR E → PR F → PR G's chain demonstrates the eval flywheel: a measurement surfaces a real bug, a fix lands, the next measurement either confirms or catches recurrence.
 
 ---
 
 ## Structure pass
 
-**Layers.** Agent evaluation sits orthogonal to the request flow — its own band that grades the others. Four layers: the **Live request band** (what runs in production — Pipeline → agent loop → tools, emitting NDJSON trace events as it goes), the **Recorded trajectory** (the stream of `{tool, args, duration, result, error}` events the loop already emits, persistable but not yet persisted at eval scope), the **Eval-time gates** (`lib/eval/*` — today: schema validation + coverage gate run against agent outputs), and the **Trajectory-eval harness** (would replay recorded runs against golden expectations, grade tool-call accuracy / trajectory length / recovery / cost — absent today). The eval band runs offline, the live band runs per-request, but they share a vocabulary.
+**Layers.** Agent evaluation sits orthogonal to the request flow — its own band that grades the others. Four layers: the **Live request band** (what runs in production — route → agent loop → DataSource, emitting NDJSON trace events as it goes), the **Recorded trajectory** (the stream of `{tool, args, duration, result, error}` events the loop emits, persisted to `lib/state/investigations.ts` and to `eval/results/<date>/` for the eval runners), the **Loop-shape unit tests** (269 vitest tests across `test/` and `mcp-server-olist/test/` with injected `DataSource` + Anthropic fakes — assert invariants), and the **Trajectory-grade eval harness** (`eval/scripts/run-*.ts` — runs the real agents against seeded Olist ground truth, scores via deterministic matchers OR a Sonnet-as-judge rubric, writes JSON + `summary.md` per dated run).
 
-**Axis: guarantees.** What does the eval promise vs what does it merely best-effort observe — and at what moment in the lifecycle (request-time deterministic check vs offline probabilistic grade)? This is the right axis because the entire discipline of agent evaluation is about *layering different kinds of guarantees onto different stages*. A schema gate at request time is a hard guarantee (parse or fail); a trajectory grade at offline-eval time is a probabilistic measurement against a golden set. Pick the wrong axis (control, say) and the eval band looks like just "another call into the loop" — guarantees is what makes the offline/online split legible.
+**Axis: guarantees.** What does the eval promise vs what does it merely best-effort observe — and at what moment in the lifecycle (request-time deterministic check vs offline probabilistic grade)? This is the right axis because the entire discipline of agent evaluation is about *layering different kinds of guarantees onto different stages*. A schema gate at request time is a hard guarantee (parse or fail); a deterministic detection match (LOOSE / STRICT) is a hard rule applied offline; an LLM-as-judge rubric score is a probabilistic measurement across K runs. Pick the wrong axis (control, say) and the eval band looks like just "another call into the loop" — guarantees is what makes the four-pillar split legible.
 
-**Seams.** Two seams matter. Seam 1 sits between the live request band and the recorded trajectory — guarantees flip from "request-time deterministic check (schema parse, coverage gate)" to "observed event stream you can replay later." Seam 2 sits between the recorded trajectory and the trajectory-eval harness — guarantees flip from "this happened" (a fact about one run) to "this is the rate at which our agent picks the right first tool" (a statistical claim across many runs against a golden set). Seam 2 is the load-bearing one: it's the boundary between observability and evaluation, and it's the boundary blooming insights hasn't crossed yet — the recorder exists, the harness doesn't.
+**Seams.** Two seams matter. Seam 1 sits between the live request band and the recorded trajectory — guarantees flip from "request-time deterministic check (schema parse, coverage gate)" to "observed event stream you can replay later." Seam 2 sits between the recorded trajectory and the eval harness — guarantees flip from "this happened" (a fact about one run) to "this is the rate at which our agent surfaces a known anomaly across K=10 runs" (a statistical claim with ground truth). Seam 2 is the load-bearing one: it's the boundary between observability and evaluation, and it's the boundary Phase 3 crossed — the four eval runners each plant their own foot on the harness side of that seam, with `eval/judges/*.md` versioning the rubric prompts alongside the code.
 
 ```
   Structure pass — Agent evaluation
@@ -52,8 +56,8 @@
   ┌─ 1. LAYERS ───────────────────────────────────┐
   │  Live request band (emits NDJSON trace)        │
   │  Recorded trajectory (event stream)            │
-  │  Eval-time gates (schema + coverage today)     │
-  │  Trajectory-eval harness (absent today)        │
+  │  Loop-shape unit tests (269, injected fakes)   │
+  │  Trajectory-grade eval harness (4 runners)     │
   └────────────────────────┬───────────────────────┘
                            │  pick the axis
   ┌─ 2. AXIS ─────────────▼────────────────────────┐
@@ -66,16 +70,16 @@
   │          (sync deterministic check →           │
   │          observed event stream)                │
   │  Seam 2: Recorded trajectory ↔ Eval harness    │
-  │          (one run "happened" → many runs       │
-  │          graded against golden)                │
+  │          (one run "happened" → K runs scored   │
+  │          against seeded ground truth)          │
   │          ★ load-bearing — observability ↔ eval │
-  │  In this repo: Seam 2 is the unbuilt one       │
+  │  Phase 3 crossed Seam 2 with the four runners  │
   └────────────────────────┬───────────────────────┘
                            ▼
                    Block 4 — How it works
 ```
 
-The skeleton is mapped — the rest of this file walks the unit-of-evaluation expansion, what's recorded today, and what a trajectory-eval harness would add on top.
+The skeleton is mapped — the rest of this file walks the unit-of-evaluation expansion, what each of the four eval pillars measures, and how the eval flywheel turns measurements into shipped fixes.
 
 ---
 
@@ -102,7 +106,7 @@ the unit of evaluation expands
                           └──────────────────────────────┘
 ```
 
-The strategy in plain English: **the trajectory is data you can inspect, freeze, diff, and grade.** Three things have to be true for trajectory eval to be possible: (1) the trajectory is recorded structurally (not just logged as prose), (2) there's a way to compare a new trajectory against an expected shape, and (3) the comparison is cheap enough to run on every PR. blooming insights has (1) — every reasoning step, tool call, result, error, and final output is in a tagged-union event record and replayable from the cache. It has a partial version of (2) — the unit tests assert *loop-shape* invariants (forced-final paths, parse fallbacks, budget enforcement). It does not have (3) — no automated trajectory-eval harness that runs a frozen anomaly through the loop and scores the new trajectory against a golden one.
+The strategy in plain English: **the trajectory is data you can inspect, freeze, diff, and grade.** Three things have to be true for trajectory eval to be possible: (1) the trajectory is recorded structurally (not just logged as prose), (2) there's a way to compare a new trajectory or its output against an expected shape, and (3) the comparison is cheap enough to run on demand. blooming insights has all three: (1) every reasoning step, tool call, result, error, and final output is in a tagged-union `AgentEvent` record streamed live and persisted; (2) the unit tests assert *loop-shape* invariants AND the four eval runners assert *output-quality* claims against seeded ground truth and captured goldens; (3) `npm run eval:detection -- --K=10` runs ~10 minutes and costs ~$1-3 — cheap enough to gate on a prompt change, not on every PR. The harness is opt-in (not in CI yet) by deliberate choice: it spends real money, and the goldens drift faster than the prompts do, so re-baselining is the bigger ongoing cost than running it.
 
 ### Move 1 — The trajectory exists as a typed record
 
@@ -134,7 +138,7 @@ The condition under which it works: the trajectory has to be complete and faithf
 
 ### Move 2 — Unit tests grade the LOOP, not the trajectory quality
 
-The technical thing: **~169 vitest tests use the injected model client and MCP-caller seams in the shared agent loop to drive the loop with fake responses**, then assert the loop's reactive behaviour — parse-failure fallback, the forced-final tool-less path, the budget cap, the schema gate, validators returning safe defaults.
+The technical thing: **269 vitest tests use the injected model client and `DataSource`/`McpCaller` seams in the shared agent loop to drive the loop with fake responses**, then assert the loop's reactive behaviour — parse-failure fallback, the forced-final tool-less path, the budget cap, the schema gate, validators returning safe defaults. 226 of the 269 sit under `test/` covering the app; the other 43 sit under `mcp-server-olist/test/` covering the authored MCP server's three domain tools and SQLite query layer.
 
 If you're coming from frontend, this is component-testing posture: render with a mock data layer, click through, assert the right callbacks fired. You're testing *that the component reacts correctly to inputs*, not that the data layer's content is correct.
 
@@ -156,48 +160,69 @@ the test seams — a small interface for fakes
     ✓ ...
 ```
 
-What these tests do well: they pin down the *invariants* of the loop. The forced-final turn always strips tools. A budget overrun always triggers the synthesis instruction. A parse failure always returns the type's safe default rather than throwing through the route. Those invariants are the load-bearing safety properties — if any of them broke, the system would silently misbehave. The 169 tests are how you sleep at night knowing they hold.
+What these tests do well: they pin down the *invariants* of the loop. The forced-final turn always strips tools. A budget overrun always triggers the synthesis instruction. A parse failure always returns the type's safe default rather than throwing through the route. Those invariants are the load-bearing safety properties — if any of them broke, the system would silently misbehave. The 269 tests are how you sleep at night knowing they hold.
 
-What these tests don't do: grade whether the trajectory itself was *good*. They assert "given fake response X, the loop did Y" — they don't assert "given anomaly X, the model's chosen tools and order were optimal." That's the gap a trajectory-eval harness would fill.
+What these tests don't do: grade whether the trajectory itself was *good*. They assert "given fake response X, the loop did Y" — they don't assert "given anomaly X, the model's chosen tools and order were optimal." That's the gap the Phase 3 eval suite fills.
 
 The condition under which it works: the fakes have to be representative. A fake `McpCaller` that returns `{count: 42000}` lets the loop run; whether the model actually decides correctly *given that count* is a model-quality question, not a loop-shape question. The tests are deliberately scoped to the latter.
 
-### Move 3 — What's not yet built: the trajectory-eval harness (Case B)
+### Move 3 — The four-pillar eval suite (the harness Phase 3 built)
 
-The technical thing: **a harness that runs the real (or near-real) agent loop on a curated set of input cases and scores each resulting trajectory against expected outcomes.**
-
-A trajectory-eval harness, in its mature form, has four pieces:
+The technical thing: **four runners under `eval/scripts/` that each drive the real agent loop against the seeded Olist subprocess, score the output against a known-good rubric or matcher, and write per-run JSON plus a `summary.md` to a dated results directory.** Each pillar measures a different unit of evaluation: detection grades *what was surfaced*, diagnosis grades *the reasoning that followed*, recommendation grades *the action proposed*, regression grades *the drift between captures*. The seed data in `mcp-server-olist/data/olist.db` carries three ground-truth anomalies (the `seeded_anomalies` table): `sp-revenue-drop-w4` (critical, ×0.7), `electronics-spike-w2` (warning, ×2.5), `voucher-dropoff-w10-on` (critical, ×0.05). The agent under test never knows they're there.
 
 ```
-trajectory-eval harness (NOT in this codebase yet)
+the four-pillar eval suite (built in Phase 3)
 
-  ┌─ frozen input set ────────────────────────────────────────┐
-  │  ~30–100 representative anomalies / queries / workspaces  │
-  │  versioned in the repo, not mocked                        │
+  ┌─ seeded ground truth ─────────────────────────────────────┐
+  │  mcp-server-olist/data/olist.db                            │
+  │    seeded_anomalies table — 3 ground-truth records         │
+  │    + ~10k synthetic Olist rows + 6-month data horizon      │
   └──────────────────────┬────────────────────────────────────┘
                          ▼
-  ┌─ run the agent ───────────────────────────────────────────┐
-  │  shared agent loop on each input → trajectory             │
-  │  may use cached MCP responses for determinism             │
+  ┌─ run each agent against the live Olist subprocess ────────┐
+  │  K=10 fresh agent runs per anomaly per eval                │
+  │  fresh subprocess per run (one crash doesn't poison K)     │
+  │  EVAL_RUN_TAG env var stamps each run for the audit trail  │
   └──────────────────────┬────────────────────────────────────┘
                          ▼
-  ┌─ score the trajectory ────────────────────────────────────┐
-  │  metrics:                                                  │
-  │    task success rate     (final output passes validators)│
-  │    tool-call accuracy    (expected tools called, in order)│
-  │    trajectory efficiency (steps & cost to completion)     │
-  │    recovery rate         (loop absorbed transient errors) │
+  ┌─ score against the right yardstick per pillar ────────────┐
+  │  detection      → deterministic matcher (metric +          │
+  │                   segment + time-window, 2/3 = LOOSE,      │
+  │                   3/3 = STRICT)                            │
+  │  diagnosis      → Sonnet 4.6 judge, 5-criterion rubric,    │
+  │                   pass ≥ 7 (root cause · evidence ·         │
+  │                   hypotheses · scope · impact)             │
+  │  recommendation → Sonnet 4.6 judge, 3-criterion rubric,    │
+  │                   pass ≥ 4 (specificity · feature fit ·    │
+  │                   impact plausibility)                     │
+  │  regression     → 2-mode (capture | score) — capture       │
+  │                   freezes a golden, score diffs current    │
+  │                   output structurally + via a similarity   │
+  │                   judge                                    │
   └──────────────────────┬────────────────────────────────────┘
                          ▼
-  ┌─ compare vs frozen golden ────────────────────────────────┐
-  │  diff new trajectory against last-good trajectory          │
-  │  PR comment: "tool calls +2, cost +$0.04, success same"    │
+  ┌─ write artefacts ─────────────────────────────────────────┐
+  │  eval/results/<YYYY-MM-DD>[<-tag>]/                        │
+  │    <pillar>-K10-{loose,strict}.json                        │
+  │    <pillar>-K10-raw.json    (audit trail)                  │
+  │    summary.md               (human-readable scorecard)     │
+  │  + eval/judges/*.md          (rubric prompts, versioned)   │
   └────────────────────────────────────────────────────────────┘
 ```
 
-The practical consequence of NOT having this: model improvements (or regressions) ship blind. A prompt change might improve answer quality and add 3 tool calls per investigation; both are real effects and only the second one shows up in the bill weeks later. The streamed trace makes spot-checking easy (open `/debug`, eyeball the trajectory) but spot-checking 30 inputs by hand doesn't catch slow drift.
+The practical consequence: model improvements (or regressions) no longer ship blind. A prompt change either lifts the detection number across a K=10 rerun or it doesn't; either lifts the diagnosis rubric score or it doesn't. The streamed trace still makes spot-checking easy (open `/debug`, eyeball the trajectory) — but spot-checking is now the supplement to the numbers, not the only line of defence.
 
-Why it's not built (the honest reason): the agent loop is gated behind real MCP calls to a rate-limited remote host. To freeze trajectories, you'd need either (a) cached MCP responses replayable from a fixture file (the seed file is a start) or (b) a mock MCP server that returns deterministic results. Both are real work. The 169 unit tests + the inspectable streamed trace are how the codebase currently catches the failure modes that matter most; trajectory eval is the next escalation if model-quality drift becomes a real concern.
+The condition under which it works: the seeded anomalies must be *the* anomalies the test data contains. If the synthetic Olist generator accidentally introduced a fourth pattern strong enough for the agent to find, every detection of it counts as a false positive against ground truth — even though it's a real signal. The deterministic generator + the `seeded_anomalies` table are the contract; deviations there silently invalidate every score.
+
+**The eval flywheel — what this actually buys.** The four pillars don't matter in isolation; they matter as a closed loop. The PR D → PR E → PR F → PR G chain shows it end to end:
+
+  → **PR D (detection)** surfaced a 5% LOOSE recall on the first run — the monitoring agent was anchoring on "last 90 days" framing from the Bloomreach-era prompt, and on Olist's 6-month horizon that window landed past the seeded anomalies.
+  → **Phase 2.5 fix** rewrote the monitoring prompt with the `DATA HORIZON` block + the 3-dim scan plan. Reran detection: voucher detection lifted 1/10 → 10/10, LOOSE recall lifted ~5x to 33.3%. The fix landed because the number changed.
+  → **PR E (diagnosis)** surfaced a unit-conversion bug — the diagnostic agent was reading BRL `payment_value` as Reais in one query and cents in the next, so its conclusions sometimes silently swung by ~100x. The 5-criterion judge caught it as an "evidence grounding" failure; a prompt fix patched it.
+  → **PR F (recommendation)** reran with the BRL fix in. The judge caught the unit bug recurring at run 8 of K=10 — a real measurement that the fix wasn't tight enough yet, surfaced before it could ship to users.
+  → **PR G (regression)** added the capture-and-score flow that now diffs every prompt change against a 10-fixture golden set. The 30% baseline is honest: monitoring/diagnostic outputs drift semantically more than the prompt structure changed, which is exactly the signal the regression eval exists to surface.
+
+This loop — measurement → fix → re-measurement → discovery of the next thing — is what a working eval system looks like. The numbers aren't the point; the loop is.
 
 ### Move 4 — The evaluator paradox (why agent-as-judge needs care)
 
@@ -236,11 +261,11 @@ The full picture is below.
 ## Agent evaluation — diagram
 
 ```
-What's built (✓) vs what's not yet (✗)
+Three layers, all built (✓)
 
   ┌──────────── LOOP-SHAPE TESTS (✓ built) ──────────────────────┐
-  │ ~169 vitest tests with injected model + MCP-caller fakes      │
-  │ assert invariants:                                            │
+  │ 269 vitest tests (226 app + 43 mcp-server-olist) with         │
+  │ injected DataSource + Anthropic fakes assert invariants:      │
   │   forced-final turn strips tools                              │
   │   budget cap triggers synthesis instruction                   │
   │   parse failures → safe defaults                              │
@@ -259,22 +284,35 @@ What's built (✓) vs what's not yet (✗)
   │ viewable: /debug, /api/agent?insightId=<id>                    │
   └──────────────────────────────────────────────────────────────┘
                             ▲
-                            │ replayable for eye inspection — no harness
+                            │ replayable for eye inspection
+                            │ AND consumed by the eval runners below
                             │
-  ┌──────────── TRAJECTORY-EVAL HARNESS (✗ not yet built) ───────┐
-  │ would add:                                                    │
-  │   frozen input set (30–100 anomalies / queries)               │
-  │   deterministic MCP fixtures (replay or mock)                 │
-  │   trajectory scoring:                                         │
-  │     • task success rate                                       │
-  │     • tool-call accuracy (expected tools, expected order)     │
-  │     • trajectory efficiency (steps + $ to completion)         │
-  │     • recovery rate (was a 429 absorbed cleanly)              │
-  │   cross-family judge + frozen golden + human spot-check       │
-  │ would catch what unit tests + spot-checks miss:               │
-  │   silent regressions in tool choice                           │
-  │   cost drift per investigation                                │
-  │   recovery degradation under load                             │
+  ┌──────────── PHASE 3 EVAL SUITE (✓ built) ────────────────────┐
+  │ ground truth: 3 seeded anomalies in mcp-server-olist/data    │
+  │ K=10 runs per anomaly, fresh subprocess per run               │
+  │ EVAL_RUN_TAG env var stamps each batch                        │
+  │                                                                │
+  │ ┌─ DETECTION ──────────────── 37% LOOSE p · 33.3% recall ──┐ │
+  │ │  run-detection.ts + scorer.ts (deterministic 3-criterion) │ │
+  │ │  metric · segment · time-window match                     │ │
+  │ └───────────────────────────────────────────────────────────┘ │
+  │ ┌─ DIAGNOSIS ──────────────── 53.3% pass rate ─────────────┐ │
+  │ │  run-diagnosis.ts + judge.ts (Sonnet 4.6 judge, ≥7 pass) │ │
+  │ │  5-criterion rubric in eval/judges/diagnosis-judge.md    │ │
+  │ └───────────────────────────────────────────────────────────┘ │
+  │ ┌─ RECOMMENDATION ─────────── 100% pass rate ──────────────┐ │
+  │ │  run-recommendation.ts + judge-rec.ts (≥4 pass)          │ │
+  │ │  3-criterion rubric in eval/judges/recommendation-judge.md│ │
+  │ └───────────────────────────────────────────────────────────┘ │
+  │ ┌─ REGRESSION ─────────────── 30% baseline pass rate ──────┐ │
+  │ │  run-regression.ts (capture | score modes)               │ │
+  │ │  structural-diff.ts + similarity-judge.ts                 │ │
+  │ │  10 golden fixtures across the 4 agent stages            │ │
+  │ └───────────────────────────────────────────────────────────┘ │
+  │                                                                │
+  │ The flywheel: PR D detection gap → Phase 2.5 prompt fix →    │
+  │ PR E BRL bug → PR F judge catches recurrence → PR G regression│
+  │ surfaces conclusion-stability drift across the suite           │
   └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -282,33 +320,64 @@ What's built (✓) vs what's not yet (✗)
 
 ## Implementation in codebase
 
-**Case A — partial (loop-shape testing + inspectable trajectory).**
+All three layers are built.
 
-**Loop-shape unit tests (the ~169):**
-**Directory:** `tests/` (vitest)
-**Seams used:** the `McpCaller` interface (`lib/agents/base.ts` L16–L22) and the Anthropic client passed into `runAgentLoop()` — both injected, no network in tests.
+**Loop-shape unit tests (the 269):**
+**Directories:** `test/` (226 tests covering the app's agents, MCP boundary, state, streaming, data-source adapters) and `mcp-server-olist/test/` (43 tests covering the authored MCP server: domain tools, SQLite query layer, server boot)
+**Seams used:** the `McpCaller` type alias (`lib/agents/base.ts:24` — `Pick<DataSource, 'callTool'>`) and the Anthropic client passed into `runAgentLoop()` — both injected, no network in tests. The `DataSource` interface (`lib/data-source/types.ts`) is the contract every fake satisfies.
 
 **The streamed trajectory record:**
 **File:** `lib/mcp/events.ts` — `AgentEvent` union
-**Route boundary:** `app/api/agent/route.ts` — `hooksFor(agent)` (L181–L195) wires `runAgentLoop`'s `onText` / `onToolCall` / `onToolResult` into `send(...)` which appends to `collected: AgentEvent[]` (L171–L175)
-**Persistence:** `lib/state/investigations.ts` L11/L22/L30 (in-memory `Map`) + the dev cache file + the committed demo seed
+**Route boundary:** `app/api/agent/route.ts` — wires `runAgentLoop`'s `onText` / `onToolCall` / `onToolResult` into a `send(...)` that appends to a `collected: AgentEvent[]` buffer while streaming each event to the client.
+**Persistence:** `lib/state/investigations.ts` (in-memory `Map`) + the dev cache file + the committed demo seed
 **Inspection surfaces:** `GET /api/agent?insightId=<id>` replays the array; `/debug` views it; the investigation page consumes it via `lib/hooks/useInvestigation.ts`
 
-**Case B — not yet implemented.**
-
-There is no automated trajectory-eval harness in this codebase. The honest reason: the agent loop hits a rate-limited live MCP server, so deterministic trajectory regression requires either replayable MCP fixtures (the seed file is a start) or a mock MCP server, and neither is wired up. The cost so far is model-quality drift would have to be caught by hand-spot-checking the streamed trace, not by an automated diff against a golden trajectory.
+**Phase 3 eval suite (the four runners):**
 
 ```
-shape of what would change to build it (not written):
-  // tests/eval/trajectories.eval.ts (new)
-  for (const goldenInput of frozenAnomalies) {
-    const traj = await runMonitoringWithFixedMcp(goldenInput);
-    const score = scoreTrajectory(traj, goldenInput.expected);
-    expect(score.toolCallAccuracy).toBeGreaterThan(0.9);
-    expect(score.steps).toBeLessThan(goldenInput.maxSteps);
-    expect(score.taskSuccess).toBe(true);
+eval/
+  scripts/
+    run-detection.ts          ← MonitoringAgent.scan × K=10 against
+                                  seeded Olist; LOOSE/STRICT scoring
+    run-diagnosis.ts          ← DiagnosticAgent + Sonnet-as-judge
+                                  over 5-criterion rubric (≥7 pass)
+    run-recommendation.ts     ← RecommendationAgent + Sonnet-as-judge
+                                  over 3-criterion rubric (≥4 pass)
+    run-regression.ts         ← capture | score mode against 10
+                                  golden fixtures across all agents
+    lib/
+      run-agent.ts            ← spawns OlistDataSource subprocess,
+                                  drives one agent end-to-end
+      scorer.ts               ← deterministic 3-criterion detection
+                                  matcher (metric · segment · window)
+      judge.ts / judge-rec.ts ← LLM-as-judge calls with the rubric
+      structural-diff.ts      ← regression structural pass
+      similarity-judge.ts     ← regression semantic pass
+      summary.ts              ← K-run aggregator + summary.md renderer
+  judges/
+    diagnosis-judge.md        ← 5-criterion rubric prompt (versioned)
+    recommendation-judge.md   ← 3-criterion rubric prompt (versioned)
+    similarity-judge.md       ← regression similarity prompt (versioned)
+  fixtures/                   ← reference diagnoses, judge anchors
+  results/<YYYY-MM-DD>[-tag]/ ← dated batches, committed:
+    detection-K10-{loose,strict,raw}.json
+    summary.md
+```
+
+```
+shape of one run (real, from eval/scripts/run-detection.ts):
+  // K=10, one fresh subprocess per run, EVAL_RUN_TAG stamps the batch
+  for (let i = 0; i < K; i++) {
+    const result = await runMonitoringAgentOnce({ … });   // spawn + drive
+    const matches = scoreRun(result.insights, seeded);    // 3-criterion
+    runs.push({ index: i, looseHits, strictHits, falsePositives });
   }
+  const summary = aggregate(runs);                         // p/r per anomaly
+  writeFileSync(resultsDir + 'summary.md',
+                renderSummaryMarkdown(summary, runs));
 ```
+
+The eval runners are opt-in (`npm run eval:detection -- --K=10`), not in CI — they spend real Anthropic budget. The `eval/judges/*.md` files are the versioned rubric prompts; treating them as code is the answer to "what does it mean for an LLM-as-judge to be reproducible" — the rubric is reproducible because its prompt is committed.
 
 ---
 
@@ -345,13 +414,13 @@ Trajectory eval breaks down when the "right" trajectory isn't unique — when tw
 ## Interview defense
 
 ### What an interviewer is really asking
-When an interviewer asks "how do you evaluate your agent," they're testing whether you understand that the trajectory IS the work — not just the final answer — and whether you've built or honestly named what's needed to grade it. The strong signal is distinguishing loop-shape testing (invariants) from trajectory eval (quality of decisions) and saying which one you have. The weak signal is "we have unit tests."
+When an interviewer asks "how do you evaluate your agent," they're testing whether you understand that the trajectory IS the work — not just the final answer — and whether you've built or honestly named what's needed to grade it. The strong signal is distinguishing loop-shape testing (invariants) from trajectory/output eval (quality of decisions) and naming both, with real numbers. The weakest signal is "we have unit tests"; the strongest is "we have four eval pillars, here are the portfolio numbers, here is the flywheel that produced them."
 
 ### Likely questions
 
-[mid] Q: What do the 169 tests actually check?
+[mid] Q: What do the 269 tests actually check?
 
-A: They check the loop's *shape* invariants, not trajectory quality. Using injected fakes (the `McpCaller` interface at `lib/agents/base.ts` L16 and a fake Anthropic client), they assert: the forced-final turn strips tools (`base.ts` L101), the synthesis instruction is appended when the budget is spent (L98), parse failures return safe defaults via the `validate.ts` type guards, the schema gate excludes categories the workspace can't run, and every fake tool error correctly pushes an `is_error` block back into messages. They don't check whether the model's chosen tools were the right ones for a real anomaly — that's a different kind of eval.
+A: They check the loop's *shape* invariants, not output quality. Using injected fakes (the `McpCaller` alias = `Pick<DataSource, 'callTool'>` at `lib/agents/base.ts:24`, and a fake Anthropic client), they assert: the forced-final turn strips tools, the synthesis instruction is appended when the budget is spent, parse failures return safe defaults via the `validate.ts` type guards, the schema gate excludes categories the workspace can't run, and every fake tool error correctly pushes an `is_error` block back into messages. 226 cover the app's loop and 43 cover the authored `mcp-server-olist`'s domain tools + SQLite layer. They don't check whether the model's chosen tools were the right ones for a real anomaly — that's what the four Phase 3 evals are for.
 
 Diagram:
 ```
@@ -365,26 +434,30 @@ Diagram:
                                               request params
 ```
 
-[senior] Q: You said the trajectory is recorded but not graded. Why didn't you build the harness?
+[senior] Q: You have four eval pillars and four portfolio numbers. Which one is load-bearing?
 
-A: Because the cost-to-build was high and the failure mode it would catch hadn't shown up yet. The agent loop hits a rate-limited live MCP server, so a deterministic trajectory-eval harness needs either frozen MCP fixtures (about a week of work to cover the loomi surface) or a mock MCP server (also a week). The inspectable streamed trace + the 169 unit tests cover the failure modes I'm currently worried about — safety invariants, parse fallback, budget enforcement. What they miss is silent drift in tool choice or cost per investigation, and so far that drift hasn't manifested as user-visible pain. The day a prompt change ships and the bill goes up unexpectedly, I'd build the harness — and the first thing I'd build is frozen MCP fixtures, because everything else (scorer, golden diff, CI integration) hangs off determinism.
+A: Detection — for two reasons. First, it's the only one with deterministic scoring against seeded ground truth, no LLM judge in the loop, so the number is reproducible across rate-limit retries and judge-prompt drift. Second, detection is upstream: if monitoring doesn't surface the anomaly, the diagnostic and recommendation evals never see it, so the 53.3% / 100% downstream numbers are conditional on detection's 37% / 33.3%. The recommendation 100% is suspicious-by-design — it's the loosest rubric and the easiest stage, so it tells me the rubric has headroom but not that the recommendation agent is "done." The regression 30% is the most informative for catching drift between captures, but the baseline carries judge-shape noise I haven't tuned out yet. Net: detection is the number to defend, diagnosis is the rubric to keep tight, recommendation is the headroom to watch, regression is the ongoing drift gauge. They're a system, not four independent claims.
 
 Diagram:
 ```
-   Built                                Not built
-   ┌────────────────────────┐          ┌────────────────────────┐
-   │ ~169 vitest tests       │         │ frozen input set       │
-   │ injected fakes          │         │ deterministic MCP      │
-   │ ▼                       │         │ fixtures               │
-   │ asserts loop INVARIANTS │         │ trajectory scorer      │
-   │ (safety properties)     │         │ golden-diff CI          │
-   │                         │         │ cross-family judge     │
-   │ TRACE recorded as       │         │ ▼                       │
-   │ AgentEvent[]            │         │ would catch:            │
-   │ /debug + cache replay   │         │   tool-choice drift     │
-   │ inspectable by eye      │         │   cost drift            │
-   └────────────────────────┘          │   efficiency drift     │
-                                       └────────────────────────┘
+   The four numbers, ranked by what they actually claim
+   ┌────────────────────────────────────────────────────┐
+   │ DETECTION 37% LOOSE p / 33.3% recall                │
+   │   load-bearing — deterministic, upstream            │
+   │   PR D → Phase 2.5 fix → voucher 1/10 → 10/10       │
+   │                                                     │
+   │ DIAGNOSIS 53.3% pass                                │
+   │   conditional on detection; Sonnet-judge noise      │
+   │   PR E surfaced BRL cents-vs-Reais unit bug         │
+   │                                                     │
+   │ RECOMMENDATION 100% pass                            │
+   │   rubric headroom; honest but not decisive          │
+   │   PR F caught BRL bug recurring at run 8/10         │
+   │                                                     │
+   │ REGRESSION 30% baseline                             │
+   │   drift gauge across the 10-fixture golden set      │
+   │   PR G — captures monitoring/diagnostic drift       │
+   └────────────────────────────────────────────────────┘
 ```
 
 [arch] Q: If you were grading trajectories with an LLM judge, how would you avoid the evaluator paradox?
@@ -407,53 +480,59 @@ Diagram:
 ```
 
 ### The question candidates always dodge
-Q: If you don't have automated trajectory eval, how do you actually know your agent is working today?
+Q: Your judge is Sonnet 4.6. Your actor is Sonnet 4.6. Doesn't that bias the diagnosis and recommendation scores upward?
 
-A: Honest answer: I rely on three things, none of which is a substitute for trajectory eval. (1) The 169 unit tests catch the safety surface — forced-final, budget caps, parse fallbacks — so I'm confident the loop won't loop forever, hang on a bad parse, or skip its synthesis. (2) The streamed `AgentEvent[]` trace is inspectable on every run (`/debug` and the investigation cache), so I can spot-check trajectories by eye when something feels off; that catches obvious drift but not subtle drift. (3) The cached demo investigations + the unit tests' fake-driven runs give me a rough baseline of what trajectories should look like; if a new run looks much longer or chooses unexpected tools, I'd notice on a spot-check. What I *don't* have is automated detection of subtle drift across runs — tool-choice regressions, slow cost creep, efficiency degradation. That's the gap. The mitigation is: when the absence of the harness starts to bite (a regression slips through, the bill jumps, a prompt change has unclear effects), I'd build the smallest viable harness — 20 frozen anomalies, replayable MCP fixtures, a scorer that diffs trajectories against goldens — rather than a full LangSmith integration up front.
+A: Yes, and it's the single biggest caveat on those two numbers. Same-family judge shares the actor's blind spots — the unit-conversion bug PR E caught is exactly the kind of failure both models *should* miss in the same direction. The reason I kept it that way is constraint, not principle: a different-family judge means a second API key, a second SDK, a different output-format quirk to plumb through `eval/scripts/lib/judge.ts`, and rubric prompts that translate cleanly. None of that is hard; it's just work that wasn't on the K=10-first-run critical path. The honest mitigation is the layered stack: detection is deterministic (judge-free), so it's the anchor; the regression eval's structural pass is also judge-free; the similarity judge runs over text content where same-family blind spots are smaller (semantic equivalence, not chain-of-thought validation); the diagnosis and recommendation rubrics are the ones to view with the most skepticism. The next thing I'd build is a cross-family backstop on the diagnosis judge — likely GPT-4 — and compare its scores against Sonnet's on the same K=10 batch. If they correlate, the bias is small; if they don't, the diagnosis number drops to "Sonnet thinks it's fine" and I'd publish both.
 
 Diagram:
 ```
-   How I know it works today              What I can't catch today
-   ┌────────────────────────────┐         ┌────────────────────────────┐
-   │ ✓ 169 tests on loop shape  │         │ ✗ tool-choice drift         │
-   │ ✓ trace replayable + viewable│        │ ✗ cost-per-trajectory drift │
-   │ ✓ demo seed as eyeball baseline│      │ ✗ recovery degradation       │
-   │ ✓ unit tests cover parse,    │        │ ✗ subtle quality regressions│
-   │   budget, schema gate         │        │                             │
-   │                               │        │ → spot-checks of the trace  │
-   │ → safety floor + manual eye   │        │   are the only check today  │
-   └────────────────────────────┘         └────────────────────────────┘
-   Mitigation when it bites: build smallest-viable harness
-   (frozen inputs + MCP fixtures + golden diff), not a full SaaS.
+   Where the same-family bias hurts most       Where it hurts least
+   ┌────────────────────────────────────┐      ┌────────────────────────────┐
+   │ DIAGNOSIS rubric                    │      │ DETECTION (deterministic)  │
+   │   5 criteria, model judges reasoning│      │   3-criterion matcher,     │
+   │   ← MOST exposed to blind spots     │      │   no LLM in the loop       │
+   │                                     │      │   ← unbiased anchor        │
+   │ RECOMMENDATION rubric               │      │                            │
+   │   3 criteria, model judges plausibility│   │ REGRESSION structural pass │
+   │   ← also exposed                    │      │   field-by-field diff      │
+   │                                     │      │   ← unbiased               │
+   │ SIMILARITY judge (regression)       │      │                            │
+   │   semantic equivalence of text      │      │ UNIT TESTS                 │
+   │   ← partially exposed               │      │   loop-shape, injected     │
+   │                                     │      │   fakes ← unbiased         │
+   └────────────────────────────────────┘      └────────────────────────────┘
+   Next move: add cross-family (GPT-4) judge as a backstop on
+   diagnosis; publish both scores if they diverge.
 ```
 
 ### One-line anchors
 - "The trajectory is the work — grading only the final answer misses the failure modes that cost the most."
-- "169 unit tests guard the loop's shape; the trace IS the trajectory record; the harness that would grade trajectories doesn't exist yet."
-- "Agent-as-judge has the same blind-spot bias as LLM-as-judge — cross-family judge + frozen goldens + human spot-checks is the production stack."
-- "The build cost of a trajectory harness is real (MCP fixtures, scorer, golden diff) — earned the day model-quality drift starts mattering."
-- "Determinism in CI starts with MCP fixtures; everything else hangs off that."
+- "269 unit tests guard the loop's shape; the four eval pillars (detection · diagnosis · recommendation · regression) grade the outputs against seeded ground truth."
+- "Detection is the load-bearing eval — deterministic, upstream, no judge in the loop. Everything else is conditional on it."
+- "The seeded Olist dataset is what made the harness tractable: three known anomalies in `mcp-server-olist/data/olist.db`, the agent never told they're there."
+- "Same-family judge (Sonnet actor + Sonnet judge) is the live caveat on the diagnosis/recommendation numbers — a cross-family backstop is the next move."
+- "The eval flywheel: PR D surfaces a gap → Phase 2.5 prompt fix → PR F's judge catches recurrence → PR G's regression eval surfaces drift. The number isn't the win; the loop is."
 
 ---
 
 ## Validate your understanding
 
 ### Level 1 — Reconstruct the diagram
-Close this file. Draw the three boxes: loop-shape tests (built, what they assert), inspectable trajectory (built, what's in `AgentEvent`), trajectory-eval harness (not built, what its four parts would be). Label which file or directory each piece lives in (or "absent" for the harness).
+Close this file. Draw the three boxes: loop-shape tests (269, what they assert), inspectable trajectory (what's in `AgentEvent`), the four-pillar Phase 3 eval suite (detection · diagnosis · recommendation · regression — what each scores against). Label which file or directory each piece lives in.
 
 Open the file. Compare.
 
-✓ Pass: three boxes correctly labelled, with `tests/` + `base.ts` seams for box 1, `events.ts` + `investigations.ts` for box 2, "not built" for box 3
+✓ Pass: three boxes correctly labelled, with `test/` + `base.ts:24` `McpCaller` seam for box 1, `events.ts` + `investigations.ts` for box 2, `eval/scripts/run-*.ts` + `eval/judges/*.md` + the four portfolio numbers (37%/33.3% · 53.3% · 100% · 30%) for box 3
 ✗ Fail: re-read How it works moves 1–3, wait 10 minutes, try again.
 
 ### Level 2 — Explain it out loud
 Explain "how do you evaluate this agent today" to a colleague who just asked "do you have a benchmark?" No notes. Under 90 seconds.
 
 Checkpoints — did you:
-- Distinguish loop-shape testing from trajectory-quality eval?
-- Name the `AgentEvent[]` trajectory as the inspectable record?
-- Be honest that the automated trajectory-eval harness doesn't exist yet?
-- Name the evaluator paradox in one sentence?
+- Distinguish loop-shape testing (269 tests, unit-test-shaped) from output-quality eval (the four Phase 3 pillars)?
+- Name the `AgentEvent[]` trajectory as the inspectable record AND the input to the regression eval?
+- Cite at least two of the four portfolio numbers and which pillar each comes from?
+- Name the same-family judge bias as the live caveat on the diagnosis/recommendation scores?
 
 If you skipped any: you described it, you didn't understand it.
 
@@ -469,10 +548,10 @@ Reference: the absence of `langsmith`/`braintrust` in `package.json`, the existi
 
 ### Quick check — code reference test
 Without opening any files:
-- What interface in `base.ts` is the test seam for fake MCP calls?
+- What type alias in `base.ts` is the test seam for fake tool calls, and what interface is it derived from?
 - What type holds the streamed trajectory records, and what file is it in?
 - What function persists a finished investigation server-side?
-- Is there a trajectory-eval harness in this repo? (Yes/no + one sentence why.)
+- Name the four eval pillars and the directory they live under. Which one is judge-free?
 
 Open and verify. ✓ File + function names matter; line numbers drifting is fine.
 
@@ -486,3 +565,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Phase 3 landed: replaced "trajectory-eval harness absent" framing with the four-pillar suite (detection precision/recall · diagnosis 5-criterion rubric · recommendation 3-criterion rubric · regression capture+score), anchored to `eval/scripts/run-*.ts` and `eval/judges/*.md`, with the four portfolio numbers (37%/33.3% · 53.3% · 100% · 30%) and the PR D→E→F→G flywheel as the load-bearing narrative. Test count updated 169 → 269 (226 app + 43 mcp-server-olist). McpCaller seam relocated to `lib/agents/base.ts:24` as `Pick<DataSource, 'callTool'>`. Same-family-judge bias re-spotlit as the live caveat on diagnosis/recommendation numbers.

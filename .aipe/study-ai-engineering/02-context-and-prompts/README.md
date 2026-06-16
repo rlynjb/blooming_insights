@@ -17,5 +17,17 @@ Read in order: **01 → 02 → 03**. `01-context-window.md` establishes the fini
 
 All citations are to blooming insights files (verified line numbers) and curriculum IDs for provenance only.
 
+## Phase 2.5 — the DATA HORIZON prompt-anchoring case study (eval-driven prompt edit)
+
+A worked example of an eval-driven prompt iteration the codebase actually ran (committed at `eval/results/2026-06-15-after-fix/summary.md`):
+
+1. **Surface.** PR D's detection eval baseline (`eval/results/2026-06-15/summary.md`) showed 6.7% loose recall — the monitoring agent was issuing time queries outside the synthetic dataset's 26-week horizon (`2025-12-01 → 2026-06-01`), wasting tool calls on guaranteed-empty results.
+2. **Fix.** Phase 2.5 added a **DATA HORIZON section** + a **3-dimensional scan plan** (state × category × payment_type) to every monitoring/diagnostic/query prompt, and `schemaSummary()` now emits `Data horizon: <from> → <to>` at the bottom of the schema injection.
+3. **Result.** Post-fix loose recall lifted to 33.3% — a **5× lift** on the easiest of the three seeded anomalies (`voucher-dropoff-w10-on` went 1/10 → 10/10 detection).
+4. **Honest limit.** Strict recall stayed at 0% across all three anomalies. The "recent 4w vs baseline 12w" framing fundamentally cannot catch mid-horizon week-specific anomalies (weeks 2 and 4). **The prompt fix is partial** — closing the gap needs a tool-layer fix (`detect_outliers` — see `../04-agents-and-tool-use/08-authoring-mcp-server.md` exercise).
+
+The case study is exactly the kind of eval-flywheel evidence senior reviews look for: an honest "this prompt edit lifted X but couldn't close Y, and here's the tool-layer fix that would." See `../05-evals-and-observability/02-eval-methods.md` for the scoring side and `../07-system-design-templates/03-multi-rubric-eval-pipeline.md` for the full flywheel walkthrough.
+
 ---
 Updated: 2026-05-28 — Refreshed the 03-prompt-chaining entry for the two-step `?step=diagnose`/`?step=recommend` split with the `bi:diag:<id>` sessionStorage handoff (was a single `await` chain at route.ts L145–L161); the 01/02 entries and `base.ts` refs verified unchanged.
+Updated: 2026-06-16 — added the Phase 2.5 DATA HORIZON prompt-anchoring case study (eval-driven prompt edit: 5× loose-recall lift, partial strict-recall fix, honest tool-layer follow-up) as a new section.

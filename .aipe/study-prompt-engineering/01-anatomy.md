@@ -140,6 +140,26 @@ The takeaway for anatomy: do not assume all four prompts are the identical six-s
 
 ---
 
+### The Phase 2.5 anatomy receipt: a `## DATA HORIZON` section earned by eval numbers
+
+The monitoring prompt now also carries a `## DATA HORIZON` section right under `## Role` — an explicit "READ BEFORE QUERYING" block that names the synthetic Olist dataset's `2025-12-01 → 2026-06-01` window and bans 2017/2018 dates from training memory. This is anatomy as a real prompt-engineering case study, because the section earned its place through a *measured* before/after eval pass:
+
+```
+   PRE Phase 2.5                       POST Phase 2.5
+   ──────────────────────────          ──────────────────────────
+   ## Role …                            ## Role …
+   ## Your category checklist           ## DATA HORIZON      ← NEW anchor
+   ## Hard rules …                      ## Your category checklist
+                                        ## Hard rules …
+
+   loose recall:    6.7%                loose recall:    33.3%  (+26.6, 5x)
+   voucher detect:  1/10                voucher detect:  10/10
+```
+
+Two architecture details worth internalizing. First, the `Data horizon: <from> → <to>` line is *also* injected dynamically — `schemaSummary()` emits it as a one-liner at the bottom of the `{schema}` placeholder when the live adapter is Olist (synthetic, fixed-horizon) and omits it when the live adapter is Bloomreach (open-ended). So the `## DATA HORIZON` *section* is a constant prompt block at Layer A, and the date values inside the `{schema}` slot are Layer B per-call injection — the section and its values arrive on two different layers, on purpose, so swapping adapters at runtime never leaves the prompt referencing the wrong horizon. Second, the section *itself* (the human-authored "READ BEFORE QUERYING" header + the framing rules + the worked recent/baseline-window examples) is what the eval scored — the Phase 2.5 fix added BOTH the section and a 3-dimension scan plan ("state, category, payment_type — skip any, miss its anomaly") to the same prompt. Loose recall lifted 5x; the eval credits the combination, not either alone. That is the receipt — a real before/after eval pass tied to a specific structural addition. (Full numbers and the honest partial-win framing live in → 05-eval-driven-iteration.md.)
+
+---
+
 ### The decomposition rule: every Role disclaims the others
 
 Here is the part that separates this from a generic template. Each `## Role` does not just say what the agent does — it explicitly says what it does *not* do, naming the other agents' jobs:
@@ -412,3 +432,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Added the Phase 2.5 anatomy receipt: monitoring.md gained a `## DATA HORIZON` section (constant Layer A) whose date values arrive via `schemaSummary()` inside the `{schema}` placeholder (per-call Layer B). The section earned its place through a measured 5x loose-recall lift on the eval suite — anatomy choices now carry receipts.

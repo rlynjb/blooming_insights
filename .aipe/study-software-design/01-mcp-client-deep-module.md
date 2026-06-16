@@ -1,9 +1,11 @@
-# McpClient as the deep module
+# McpClient (now BloomreachDataSource) as the deep module
 
 **Industry name(s):** Deep module · information hiding · narrow interface over fat implementation (Ousterhout)
-**Type:** Industry standard · Language-agnostic (the canonical example in this repo)
+**Type:** Industry standard · Language-agnostic (one of two canonical deep-module examples in this repo)
 
-> `McpClient` (172 LOC) exposes three methods — constructor, `callTool`, `listTools` — and absorbs six independent mechanics: TTL cache, spacing gate, retry loop with parsed `Retry-After`, error tagging, write-on-success caching, and the Bloomreach error-grammar parsing. The caller learns three signatures; the body absorbs the entire MCP-rate-limit reality. This is the canonical deep module in the codebase, and the pattern every other module is measured against.
+> **POST-2026-06-15 NOTE.** This class was renamed and moved in Phase 2 PR A: `McpClient` → `BloomreachDataSource`, `lib/mcp/client.ts` → `lib/data-source/bloomreach-data-source.ts`. The internals didn't change — the class was already shaped to be the Bloomreach adapter; lifting `DataSource` over it only changed the type that callers consume. `lib/mcp/client.ts` survives as a 17-line shim re-exporting `BloomreachDataSource as McpClient` so existing test imports compile unchanged. **All file references below are updated to the new path; the depth analysis still holds.** A second deep-module case study has emerged at the seam level — the `DataSource` interface + `makeDataSource` factory — see the audit's deep-vs-shallow-modules lens for the deep walk.
+
+> `BloomreachDataSource` (214 LOC, was 172) exposes three methods — constructor, `callTool`, `listTools` — and absorbs six independent mechanics: TTL cache, spacing gate, retry loop with parsed `Retry-After`, error tagging, write-on-success caching, and the Bloomreach error-grammar parsing. The caller learns three signatures; the body absorbs the entire MCP-rate-limit reality. This was the canonical deep module in 2026-06-02 and remains one of two now (the other being the DataSource seam itself).
 
 ---
 
@@ -406,7 +408,10 @@ Interview-defense diagram — the spacing gate, why it's load-bearing
 
 ## See also
 
-- `audit.md` — the deep-vs-shallow-modules lens names `McpClient` as the deepest module and contrasts it with `app/page.tsx` as the shallowest.
-- `02-shallow-module-page-component.md` — the opposite shape, same axis.
-- `03-insight-anomaly-silent-leak.md` — the leak that fails the same hiding test `McpClient` passes.
-- `04-synthesize-recovery-duplication.md` — a candidate to be absorbed into `runAgentLoop` the same way rate-limit retries were absorbed into `McpClient`.
+- `audit.md` — the deep-vs-shallow-modules lens now names the **DataSource seam** as the new top deep-module case study; `BloomreachDataSource` is the deepest single class. The deep walk on the seam lives in the audit lens itself.
+- `02-shallow-module-page-component.md` — RESOLVED; the opposite shape worked example.
+- `03-insight-anomaly-silent-leak.md` — RESOLVED; the leak that failed the same hiding test `BloomreachDataSource` passes.
+- `04-synthesize-recovery-duplication.md` — RESOLVED; the prediction in the original file came true — the recovery was absorbed into `runAgentLoop` the same way rate-limit retries are absorbed into `BloomreachDataSource`.
+
+---
+Updated: 2026-06-16 — class renamed to `BloomreachDataSource` and moved to `lib/data-source/bloomreach-data-source.ts` in Phase 2 PR A; internals unchanged; `lib/mcp/client.ts` kept as 17-line shim; depth analysis still holds; cross-refs updated to flag resolved sibling files.

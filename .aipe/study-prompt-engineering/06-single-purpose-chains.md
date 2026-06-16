@@ -324,6 +324,7 @@ The unit of debuggability is the link. The moment two jobs share a prompt, you'v
 1. **Chaining multiplies round-trips.** Each link is its own model loop (`runAgentLoop`), so diagnose→recommend is two full agent runs plus their `synthesize()` retries. A monolith would be fewer calls. The chain trades latency/cost for attributability and routing.
 2. **The handoff can lose information.** The recommendation agent sees the `Diagnosis` (L158), not the diagnostic agent's full reasoning trace. If a recommendation needs context the diagnosis didn't capture, the lossy boundary hurts — the typed handoff is also a bottleneck.
 3. **Disclaimers are advisory.** "You do not diagnose causes" (`monitoring.md` L5) is honored statistically (→ 01-anatomy.md); a model can still bleed across the boundary, and only the downstream validator catches output that doesn't match the link's declared shape.
+4. **Dual-adapter framing fans the disclaimer out twice.** Phase 2 added a second backend — every agent prompt must now scope its job against EITHER the Bloomreach (EQL) adapter OR the Olist (SQL-tools) adapter, with the live tool catalog deciding which. Each prompt carries paired guidance ("Under Bloomreach do X" / "Under Olist do Y") AND the same single-job scope on both sides. So decomposition's cost now includes a second axis: the chain has 4 single-purpose links *and* each link has 2 adapter-specific bodies in one prompt. The disclaimer survives ("you do not diagnose causes" reads the same regardless of backend), but the method section doubles.
 
 ### What to explore next
 
@@ -432,3 +433,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Added a fourth "Where this breaks down" item: Phase 2 dual-adapter framing (Bloomreach EQL + Olist SQL-tools) doubles the method section per prompt without breaking decomposition's single-job scope.

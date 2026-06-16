@@ -261,6 +261,8 @@ QueryAgent.answer()
 
 All four share the same shared loop with no special-casing inside the loop itself. The loop is "dumb" — it executes tool calls and accumulates messages. The agents are where the domain logic lives.
 
+The shared loop is also **adapter-agnostic** since the 2026-06 `DataSource` seam landed: `runAgentLoop`'s `mcp` parameter is structurally a `DataSource` (`callTool` + `listTools`), and the route picks the adapter via `makeDataSource(mode, sessionId)` — `live-bloomreach` returns a `BloomreachDataSource`, `live-sql` returns an `OlistDataSource` spawned over the mcp-server-olist subprocess. The loop never sees the difference; the agents never see the difference; the only place the choice is visible is the route's call to the factory. Topology unchanged, backend swappable. See `03-provider-abstraction.md`.
+
 ---
 
 ### The schema gate — bounding monitoring to runnable categories
@@ -693,9 +695,10 @@ A reviewer says: "You should use a single large agent with all tools instead of 
 
 ## See also
 
-→ [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (parse-helper mechanism)
+→ [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` upper seam the agents now ride over) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · [09-eval-pipeline.md](./09-eval-pipeline.md) (how this orchestration is measured by the 4-pillar eval suite) · `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (parse-helper mechanism)
 
 ---
+Updated: 2026-06-16 — added one paragraph noting that since the 2026-06 `DataSource` seam landed, `runAgentLoop.mcp` is structurally adapter-agnostic — `live-bloomreach` injects `BloomreachDataSource`, `live-sql` injects `OlistDataSource` (mcp-server-olist subprocess); topology and budget mechanics unchanged. Cross-linked `03-provider-abstraction.md` and the new `09-eval-pipeline.md` (which measures this orchestration's outputs across K iterations).
 Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.
 

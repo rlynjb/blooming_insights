@@ -13,33 +13,36 @@ This guide applies Ousterhout's *A Philosophy of Software Design* to **this repo
   └────────────────────────────┬─────────────────────────────┘
                                │  cross-links to ↓
   ┌─ Pass 2: discovered patterns ───────────────────────────┐
-  │  01-mcp-client-deep-module.md         the deep canon    │
-  │  02-shallow-module-page-component.md  the shallow canon │
-  │  03-insight-anomaly-silent-leak.md    the worst leak    │
-  │  04-synthesize-recovery-duplication.md the define-out   │
+  │  01-mcp-client-deep-module.md (BloomreachDataSource post-rename)│
+  │  02-shallow-module-page-component.md  RESOLVED — example │
+  │  03-insight-anomaly-silent-leak.md    RESOLVED — example │
+  │  04-synthesize-recovery-duplication.md RESOLVED — example│
   └─────────────────────────────────────────────────────────┘
 ```
 
 ## The verdict in one paragraph
 
-This codebase is mostly well-designed at the module level. `McpClient` is a textbook deep module (172 LOC of cache + spacing + retry + error-tagging behind 3 methods); `runAgentLoop` is one function reused by four agents with no duplication; error handling clusters at three intentional boundaries. The load-bearing gap is in the UI band: `app/page.tsx` (817 LOC, 8 concerns, 14 useState slots) is the worst shallow module in the repo. The highest-priority finding is that one file — extracting three hooks retires the cognitive-load hotspot and the parser duplication it carries. Two other deliberate fixes ride along: the Insight↔Anomaly silent field-drop (three locations, TypeScript can't catch it) and the duplicated `synthesize()` recovery method (two copies of the same special case the agent loop should own).
+**2026-06-15 state.** The codebase is well-designed at the module level. The three top fires from 2026-06-02 (page.tsx shallow module, Insight↔Anomaly leak, duplicated `synthesize()`) have all RESOLVED. Phase 2 added a textbook deep-module case study — the `DataSource` seam in `lib/data-source/` (a 73-LOC interface with two adapter implementations of ~214 and ~197 LOC behind it, plus a 113-LOC factory hiding four orthogonal facts) — and a special-purpose-vs-general-purpose call (the `mcp-server-olist/` sibling package ships three domain tools instead of one general `execute_sql`). The remaining live debt is small: inline-CSS drift in `InsightCard.tsx`, partial pull-down opportunity on `synthesisInstruction` boilerplate ×4, and two vague names in `lib/insights/derive.ts`. The biggest named trade-off is keeping `lib/mcp/client.ts` as a 17-line backwards-compat shim — explicitly to avoid 16 test renames for zero behavioral win.
 
 ## Reading order
 
-1. **`audit.md`** first. The one-pass survey. Walks all eight APOSD lenses against the codebase and ranks the top 3 fixes at the end. Lenses with significant findings cross-link to the pattern files below.
+1. **`audit.md`** first. The one-pass survey. Walks all eight APOSD lenses against the post-Phase-2 codebase. Records resolutions from the 2026-06-02 set and names the new deep-module + special-purpose-interface findings. Top 3 ranked findings (now LOW/MEDIUM) at the end.
 
-2. **Pass 2 pattern files** in order:
-   - `01-mcp-client-deep-module.md` — what a deep module looks like in this repo (the model to learn from).
-   - `02-shallow-module-page-component.md` — the opposite shape, the file to fix first.
-   - `03-insight-anomaly-silent-leak.md` — the worst information leak; the fix retires it in one diff.
-   - `04-synthesize-recovery-duplication.md` — the duplicated special case; the lift deletes ~90 LOC.
+2. **Pass 2 pattern files** as worked examples (three of four RESOLVED, kept for the lesson):
+   - `01-mcp-client-deep-module.md` — the deep-module case study. Updated header notes the class rename to `BloomreachDataSource` and points to the audit's deep-vs-shallow-modules lens for the new DataSource-seam case study.
+   - `02-shallow-module-page-component.md` — RESOLVED. Kept as the worked example of how the shallow→deep refactor played out (page 817→462 LOC + three hooks), with post-fix calibration on LOC vs visibility-surface deltas.
+   - `03-insight-anomaly-silent-leak.md` — RESOLVED. Kept as the worked example of colocate-then-comment-then-test; the post-fix lesson names how comments carry intent TypeScript can't enforce.
+   - `04-synthesize-recovery-duplication.md` — RESOLVED. Kept as the canonical "define it out of existence" worked example; the post-fix lesson names why this beat a shared helper.
 
 ## Through-line
 
-**Complexity is the enemy; deep modules are the weapon.** Every pattern file is a different facet of the same axis — interface size vs absorbed behavior. The deep modules earn their place by hiding decisions every caller would otherwise have to make. The shallow module fails because nothing is hidden. The leak fails because the same knowledge lives in three files. The duplicated recovery fails because the same strategy lives in two. All four files are the same lesson at different scales.
+**Complexity is the enemy; deep modules are the weapon.** Every pattern file is a different facet of the same axis — interface size vs absorbed behavior. The deep modules earn their place by hiding decisions every caller would otherwise have to make. Phase 2 added two more weapons to this rack: the DataSource seam (a deep module at the *architecture* seam, not just a single-class hide) and the domain-tool MCP server (the choice to narrow the interface rather than maximize it). The three resolved fires — shallow page, silent leak, duplicated recovery — are now case studies in how the move was made, not pieces of live debt. The lesson scales: the same axis names the wins AND the (now-historical) losses.
 
 ## Cross-references
 
 - `read-aposd/` (when present) — the conceptual treatment of every primitive named here. Read for the framework; read this guide for the audit.
-- `study-system-design/` — the system-architecture altitude (services, boundaries, scaling). Findings about request flow, OAuth boundary, streaming NDJSON live there, not here.
-- `study-dsa-foundations/` — algorithm and data-structure curriculum. Not exercised in this guide's findings; the complexity here is structural, not algorithmic.
+- `study-system-design/` — the system-architecture altitude. The new `DataSource` seam lives at the boundary between code-level design (this guide) and system-design (services, request flow, scaling). Findings about routing, OAuth boundary, NDJSON streaming live there.
+- `study-dsa-foundations/` — algorithm and data-structure curriculum. Not exercised in this guide.
+
+---
+Updated: 2026-06-16 — verdict paragraph rewritten for post-Phase-2 state (DataSource seam, domain-tool server, 3 top fires resolved); reading order updated to flag the resolved pattern files as worked examples with kept lessons; through-line expanded to name Phase-2 additions.

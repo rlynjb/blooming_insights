@@ -1,9 +1,9 @@
 # Tool calling and MCP
 
-**Industry name(s):** Model Context Protocol (MCP), tool calling, function calling, tool gateway, tool registry
+**Industry name(s):** Model Context Protocol (MCP), tool calling, function calling, tool gateway, tool registry, authored MCP server
 **Type:** Industry standard · Language-agnostic
 
-> The substrate every reasoning pattern runs on — the model emits structured tool calls, your loop executes them, the result feeds the next turn. blooming insights runs it through MCP: one connection to Bloomreach's loomi MCP server, one tool list, sliced per agent so each one only sees the affordances its job needs.
+> The substrate every reasoning pattern runs on — the model emits structured tool calls, your loop executes them, the result feeds the next turn. blooming insights runs it through MCP, but Phase 2 added a `DataSource` seam **above** MCP so the substrate can swap: one adapter talks to Bloomreach's loomi MCP server over OAuth; a second adapter spawns the sibling-package `mcp-server-olist` subprocess and talks to its three authored domain tools. The agents only know the seam.
 
 
 ---
@@ -324,37 +324,54 @@ The full substrate — what every reasoning pattern stands on
 
 The four allow-lists live in `lib/mcp/tools.ts` L5–L40 (`monitoringTools`, `diagnosticTools`, `recommendationTools`, `queryTools`). Each agent passes one to `filterToolSchemas` at construction (`monitoring.ts` L96, etc.).
 
-**The single client (cross-cutting concerns):**
-**File:** `lib/mcp/client.ts`
-**Function:** `McpClient.callTool()`
-**Line range:** L97–L146 (cache L105, spacing L149 in `liveCall`, retry L122, no-cache-on-error L137)
+**The DataSource seam (the new layer above MCP — Phase 2):**
+**File:** `lib/data-source/types.ts` — `DataSource` interface (`callTool` / `listTools` / `dispose`)
+**File:** `lib/data-source/index.ts` — `makeDataSource(mode, sessionId)` factory; bootstrap moved here per adapter
+**File:** `lib/data-source/bloomreach-data-source.ts` — the relocated `BloomreachDataSource` (was `lib/mcp/client.ts`'s `McpClient`)
+**File:** `lib/data-source/olist-data-source.ts` — spawns `mcp-server-olist` via `StdioClientTransport`
+**File:** `lib/mcp/client.ts` — now a 17-line backwards-compat re-export (`McpClient` is `BloomreachDataSource`)
+
+**The Bloomreach adapter's cross-cutting concerns:**
+**File:** `lib/data-source/bloomreach-data-source.ts`
+**Function:** `BloomreachDataSource.callTool()` — same surface as the old `McpClient` (60s TTL cache; ~1.1s spacing; bounded exp-backoff retry; no-cache-on-error)
 
 **The transport (MCP SDK):**
 **File:** `lib/mcp/transport.ts` — `SdkTransport` wraps `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`.
 **File:** `lib/mcp/connect.ts` — `BloomreachAuthProvider` implements OAuth (PKCE + DCR); `connectMcp()` wires the transport with `minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3` (L92–L96).
 
-**The route boundary (one listTools per request, then slice):**
+**The route boundary (one connect, one listTools per request, then slice):**
 **File:** `app/api/agent/route.ts`
-**Function:** the `GET` stream `start()` body
-**Line range:** L203–L207 (`rawTools = await conn.mcp.listTools()`), then `new MonitoringAgent(anthropic, conn.mcp, schema, allTools)` constructs each agent with the shared client + raw list.
+**Function:** the `GET` stream `start()` body — reads `?mode=` (default `'live-sql'`), calls `makeDataSource(mode, sid)`, calls `dsResult.bootstrap(signal)` for the schema (which knows per-adapter how to derive it: Bloomreach lists discovery tools; Olist returns the fixed `olistWorkspaceSchema()`), calls `dataSource.listTools({ signal })`, then constructs each agent with the shared `dataSource` + `allTools`.
+
+**The authored MCP server (the new Olist surface — Phase 2):**
+**Package:** `mcp-server-olist/` (sibling Node package, ~1800 LOC)
+**Tools:** `mcp-server-olist/src/tools/get_metric_timeseries.ts` · `get_segments.ts` · `get_anomaly_context.ts`
+**Data:** `mcp-server-olist/data/olist.db` — SQLite, ~10k synthetic rows + a `seeded_anomalies` table holding 3 ground-truth records the agent never sees
+**Why three domain tools, not `execute_sql`:** SQL is too sharp an edge for the agent — it would have to derive period-over-period math, segment cuts, and the anomaly-context join itself, every time, blowing the budget on plumbing. The authored tools pre-bake those queries; the agent reasons in domain terms ("revenue last 4w vs prior 12w by state"), and the eval suite (`eval/scripts/run-detection.ts`) becomes tractable because the agent's surface is small enough to score deterministically.
 
 ```
 shape (not full impl):
-  // route.ts — one connect, one listTools, slice per agent at construct
-  conn = await connectMcp(sid);                         // OAuth-aware client
-  const rawTools = await conn.mcp.listTools();          // discover once
+  // route.ts — pick mode, factory the adapter, discover, slice per agent
+  const mode = req.nextUrl.searchParams.get('mode') === 'live-bloomreach'
+             ? 'live-bloomreach' : 'live-sql';
+  const dsResult = await makeDataSource(mode, sid);
+  if (!dsResult.ok) return redirect(dsResult.authUrl);    // Bloomreach OAuth gate
+  const dataSource = dsResult.dataSource;
+  const schema     = await dsResult.bootstrap(signal);
+  const rawTools   = await dataSource.listTools({ signal });
+
   const agents = {
-    monitoring: new MonitoringAgent(anth, conn.mcp, schema, rawTools.tools),
-    diagnostic: new DiagnosticAgent(anth, conn.mcp, schema, rawTools.tools),
-    recommendation: new RecommendationAgent(anth, conn.mcp, schema, rawTools.tools),
-    query: new QueryAgent(anth, conn.mcp, schema, rawTools.tools),
+    monitoring: new MonitoringAgent(anth, dataSource, schema, rawTools.tools),
+    diagnostic: new DiagnosticAgent(anth, dataSource, schema, rawTools.tools),
+    recommendation: new RecommendationAgent(anth, dataSource, schema, rawTools.tools),
+    query: new QueryAgent(anth, dataSource, schema, rawTools.tools, sid),
   };
 
   // each agent's loop slices the list per its job
-  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // monitoring.ts L96
+  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // monitoring.ts
 
-  // base.ts — the round trip
-  const { result, durationMs, fromCache } = await mcp.callTool(tu.name, tu.input);
+  // base.ts — the round trip (DataSource seam, not McpClient)
+  const { result, durationMs, fromCache } = await dataSource.callTool(tu.name, tu.input);
 ```
 
 ---
@@ -528,3 +545,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Added the `DataSource` seam above MCP (Phase 2): subtitle + Implementation block now name `lib/data-source/*`, both adapters (Bloomreach OAuth, Olist subprocess), and the authored `mcp-server-olist` sibling package with its three domain tools (`get_metric_timeseries` / `get_segments` / `get_anomaly_context`) replacing raw SQL.

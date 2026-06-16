@@ -2,9 +2,11 @@
 
 A topic-focused companion to [`../study-ai-engineering/`](../study-ai-engineering/). Same staff-engineer voice, same per-concept template — but the lens is **what happens above one agent**: reasoning patterns beyond ReAct, retrieval as a control loop, multi-agent orchestration topologies, agent infrastructure, and serving for an autonomous loop.
 
-## Codebase shape: multi-agent (minimal topology)
+## Codebase shape: multi-agent (minimal topology) + adapter-switchable
 
 blooming insights is a **multi-agent** codebase, but deliberately the *minimal* form — a deterministic sequential pipeline (monitoring → diagnostic → recommendation) plus an intent router, with the typed `Diagnosis` as the inter-stage message. The orchestration is **deterministic route code, not an LLM supervisor** — the route picks the next agent from `?step=`, and the user gates each transition by navigating. This is the architectural opinion at the heart of the guide: split work into specialists, keep coordination in code, escalate to an autonomous supervisor only when the coordination decision itself needs the model. See `03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` for the full defense.
+
+A second axis landed in Phase 2: **the topology is now adapter-switchable.** Every agent holds a `DataSource` (`lib/data-source/types.ts`), not an `McpClient`. Two adapters implement it: `BloomreachDataSource` (live OAuth MCP) and `OlistDataSource` (spawns the sibling-package `mcp-server-olist` server, whose three authored domain tools `get_metric_timeseries` / `get_segments` / `get_anomaly_context` replace raw SQL). The `bi:mode` localStorage key holds `'demo' | 'live-sql' | 'live-bloomreach'`. Phase 3 then built the four-pillar eval suite (`eval/`) on top of the Olist adapter — detection precision/recall, diagnosis rubric, recommendation rubric, regression — producing the four portfolio numbers (37%/33.3% · 53.3% · 100% · 30%) that this guide treats as load-bearing measurements, not vanity stats.
 
 Start with [`00-overview.md`](00-overview.md) for the system map, then [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md) for the feature-by-feature breakdown.
 
@@ -13,7 +15,7 @@ Start with [`00-overview.md`](00-overview.md) for the system map, then [`agent-p
 - **[01-reasoning-patterns/](01-reasoning-patterns/README.md)** (6 files) — chains-vs-agents (the boundary), ReAct (the baseline), plan-and-execute, reflexion / self-critique, tree of thoughts, routing (the bridge to multi-agent).
 - **[02-agentic-retrieval/](02-agentic-retrieval/README.md)** (3 files) — agentic RAG, self-corrective RAG, retrieval routing. Intentionally thin: retrieval here is *live agentic EQL*, not embedding-RAG (the design rationale is cross-referenced to `../study-ai-engineering/03-retrieval-and-rag/11-rag.md`).
 - **[03-multi-agent-orchestration/](03-multi-agent-orchestration/README.md)** (9 files) — when-not-to-go-multi-agent, supervisor-worker, sequential pipeline, parallel fan-out, debate / verifier-critic, swarm / handoff, graph orchestration, shared state and message passing, coordination failure modes. **The load-bearing section** for a multi-agent codebase.
-- **[04-agent-infrastructure/](04-agent-infrastructure/README.md)** (5 files) — context engineering, agent memory tiers, tool calling and MCP, agent evaluation, guardrails and control. The cross-cutting disciplines that separate a demo from a shipped system.
+- **[04-agent-infrastructure/](04-agent-infrastructure/README.md)** (5 files) — context engineering, agent memory tiers, tool calling and MCP (with the new `DataSource` seam under it), agent evaluation (now anchored to the Phase 3 four-pillar suite under `eval/`), guardrails and control. The cross-cutting disciplines that separate a demo from a shipped system.
 - **[05-production-serving/](05-production-serving/README.md)** (3 files) — cross-turn caching, fan-out backpressure, per-tool circuit breaking. These cover what `../study-ai-engineering/06-production-serving/` becomes once the unit is a loop or a topology.
 - **[06-orchestration-system-design-templates/](06-orchestration-system-design-templates/README.md)** (3 files) — IK-style 9-bullet templates: multi-agent research assistant, agentic support system, agentic coding system. Mapped against this codebase's actual shape.
 
@@ -32,12 +34,12 @@ The cross-sub-section order is **A → B → C → D → E → F**, but no file 
 
 **Case A** (implemented — cited to real `file:line`):
 - The whole of SECTION A's chains-vs-agents boundary, ReAct, and routing (the four agents on `runAgentLoop`; the intent classifier).
-- SECTION B's agentic-RAG (reframed: agentic, but the tool is live EQL — not embeddings).
+- SECTION B's agentic-RAG (reframed: agentic, but the tool is a pre-baked domain tool (`get_metric_timeseries` under Olist, `execute_analytics_eql` under Bloomreach) — not embeddings).
 - SECTION C's sequential pipeline, shared-state-and-message-passing (the `bi:diag:<id>` handoff), and coordination-failure-modes (this codebase's *deterministic* orchestration structurally avoids whole classes of multi-agent failures).
-- All of SECTION D — context engineering (`{categories}` injection + schema/tool truncation), memory tiers (working + ephemeral persistence), tool calling and MCP, guardrails (`maxToolCalls`, read-only tools, validators, coverage gate, auto-reconnect).
-- SECTION E's cross-turn caching (the 60s TTL + demo replay).
+- All of SECTION D — context engineering (`{categories}` injection + schema/tool truncation + Phase 2.5's `DATA HORIZON` + 3-dim scan plan in the monitoring prompt), memory tiers (working + ephemeral persistence), tool calling and MCP (with the `DataSource` seam above MCP), **agent evaluation now Case A: the four-pillar eval suite under `eval/` produces real portfolio numbers**, guardrails (`maxToolCalls`, read-only tools, validators, coverage gate, auto-reconnect).
+- SECTION E's cross-turn caching (the 60s TTL on the Bloomreach adapter + demo replay).
 
-**Case B** (not yet implemented — the SECTION F template carries the refactor): SECTION A's plan-and-execute, reflexion, tree of thoughts. SECTION B's self-corrective-RAG and retrieval-routing. SECTION C's supervisor-worker (would replace the deterministic route), parallel fan-out, debate/critic, swarm/handoff, graph orchestration. SECTION D's automated trajectory/tool-call eval. SECTION E's fan-out backpressure (no fan-out exists) and per-tool circuit breaking.
+**Case B** (not yet implemented — the SECTION F template carries the refactor): SECTION A's plan-and-execute, reflexion, tree of thoughts. SECTION B's self-corrective-RAG and retrieval-routing. SECTION C's supervisor-worker (would replace the deterministic route), parallel fan-out, debate/critic, swarm/handoff, graph orchestration. SECTION E's fan-out backpressure (no fan-out exists) and per-tool circuit breaking. Cross-family judge backstop (the diagnosis/recommendation evals run Sonnet-on-Sonnet today — adding GPT-4 as a backstop is the next eval-quality move).
 
 ## How this guide composes with the rest of the family
 
@@ -64,3 +66,4 @@ The boundary with `study-ai-engineering/`: that guide stops at the single-agent 
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-16 — Reflected Phase 2 DataSource seam (adapter-switchable), Phase 3 four-pillar eval suite (`eval/`) moving Case A coverage to include automated trajectory/output eval (no longer Case B). Flipped the agent-evaluation Case B line into Case A with the four portfolio numbers; named the new Case B (cross-family judge backstop).

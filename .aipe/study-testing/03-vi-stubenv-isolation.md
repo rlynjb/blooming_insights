@@ -9,7 +9,7 @@ A flake erodes trust in the whole green bar. Once "oh that test fails sometimes"
 ```
 Zoom out — where this pattern lives in the test infrastructure
 
-  ┌─ Test suite (169 tests across 18 files) ──────────────────────┐
+  ┌─ Test suite (269 tests across 28 files) ──────────────────────┐
   │                                                                │
   │  vitest runs files in parallel WORKERS                        │
   │  each worker is a Node process; a worker is reused across     │
@@ -292,8 +292,9 @@ The AUTH_SECRET flake fix — before vs after
   │   • Worker.process.env on test exit === on test entry.          │
   │   • Parallel workers no longer race for the global.             │
   │                                                                  │
-  │  RESULT: 169 tests pass across repeated runs (commit message    │
-  │  says 157 at fix time; suite has grown since). Zero re-flakes.  │
+  │  RESULT: 269 tests pass across repeated runs (commit message    │
+  │  says 157 at fix time; suite has grown to 269 since via Phase  │
+  │  2 + 3). Zero re-flakes from this fix's pattern.                │
   │                                                                  │
   │  THE COMMENT BLOCK is part of the fix — it explains WHY this    │
   │  pattern exists so the next person doesn't "simplify" it back.  │
@@ -396,6 +397,8 @@ The fix in one diagram
 
 **Q: What flake classes haven't you generalized this lesson to?** Honest answer: the rest of the suite hasn't been re-audited with the same lens. The fix landed in one file; the discipline hasn't been generalized to a lint rule banning direct `process.env.X = …` in test files. Adding an ESLint rule (or a project-specific check) would prevent the same class of bug from landing in a future test file. That's flag 8 in the red-flag audit and the obvious next move.
 
+**Q: Has this lesson been generalized at all?** Yes — to one new domain. The Phase 3 eval suite faced an analogous parallel-shared-state problem: two sessions (main + a PR E sub-agent) both running `npm run eval:diagnosis -- --K=10` against the same `eval/results/<date>/` directory. Detected via `ps aux` and killed (PIDs 30039/30040) before clobber. The mitigation is `EVAL_RUN_TAG=<suffix>` — set the env var and the eval script writes to `eval/results/<date>-<tag>/` instead. Same family of fix as `vi.stubEnv`: route mutation of a shared resource through a discriminator the framework respects. Cf. file `06-eval-flywheel.md` for the full incident. The unaddressed sibling: nothing forces `EVAL_RUN_TAG` to be set when a sibling process is already writing — a lockfile gate would close that loop the same way `vi.unstubAllEnvs` closes the env-mutation loop.
+
 ## Validate
 
 1. **Reconstruct:** Without looking, draw the timeline of the AUTH_SECRET flake: which worker mutated which global at which point, and why parallel workers made it visible.
@@ -406,6 +409,10 @@ The fix in one diagram
 ## See also
 
 - `audit.md#determinism-isolation-and-flakiness` — the full isolation map for the suite
-- `audit.md#testing-red-flags-audit` — flag 8 (no lint guard on env mutation) is the generalization opportunity this fix points to
+- `audit.md#testing-red-flags-audit` — flag 8 (no lint guard on env mutation) and flag 12 (parallel eval-run hazard) are the two generalization opportunities this fix points to
 - `01-scripted-anthropic-harness.md` — the agent tests' isolation depends on the same family (`vi.fn`, `vi.stubGlobal` work on the same tracked-mutation principle)
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard tests this file's `_authCookieCrypto` calls feed
+- `06-eval-flywheel.md` — the K=10 parallel-run incident in full; same family of fix at a new layer
+
+---
+Updated: 2026-06-16 — Test count 169→269 (suite grew via Phase 2+3). Added Q on "has this been generalized" pointing at the Phase 3 parallel-run incident and `EVAL_RUN_TAG` as the same family of fix. Added cross-link to 06-eval-flywheel.md.

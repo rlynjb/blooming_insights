@@ -1,9 +1,11 @@
-# Insight ↔ Anomaly silent leak
+# Insight ↔ Anomaly silent leak — RESOLVED 2026-06-15
 
 **Industry name(s):** Information leakage · same-knowledge-in-two-places · change amplification · silent field-drop
-**Type:** Industry standard · Language-agnostic (the canonical leak in this repo)
+**Type:** Industry standard · Language-agnostic (historic leak, now resolved — kept as worked example)
 
-> The fields that cross between an `Anomaly` (what the monitoring agent emits) and an `Insight` (what the feed renders) are encoded in three places: the type interfaces in `lib/mcp/types.ts`, the `anomalyToInsight` mapping in `lib/state/insights.ts:8-28` (copies 8 fields), and the `insightToAnomaly` mapping in `app/api/agent/route.ts:29-31` (copies 4 of those 8 and silently drops `evidence`, `impact`, `history`, `category`). Add a new field to `Anomaly` and TypeScript catches case (1) but not cases (2) or (3) — the round-trip silently loses data. This is the worst information leak in the codebase and the reason the field list is also the design.
+> **STATUS: RESOLVED.** The surface fix proposed below has landed. `insightToAnomaly` now lives at `lib/state/insights.ts:53-55`, colocated with its inverse `anomalyToInsight`. The route handler imports it via `import { ..., insightToAnomaly } from '@/lib/state/insights'`. A round-trip test was added at `test/state/insights.test.ts`. Crucially, **the fix wasn't to copy the dropped fields** — it was to mark the drop as intentional with a load-bearing comment (`lib/state/insights.ts:47-52`: "Reverse mapper. Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream."). The "deeper fix" — change the wire format so the route accepts only `insightId` — was deliberately not done; the cheap fix retired the leak. The verdict — "the worst information leak in the codebase" — was true on 2026-06-02 and is preserved below as a worked example of the colocate-then-comment-then-test fix. The lesson is the *move*: a comment can carry intent TypeScript can't.
+
+> **Original verdict (historical).** The fields that crossed between an `Anomaly` (what the monitoring agent emits) and an `Insight` (what the feed renders) were encoded in three places: the type interfaces in `lib/mcp/types.ts`, the `anomalyToInsight` mapping in `lib/state/insights.ts` (copied 8 fields), and the `insightToAnomaly` mapping in `app/api/agent/route.ts:29-31` (copied 4 of those 8 and silently dropped `evidence`, `impact`, `history`, `category`). Adding a new field to `Anomaly` meant TypeScript caught case (1) but not cases (2) or (3) — the round-trip silently lost data. This was the worst information leak in the codebase. **The fix below is now what the code looks like (surface fix only — the wire format remains unchanged).**
 
 ---
 
@@ -368,7 +370,9 @@ A subtle point worth naming: the leak's *behavioral* cost depends on whether dow
 
 What to read next: the `read-aposd` chapter on information hiding (when present) carries the conceptual treatment. The `01-mcp-client-deep-module.md` file in this guide is the contrast — the strongest hide in the codebase (`parseRetryAfterMs`) is what passes the grep test that this leak fails.
 
-A non-finding worth naming as praise: `parseRetryAfterMs` (`lib/mcp/client.ts:31-38`) is the strongest hide in the repo precisely because no other file knows the Bloomreach error grammar. The same grep test applied there returns one file. That's what hiding looks like. The Anomaly/Insight field list returns three.
+A non-finding worth naming as praise: `parseRetryAfterMs` (now at `lib/data-source/bloomreach-data-source.ts:57-74`) is the strongest hide in the repo precisely because no other file knows the Bloomreach error grammar. The same grep test applied there returns one file. That's what hiding looks like. After the colocation + comment fix, the Anomaly/Insight field list now also passes the test (one file owns the mapping, with the intentional-drop comment carrying the contract).
+
+**Post-fix lesson worth carrying forward.** The grep test was sharp, but it wasn't the whole picture. The leak existed because two converter functions encoded the same knowledge in different files. The fix could have been: (a) make both copy the same fields (rewrites the converters), (b) eliminate one by changing the wire format (rewrites the route + the browser), or (c) colocate the two and use a comment to declare the asymmetry intentional. Option (c) won because the dropped fields *are* intentional — the diagnostic agent regenerates evidence via tool calls and doesn't need the input Anomaly's evidence. The leak wasn't in the *behavior*; it was in the *invisible intent*. A comment can fix that, where TypeScript can't. The lesson generalizes: when two functions diverge by design, name the design in a comment; the leak isn't the asymmetry, it's the silent asymmetry.
 
 ## Interview defense
 
@@ -417,6 +421,9 @@ Interview-defense diagram — surface fix vs deeper fix
 
 ## See also
 
-- `audit.md` — the information-hiding-and-leakage lens names this as the worst leak in the repo.
-- `01-mcp-client-deep-module.md` — the strongest hide in the codebase (`parseRetryAfterMs`), the contrast that passes the grep test this leak fails.
-- `04-synthesize-recovery-duplication.md` — a different shape of leak (same logic in two places, vs same knowledge in three files).
+- `audit.md` — the information-hiding-and-leakage lens records the resolution and names new hides added by Phase 2 (`makeDataSource` factory, domain-tool surface in `mcp-server-olist/`).
+- `01-mcp-client-deep-module.md` — the strongest hide in the codebase (`parseRetryAfterMs`); now passes the same test this fix introduced via comment.
+- `04-synthesize-recovery-duplication.md` — RESOLVED, same fix shape (same logic in two places, lifted to one owner).
+
+---
+Updated: 2026-06-16 — verdict RESOLVED; surface fix landed (colocation + intentional-drop comment + round-trip test); deeper wire-format fix deliberately not done; kept as worked example with post-fix lesson on comments as carriers of intent TypeScript can't enforce.

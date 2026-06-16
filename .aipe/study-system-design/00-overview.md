@@ -3,7 +3,7 @@
 **Industry name(s):** system map · component diagram · trust-and-data topology
 **Type:** Industry standard · Language-agnostic
 
-> blooming insights is a **Next.js 16 (App Router) app that hangs four Claude agents off one MCP server, with no database**. The whole architecture earns its weight from three load-bearing pieces: `runAgentLoop` (one function, four agents), `McpClient` (the single MCP choke-point — cache + spacing + retry), and the route-level NDJSON streams that turn long agent runs into a UI that's *visibly working* before it's done. The most surprising choice is the deliberate absence of a database — state lives in in-memory `Map`s plus an encrypted-cookie auth store plus committed demo JSON. That choice buys deploy simplicity at hackathon scale and silently costs durability across Vercel instances; everything in this guide follows from that decision.
+> blooming insights is a **Next.js 16 (App Router) app that hangs four Claude agents off a swappable MCP backend, with no database for app state and a committed SQLite seed for eval ground truth**. The whole architecture earns its weight from FOUR load-bearing pieces: `runAgentLoop` (one function, four agents), `BloomreachDataSource` (the prod MCP choke-point — cache + spacing + retry), the route-level NDJSON streams that turn long agent runs into a UI that's *visibly working* before it's done, and the 4-pillar eval suite (`eval/`) that makes the agent system measurable. The architecture's most consequential 2026-06 change is the `DataSource` interface (`lib/data-source/types.ts`) — a three-method seam that lets the SAME agent code drive Bloomreach Engagement OR a SQLite-backed `mcp-server-olist` subprocess, picked at runtime by `bi:mode = 'demo' | 'live-sql' | 'live-bloomreach'`. The most surprising choice is the deliberate absence of an app-state database — state lives in in-memory `Map`s plus an encrypted-cookie auth store plus committed demo JSON. That choice buys deploy simplicity at hackathon scale and silently costs durability across Vercel instances; everything in this guide follows from that decision.
 
 ---
 
@@ -35,24 +35,46 @@
   │   │   4 callers · monitoring · diagnostic · recommendation · query │         │
   │   │   each = prompt + tool subset + validator + synthesize() fallback│         │
   │   └────────────────────────┬─────────────────────────────────────┘         │
-  │        Anthropic SDK       │ McpClient.callTool                            │
+  │        Anthropic SDK       │ DataSource.callTool                           │
   │        (claude-sonnet-4-6) ▼                                                │
-  │   ┌─ Provider/transport seam ───────────────────────────────────┐          │
-  │   │ lib/mcp/client.ts     McpClient  (TTL cache + ~1.1s spacing  │          │
-  │   │                                    + bounded retry on 429)   │          │
-  │   │ lib/mcp/transport.ts  McpTransport ⇠ SdkTransport (+ fakes)  │          │
-  │   │ lib/mcp/connect.ts    connectMcp / completeAuth              │          │
-  │   │ lib/mcp/auth.ts       BloomreachAuthProvider (PKCE + DCR)    │          │
-  │   └────────────────────────┬─────────────────────────────────────┘          │
-  └────────────────────────────│───────────────────────────────────────────────┘
-                               │  HTTPS + Bearer (per-user OAuth token)
-  ┌─ State (process-local) ────┴──┐   ┌─ External providers ─────────────────┐
-  │ lib/state/insights.ts          │   │ Bloomreach loomi-connect MCP server  │
-  │ lib/state/investigations.ts    │   │   (StreamableHTTPClientTransport,    │
-  │   in-memory Map + dev file      │   │    ~1 req/s/user GLOBAL limit)       │
-  │   + committed demo-*.json       │   │ Anthropic API (claude-sonnet-4-6)    │
-  │   + module-cached schema        │   └──────────────────────────────────────┘
-  └─────────────────────────────────┘
+  │   ┌─ DataSource seam (upper) — picked by makeDataSource(mode, sid) ─┐      │
+  │   │ lib/data-source/types.ts    DataSource interface (3 methods)     │      │
+  │   │ lib/data-source/index.ts    makeDataSource(mode, sessionId)      │      │
+  │   │                                                                   │      │
+  │   │ ┌── live-bloomreach ─────────┐   ┌── live-sql ─────────────────┐ │      │
+  │   │ │ BloomreachDataSource       │   │ OlistDataSource             │ │      │
+  │   │ │ (lib/data-source/          │   │ (lib/data-source/           │ │      │
+  │   │ │  bloomreach-data-source.ts)│   │  olist-data-source.ts)      │ │      │
+  │   │ │ TTL cache + ~1.1s spacing  │   │ StdioClientTransport →      │ │      │
+  │   │ │ + bounded retry on 429     │   │ mcp-server-olist subprocess │ │      │
+  │   │ │      │                     │   │ (Node, better-sqlite3)      │ │      │
+  │   │ │      ▼                     │   │ 3 tools, ~10–50 ms/call     │ │      │
+  │   │ │ McpTransport (lower seam)  │   └─────────────────────────────┘ │      │
+  │   │ │ SdkTransport ⇠ MCP SDK     │                                    │      │
+  │   │ │      │                     │                                    │      │
+  │   │ │ BloomreachAuthProvider     │                                    │      │
+  │   │ │ (PKCE + DCR + AES-cookie)  │                                    │      │
+  │   │ └────────────────────────────┘                                    │      │
+  │   │ lib/mcp/client.ts = 17-line shim re-exporting BloomreachDataSource│      │
+  │   └────────────┬────────────────────────────┬─────────────────────────┘      │
+  └────────────────│────────────────────────────│──────────────────────────────┘
+                   │ HTTPS + Bearer              │ stdio JSON-RPC frames
+                   │ (per-user OAuth token)      │ (one subprocess per instance)
+  ┌─ State (process-local) ────┐                ▼
+  │ lib/state/insights.ts       │  ┌─ External providers ───────────────────────┐
+  │ lib/state/investigations.ts │  │ Bloomreach loomi-connect MCP server         │
+  │   in-memory Map + dev file  │  │   (~1 req/s/user GLOBAL limit)              │
+  │   + committed demo-*.json   │  │ mcp-server-olist child process              │
+  │   + module-cached schema    │  │   + data/olist.db (3.6 MB, committed)       │
+  └─────────────────────────────┘  │   + seeded_anomalies (eval ground truth)    │
+                                    │ Anthropic API (claude-sonnet-4-6)           │
+                                    └─────────────────────────────────────────────┘
+
+  ┌─ eval/ (sibling, ~75 files) — not in the production code path ──────────────┐
+  │  eval:detection / :diagnosis / :recommendation / :regression                │
+  │  spawns the same agents over OlistDataSource → judges → writes              │
+  │  eval/results/<date>[/<tag>]/*.json + summary.md                            │
+  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Zoom in — narrow to the concept.** The question this whole guide answers is: *where do data, state, and work live in blooming insights, how do they move, where do the boundaries fail, and what changes at 10x?* Every other file picks one audit lens (system map, request/response, state ownership, caching, storage, failure, scale, red flags) and walks that lens across this map. By the end you should be able to point at any box, name what it owns, name what crosses each arrow, and predict what breaks first when the load goes up.
@@ -302,7 +324,7 @@ The map above is the index. **Reading order:** start with [audit.md](./audit.md)
 | [audit.md](./audit.md) | Pass 1 audit | 8 lens sections + ranked top-3 findings. Verdict-first, cross-linked into each pattern file. |
 | [01-request-flow.md](./01-request-flow.md) | Pattern | The seven-hop briefing pipeline; gates, layer crossings, the demo short-circuit. |
 | [02-oauth-boundary.md](./02-oauth-boundary.md) | Pattern | OAuth 2.0 + PKCE + DCR via the MCP SDK's `OAuthClientProvider`; the encrypted-cookie store + ALS pattern that survives Vercel's ephemeral instances. |
-| [03-provider-abstraction.md](./03-provider-abstraction.md) | Pattern | Two narrow interfaces this codebase owns (`McpTransport`, `McpCaller`) — why 125 tests run offline without an API key. |
+| [03-provider-abstraction.md](./03-provider-abstraction.md) | Pattern | Two-seam vertical stack — upper `DataSource` (backend swap: Bloomreach vs Olist) + lower `McpTransport` (HTTP-SDK swap, Bloomreach-only); `makeDataSource(mode, sessionId)` factory; 269 tests run offline. |
 | [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) | Pattern | The `McpClient.callTool` four-stage funnel: cache check → spacing gate → live call → bounded retry; never cache on error. |
 | [05-streaming-ndjson.md](./05-streaming-ndjson.md) | Pattern | Producer/consumer over `ReadableStream`; the `AgentEvent` discriminated union; line-buffering kernel; why `fetch`-stream and not `EventSource`. |
 | [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) | Pattern | One shared `runAgentLoop`; `maxToolCalls` + `forceFinal` + dedicated `synthesize()`; four agents, one loop. |
@@ -332,9 +354,10 @@ The earlier `.aipe/study-system-design/` is preserved as the curriculum-DSA comp
 
 ## Sections
 
-- **[README.md](README.md)** — reading order: audit.md first, then the 8 discovered-pattern files.
+- **[README.md](README.md)** — reading order: audit.md first, then the 10 discovered-pattern files.
 
 ---
 
+Updated: 2026-06-16 — refreshed the verdict paragraph to name `DataSource` as a load-bearing seam (it now ships two real adapters and a runtime mode switch) and to add the 4-pillar eval suite as the fourth load-bearing piece; refreshed the system diagram to show the upper/lower seam split with the two adapters side-by-side (Bloomreach over HTTPS, Olist over stdio subprocess); added the `mcp-server-olist` external + `data/olist.db` + `seeded_anomalies`; added the `eval/` sibling band; bumped Pass-2 file count to 10 (added 09-eval-pipeline, 10-authored-mcp-server). The "no database" framing is qualified — *for app state*; the SQLite seed for eval ground truth is now a real durable storage tier.
 Updated: 2026-06-02 — Restructured to v1.59.2 audit-style two-pass shape: `audit.md` (Pass 1, 8 lenses) + 8 discovered-pattern files (Pass 2). The 8 legacy lens-named files (`01-system-map-and-boundaries.md` through `08-system-design-red-flags-audit.md`) are deleted; their content lives in `audit.md`'s lens sections + cross-links to the pattern files. Pattern files promoted from the legacy archive `.aipe/study-system-design/` (which remains as the curriculum-DSA companion and is not modified).
 Updated: 2026-06-01 — Initial generation as v1.55 audit-shaped guide; legacy `.aipe/study-system-design/*` retained as archive (cited, not duplicated).

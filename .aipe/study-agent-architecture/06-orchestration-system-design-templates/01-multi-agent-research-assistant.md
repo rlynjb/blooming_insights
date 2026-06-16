@@ -96,5 +96,16 @@ So blooming insights occupies the structural slot the template names — orchest
 
 The honest version of "how to make it apply" is: don't, unless a feature genuinely requires multiple sources or genuinely benefits from parallelism. The coordination tax (2–5x overhead, larger debugging surface, the conflict-merge failure mode) buys nothing under one source and one rate limit. The codebase's current shape is the right answer to its current problem.
 
+**Where this codebase IS load-bearing for this template's interview answer: the eval flywheel.** What blooming insights doesn't exercise on the *topology* axis it does exercise on the *measurement* axis. The four-pillar eval suite under `eval/` (detection precision/recall, diagnosis rubric, recommendation rubric, regression) is exactly the kind of senior-level discipline this template's "Eval framing" bullet asks for — and the flywheel that produced its portfolio numbers is the interview-grade detail to lead with:
+
+  → PR D ran detection K=10 and surfaced 5% LOOSE recall — the monitoring agent was anchoring on the wrong time window for the Olist data horizon.
+  → Phase 2.5 fixed the prompt (added a `DATA HORIZON` section + a 3-dim scan plan). Detection lifted 5x (voucher anomaly: 1/10 → 10/10).
+  → PR E added the diagnosis rubric. Its Sonnet-as-judge caught a **BRL cents-vs-Reais unit-conversion bug** — the diagnostic agent was reading `payment_value` as Reais in one query and cents in the next, silently swinging conclusions by ~100x.
+  → A prompt fix patched it; PR F's rerun caught the bug **recurring at run 8 of K=10** — proof that the eval catches recurrence, not just first-occurrence.
+  → PR G's regression eval scored 30% baseline against 10 captured fixtures, surfacing that monitoring and diagnostic outputs drift semantically faster than the prompts change — which is the next thing to tighten.
+
+The pattern to name in interview: *measurement → fix → re-measurement → discovery of the next thing.* That's what an eval flywheel looks like in production, and it's the work blooming insights actually did. The supervisor-worker topology refactor above is hypothetical; the eval discipline is shipped.
+
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-16 — Added closing "eval flywheel" case study (PR D → Phase 2.5 → PR E BRL bug → PR F recurrence → PR G drift) — the senior-level systems pattern this template's "Eval framing" bullet asks for, anchored to the actual Phase 3 work.

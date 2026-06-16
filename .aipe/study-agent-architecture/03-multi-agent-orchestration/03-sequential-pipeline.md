@@ -326,17 +326,17 @@ Sequential pipeline — the full picture in this codebase
 ```
 shape (not full impl):
 
-  // route.ts — code owns the pipeline order
+  // route.ts — code owns the pipeline order; agents take the DataSource seam
   if (step === 'recommend') {
     diagnosis = parseDiagnosis(diagnosisParam);  // resumed handoff
   } else {
-    const diagAgent = new DiagnosticAgent(anthropic, conn.mcp, schema, allTools);
+    const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools);
     diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
     send({ type: 'diagnosis', diagnosis });      // emit to UI + persist
   }
 
   if (step !== 'diagnose') {
-    const recAgent = new RecommendationAgent(anthropic, conn.mcp, schema, allTools);
+    const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools);
     const recs = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
     for (const r of recs) send({ type: 'recommendation', recommendation: r });
   }
@@ -521,3 +521,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Updated Implementation block pseudocode (`conn.mcp` → `dataSource`) to reflect Phase 2's DataSource seam; agent constructors now receive the adapter, not the McpClient.

@@ -292,22 +292,22 @@ the shared agent loop — the baseline reused four times
 **The loop itself**
 **File:** `lib/agents/base.ts`
 **Function / class:** `runAgentLoop()`
-**Line range:** L48–L176 — model L9; for-loop L85; forceFinal calc L90–L91; tools omit on forced-final L101; messages.create L102; assistant turn appended L105; natural stop on zero tool_use L121; mcp.callTool L144; tool_results pushed L171
+**Line range:** L86 onward — `AGENT_MODEL` L10; `McpCaller` alias L24 (= `Pick<DataSource, 'callTool'>`); for-loop body; `forceFinal` gate at the `budgetSpent` calc (L122–L123); tools omitted from `params.tools` on forced-final (L133); natural stop on zero tool_use; `dataSource.callTool` is the dispatch site; tool_results pushed as the next user turn.
 
 **The four callers — each one parameterizes the same loop**
 
-- `MonitoringAgent.scan` — `lib/agents/monitoring.ts` L69–L120 — `maxToolCalls: 6` (L101), produces an Anomaly[]
-- `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` L45–L83 — `maxToolCalls: 6` (L62), produces a Diagnosis
-- `RecommendationAgent.propose` — `lib/agents/recommendation.ts` L36–L77 — `maxToolCalls: 4` (L57), produces Recommendation[]
-- `QueryAgent.answer` — `lib/agents/query.ts` L24–L48 — `maxToolCalls: 6` (L41), produces prose
+- `MonitoringAgent.scan` — `lib/agents/monitoring.ts` — `maxToolCalls: 6`, produces an Anomaly[]
+- `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` — `maxToolCalls: 6`, produces a Diagnosis
+- `RecommendationAgent.propose` — `lib/agents/recommendation.ts` — `maxToolCalls: 4`, produces Recommendation[]
+- `QueryAgent.answer` — `lib/agents/query.ts` — `maxToolCalls: 6`, produces prose
 
-Each caller supplies its own system prompt (`lib/agents/prompts/*.md`), tool subset (`lib/mcp/tools.ts`), and `synthesisInstruction`. The loop body is identical for all four.
+Each caller supplies its own system prompt (`lib/agents/prompts/*.md`), tool subset (`lib/mcp/tools.ts`), and `synthesisInstruction`. The loop body is identical for all four. Each is constructed with a `DataSource` (not an `McpClient`) — Phase 2's seam means the loop is agnostic to whether the tools come from Bloomreach (~27 MCP tools over OAuth) or the authored `mcp-server-olist` subprocess (3 domain tools: `get_metric_timeseries`, `get_segments`, `get_anomaly_context`). The model never sees `execute_sql` under Olist — the domain tools pre-bake the period-over-period math, which is the authoring-MCP-server angle this file's escalation ladder doesn't have to address.
 
 ```
 shape (not full impl):
   // per-caller knobs become a single runAgentLoop call
   await runAgentLoop({
-    anthropic, mcp,
+    anthropic, dataSource,                                  // DataSource seam
     agent: 'diagnostic',                                    // for trace events
     system,                                                 // per-agent prompt
     userPrompt: 'Investigate the anomaly and return JSON.', // role-specific
@@ -471,3 +471,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Updated Implementation block to reflect Phase 2's DataSource seam (agents constructed with `DataSource`, not `McpClient`; loop dispatches via `dataSource.callTool`) and the authored Olist domain tools (`get_metric_timeseries`/`get_segments`/`get_anomaly_context`) replacing raw SQL — the agent never sees `execute_sql`.

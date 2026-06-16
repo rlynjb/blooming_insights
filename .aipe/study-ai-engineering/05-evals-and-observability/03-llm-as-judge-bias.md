@@ -3,7 +3,7 @@
 **Industry name(s):** LLM-as-judge / model-graded eval, position bias, verbosity bias, self-preference / self-enhancement bias, judge calibration
 **Type:** Industry standard · Language-agnostic
 
-> When you use a model to score another model's output, the judge is itself a non-deterministic model with systematic biases — it favors the first option, the longer answer, and outputs from its own family — and a judge with uncorrected bias produces an eval score that measures the bias, not the quality.
+> When you use a model to score another model's output, the judge is itself a non-deterministic model with systematic biases — it favors the first option, the longer answer, and outputs from its own family — and a judge with uncorrected bias produces an eval score that measures the bias, not the quality. blooming insights now ships three LLM-as-judge surfaces (`eval/judges/diagnosis-judge.md`, `recommendation-judge.md`, `similarity-judge.md`), all running on `claude-sonnet-4-6` — the SAME family as the agents — so self-preference bias is the live trap. The mitigation in place is **per-criterion rubrics + manual-vs-judge calibration receipts** (diagnosis 8/8, recommendation 3/3); cross-family judging is the remaining Case-B gap.
 
 
 ---
@@ -35,9 +35,14 @@
   │  trustworthy ⇒ ship; biased ⇒ confident lie       │
   └──────────────────────────────────────────────────┘
 
-  Currently in this codebase: no LLM-as-judge is wired —
-  this file is study material plus the debiasing checklist
-  you'd apply when introducing one.
+  Currently in this codebase: three LLM-as-judges ARE
+  wired (diagnosis, recommendation, similarity for
+  regression) — all on `claude-sonnet-4-6`, same family
+  as the agents → self-preference live. The mitigations
+  in place: per-criterion rubrics + manual-vs-judge
+  calibration receipts (diagnosis 8/8, recommendation
+  3/3 incl BRL-bug catch). Cross-family judging is the
+  remaining Case-B gap.
 ```
 
 **Zoom in — narrow to the concept.** The question is: when you delegate quality scoring to a model, what systematic errors does that judge introduce, and how do you correct them so the score reflects the answer's quality rather than the judge's prejudices? An uncorrected judge turns your eval into a confident lie — a biased judge still returns a clean number, and a number is persuasive. The fixes (randomized order, length controls, cross-family judging) are cheap; not applying them is how teams ship "data-driven" decisions powered by noise. How it works walks each bias, the cheap correction, and why a judge of the same family flatters the system it grades.
@@ -212,11 +217,39 @@ The model is the instrument; the harness is the protocol that subtracts its know
 
 ## Implementation in codebase
 
-**Not yet implemented.** blooming insights has no LLM-as-judge — there is no judge model wired for evaluation, no pairwise comparison code, and no debiasing protocol, because (per `01-eval-set-types.md` and `02-eval-methods.md`) there is no eval harness at all.
+**Case A — partial. The trap is acknowledged-and-receipted, not avoided.**
 
-The relevant codebase fact is the *trap waiting to be sprung*: the agents run on `claude-sonnet-4-6` (`AGENT_MODEL`, `lib/agents/base.ts` L9), and the intent classifier on `claude-haiku-4-5` (`CLASSIFIER_MODEL`, `lib/agents/intent.ts` L14). The naive first eval anyone builds will reach for the SDK already in the repo and judge sonnet output with a sonnet judge — the exact self-preference mistake this file exists to prevent.
+blooming insights now ships three LLM-as-judge surfaces, all running `claude-sonnet-4-6` — the **same family** as the agents (`AGENT_MODEL` at `lib/agents/base.ts:10`). That is self-preference bias by construction. The mitigations actually in place are per-criterion rubrics (verbosity-bias control) and standing manual-vs-judge calibration spot-checks (the human-eval rung from `02-eval-methods.md` applied as receipts).
 
-Where the debiased judge would live: `evals/scorers/judge.ts` (the protocol-wrapped judge call) and `evals/scorers/pairwise.ts` (order-randomized comparison), both consumed by `evals/runner.ts` from `02-eval-methods.md`. The judge model must be configured to a different family than `claude-sonnet-4-6`. The exercise below is that scorer.
+### Diagnosis judge
+
+- **File:** `eval/judges/diagnosis-judge.md` (the prompt, ~235 lines) + `eval/scripts/lib/judge.ts` (the harness)
+- **Model:** `claude-sonnet-4-6` — same family as the agent it judges (self-preference live)
+- **Verbosity control:** per-criterion rubric (5 criteria — hypothesis 0-2, evidence 0-2, sizing 0-2, calibration 0-1, fabrication 0-2 — total 0-9; pass ≥ 7). Each criterion has explicit numeric ranges in the prompt, so a longer answer cannot win by being longer; it has to *satisfy each criterion*.
+- **Position control:** N/A — this is absolute scoring, not pairwise; no order to randomize.
+- **Calibration receipt:** `eval/results/2026-06-15/diagnosis-summary.md` — 8/8 manual-vs-judge agreement on a stratified sample (lowest, highest, and mid-pack per anomaly). The judge consistently scores `calibration=0` when the candidate's `confidence: high` field is set; the spot-check confirms this is a real reading of the rubric (the agent overclaims), not a judge artifact.
+
+### Recommendation judge
+
+- **File:** `eval/judges/recommendation-judge.md` (~243 lines) + `eval/scripts/lib/judge-rec.ts`
+- **Model:** `claude-sonnet-4-6` — same self-preference caveat
+- **Verbosity control:** per-criterion rubric (3 criteria — plausible 0-2, specific 0-2, impact_sized 0-1; pass ≥ 4)
+- **Calibration receipt:** `eval/results/2026-06-15/recommendation-summary.md` — 3/3 manual-vs-judge agreement on a stratified sample. The receipt that proves the judge isn't rubber-stamping: at run 8 of `electronics-spike-w2` it scored `impact_sized=0` on a recommendation citing `R$131,965 AOV → $26K/order`, correctly catching the BRL cents-vs-Reais bug and dropping the run from 5/5 to 4/5. **The judge IS critical when warranted.**
+
+### Similarity judge (regression)
+
+- **File:** `eval/judges/similarity-judge.md` (~225 lines) + `eval/scripts/lib/similarity-judge.ts`
+- **Model:** `claude-sonnet-4-6` — same self-preference caveat
+- **Verbosity control:** the rubric asks for a yes/no semantic match plus a confidence and a `notes` / `differences` array — not a holistic score, so length is not the lever.
+- **Calibration receipt:** the 30% semantic pass-rate baseline at `eval/results/2026-06-15-score-baseline/regression-summary.md` is itself a calibration anchor — running capture-then-immediately-score against identical prompts produces 30% match, which means *any* prompt edit must clear that floor to count as a non-regression. The `differences` arrays in the failure cases (see `regression-summary.md`) are the receipts the human can spot-check.
+
+### What's NOT done — the named gaps
+
+- **Cross-family judging.** The remaining Case-B gap. A GPT-class or Gemini-class judge model would remove the self-preference axis; today it's a known cost paid in exchange for keeping the eval suite single-provider (Anthropic SDK only).
+- **Pairwise comparison.** No swap-and-average mode exists — the three judges all do absolute scoring. Adding pairwise is the exercise in `02-eval-methods.md`.
+- **Panel of judges.** No multi-family ensemble; the single-judge per surface is what's wired.
+
+The standing calibration discipline (manual spot-checks on stratified samples, committed alongside each result dir) is the *honest substitute* for cross-family judging today: it accepts the bias and audits its effect, rather than removing it.
 
 ---
 
@@ -257,23 +290,23 @@ Every bias is a confound — a variable correlated with the score that is not qu
 
 ## Project exercises
 
-### Build a debiased LLM-as-judge for diagnosis quality
+### Add a cross-family judge for diagnosis (close the self-preference gap)
 
-- **Exercise ID:** B3.3 / B3.7 (adapted) — the debiased judge, the primary buildable target.
-- **What to build:** `evals/scorers/judge.ts` that scores `DiagnosticAgent` output against a golden reference with all three corrections wired in: a configurable judge model defaulting to a *different family* than `claude-sonnet-4-6` (self-preference), a per-criterion rubric prompt with length-neutral instructions (verbosity), and — for pairwise mode — swap-and-average over both orders (position). Expose a `flipRate` diagnostic that reports how often the judge changes its verdict on order swap.
-- **Why it earns its place:** demonstrates you treat the judge as a biased instrument and correct each offset — the precise senior signal that you do not trust a model-graded number blindly, and specifically that you would never let sonnet judge sonnet.
-- **Files to touch:** `evals/scorers/judge.ts`, `evals/scorers/pairwise.ts` (swap-and-average), `evals/runner.ts` (wires the judge); judge model config separate from `AGENT_MODEL` in `lib/agents/base.ts` L9; references the `Diagnosis` shape in `lib/mcp/types.ts` L64–L73.
-- **Done when:** the judge defaults to a non-sonnet family, pairwise mode runs both orders and reports a `flipRate`, and a holdout of human-scored cases shows judge-human agreement above your chosen threshold.
+- **Exercise ID:** B3.3 / B3.7 (adapted) — the actual remaining gap.
+- **What to build:** extend `eval/scripts/lib/judge.ts` to accept a `--judge-model` flag (defaulting to `gpt-4o` or `gemini-2.0-pro` — anything NOT in the Claude family), and add the corresponding SDK as a dev dependency. Re-run `eval:diagnosis` with both judges side-by-side and add a per-criterion **judge-family agreement table** to the resulting `summary.md` ("does GPT agree with Sonnet on hypothesis score? on fabrication?"). Where they disagree, the Sonnet judge is the suspect side (because it's the family being judged).
+- **Why it earns its place:** the codebase ships the eval suite and accepts self-preference as a known cost. Closing this is the proof you would not let a sonnet judge be the ONLY voice scoring sonnet output, even though that's where you started.
+- **Files to touch:** `eval/scripts/lib/judge.ts` (configurable provider), `eval/scripts/lib/judge-rec.ts` (same), `eval/judges/diagnosis-judge.md` (verify the prompt is portable — no Anthropic-specific tags), `package.json` (add the non-Anthropic SDK).
+- **Done when:** `npm run eval:diagnosis -- --K=10 --judge-model=gpt-4o` runs to completion, and the resulting `summary.md` shows the agreement table between the two judges on the same K=10 candidates.
 - **Estimated effort:** 1–2 days
 
-### Add a one-time human-calibration harness
+### Standardize the calibration receipt format
 
-- **Exercise ID:** C3.3 (provenance) — judge calibration.
-- **What to build:** a small script that takes a sample of golden cases, records human scores alongside the debiased judge scores, and prints an agreement metric (e.g. Cohen's kappa or rank correlation) so the judge is validated before it is trusted at scale.
-- **Why it earns its place:** shows you close the loop — a debiased judge is still only as good as its agreement with the humans whose judgment it approximates.
-- **Files to touch:** `evals/calibrate.ts`, reads `evals/fixtures/golden.json`, uses `evals/scorers/judge.ts`.
-- **Done when:** the script outputs a judge-human agreement score for the sample and flags it pass/fail against a threshold.
-- **Estimated effort:** 1hr–1day
+- **Exercise ID:** C3.3 (provenance) — operationalize judge calibration.
+- **What to build:** the diagnosis and recommendation summaries already include manual-vs-judge spot-checks, but the format is ad-hoc (a markdown table embedded in `summary.md`). Extract it into a reusable `eval/scripts/lib/calibration.ts` that takes a `manualScores.json` file + the judge output and produces a standardized receipt block (agreement rate per criterion, flag any rate < threshold). Add it to `run-recommendation.ts` and `run-diagnosis.ts` so every result dir carries one.
+- **Why it earns its place:** the calibration discipline is the load-bearing mitigation in this codebase's self-preference handling. Making it mechanical (and CI-friendly) is the difference between "we did it once" and "every result dir has a receipt."
+- **Files to touch:** `eval/scripts/lib/calibration.ts` (new), `eval/scripts/run-diagnosis.ts` + `run-recommendation.ts` (wire it), `eval/fixtures/manual-scores/<date>.json` (the human-scored sample).
+- **Done when:** every new dated dir under `eval/results/` carries a standardized calibration receipt block in its `summary.md`.
+- **Estimated effort:** <1 day
 
 ---
 
@@ -358,3 +391,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Phase 3 flipped this file to "Case A — partial; trap acknowledged-and-receipted, not avoided": opening verdict + Implementation in codebase now name the three live LLM-as-judge surfaces (`eval/judges/diagnosis-judge.md`, `recommendation-judge.md`, `similarity-judge.md`, all on `claude-sonnet-4-6` → self-preference live). Calibration receipts cited (diagnosis 8/8, recommendation 3/3 incl BRL-bug catch); cross-family judging + pairwise + panel-of-judges named as the remaining Case-B gaps. Replaced the "build a debiased judge" exercise with two new ones: cross-family judge (close self-preference) and standardized calibration receipts.

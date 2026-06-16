@@ -282,6 +282,25 @@ Compute the cheap gate before the expensive work, and let one computation serve 
 
 **Registry drift.** The 10 categories and their dep tokens are hard-coded. A workspace using non-standard event names reads as `unavailable` (see the exact-string coupling in `../02-dsa/07-coverage-gate.md`). The gate is only as good as the registry's vocabulary matching the schema's.
 
+**Adapter-aware schema shape (since 2026-06).** The gate now runs against schemas from **two different adapters with two different vocabularies**:
+
+- `live-bloomreach`: `bootstrapSchema(mcp)` makes 4 real MCP calls and parses event names like `purchase`, `view_item`, `checkout`, `session_start`. The 10-category registry was designed against this vocabulary, so the gate typically classifies 7–10 categories as `full` or `limited`.
+- `live-sql`: `olistWorkspaceSchema()` (`lib/mcp/schema.ts` L232–L280) synthesizes a schema in-memory (the Olist server intentionally exposes no schema-discovery tools — see `10-authored-mcp-server.md`). Its `events` look like `order`, `payment`, `review` — none of which match the registry's `requires` lists. The gate classifies **every** category as `unavailable` for the Olist adapter, and `runnableCategories(...)` returns `[]`.
+
+When `runnable === []`, the monitoring agent's prompt has an explicit fallback branch ("If the checklist is empty, fall back to scanning the Olist core metrics — revenue, order_count, payment_value — by state / category / payment_type"). The gate isn't bypassed; the agent just operates under a different prompt branch. The UI still shows the 10 ghost tiles honestly — under `live-sql` every tile is `unavailable`, which is the correct verdict for a Brazilian e-commerce SQL backend that doesn't emit Bloomreach-shaped events.
+
+**DATA HORIZON — a new schema-summary contract (Phase 2.5, 2026-06).** The `WorkspaceSchema` shape gained a `dataHorizon?: { from: string; to: string; durationDays: number }` field (`lib/mcp/schema.ts` L18–L27). Present for synthetic datasets (Olist seeds a fixed 26-week window); `undefined` for live Bloomreach workspaces where the bound is open-ended. The four agent prompts (`lib/agents/prompts/monitoring.md` L9–L14, plus the diagnostic / query / recommendation prompts) now read `dataHorizon` to anchor `time_range` arguments inside the populated window rather than hallucinating dates from training memory.
+
+```
+WorkspaceSchema  ──────►  prompt interpolation  ──────►  agent.scan(...)
+       │                          │                            │
+       └─ dataHorizon: { from,    └─ "Anchor time_range        └─ tool calls
+          to, durationDays }        inside dataHorizon.from–      use the right
+          (Olist only)              dataHorizon.to"                window
+```
+
+This is the second prompt-level gate (alongside the per-category checklist): the **horizon scan plan** added in 2026-06 to the monitoring / diagnostic / query / recommendation prompts. It's a soft gate (prompt-injected, not enforced in code) — but combined with the hard gate (`runnableCategories`), it's what makes a single shared agent loop produce useful queries against two backends with different data horizons.
+
 ### What to explore next
 
 - **Persist the coverage report** alongside insights so the investigate page and exports can show "this briefing covered 7/10 categories" without recomputing.
@@ -375,9 +394,10 @@ Your PM says: "The ghost tiles look broken — just hide categories the workspac
 
 ## See also
 
-→ [audit.md](./audit.md) (request-response-and-data-flow + scale-bottlenecks lenses — the gate is what bounds the agent's `maxToolCalls: 6` budget to runnable categories) · [01-request-flow.md](./01-request-flow.md) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`
+→ [audit.md](./audit.md) (request-response-and-data-flow + scale-bottlenecks lenses — the gate is what bounds the agent's `maxToolCalls: 6` budget to runnable categories) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the schema-vocabulary asymmetry between adapters) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · [10-authored-mcp-server.md](./10-authored-mcp-server.md) (why the Olist server intentionally has no schema-discovery tools) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`
 
 ---
+Updated: 2026-06-16 — added two paragraphs to "Where it breaks down": (1) adapter-aware schema shape — under `live-sql` the Olist vocabulary doesn't match the registry, every tile is `unavailable`, and the monitoring prompt's empty-checklist branch fires; (2) DATA HORIZON — a new `dataHorizon` field on `WorkspaceSchema` and the corresponding prompt anchoring across the four agent prompts, framed as the second (prompt-level) gate next to the hard `runnableCategories` gate. Cross-linked `03-provider-abstraction.md` and `10-authored-mcp-server.md`.
 Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.

@@ -3,7 +3,7 @@
 **Industry name(s):** evaluation datasets, golden sets / ground-truth sets, adversarial test sets, regression suites, held-out eval data
 **Type:** Industry standard · Language-agnostic
 
-> An eval set is a fixed collection of inputs paired with the answer you expect, run against the live model to score output *quality* — not a unit test that asserts plumbing. blooming insights has 169 Vitest tests, but they inject fakes and assert control flow; not one scores an LLM's answer, so the codebase has no eval set, and the three set types below are the buildable target.
+> An eval set is a fixed collection of inputs paired with the answer you expect, run against the live model to score output *quality* — not a unit test that asserts plumbing. blooming insights has 269 Vitest tests that still inject fakes and assert control flow, but it now ALSO has a real eval pillar: the **golden set** is the 3 seeded anomalies in the authored `mcp-server-olist/data/olist.db` (+ reference diagnoses/recommendations under `eval/fixtures/`), the **regression set** is 10 captured fixtures under `eval/fixtures/regression-golden/`, and the **adversarial set** for `?q=` is still the named Case-B gap.
 
 
 ---
@@ -47,7 +47,7 @@
 
 **Layers.** Four layers run *parallel* to the live request, not nested inside it: the eval harness (loads fixed inputs from a set), the same per-agent code that serves live users (`DiagnosticAgent.investigate`), the scorer (rubric or judge consumes the produced output and compares to expected), and a quality number tracked over time. Three set types — golden, adversarial, regression — answer different quality questions.
 
-**Axis: guarantees.** What does each layer's result guarantee — a deterministic pass/fail (unit test) or a probabilistic quality measurement (eval)? This axis is the right lens because the file's whole frame is "evals are not unit tests" — they consume the *live* model and tolerate non-determinism. The 169 Vitest tests guarantee plumbing; the absent eval sets would guarantee *quality on representative input*. Cost is downstream; the upstream question is what kind of statement you're trying to make.
+**Axis: guarantees.** What does each layer's result guarantee — a deterministic pass/fail (unit test) or a probabilistic quality measurement (eval)? This axis is the right lens because the file's whole frame is "evals are not unit tests" — they consume the *live* model and tolerate non-determinism. The 269 Vitest tests guarantee plumbing; the absent eval sets would guarantee *quality on representative input*. Cost is downstream; the upstream question is what kind of statement you're trying to make.
 
 **Seams.** The cosmetic seam is between the harness and the per-agent code — both are CODE. The load-bearing seam is between the per-agent output and the scorer: guarantees flip here from "live probabilistic prose" to "a number you can act on." A second load-bearing seam sits parallel to the live request flow: live UI consumes the same per-agent output for users; the eval scorer consumes it for *measurement*. Same data, two different guarantees — one "show the user," the other "is this getting better."
 
@@ -180,18 +180,28 @@ This is the eval-world equivalent of "write a failing test that reproduces the b
 ### Current state vs. future state
 
 ```
-CURRENT (Case B)                    FUTURE (the buildable target)
+PHASE 2 (was Case B)                PHASE 3 (now Case A)
 ──────────────────────────────      ──────────────────────────────────
-test/ — 169 Vitest unit tests       test/ — unchanged (plumbing)
-  fakes injected, no model           +
-  asserts shape & control flow      evals/ — new directory
-                                       fixtures/ golden, adversarial,
-no evals/ directory                              regression cases (JSON)
-no reference answers                   runner.ts — runs cases vs. model
-no quality score                       scored output, tracked over time
+test/ — 169 Vitest unit tests       test/ — 269 Vitest unit tests
+  fakes injected, no model            (unchanged discipline — fakes,
+  asserts shape & control flow         plumbing — just more of them)
+                                      +
+no evals/ directory                 eval/ — REAL, WIRED
+no reference answers                  fixtures/reference-diagnoses.json
+no quality score                      fixtures/reference-recommendations.json
+                                      fixtures/regression-golden/*.json (10 fixtures)
+                                      judges/{diagnosis,recommendation,
+                                              similarity}-judge.md
+                                      scripts/run-{detection,diagnosis,
+                                                   recommendation,regression}.ts
+                                      scripts/lib/{judge,judge-rec,scorer,
+                                                   similarity-judge,
+                                                   structural-diff,summary}.ts
+                                      results/<YYYY-MM-DD>/ — committed paper trail
+                                  ADVERSARIAL set on ?q= — still Case B
 ```
 
-The unit tests stay exactly as they are — they guard plumbing and they are good at it. The evals are a *new, parallel* artifact, not a replacement.
+The unit tests stay exactly as they are — they guard plumbing and they are good at it. The eval suite is the *new, parallel* artifact running real Sonnet 4.6 against ground-truth fixtures, scored by per-criterion LLM-as-judge rubrics, with K=10 repeats and dated result dirs.
 
 ---
 
@@ -238,11 +248,26 @@ The eval set is a dataset that exercises the real Provider boundary; the unit su
 
 ## Implementation in codebase
 
-**Not yet implemented.** blooming insights has no eval set — its 169 Vitest tests are unit/integration tests that inject fakes (`McpCaller`, often a fake Anthropic client) and assert plumbing (control flow, output *shape* via `isDiagnosis`/`isAnomalyArray`/`isRecommendationArray`, NDJSON round-trip, budget enforcement); none of them call the real model or score answer quality.
+**Case A — implemented.** blooming insights now has a real eval suite under `eval/` that runs the *live* Sonnet 4.6 agents (`AGENT_MODEL` at `lib/agents/base.ts:10`) against ground-truth fixtures. The 269 Vitest tests under `test/` still inject fakes and assert plumbing — that hasn't changed and it shouldn't. The eval suite is the parallel, real-money quality layer.
 
-You can confirm the absence: `test/agents/diagnostic.test.ts` and its siblings build fake MCP callers and assert structure, not correctness; `lib/mcp/validate.ts` (L17–L53) validates *shape* (`metric` is a string, `evidence` is an array), not whether a conclusion is true; there is no `evals/` directory, no reference-answer fixtures, and no scoring code anywhere in the repo.
+### The golden set
 
-Where evals would live: a new top-level `evals/` directory holding `evals/fixtures/{golden,adversarial,regression}.json` (the datasets) and `evals/runner.ts` (the harness that loads each case, calls the live agent, scores the output, and reports an aggregate). The runner is detailed in `02-eval-methods.md`; the datasets are the deliverable of the exercises below.
+- **File:** `mcp-server-olist/data/olist.db` → table `seeded_anomalies`
+- **What's in it:** three rows, one per seeded anomaly — `sp-revenue-drop-w4` (state=SP, multiplier=0.7 on week 4 revenue), `electronics-spike-w2` (category=electronics, week 2), `voucher-dropoff-w10-on` (payment_type=voucher, sustained from week 10). Each row carries metric / dimension / segment / time-window / ground-truth multiplier / expected severity / description. These are the ground-truth references the detection eval scores against.
+- **Reference diagnoses + recommendations:** `eval/fixtures/reference-diagnoses.json`, `eval/fixtures/reference-diagnoses-as-input.json`, `eval/fixtures/reference-recommendations.json` — hand-crafted reference answers for the diagnosis and recommendation judges to compare against (rubric is the actual instrument; references are the anchor).
+
+### The regression set
+
+- **Directory:** `eval/fixtures/regression-golden/` — 10 fixtures captured 2026-06-15: `01-monitoring-empty.json`, `02-monitoring-3-anomalies.json`, `03-diagnostic-sp.json`, `04-diagnostic-electronics.json`, `05-diagnostic-voucher.json`, `06-recommendation-sp.json`, `07-recommendation-electronics.json`, `08-recommendation-voucher.json`, `09-query-revenue-by-state.json`, `10-intent-classify-investigation.json`.
+- **Capture mechanism:** `eval/scripts/run-regression.ts` in `capture` mode writes today's outputs into `eval/results/<date>-capture/`; the golden directory is a hand-promoted snapshot. See `05-regression-evals.md` for the capture/score split.
+
+### The adversarial set
+
+- **Status:** Case B. The `?q=` path (`app/api/agent/route.ts`) is still only `.trim()`'d — no adversarial fixtures exist for it. This is the named gap.
+
+### What's deliberately NOT here
+
+The 269 Vitest tests under `test/agents/diagnostic.test.ts` and its siblings still build fake MCP callers and assert structure (not correctness); `lib/mcp/validate.ts` still validates *shape* (`metric` is a string, `evidence` is an array), not whether a conclusion is true. The eval suite did not replace any of that — it added a *new, separate* parallel artifact. Confusing the two (e.g., adding an eval to the Vitest suite, or asking a unit test to score answer quality) collapses the discipline.
 
 ---
 
@@ -284,23 +309,23 @@ The eval set keeps the *discipline* of unit testing (fixed inputs, expected outp
 
 ## Project exercises
 
-### Create the `evals/` directory with golden, adversarial, and regression fixtures
+### Build an adversarial set for the `?q=` path
 
-- **Exercise ID:** B3.1 / B3.10 (adapted) — eval-set construction, the primary buildable target.
-- **What to build:** a new `evals/fixtures/` directory with three JSON files — `golden.json` (15–30 representative anomaly + `?q=` cases, each with an expert reference answer or rubric), `adversarial.json` (10–20 hostile `?q=` inputs with `expect: "refuse" | "no_destructive_tool" | "no_prompt_leak"`), and `regression.json` (seeded empty, with a documented format for appending captured failures). Each case carries the frozen MCP context (recorded tool results) so runs are reproducible.
-- **Why it earns its place:** demonstrates you can tell a unit test from an eval and can curate ground truth — the judgment that separates "we have tests" from "we measure quality."
-- **Files to touch:** `evals/fixtures/golden.json`, `evals/fixtures/adversarial.json`, `evals/fixtures/regression.json`, `evals/README.md` (format spec); reference the real shapes in `lib/mcp/types.ts` (`Anomaly` L53–L61, `Diagnosis` L64–L73, `Recommendation` L85–L99) so cases match production types.
-- **Done when:** each fixture file parses, every case validates against its agent's output type, and the adversarial set covers at least the injection, oversized, and empty-input classes for `?q=`.
+- **Exercise ID:** B3.10 (adapted) — close the named Case-B gap.
+- **What to build:** a new `eval/fixtures/adversarial-query.json` (10–20 hostile `?q=` inputs with `expect: "refuse" | "no_destructive_tool" | "no_prompt_leak"`), plus an `eval/scripts/run-adversarial.ts` runner that exercises the live `QueryAgent` (`lib/agents/query.ts`) over the OlistDataSource and asserts the expected behaviour. Same K=10 + fresh-subprocess discipline as the detection runner.
+- **Why it earns its place:** detection / diagnosis / recommendation / regression are wired; this is the remaining quadrant. Closes the gap named in `../06-production-serving/03-prompt-injection.md`.
+- **Files to touch:** `eval/fixtures/adversarial-query.json`, `eval/scripts/run-adversarial.ts`, `package.json` (`eval:adversarial` script); reuses `eval/scripts/lib/run-agent.ts` and the Olist subprocess spawn pattern.
+- **Done when:** `npm run eval:adversarial -- --K=10` runs each adversarial input, asserts the expected behaviour, and writes results to `eval/results/<date>/adversarial-K10.json`.
 - **Estimated effort:** 1–2 days
 
-### Capture the first regression case from the unsanitized `?q=` path
+### Promote a captured eval failure into the regression-golden set
 
-- **Exercise ID:** C3.1 (provenance) — regression-set seeding from a real hole.
-- **What to build:** drive the `?q=` path (`app/api/agent/route.ts` L115, L211–L218) with an injection input, record the model's actual behaviour, and add it to `regression.json` with the corrected expected behaviour — making the first concrete regression guard the codebase's known security gap.
-- **Why it earns its place:** shows you connect a discovered vulnerability to a permanent eval guard rather than a one-off manual check — and cross-links the defence in `../06-production-serving/03-prompt-injection.md`.
-- **Files to touch:** `evals/fixtures/regression.json`, and a note in `evals/README.md` linking the case to the sanitization fix it should accompany.
-- **Done when:** the captured case exists in `regression.json` with its expected-behaviour assertion and a pointer to the prompt-injection defence file.
-- **Estimated effort:** <1hr
+- **Exercise ID:** C3.1 (provenance) — operationalize the eval flywheel.
+- **What to build:** when an eval run surfaces a real bug (the BRL cents-vs-Reais bug PR E surfaced + PR F's judge re-caught is the model case), capture the candidate output, the expected output after fix, and the rubric criterion that fired, then promote it as a new fixture into `eval/fixtures/regression-golden/`. Document the link from result-dir summary → fixture in `eval/README.md`.
+- **Why it earns its place:** shows you operationalize the discipline: every eval-surfaced bug becomes a permanent regression guard, not a one-off PR description. The 30% regression baseline only ratchets toward 100% if discovered drift gets frozen.
+- **Files to touch:** `eval/fixtures/regression-golden/11-<your-case>.json`, `eval/README.md` (link the case to the surfacing eval + fix), optionally `eval/scripts/run-regression.ts` if the new fixture exercises a new shape.
+- **Done when:** a re-run of `eval:regression score` includes the new fixture and either passes (fix in) or fails honestly (still drifts).
+- **Estimated effort:** <1hr per case
 
 ---
 
@@ -308,7 +333,7 @@ The eval set keeps the *discipline* of unit testing (fixed inputs, expected outp
 
 ### What an interviewer is really asking
 
-"How do you test your LLM feature?" is probing whether you know that your unit tests do not test quality. The junior answer is "we have 169 tests." The senior answer names the gap: those tests mock the model and assert plumbing; quality needs a separate golden/adversarial/regression set run against the real model. The signal is that you can articulate *why* a passing test suite tells you nothing about whether the diagnosis is correct.
+"How do you test your LLM feature?" is probing whether you know that your unit tests do not test quality. The junior answer is "we have 269 tests." The senior answer names two separate artifacts: the 269 Vitest tests under `test/` mock the model and assert plumbing; **the 4-pillar eval suite under `eval/`** runs the real Sonnet 4.6 against ground-truth fixtures and scores quality (detection set-overlap, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression structural+similarity). Naming both — and the calibration receipts that keep the LLM-as-judge honest — is the signal.
 
 ### Likely questions
 
@@ -323,7 +348,7 @@ eval:      real model → score answer  → "the moon is cheese" FAILS
 
 **[senior] You're about to swap `claude-sonnet-4-6` for a newer model. How do you know quality didn't regress?**
 
-Without an eval set, you don't — it is a blind deploy. With one, you run the golden set on both models and compare aggregate scores: same inputs, same rubric, two models, one number each. That A/B is the only objective answer. The unit suite stays green on both and tells you nothing.
+Run the full eval suite on both models. Detection precision/recall (set-overlap), diagnosis pass-rate over the 5-criterion rubric, recommendation pass-rate over the 3-criterion rubric, regression-set semantic pass relative to the 30% baseline at `eval/results/2026-06-15-score-baseline/`. Same inputs, same judges, two models, four numbers each. That four-way comparison is the objective answer. The 269-test Vitest suite stays green on both and tells you nothing about quality.
 
 ```
 golden set ─┬─▶ claude-sonnet-4-6 → score 0.82
@@ -345,7 +370,7 @@ adversarial.json ─▶ ?q= path ─▶ assert: no destructive tool / no leak
 
 ### One-line anchors
 
-- 169 Vitest tests inject fakes and assert plumbing — not one scores an answer (Case B).
+- 269 Vitest tests inject fakes and assert plumbing — separate from the 4-pillar eval suite under `eval/` (the quality layer).
 - `isDiagnosis` (`lib/mcp/validate.ts` L29–L35) checks shape, not truth.
 - `?q=` is `.trim()`'d only (`app/api/agent/route.ts` L115) → adversarial set is apt.
 - Golden = quality, adversarial = robustness, regression = never-again.
@@ -361,7 +386,7 @@ From memory, draw the one-line difference between a unit test case and an eval c
 
 ### Level 2 — Explain
 
-Out loud: why does a green run of all 169 Vitest tests tell you nothing about whether `DiagnosticAgent` produces a *correct* diagnosis? Use `isDiagnosis` to make the point concrete.
+Out loud: why does a green run of all 269 Vitest tests tell you nothing about whether `DiagnosticAgent` produces a *correct* diagnosis — even though the eval suite under `eval/` now does score that? Use `isDiagnosis` (which only validates *shape*) to make the point concrete: the Vitest suite is plumbing; the `eval/` suite is the quality layer. Both exist; they answer different questions.
 
 ### Level 3 — Apply
 
@@ -386,3 +411,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Phase 3 flipped this file from Case B to Case A: opening verdict, Current state vs future state table, and Implementation in codebase now anchor to the real `eval/fixtures/`, `eval/scripts/`, and `mcp-server-olist/data/olist.db` `seeded_anomalies` table; 269 Vitest tests (was 169); replaced the now-obsolete "build the evals/ directory" exercises with two new ones (adversarial set for `?q=` to close the remaining Case-B gap; promote captured failures into `eval/fixtures/regression-golden/`).

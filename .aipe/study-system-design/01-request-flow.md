@@ -246,37 +246,44 @@ send({insight}) per insight → send({done})   ← NDJSON stream
 page: collect → on done: setInsights(collected) → setStatus("loaded") → render cards
 ```
 
-### Move 2.5 — Live briefing vs cached demo
+### Move 2.5 — Three modes, one pipeline (`bi:mode` = demo | live-sql | live-bloomreach)
 
-The demo/live choice is a **runtime toggle**, not a build flag: the page reads a persisted `mode` from local storage, and live mode hits the bare endpoint while demo mode appends `?demo=cached`. A mode-switch handler persists the choice and re-runs the fetch effect.
+The demo/live choice is a **runtime toggle**, not a build flag: the page reads a persisted `bi:mode` from local storage, and the route reads it back as a query param to pick the adapter. Since the DataSource seam landed (2026-06), there are now **three** modes, not two: the same agents drive a cached snapshot, a SQLite-backed Olist subprocess, OR the live Bloomreach MCP server. The factory `makeDataSource(mode, sessionId)` (`lib/data-source/index.ts` L73–L109) lives in the route's `connect` slot and hides the choice — the downstream pipeline is identical.
 
-| Step | Live briefing (no demo flag) | Cached demo (`?demo=cached`) |
-|------|------------------------------|------------------------------|
-| Auth | Session cookie + OAuth flow (prod: encrypted-cookie store) | None |
-| Data source | MCP server (network) | A committed snapshot file (disk) |
-| Agent run | Yes — up to 5 min | No — replays a captured snapshot |
-| Response shape | NDJSON stream: `workspace` → `coverage_item` tiles → `tool_call_*` → `insight` → `done` | Same NDJSON event order, replayed at ~140 ms / event |
-| Failure modes | 401 (pre-stream), 500 (setup throw), `error` event mid-stream, empty | Only file parse error (falls through to live) |
+| Step | `demo` | `live-sql` (new) | `live-bloomreach` |
+|------|--------|------------------|--------------------|
+| Auth | None | None (subprocess is local) | Session cookie + OAuth (PKCE + DCR) |
+| Data source | Committed snapshot file (disk) | `OlistDataSource` → `mcp-server-olist` subprocess (stdio + SQLite) | `BloomreachDataSource` → HTTPS to loomi-mcp-alpha |
+| Schema bootstrap | Skipped (snapshot includes it) | `olistWorkspaceSchema()` synthesized in-memory (no I/O, no tools) | `bootstrapSchema(mcp)` — 4 sequential MCP calls (~1100 ms each, module-cached) |
+| Tool calls | Replayed from snapshot | stdio JSON-RPC frames to child process; SQLite-backed; ~10–50 ms each | HTTPS to loomi-mcp-alpha; ~1 req/s GLOBAL/user; ~500–2000 ms each |
+| Rate limit | N/A | None (single local process) | ~1 req/s/user GLOBAL — enforced inside `BloomreachDataSource` |
+| Agent run | No — replay | Yes — fits easily in 300s | Yes — typical 70–120s, retry can push to ~180s |
+| Response shape | NDJSON stream (replay paced ~140 ms/event) | NDJSON stream (live, real timing) | NDJSON stream (live, real timing) |
+| Failure modes | Only file parse error (falls through to live) | Subprocess spawn failure → 500 with real error; tool errors propagated as `isError: true` envelopes | 401 pre-stream (OAuth expired), 500 (setup throw), `error` event mid-stream |
 
-Both paths now emit the SAME NDJSON event sequence — demo just replays a recorded snapshot at a fixed pace instead of computing it live.
+All three paths now emit the SAME NDJSON event sequence — demo replays a recorded snapshot at a fixed pace; the two live modes compute it for real.
 
 ```
-         live                          cached demo
-fetch(briefing)                fetch(briefing?demo=cached)
-         │                                  │
-    session check                    snapshot file exists?
-         │                             yes │  no
-    MCP connect ◄────────────────────────  │  └── falls through to live
-         │                                 │
-    bootstrapSchema               read snapshot + parse JSON
-         │                                 │
-    coverage gate                 ReadableStream replay (~140 ms/event):
-    agent.scan                      {workspace}→{coverage_item}…
-         │                          →recorded {tool_call_*}…→{insight}…→{done}
-    anomalyToInsight
-         │
-    NDJSON: {workspace}→{coverage_item}…{insight}…{done}
+         demo                       live-sql                    live-bloomreach
+fetch(briefing?demo=cached)   fetch(briefing?mode=live-sql)  fetch(briefing)
+         │                            │                              │
+    snapshot file?              makeDataSource('live-sql')   session check + OAuth
+       yes ↓                          │                              │
+    read JSON                   spawn mcp-server-olist          connectMcp(sid)
+         │                      (Node subprocess, stdio)             │
+    ReadableStream replay             │                       bootstrapSchema (4 MCP calls)
+    (~140 ms/event):           olistWorkspaceSchema()                │
+    {workspace}                       │                       coverage gate
+    {coverage_item}…           coverage gate                  agent.scan(hooks, runnable)
+    recorded                          │                              │  (~1 req/s GLOBAL)
+    {tool_call_*}…             agent.scan(hooks, runnable)           │
+    {insight}                  (10–50 ms per tool call)        anomalies → insights
+    {done}                            │                              │
+                              anomalies → insights            send NDJSON, dispose=noop
+                              send NDJSON, dispose subprocess
 ```
+
+The key structural fact: `bootstrap` and `dispose` are **adapter-defined**. `live-sql` bootstrap is a synthesized schema (no I/O — the Olist server intentionally exposes no schema-discovery tools, so the factory hands back a hardcoded `olistWorkspaceSchema()` over the real Brazilian e-commerce shape — see `03-provider-abstraction.md` and `10-authored-mcp-server.md`). `live-bloomreach` bootstrap is the original 4-call sequence. Same for `dispose`: `live-sql` kills the subprocess; `live-bloomreach` no-ops because the session outlives the request.
 
 ### Move 3 — The generalizing principle
 
@@ -620,9 +627,10 @@ Without reading the file, answer:
 
 ## See also
 
-→ [audit.md](./audit.md) (request-response-and-data-flow lens) · [02-oauth-boundary.md](./02-oauth-boundary.md) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md)
+→ [audit.md](./audit.md) (request-response-and-data-flow lens) · [02-oauth-boundary.md](./02-oauth-boundary.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` upper seam the route now branches over) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · [10-authored-mcp-server.md](./10-authored-mcp-server.md) (the subprocess on the far side of `live-sql`)
 
 ---
+Updated: 2026-06-16 — added the third `bi:mode` (`live-sql`) to Move 2.5; the comparison table now has three columns (demo / live-sql / live-bloomreach); added the new flow diagram for `live-sql` (spawn subprocess → `olistWorkspaceSchema()` → coverage gate → agent.scan → dispose); noted `makeDataSource(mode, sessionId)` as the route's adapter-picker; cross-linked `03-provider-abstraction.md` and `10-authored-mcp-server.md`. Hops 1–7 still describe the live-bloomreach path (the canonical one); `live-sql` differs only at hops 4–5 (no auth, synthesized schema).
 Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens.
 Updated: 2026-05-28 — re-derived all "In this codebase" line refs; route now streams NDJSON (`describeToolCall`/`trunc`, no `summarizeTrace`) with `maxDuration = 300`; `connectMcp` is async and wrapped in `withAuthCookies`; setup is in a try/catch returning the real error; noted the runtime `localStorage` `bi:mode` demo/live toggle and `anomalyToInsight`'s `impact`/`history`/`deriveInsightFields`.
 

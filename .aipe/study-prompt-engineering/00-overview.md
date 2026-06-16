@@ -23,10 +23,18 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 │   structured outputs [02] · output-mode mismatch [07]             │
 │  query path: prose, NO validator, user ?q= interpolated  [12]      │
 └───────────────┬───────────────────────────────────────────────────┘
-                │ what's MISSING (the buildable gaps)
+                │ orthogonal: SCORED off-path (Phase 3)
                 ▼
-   eval harness [05] · self-critique [10] · meta-prompting [11]
+┌─ eval/ suite ─────────────────────────────────────────────────────┐
+│  detection runner + LOOSE/STRICT scorer  (precision/recall)       │
+│  diagnosis judge (5-criterion, ~350 LOC) + recommendation (3-crit)│
+│  receipt: monitoring Phase 2.5 fix → loose recall 6.7%→33.3% [05] │
+└───────────────┬───────────────────────────────────────────────────┘
+                │ what's STILL MISSING (the buildable gaps)
+                ▼
+   self-critique [10] · meta-prompting [11]
    injection delimiters [12] · rotating formulas if a digest is added [13]
+   judge-vs-human validation tier · CI gate on eval scores
 ```
 
 ## The 13 concepts — grouped, with the failure mode each prevents
@@ -37,7 +45,7 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 - **[02 structured outputs](02-structured-outputs.md)** — *Prevents:* the parser breaking when a courteous model wraps JSON in a markdown fence. blooming insights: prompt-instructed fenced JSON + `parseAgentJson` fence-strip + type guards + retry. **Case A.**
 - **[03 prompts as code](03-prompts-as-code.md)** — *Prevents:* a prompt that worked on one model silently breaking on the next, with no record of the pairing. blooming insights: `.md` files under version control; the model-ID pairing is the honest gap. **Case A-partial.**
 - **[04 token budgeting](04-token-budgeting.md)** — *Prevents:* a chain that worked on small inputs truncating or timing out at scale because nobody counted. blooming insights: `schemaSummary` caps, char budgets, tool-call caps — no prefix caching. **Case A.**
-- **[05 eval-driven iteration](05-eval-driven-iteration.md)** — *Prevents:* iterating by vibes and shipping a "better" prompt that regresses an untracked edge case. blooming insights: no harness yet — the prompts' "CRITICAL/Never" blocks are an informal regression suite in prose. **Case B.**
+- **[05 eval-driven iteration](05-eval-driven-iteration.md)** — *Prevents:* iterating by vibes and shipping a "better" prompt that regresses an untracked edge case. blooming insights: Phase 3 ships `eval/` — 4-pillar suite (detection LOOSE/STRICT + 5-crit diagnosis judge + 3-crit recommendation judge + regression golden-set). Receipt: Phase 2.5 monitoring prompt fix drove loose recall 6.7% → 33.3% (voucher 1/10 → 10/10), with sp-revenue/electronics 0/10 strict honestly named as a framing limit. **Case A.**
 
 **Specific techniques:**
 
@@ -51,3 +59,6 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 - **[13 forbidden patterns](13-forbidden-patterns.md)** — *Prevents:* a generative chain converging on the same phrasing every run. blooming insights: heavy negative-constraint instructions; rotation correctly absent (structured/one-shot outputs). **Case A (constraints) / Case B (rotation).**
 
 > Reading order, and the Case A/B split, live in [README.md](README.md). The companion guides are [`../study-ai-engineering/`](../study-ai-engineering/README.md) (the systems lens on the same agents) and [`../study-system-design/`](../study-system-design/README.md).
+
+---
+Updated: 2026-06-16 — Updated the eval row to Case A (Phase 3 `eval/` ships) and rebuilt the `what's MISSING` diagram band into "eval/ suite (Phase 3)" + a smaller residual gap list. Real receipt: monitoring Phase 2.5 fix → loose recall 6.7% → 33.3% with framing limit honestly named.

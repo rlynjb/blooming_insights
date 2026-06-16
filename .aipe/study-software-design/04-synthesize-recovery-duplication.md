@@ -1,9 +1,11 @@
-# synthesize() recovery duplication
+# synthesize() recovery duplication — RESOLVED 2026-06-15
 
 **Industry name(s):** Special-case sprawl · temporal decomposition (mild) · duplicated recovery logic · "define it out of existence" candidate
-**Type:** Industry standard · Language-agnostic (the canonical define-out target in this repo)
+**Type:** Industry standard · Language-agnostic (historic candidate, now resolved — kept as worked example)
 
-> The "agent emitted no parseable JSON" recovery is handled with a dedicated `synthesize()` method in BOTH `DiagnosticAgent` (`lib/agents/diagnostic.ts:86-126`) and `RecommendationAgent` (`lib/agents/recommendation.ts:82-132`). Two ~50-line copies of the same shape: serialize the tool-call history, run a tool-less Anthropic call with a recovery prompt, parse the result, return null on failure. The *strategy* is identical; only the prompt and parser differ. This is the canonical special case to define out of existence by lifting the recovery into `runAgentLoop`. The fix deletes ~90 LOC and retires a recurring smell.
+> **STATUS: RESOLVED.** The lift proposed below has landed exactly as predicted. `runAgentLoop` (`lib/agents/base.ts`) now accepts `parseResult: (text: string) => T | null` and `recoveryPrompt: (toolCalls: ToolCall[]) => string` (see L65-66). The post-loop recovery turn lives at `lib/agents/base.ts:213-217`: if `parseResult(finalText)` returns null and a `recoveryPrompt` is provided, the loop runs one tool-less turn and parses again. Both `synthesize()` methods are gone from `lib/agents/diagnostic.ts` and `lib/agents/recommendation.ts`. `DiagnosticAgent` now calls the loop with `parseResult: tryParseDiagnosis` + a per-anomaly recovery prompt (L77, L82-…); `RecommendationAgent` does the same with `tryParseRecommendations` (L67, L73). ~90 LOC removed as estimated. The verdict — "the canonical define-out target in the repo" — was true on 2026-06-02 and the file is preserved as the worked example of the lift-to-loop move.
+
+> **Original verdict (historical).** The "agent emitted no parseable JSON" recovery was handled with a dedicated `synthesize()` method in BOTH `DiagnosticAgent` (`lib/agents/diagnostic.ts:86-126`) and `RecommendationAgent` (`lib/agents/recommendation.ts:82-132`). Two ~50-line copies of the same shape: serialize the tool-call history, run a tool-less Anthropic call with a recovery prompt, parse the result, return null on failure. The *strategy* was identical; only the prompt and parser differed. This was the canonical special case to define out of existence by lifting the recovery into `runAgentLoop`. **The fix below is now what the code looks like.**
 
 ---
 
@@ -400,7 +402,9 @@ A subtlety on why this didn't get done earlier: the `synthesize()` shape evolved
 
 What to read next: the `read-aposd` chapter on errors and special cases (when present) carries the conceptual treatment. The `01-mcp-client-deep-module.md` file in this guide is the model — that's what "the loop owns the recovery, agents don't see it" looks like when the pattern is fully applied (the rate-limit retry inside `McpClient` is the same shape as the proposed `runAgentLoop` recovery).
 
-A non-finding worth naming as praise: `MonitoringAgent.scan` and `QueryAgent.answer` don't have `synthesize()` methods. `MonitoringAgent` returns `[]` on parse fail (acceptable for a feed of zero anomalies); `QueryAgent` returns prose, no parsing needed. The pattern is already partial; the lift just completes it for the two agents that need recovery.
+A non-finding worth naming as praise: `MonitoringAgent.scan` and `QueryAgent.answer` don't have `synthesize()` methods. `MonitoringAgent` returns `[]` on parse fail (acceptable for a feed of zero anomalies); `QueryAgent` returns prose, no parsing needed. The pattern was already partial; the lift just completed it for the two agents that need recovery.
+
+**Post-fix lesson worth carrying forward.** The prediction in the original Move 2 ("Why this is 'define out,' not just 'deduplicate'") held in practice. The post-fix `DiagnosticAgent.investigate` and `RecommendationAgent.propose` methods are noticeably simpler — they have *no* code path for "what to do if the parser returns null"; they just read `parsed` from the loop result and fall back to `FALLBACK` (or `[]`). The "if the parser fails, run recovery" decision doesn't appear at the agent layer at all anymore. That's the difference between deduplicating code (still leaves "remember to call recovery" as a per-agent obligation) and defining-out the case (no obligation; the loop always does it when `parseResult` returns null). The Ousterhout move ranked higher than a shared helper — and at the cost of two new optional parameters on the loop — was the right call.
 
 ## Interview defense
 
@@ -452,6 +456,9 @@ Interview-defense diagram — helper vs lift
 
 ## See also
 
-- `audit.md` — the errors-and-special-cases lens names this as the one special case to define out of existence.
-- `01-mcp-client-deep-module.md` — the proof-of-concept for the lift; rate-limit recovery inside `McpClient` is the same shape as the proposed `runAgentLoop` recovery.
-- `03-insight-anomaly-silent-leak.md` — same fix shape (one owner, not two), different scale (data vs logic).
+- `audit.md` — the errors-and-special-cases lens records the resolution and names a sibling instance (PR G goldens-empty pre-flight) where "design the safety in" was applied to infrastructure rather than agent flow.
+- `01-mcp-client-deep-module.md` — the proof-of-concept for the lift; rate-limit recovery inside `BloomreachDataSource` (formerly `McpClient`) is the same shape as the now-applied `runAgentLoop` recovery.
+- `03-insight-anomaly-silent-leak.md` — RESOLVED with the same fix shape (one owner, not two), different scale (data vs logic).
+
+---
+Updated: 2026-06-16 — verdict RESOLVED; lift landed as predicted (parseResult + recoveryPrompt parameters on runAgentLoop; ~90 LOC deleted); kept as the canonical worked example of "define it out of existence" at the agent-loop seam, with a post-fix lesson on why this beat a shared helper.

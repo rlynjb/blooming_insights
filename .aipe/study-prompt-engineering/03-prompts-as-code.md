@@ -270,7 +270,7 @@ unbisectable               bisectable by hand             bisectable automatical
                            ◀── blooming insights is here
 ```
 
-The progression is: make it a file (review), then make it observable (trace). A prompt is logic tuned to a model; the full discipline versions the pair and records which pair ran. blooming insights is one step short of full.
+The progression is: make it a file (review), then make it observable (trace). A prompt is logic tuned to a model; the full discipline versions the pair and records which pair ran. blooming insights is one step short of full for *production* traffic — and one step *closer* than the diagram suggests for *eval* traffic. The Phase 3 eval suite commits per-day result dirs (`eval/results/<YYYY-MM-DD>/summary.md`) alongside the prompt deltas they scored — so `eval/results/2026-06-15/` (pre-fix) and `eval/results/2026-06-15-after-fix/` (post-fix) form a bisectable trail for every prompt edit run through the suite. The production-output side still lacks the pair (production diagnoses don't carry a prompt SHA), but the *eval-bench* side has a real, committed history.
 
 ### Where this breaks down
 
@@ -388,3 +388,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Noted that Phase 3 ships per-day committed `eval/results/<YYYY-MM-DD>/summary.md` directories alongside the prompt deltas they scored, so the eval-bench side now has the bisectable prompt-vs-result history the production-output side still lacks.

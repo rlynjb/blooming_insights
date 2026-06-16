@@ -87,7 +87,7 @@ The shape is **plan-and-execute with a verifier loop**: one expensive call decid
 
 **Applies to this codebase:** `no`. Blooming insights is not a coding agent and has no structural overlap with this template's task domain.
 
-The repo is a Next.js app whose agents are **data analysts over Bloomreach Engagement**. They query EQL, read schemas, and emit typed insights and recommendations — they do not read source files, write source files, run tests, or open PRs. There is no codebase-retrieval layer (the only "code-aware" surface is the test suite for the agents themselves, ~169 vitest tests under `__tests__/`, and that's the developers' tool, not the agents'). The tool registry in `lib/mcp/tools.ts` contains zero coding tools — no file read, no file write, no test runner, no shell.
+The repo is a Next.js app whose agents are **data analysts over an ecommerce workspace** (Bloomreach Engagement via OAuth MCP, or the authored `mcp-server-olist` over a seeded SQLite dataset). They call domain-shaped tools, read schemas, and emit typed insights and recommendations — they do not read source files, write source files, run tests, or open PRs. There is no codebase-retrieval layer (the only "code-aware" surface is the test suite for the agents themselves — 269 vitest tests across `test/` + `mcp-server-olist/test/` — and that's the developers' tool, not the agents'). Neither the Bloomreach MCP surface nor the three authored Olist domain tools (`get_metric_timeseries` / `get_segments` / `get_anomaly_context`) carry any coding affordance — no file read, no file write, no test runner, no shell.
 
 The structural shape of this template — *plan → execute → verify, loop on failure* — does recur in blooming insights, but at a very loose analogy:
 
@@ -110,3 +110,4 @@ This file stays as the "what an agentic coding system looks like, for cross-patt
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-16 — Updated stale "169 vitest tests under `__tests__/`" reference to the current 269 across `test/` + `mcp-server-olist/test/`, and named both data adapters (Bloomreach + the authored Olist server) in the "no coding affordance" framing.

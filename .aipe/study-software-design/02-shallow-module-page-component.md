@@ -1,9 +1,11 @@
-# app/page.tsx as the shallow module
+# app/page.tsx as the shallow module — RESOLVED 2026-06-15
 
 **Industry name(s):** Shallow module · classitis (file-level variant) · cognitive-load hotspot · god component
-**Type:** Industry standard · Language-agnostic (the canonical anti-example in this repo)
+**Type:** Industry standard · Language-agnostic (historic anti-example, now resolved)
 
-> `app/page.tsx` is 817 lines, 14 `useState` slots, and eight independent concerns at one altitude: rendering, NDJSON stream parsing, reconnect policy, demo capture, mode toggling, coverage accumulation, trace accumulation, stepper-state derivation. The "interface" (the React render contract) is nearly as wide as the implementation — the JSX reads from all 14 state slots, so any external reader has to learn all 14 to follow the rendering logic. This is the worst shallow module in the codebase, and the file every other depth measurement is contrasted against.
+> **STATUS: RESOLVED.** The page-decomposition refactor that this file recommended has landed and merged. `app/page.tsx` is now 462 LOC (down from 817); the three hooks proposed below were extracted as `lib/hooks/useBriefingStream.ts` (313 LOC), `lib/hooks/useDemoCapture.ts` (146 LOC), and `lib/hooks/useReconnectPolicy.ts` (123 LOC). The verdict — "this is the worst shallow module in the repo" — was true on 2026-06-02 and is preserved below as the worked example of how the shallow→deep refactor played out in practice. The lesson is the move, not the verdict.
+
+> **Original verdict (historical).** `app/page.tsx` was 817 lines, 14 `useState` slots, and eight independent concerns at one altitude: rendering, NDJSON stream parsing, reconnect policy, demo capture, mode toggling, coverage accumulation, trace accumulation, stepper-state derivation. The "interface" (the React render contract) was nearly as wide as the implementation — the JSX read from all 14 state slots, so any external reader had to learn all 14 to follow the rendering logic. This was the worst shallow module in the codebase, and the file every other depth measurement was contrasted against. **The fix below is now what the code looks like.**
 
 ---
 
@@ -335,11 +337,11 @@ app/investigate/[id]/page.tsx  (225 LOC, the calm sibling)
 
 Where the pattern comes from: this isn't unique to React. Ousterhout's red flags include "shallow module" and "classitis" — both describe the same failure shape at different scales. The React-specific name is "god component" but the mechanism is the same: one file accumulates concerns because there's no friction to adding a new `useState`. Junior devs add state; senior devs add hooks. The hook is the seam React provides for extracting depth.
 
-A subtle correctness point: refactoring this file is *not* about reducing line count. The 817 lines don't disappear — they move into three files. What changes is the *visibility surface* per concern. A reader who wants to understand stream parsing opens `useBriefingStream.ts` and sees ~150 lines of parsing logic; they don't have to scroll past demo-capture and reconnect code first. The cognitive load drops because the seams hide concerns from each other.
+A subtle correctness point that played out in practice: the refactor was *not* about reducing line count. The 817 lines didn't disappear — they moved into three files (`lib/hooks/useBriefingStream.ts`, `lib/hooks/useDemoCapture.ts`, `lib/hooks/useReconnectPolicy.ts`). What changed is the *visibility surface* per concern. A reader who wants to understand stream parsing now opens `useBriefingStream.ts` (313 LOC) and sees only parsing logic; they don't scroll past demo-capture and reconnect code first. The cognitive load dropped because the three seams hide concerns from each other.
 
-The trajectory if the file keeps growing: eventually someone splits the page anyway (when adding the ninth concern becomes painful enough). The cost of doing it now vs later is the work itself plus the bugs introduced by every contributor who edits the file in the meantime. The hooks-extraction refactor is the kind of cleanup that takes an afternoon and removes the biggest reason the next contributor would get lost.
+**Post-fix calibration.** The actual sizes ended up slightly different from the estimates. The page collapsed to 462 LOC (not the predicted ~120) because the layout JSX itself is non-trivial — `max-w-5xl` layout, two-column grid, modal-style query box, demo-capture button, mode toggle — that JSX was always there and stays at this altitude. `useBriefingStream` ended up at 313 LOC (vs the predicted ~150) because the 9-case event handler `switch` is large and the coverage/trace/stepper derivations turned out to share more state than expected. The estimate was directionally right (page roughly halves; hooks absorb ~600 LOC of mechanics) and the principle held: **the visibility surface per concern dropped by ~75%**, even though the raw LOC reduction was closer to 50%. Lesson: when scoping a depth refactor, predict the *visibility surface* delta (which concerns hide behind which seam), not the line-count delta.
 
-A non-finding worth naming as praise: `app/investigate/[id]/page.tsx` already shows what good looks like at the page level. It delegates everything that's not layout to hooks (`useInvestigation`) and components (`EvidencePanel`, `StatusLog`). The feed page doesn't have to invent a new pattern — it has to apply the pattern its sibling page already uses.
+A non-finding worth naming as praise (and the proof-of-concept that made this fix obvious): `app/investigate/[id]/page.tsx` already showed what good looked like at the page level — it delegated everything that wasn't layout to hooks (`useInvestigation`) and components (`EvidencePanel`, `StatusLog`). The feed page didn't have to invent a new pattern — it applied the pattern its sibling page already used. That's the cheapest kind of refactor: copy a discipline that's already shipping next door.
 
 What to read next: the `read-aposd` chapter on shallow modules (when present) carries the full conceptual treatment. The `01-mcp-client-deep-module.md` file in this guide is the contrast — same depth axis, opposite verdict.
 
@@ -394,6 +396,9 @@ Interview-defense diagram — the extraction logic
 
 ## See also
 
-- `audit.md` — the deep-vs-shallow-modules lens names this file as the shallowest module in the repo.
-- `01-mcp-client-deep-module.md` — the contrast: same axis, opposite verdict.
-- `04-synthesize-recovery-duplication.md` — another place where a concern is duplicated across files instead of hidden in one.
+- `audit.md` — the deep-vs-shallow-modules lens, updated to record the resolution.
+- `01-mcp-client-deep-module.md` — the contrast: same axis, opposite verdict. The DataSource seam below it is now the new deep-module case study.
+- `04-synthesize-recovery-duplication.md` — also resolved; the `synthesize()` methods deleted as predicted.
+
+---
+Updated: 2026-06-16 — verdict RESOLVED; refactor landed (page 817→462 LOC, three hooks extracted); kept as worked example of the shallow→deep move in practice with post-fix calibration on LOC vs visibility-surface deltas.

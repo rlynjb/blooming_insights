@@ -3,7 +3,7 @@
 **Industry name(s):** evaluation methods / metrics, exact-match, fuzzy match, rubric grading, LLM-as-judge, pairwise comparison, human evaluation
 **Type:** Industry standard · Language-agnostic
 
-> Once you have an eval set, you need a way to turn an output into a score; the methods form a ladder from cheap-and-strict (exact-match) to expensive-and-nuanced (human review), and the right rung depends on the surface — blooming insights' anomaly classification fits exact-match/F1, its diagnosis and recommendation prose fit rubric or LLM-as-judge.
+> Once you have an eval set, you need a way to turn an output into a score; the methods form a ladder from cheap-and-strict (exact-match) to expensive-and-nuanced (human review), and the right rung depends on the surface. blooming insights now wires four of the rungs in production evals: detection uses set-overlap precision/recall (`eval/scripts/lib/scorer.ts`), diagnosis and recommendation use per-criterion rubric grading by LLM-as-judge (`eval/judges/{diagnosis,recommendation}-judge.md`), regression uses structural diff + similarity-judge two-mode (`eval/judges/similarity-judge.md` + `structural-diff.ts`). Pairwise A/B is the un-built rung.
 
 
 ---
@@ -34,9 +34,11 @@
   │  noise-free numbers a team will actually act on   │
   └──────────────────────────────────────────────────┘
 
-  Currently in this codebase: 169 Vitest tests exist but
-  none of them score answer quality. The methods this file
-  describes are not yet wired into a quality eval.
+  Currently in this codebase: 269 Vitest tests guard plumbing,
+  AND four eval runners under `eval/scripts/` score quality —
+  set-overlap (detection), per-criterion rubric + judge
+  (diagnosis/recommendation), structural diff + similarity judge
+  (regression). All four rungs walked below are wired.
 ```
 
 **Zoom in — narrow to the concept.** The question is: for each surface in blooming insights, which scoring method is strict enough to catch real regressions but loose enough not to fail correct-but-differently-worded answers? The wrong method makes your eval set lie — exact-match on prose creates noise, LLM-judge on enums is expensive and biased. Method choice is what makes the score *trustworthy*. How it works walks each method, the surface it fits, and the trap of using a single scorer for everything.
@@ -245,11 +247,38 @@ One harness, many methods. The cheap rungs stay local and free; only diagnosis/r
 
 ## Implementation in codebase
 
-**Not yet implemented.** blooming insights has no eval harness and no scoring code — there is no `evals/runner.ts`, no exact-match scorer, no F1 computation over monitoring output, no rubric, and no LLM-as-judge. The closest existing code is *shape* validation (`lib/mcp/validate.ts` L17–L53), which is a pass/fail on structure, not a quality score.
+**Case A — four rungs wired.** blooming insights ships a real scoring layer under `eval/scripts/lib/` that selects the rung per surface. The 269 Vitest tests under `test/` still assert *shape* and control flow against fakes; the eval suite under `eval/` is the parallel quality layer.
 
-You can confirm the absence: nothing in the repo compares an agent's output to a reference answer or assigns a quality score; the 157 Vitest tests assert structure and control flow against fakes (see `01-eval-set-types.md`).
+### Set overlap for detection (Rung 2 — fuzzy / F1 family)
 
-Where the methods would live: a new `evals/runner.ts` that loads cases from `evals/fixtures/` (built in `01-eval-set-types.md`), runs the live agent, and dispatches each output to a scorer — `evals/scorers/exact.ts`, `evals/scorers/f1.ts`, `evals/scorers/rubric.ts`, `evals/scorers/judge.ts` — chosen by the case's declared surface. The judge scorer is hardened against bias in `03-llm-as-judge-bias.md`. The exercises below are the harness.
+- **File:** `eval/scripts/lib/scorer.ts` + `eval/scripts/run-detection.ts`
+- **What it does:** for each of the K=10 monitoring-agent runs, compares the agent's `Anomaly[]` output to the 3 seeded anomalies under **two matchers**: LOOSE (2-of-3 — metric + segment + time-window) and STRICT (3-of-3). Computes precision, recall, and a per-anomaly hit-rate. Reports loose and strict separately because they answer different questions.
+- **Result paper trail:** `eval/results/2026-06-15/detection-K10-{loose,strict,raw}.json` + `summary.md`; the post-prompt-fix re-run lives at `eval/results/2026-06-15-after-fix/` (5× lift in loose recall).
+
+### Rubric + LLM-as-judge for diagnosis (Rungs 3 + 4)
+
+- **File:** `eval/scripts/lib/judge.ts` + `eval/scripts/run-diagnosis.ts` + `eval/judges/diagnosis-judge.md`
+- **What it does:** for each candidate diagnosis, sends the anomaly metadata, the reference-diagnosis shape, the candidate, and the tool-call transcript to a Sonnet-4.6 judge under a **5-criterion rubric**: hypothesis 0-2, evidence 0-2, sizing 0-2, calibration 0-1, fabrication 0-2 (total 0-9; pass threshold 7). Each criterion's score and rationale is captured for spot-check calibration.
+- **Result paper trail:** `eval/results/2026-06-15/diagnosis-K10-{candidates,judge,summary}.json` + `diagnosis-summary.md`. **Calibration receipt:** 8/8 manual-vs-judge agreement on a stratified sample (2 per anomaly + 2 mid-pack). Mean 6.37/9, 53.3% pass.
+
+### Rubric + LLM-as-judge for recommendation (Rungs 3 + 4)
+
+- **File:** `eval/scripts/lib/judge-rec.ts` + `eval/scripts/run-recommendation.ts` + `eval/judges/recommendation-judge.md`
+- **What it does:** for each candidate recommendation set (the agent returns up to 3), scores each one on a **3-criterion rubric** — plausible 0-2, specific 0-2, impact_sized 0-1 (total 0-5; pass threshold 4). The rubric specifically asks "is the impact figure credible, not just numeric?" — which is what let the judge catch the BRL cents-vs-Reais regression at run 8 of electronics-spike-w2 (R$131,965 AOV → impact_sized=0).
+- **Result paper trail:** `eval/results/2026-06-15/recommendation-K10-{candidates,judge,summary}.json` + `recommendation-summary.md`. **Calibration receipt:** 3/3 manual-vs-judge agreement on a stratified sample including the BRL-bug catch (proves the judge isn't rubber-stamping).
+
+### Structural diff + similarity judge for regression (Rung 1 + custom)
+
+- **File:** `eval/scripts/lib/structural-diff.ts` + `eval/scripts/lib/similarity-judge.ts` + `eval/scripts/run-regression.ts` + `eval/judges/similarity-judge.md`
+- **What it does:** for each of 10 golden fixtures, runs the current agent and scores the candidate against the captured golden in **two modes**: structural diff (types match, required fields present — Rung 1 equivalent for shape) AND similarity judge (does the *conclusion* materially match — a custom rung tuned for "did my prompt edit change the answer's substance"). Outputs structural-pass / semantic-pass / overall-pass per fixture.
+- **Result paper trail:** `eval/results/2026-06-15-capture/` (the capture run) and `eval/results/2026-06-15-score-baseline/regression-summary.md` (the score-against-self baseline: 100% structural, 30% semantic).
+- **Why two modes:** structural diff catches type / required-field regressions for free (no LLM call); the similarity judge catches conclusion-level drift that the structural diff cannot see (e.g., "platform-wide surge" flipped to "electronics-specific event" on identical inputs). See `05-regression-evals.md` for the full pattern walk.
+
+### What's NOT wired
+
+- **Pairwise (Rung 5)** — no `--compare promptA promptB` mode exists yet. The exercise below adds it.
+- **Exact-match (Rung 1)** on `classifyIntent` — covered by regression fixture `10-intent-classify-investigation.json` (the only fixture with semantic_pass=true reliably, because the output space is one enum word), but no dedicated `eval/scripts/run-intent.ts`.
+- **Human-eval calibration as a standing harness** — the calibration receipts in `eval/results/2026-06-15/diagnosis-summary.md` and `recommendation-summary.md` are stratified manual spot-checks, not a recurring run.
 
 ---
 
@@ -292,22 +321,22 @@ The method tracks the *entropy* of the correct-answer space. A single enum has n
 
 ## Project exercises
 
-### Build `evals/runner.ts` pointable at the live agents
+### Add severity-weighted recall to the detection scorer
 
-- **Exercise ID:** B3.1 / B3.3 (adapted) — the eval harness, the primary buildable target.
-- **What to build:** a CLI runner that loads cases from `evals/fixtures/` (from `01-eval-set-types.md`), constructs the real agent for each case (`DiagnosticAgent`, `RecommendationAgent`, `MonitoringAgent`, or `classifyIntent`) with a real or recorded MCP context, runs it against the live model, and dispatches the output to a scorer by the case's declared surface — exact-match for intent/severity, F1 for monitoring sets, rubric for diagnosis/recommendation structure. Print a per-surface aggregate.
-- **Why it earns its place:** shows you can stand up an eval loop against real agents and pick the right scorer per surface — the core competency of "we measure quality."
-- **Files to touch:** `evals/runner.ts`, `evals/scorers/exact.ts`, `evals/scorers/f1.ts`, `evals/scorers/rubric.ts`; imports `lib/agents/diagnostic.ts`, `lib/agents/recommendation.ts`, `lib/agents/monitoring.ts`, `lib/agents/intent.ts`, types from `lib/mcp/types.ts`.
-- **Done when:** `node evals/runner.ts` runs the golden set, scores each surface with its matched method, and prints precision/recall for monitoring and a rubric score for diagnosis.
-- **Estimated effort:** 1–2 days
+- **Exercise ID:** B3.1 (adapted) — sharpen the wired detection eval.
+- **What to build:** extend `eval/scripts/lib/scorer.ts` to weight recall on `critical` severity above `warning` and `info` (asymmetric error cost). Today the aggregate hides which class of miss is happening; today's 33.3% loose recall is averaged across all three seeded anomalies, but missing a `critical` should hurt more than missing an `info`. Surface a `weightedRecall` field alongside the raw one.
+- **Why it earns its place:** the F1-hides-the-error-type lesson is in this file's "Where this breaks down" section. The eval already exists — closing this loop turns a bare aggregate into something you can act on.
+- **Files to touch:** `eval/scripts/lib/scorer.ts`, `eval/scripts/lib/summary.ts` (render the weighted number in `summary.md`), `mcp-server-olist/data/seeds/anomalies.ts` (expected severity per seeded anomaly).
+- **Done when:** a re-run of `npm run eval:detection -- --K=10` prints both raw and severity-weighted recall, and the next dated dir under `eval/results/` carries both.
+- **Estimated effort:** <1 day
 
-### Add a pairwise prompt-edit A/B mode
+### Add a pairwise prompt-edit A/B mode (the un-built rung)
 
 - **Exercise ID:** B3.3 (adapted) — pairwise comparison for prompt iteration.
-- **What to build:** a `--compare promptA promptB` mode that runs the golden set through two versions of `lib/agents/prompts/diagnostic.md`, judges each case pairwise (using the debiased judge from `03-llm-as-judge-bias.md`), and reports a win-rate so a prompt edit is a measured A/B, not a vibe.
-- **Why it earns its place:** demonstrates the exact decision tooling for "did my prompt change help?" — the signal that you iterate on prompts with evidence.
-- **Files to touch:** `evals/runner.ts` (compare mode), `evals/scorers/pairwise.ts`, reads two variants of `lib/agents/prompts/diagnostic.md`.
-- **Done when:** running compare mode over the golden set prints a win-rate for v2 over v1 with order randomized per case.
+- **What to build:** a `--compare promptA promptB` mode for `run-diagnosis.ts` / `run-recommendation.ts` that runs each seeded anomaly through two versions of `lib/agents/prompts/diagnostic.md` (or `recommendation.md`), judges each case pairwise via a new `eval/scripts/lib/pairwise-judge.ts` + `eval/judges/pairwise-judge.md`, and reports a win-rate with order randomized per case (and ideally swap-and-average).
+- **Why it earns its place:** demonstrates the exact decision tooling for "did my prompt change help?" — turning vibes into a measured A/B. The Phase 2.5 DATA HORIZON fix was measured by **running detection twice with two prompt versions** (`eval/results/2026-06-15/` vs `…-after-fix/`) — pairwise is the same idea formalized at per-case granularity.
+- **Files to touch:** `eval/scripts/run-diagnosis.ts` (compare mode), `eval/scripts/lib/pairwise-judge.ts`, `eval/judges/pairwise-judge.md`, reads two variants of `lib/agents/prompts/diagnostic.md`.
+- **Done when:** `npm run eval:diagnosis -- --compare prompts/diagnostic-v1.md prompts/diagnostic-v2.md` prints a win-rate with order-randomized cases and writes results to a dated dir.
 - **Estimated effort:** 1–2 days
 
 ---
@@ -391,3 +420,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Phase 3 flipped this file from Case B to Case A: opening verdict, Implementation in codebase, and the un-wired-rung enumeration now anchor to the four real runners under `eval/scripts/` and the three judge prompts under `eval/judges/`, with calibration receipts cited (diagnosis 8/8, recommendation 3/3 including BRL-bug catch). Replaced the "build the evals/runner.ts" exercise with two new ones: severity-weighted recall on the detection scorer; pairwise prompt-edit A/B (the actual un-built rung).

@@ -270,8 +270,8 @@ The window is finite; four caps keep the sum under the practical fraction, and t
 
 - **File:** `lib/agents/monitoring.ts`
 - **Function / class:** `schemaSummary(schema: WorkspaceSchema): string`
-- **Line range:** L16–L49 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`)
-- **Role:** Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents.
+- **Line range:** L16–L57 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`); the one-liner `Data horizon: <from> → <to>` appended at L40–L49 when the live adapter is Olist (synthetic, fixed-horizon) and omitted under Bloomreach.
+- **Role:** Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents. The horizon line is the cheapest possible date anchor — one line in the prefix that earns a 5x loose-recall lift on detection eval (→ 01-anatomy.md for the structural framing, → 05-eval-driven-iteration.md for the measured before/after).
 
 ### Per-observation cap — `truncate`
 
@@ -443,3 +443,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-16 — Updated `schemaSummary` range to L16–L57 (was L16–L49) and noted the new `Data horizon: <from> → <to>` line appended at L40–L49 under Olist — a single-line prefix anchor that drove a measured 5x loose-recall lift on the Phase 3 detection eval.
