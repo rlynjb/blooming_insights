@@ -9,7 +9,7 @@
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Two pages mount this hook (the diagnose page at `app/investigate/[id]/page.tsx:38` and the recommend page at `app/investigate/[id]/recommend/page.tsx:37`). It's not the *only* NDJSON reader in the codebase — the feed page's effect (`app/page.tsx:258-476`) and `StreamingResponse.tsx:89-136` carry sibling copies of the same kernel — but it's the *cleanest* and the one the other two should look like. It sits squarely in the UI band, between the React component above (`useState`-driven re-renders) and the route handler below (`/api/agent` emitting `AgentEvent` NDJSON over `fetch`).
+**Zoom out — the bigger picture.** Two pages mount this hook (the diagnose page at `app/investigate/[id]/page.tsx:38` and the recommend page at `app/investigate/[id]/recommend/page.tsx:37`). It is no longer the only NDJSON reader in the codebase — but as of 2026-06-15 the kernel itself is no longer duplicated: every reader (`useInvestigation`, `useBriefingStream`, `useDemoCapture`, `StreamingResponse`) delegates the read loop to the shared `readNdjson` utility at `lib/streaming/ndjson.ts:18-64`. This hook's value now is its **React-specific shape** around that shared kernel: the StrictMode latch, the closure-mirror beside `useState`, the typed `handle()` switch, and the `sessionStorage` stash-on-done. It sits squarely in the UI band, between the React component above (`useState`-driven re-renders) and the route handler below (`/api/agent` emitting `AgentEvent` NDJSON over `fetch`).
 
 ```
 Zoom out — where the reader hook lives
@@ -301,7 +301,7 @@ The diagram is the contract. The page component above destructures `{ items, dia
 - **Recommend step.** `app/investigate/[id]/recommend/page.tsx:37` calls `useInvestigation(id, 'recommend')`. Same destructure shape (this time it uses `recommendations`). The hook *internally* reads `bi:diag:<id>` to load the handed-over diagnosis for context display + live-mode URL parameter.
 - **Re-visits and browser-back navigation.** Both pages — when the user clicks "← diagnosis" from the recommend page back to the diagnose page, the hook hydrates from `bi:inv:diagnose:<id>` (`useInvestigation.ts:50-63`) and renders the cached result instantly without re-firing the agent. The 30-90s wait happens *once* per investigation per tab.
 
-The feed page's inline reader loop (`app/page.tsx:323-464`) and `StreamingResponse.tsx:107-132` are *not* this hook — they're sibling copies of the same kernel. The cleanup path is to extract the kernel into a shared utility, but the architectural call hasn't been made yet (audit red flag #2).
+The other three streaming surfaces — `useBriefingStream` (feed), `useDemoCapture` (dev capture), and `StreamingResponse` (chat) — are *not* this hook, but they now all share the same kernel via `readNdjson` in `lib/streaming/ndjson.ts`. The 2026-06-15 page-decomposition refactor closed audit red flag #2 by extracting the kernel; each consumer keeps its own `onEvent` switch (the typed dispatch arms) but delegates the byte-level loop.
 
 ### Code side by side, with a line-by-line read
 
@@ -471,7 +471,7 @@ This hook is in class 3, which is the rarest class and the one React's official 
 
 - **React Query / SWR** — solves StrictMode dedupe + per-step memoization, but does not by itself solve the cross-instance handoff (the `?insight=` URL parameter needs the server-side route to be aware of the carrier, which a client-side query cache is invisible to). The honest answer is React Query *plus* `sessionStorage` for the carrier — which is more pieces, not fewer.
 - **`use(promise)` (React 19)** — would shift the hook to be Suspense-compatible. The catch: the streaming output is not a single promise; it's a long-lived event stream. The pattern doesn't compose cleanly with `<Suspense>` unless you wrap the *first event arrival* as the promise and stream the rest into state — adding a layer of indirection that the current shape doesn't need.
-- **Extracting a shared `useNdjsonReader` utility** — the kernel duplication between this hook, the feed page's effect, and `StreamingResponse.tsx` is real (audit red flag #2). The architectural call is whether the line-buffering + decoder + dispatch logic deserves to be one utility, or whether each consumer should own its own. The duplication is small enough today that the call hasn't been made.
+- **Shared `readNdjson` utility** — DONE 2026-06-15. The line-buffering + decoder + cancellation logic was hoisted to `lib/streaming/ndjson.ts` (64 LOC) and is consumed by all four streaming surfaces. Each consumer keeps its own typed `onEvent` switch, but the byte loop is one place. Audit red flag #2 RESOLVED.
 
 ---
 
@@ -576,3 +576,4 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 ---
 
 Generated: 2026-06-03 — `/aipe:study-frontend-engineering` (per `specs/study-frontend-engineering.md`).
+Updated: 2026-06-16 — kernel was hoisted to shared `lib/streaming/ndjson.ts:18-64` consumed by all four streaming surfaces (closes audit red flag #2). The hook's value now is the React-specific shape around that shared kernel (StrictMode latch, closure mirror, typed switch, sessionStorage stash).

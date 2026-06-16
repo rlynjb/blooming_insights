@@ -4,7 +4,7 @@
 >
 > **The two patterns that earn pattern-file treatment** are the load-bearing ones: the **NDJSON reader hook** (`useInvestigation` — strip it and the live agent trace dies) and the **progressive skeleton + stepper composition** (strip it and a 30-60s blank screen replaces a UI that animates from event #1). Everything else is either a known smell already named in a neighboring guide (the 817-LOC `app/page.tsx` → `study-software-design/02-shallow-module-page-component.md`; the cross-step `sessionStorage` handoff → `study-system-design/07-client-stream-handoff.md`) or a stretch of Next.js / React 19 surface area the repo hasn't exercised yet.
 >
-> **The single highest-priority frontend finding** is the same one every other audit names: extract three hooks (`useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`) from `app/page.tsx`. It retires the 14-`useState`-slot cognitive-load hotspot *and* removes the NDJSON-parser duplication between the page and `useInvestigation`. The shape is documented; the safety net is the gap (no NDJSON tests — `cleanup-2026-06-02.md` #15).
+> **The highest-priority frontend findings #1 and #2 from the 2026-06-02 audit have RESOLVED in production code** (verified 2026-06-16). The three hooks (`useBriefingStream` 313 LOC, `useReconnectPolicy` 123 LOC, `useDemoCapture` 146 LOC) live in `lib/hooks/`; `app/page.tsx` is 462 LOC (was 817); the NDJSON kernel was hoisted further to `lib/streaming/ndjson.ts` and is consumed by all four streaming surfaces (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`). The current top frontend finding is **#5** — the feed's `<aside>` (`app/page.tsx:388`) is still hand-rolled instead of using the shared `StatusLog` component — because that drift is the fold-along win the hooks extraction didn't carry. Findings #3 (no Suspense / error.tsx / loading.tsx), #4 (inline-vs-Tailwind drift, accepted), and #6 (no aria-live on streaming surfaces) are unchanged.
 
 ---
 
@@ -41,7 +41,7 @@
 
 ## state-architecture
 
-**Verdict.** All state is local `useState` (no Redux / Zustand / Jotai / Context). The state graph's shape is "fourteen `useState` slots in one component" on the feed page and "five `useState` slots + one `useRef` latch" inside one hook for both investigation pages. URL state is paths only (no search params other than the demo flag); form state has one input (the QueryBox text input — hidden behind a flag at `app/page.tsx:14`).
+**Verdict.** All state is local `useState` (no Redux / Zustand / Jotai / Context). The state graph's shape was previously "fourteen `useState` slots in one component" on the feed page — that hotspot is now distributed across three hooks in `lib/hooks/` (`useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`), each owning a coherent slice (live tier / reconnect tier / dev-capture tier). The investigation pages still share "five `useState` slots + one `useRef` latch" inside `useInvestigation`. URL state is paths only (no search params other than the demo flag); form state has one input (the QueryBox text input — hidden behind a flag).
 
 **The state graph.**
 
@@ -50,11 +50,11 @@
 | Live UI | `useState` | per mount | `setInsights`, `setItems`, `setCoverage` |
 | Run-once latch | `useRef` | per mount | `startedRef` in `useInvestigation.ts:43` and `StreamingResponse.tsx:19` |
 | Per-tab durable | `sessionStorage` | per tab | `bi:insight:<id>`, `bi:diag:<id>`, `bi:inv:<step>:<id>`, `bi:reconnecting` |
-| Per-browser durable | `localStorage` | per browser | `bi:mode` (`app/page.tsx:132, 144`) |
+| Per-browser durable | `localStorage` | per browser | `bi:mode` — now 3 values: `'demo' \| 'live-sql' \| 'live-bloomreach'`, default `'live-sql'`; legacy `'live'` migrates to `'live-sql'` (`app/page.tsx:74-78`) |
 
 **Who owns each transition.**
 
-- `app/page.tsx` (the feed page) owns 14 `useState` slots — enumerated in `study-software-design/02-shallow-module-page-component.md` lines 234-247. Every NDJSON event handler in the inline `handle()` function (`app/page.tsx:328-437`) writes to one or more of them.
+- `app/page.tsx` (the feed page) previously owned 14 `useState` slots — now distributed across three hooks in `lib/hooks/` (each owning a slice). The event-dispatch `handle()` switch moved into `useBriefingStream.ts`; it now delegates the read loop to the shared `readNdjson` kernel at `lib/streaming/ndjson.ts:18-64`.
 - `lib/hooks/useInvestigation.ts:38-43` owns five `useState` slots (`items`, `diagnosis`, `recommendations`, `complete`, `error`) plus the `startedRef` latch. Both investigation pages (`app/investigate/[id]/page.tsx:38` and `app/investigate/[id]/recommend/page.tsx:37`) destructure the hook's return.
 - `components/chat/StreamingResponse.tsx:13-18` owns five `useState` slots (`items`, `answer`, `complete`, `error`, `showReasoning`) for the `?q=` flow.
 - `components/investigation/ToolCallBlock.tsx:25` owns one `useState` (`expanded`) — the disclosure toggle.
@@ -272,25 +272,36 @@ These are referenced from inline styles in nearly every component file. Grep `co
 
 Ranked by user-visible consequence with file:line evidence. The first finding is the same one every other audit names; it earns the #1 slot here because the user-facing symptom (the brittle, unboxed feed UX) IS a frontend-architecture problem first, a module-depth problem second.
 
-### #1 — The feed page is 817 LOC with 14 useState slots; every NDJSON event triggers a fresh re-render across all of them
+### #1 — RESOLVED 2026-06-15 · feed-page module depth + 14 useState slots
 
-**Where:** `app/page.tsx:95-150` (state), `app/page.tsx:258-476` (the 218-LOC `useEffect`).
+**Original finding (kept as historical worked example).** The feed page was 817 LOC with 14 `useState` slots and one 218-LOC `useEffect` driving them. Every NDJSON event re-rendered the whole feed tree.
 
-**The user-visible consequence:** every event the live briefing emits — coverage tile, tool call start/end, reasoning step, insight — fires through one giant inline `handle()` switch (`app/page.tsx:328-437`) that writes one or more of the 14 state slots. React 19's batching covers the same microtask, but the reader loop's `await reader.read()` (line 440) creates explicit yields. Every accumulator update re-renders the whole feed tree (no `React.memo`, no `useMemo` on the derived data). On a typical 30-60s briefing that emits 20-50 events, the feed re-renders 20-50 times, each touching `CoverageGrid`, the insight list, the trace `<aside>`, and the `ProcessStepper`. Not fatal — the tree is small — but it's the *easiest* frontend optimization the codebase has not yet made (extract a hook, memoize the slow children).
+**How it played out.** The page-decomposition refactor extracted three hooks to `lib/hooks/`:
 
-**The fix is documented.** Three hooks: `useBriefingStream(mode)`, `useReconnectPolicy()`, `useDemoCapture(...)`. Page collapses to ~120 LOC of layout + composition. Each hook becomes a deep module hiding ~30-150 LOC behind a small return shape. **Blocked by the test gap** — `cleanup-2026-06-02.md` #15 names the absence of an NDJSON test harness as the reason this L-effort refactor is fix-later, not fix-now.
+- `useBriefingStream(mode)` — 313 LOC; owns the live tier (insights, coverage, trace, query count, step status, error state) and the briefing fetch loop.
+- `useReconnectPolicy()` — 123 LOC; owns the auth-revoked detection regex + reconnect button state + the `sessionStorage` reconnect-guard.
+- `useDemoCapture(...)` — 146 LOC; owns the dev-only "capture this as the demo snapshot" flow.
+
+`app/page.tsx` collapsed from 817 → 462 LOC of layout + composition. The audit's "every event re-renders the whole feed tree" complaint is unchanged in shape (the page still does one big re-render per event) but the cognitive-load argument is closed: each hook owns a coherent slice with a small return shape. The teaching value of the original finding stays as a worked example of "the AOSD shallow-module diagnosis applied at the React-component scale."
 
 → see `study-software-design/02-shallow-module-page-component.md` for the full module-depth walk.
 
-### #2 — The NDJSON reader-loop kernel is duplicated across the feed page and the investigation hook
+### #2 — RESOLVED 2026-06-15 · NDJSON reader-loop kernel duplication
 
-**Where:** `app/page.tsx:323-464` (feed) and `lib/hooks/useInvestigation.ts:184-208` (investigation). Same shape — `getReader()` + `TextDecoder` + `buf.split('\n')` + trim + `JSON.parse` + dispatch + flush trailing line — implemented twice. `components/chat/StreamingResponse.tsx:107-132` carries a third smaller copy.
+**Original finding (kept as historical worked example).** The `fetch → getReader → TextDecoder → buf.split('\n') → JSON.parse → dispatch → flush` kernel was implemented three times: once in `app/page.tsx` (feed), once in `lib/hooks/useInvestigation.ts` (investigation), once in `components/chat/StreamingResponse.tsx` (chat).
 
-**The user-visible consequence today:** none directly — both copies work. The consequence *tomorrow:* the day a malformed-line edge case bites in production (e.g. an event with an unescaped `\n` inside a string), the fix has to land in three places. The day someone adds a new `AgentEvent` variant, the consumer switch has to be updated in three places (and a server-side `filterByStep` — see `study-software-design/audit.md`'s change-amplification finding).
+**How it played out.** The kernel was lifted to a shared utility — `lib/streaming/ndjson.ts:18-64` — exposing one function: `readNdjson<E>(body, onEvent, opts?)`. The four consumers all import it:
 
-**The fix is the same as #1.** Extracting `useBriefingStream` from `app/page.tsx` retires the feed copy. Lifting the line-buffering kernel into a shared utility (`lib/hooks/useNdjsonReader.ts`?) would retire all three. The latter is *not yet documented* in any cleanup audit because the architectural call (do we have one shared reader, or do hooks each own their own?) hasn't been made.
+```
+lib/hooks/useBriefingStream.ts:6      import { readNdjson } from '@/lib/streaming/ndjson';
+lib/hooks/useInvestigation.ts:7       import { readNdjson } from '@/lib/streaming/ndjson';
+lib/hooks/useDemoCapture.ts:6         import { readNdjson } from '@/lib/streaming/ndjson';
+components/chat/StreamingResponse.tsx:7  import { readNdjson } from '@/lib/streaming/ndjson';
+```
 
-→ see `01-ndjson-stream-reader-hook.md` for the kernel pattern.
+The kernel handles flush-trailing-buffer, malformed-line skip, and `cancelOn` polling. New `AgentEvent` variants only need an arm in each consumer's switch — the read loop itself is one place. The teaching value of the original finding stays as a worked example of "kernel duplication identified by the audit, hoisted to shared lib in the next refactor cycle."
+
+→ see `01-ndjson-stream-reader-hook.md` for the kernel pattern (the file now anchors to `lib/streaming/ndjson.ts` instead of inline implementations).
 
 ### #3 — No Suspense, no error boundary, no `error.tsx` / `loading.tsx` — every route hand-rolls its own loading + error UI
 
@@ -314,7 +325,7 @@ Ranked by user-visible consequence with file:line evidence. The first finding is
 
 **The user-visible consequence:** the three places drift over time. The feed version has a slightly different `connecting to the agent…` empty message and a longer placeholder copy (`app/page.tsx:792-805`); the shared component uses `—` (`components/shared/StatusLog.tsx:33`). Today they're close enough to read as one design; tomorrow they won't be.
 
-**The fix is small.** Replace the inline `<aside>` block with `<StatusLog items={traceItems} title="how this briefing was gathered" countLabel={…} scanning={status === 'loading'} emptyMessage="connecting to the agent…" />`. Already named under the feed page's hooks-extraction refactor as a fold-along win.
+**The fix is small.** Replace the inline `<aside>` (still at `app/page.tsx:388`) with `<StatusLog items={traceItems} title="how this briefing was gathered" countLabel={…} scanning={status === 'loading'} emptyMessage="connecting to the agent…" />`. The 2026-06-15 hooks-extraction refactor closed #1 and #2 but did NOT fold along the StatusLog usage — that's why this is now the top live frontend finding.
 
 ### #6 — Streaming surfaces emit zero `aria-live` / `role="status"` / `role="log"` regions
 
@@ -329,3 +340,6 @@ Ranked by user-visible consequence with file:line evidence. The first finding is
 ---
 
 End of audit.
+
+---
+Updated: 2026-06-16 — Top findings #1 (page-decomposition / 14 useState slots) and #2 (NDJSON kernel duplication) RESOLVED in production code via page-decomposition refactor + `lib/streaming/ndjson.ts` hoist. Finding #5 (feed `<aside>` hand-rolled) promoted to top live finding. `bi:mode` value tier updated to 3-mode `'demo' \| 'live-sql' \| 'live-bloomreach'`.

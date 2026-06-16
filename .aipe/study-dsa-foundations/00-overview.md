@@ -26,6 +26,8 @@ recursion (one-level)       ★              union-find / segment    ☆
 
 The five-star primitives below are what every chapter anchors to. The starred-zero primitives are what `08-dsa-foundations-practice-map.md` ranks for deliberate practice.
 
+**Phase 3 eval addition (2026-06-15).** The `eval/scripts/lib/scorer.ts` (361 LOC) introduces real **set-intersection patterns** as worked examples: loose-set matching (2-of-3 dimension overlap) vs strict matching (3-of-3) compare a predicted anomaly's `{metric, scope, direction}` against the seeded ground truth. Same hash-set primitives the codebase already uses, applied to detection precision/recall scoring. A `structural-diff.ts` recursive JSON diff was also shipped for regression-eval scoring (tree-traversal-flavored, lightweight). Neither is in the production hot path — they live under `eval/` and run via `npm run eval:*`. The codebase's overall DSA shape is unchanged.
+
 ---
 
 ## The system in one diagram
@@ -148,3 +150,6 @@ The legacy `study-dsa-foundations/` files are the deep dives into the seven mech
 ## What you'll have at the end
 
 A working vocabulary for every standard interview DSA category, anchored to a real file when the repo exercises it and named honestly when it doesn't. The practice map (08) tells you what to build next so the not-yet-exercised list shrinks.
+
+---
+Updated: 2026-06-16 — Phase 3 eval scorer (eval/scripts/lib/scorer.ts) noted as real worked example for set-intersection primitives the codebase already exercises; structural-diff.ts adds light tree-traversal-flavored code. Neither in production hot path; overall codebase DSA shape unchanged.

@@ -1,6 +1,6 @@
 # Performance engineering — audit
 
-> **Verdict-first:** blooming insights is bounded by **three measurable ceilings and one unmeasured cost line**. The ceilings: `maxDuration = 300s` per route (`app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`), `minIntervalMs = 1100` Bloomreach spacing (`lib/mcp/connect.ts:92`), and per-agent `maxToolCalls` (6/6/6/4). The unmeasured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON, and nothing logs `res.usage` to measure it. The strongest pattern in the codebase is the 60s TTL cache that bypasses both spacing and network on a hit (`lib/mcp/client.ts:80,102-110,137-145`). The load-bearing gap is **no `res.usage` logging anywhere** — the cheapest fix in the codebase (~5 lines of `console.log`) for the most consequential blind spot (cost-per-investigation). Top finding: ship the meter (`res.usage` logging) before any other perf change, because without it every optimization is "ship and hope."
+> **Verdict-first:** blooming insights is bounded by **three measurable ceilings and one partially-measured cost line**. The ceilings: `maxDuration = 300s` per route (`app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`), `minIntervalMs = 1100` Bloomreach spacing (`lib/mcp/connect.ts:92`), and per-agent `maxToolCalls` (6/6/6/4). The partially-measured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON; **3 of 5 Anthropic call sites now log `res.usage`** (`lib/agents/base.ts:135` runAgentLoop, `base.ts:257` runRecoveryTurn, `intent.ts:36` intent classifier — added since 2026-06-02), but `diagnostic.ts:87-126` and `recommendation.ts:82-132` synthesize() retries still don't. The strongest pattern in the codebase is the 60s TTL cache that bypasses both spacing and network on a hit — now at `lib/data-source/bloomreach-data-source.ts:122,144-148` after the Phase 2 PR A seam extraction (`lib/mcp/client.ts` is now a 17-line backwards-compat shim). New ceiling on the eval side: ~$10-15 total Anthropic spend across all 4 Phase 3 eval pillars (detection/diagnosis/recommendation/regression) — first real per-investigation cost number the codebase has. Top finding: complete the meter (add `console.log` to the 2 remaining synthesize() call sites) so the cost-concentration story closes, then assess whether `synthesize()` is genuinely dominant.
 
 ## performance-budget
 
@@ -19,14 +19,19 @@ What's **not codified**: no p95 latency SLO, no error-rate budget, no cost-per-i
 
 blooming insights measures **one number** today: per-tool-call duration, emitted as `tool_call_end.durationMs` on the NDJSON event stream (`lib/mcp/events.ts:7`, captured at `lib/mcp/client.ts:112,134`). It's *displayed* in the UI's status panel and *never persisted* — every refresh wipes the history. A baseline ("a typical investigation takes 100-115s") exists only as a *comment* in `app/api/agent/route.ts:18-19`.
 
-The cheapest unread meter: `res.usage` returned by every `anthropic.messages.create` call (`lib/agents/base.ts:102`, `lib/agents/diagnostic.ts:97`, `lib/agents/recommendation.ts:96`, `lib/agents/intent.ts:18`). None of those four call sites read it. The data is free; reading it is one property access per site. This is the **cheapest fix in the codebase for the most consequential blind spot** — cost concentration is unmeasured because of this gap.
+The cheapest unread meter was `res.usage` returned by every `anthropic.messages.create` call. **PARTIALLY RESOLVED as of 2026-06-15**: 3 of 5 sites now log it (`lib/agents/base.ts:135` runAgentLoop's main turn, `base.ts:257` runRecoveryTurn, `lib/agents/intent.ts:36` intent classifier). The two remaining sites are the synthesize() fallback Anthropic calls inside `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — exactly the call sites the cost-concentration finding suspects of dominating. Closing those two completes the meter and unblocks the cost-concentration confirmation.
 
-What's `not yet exercised`:
+**New measured data point (Phase 3, 2026-06-15):** ~$10-15 total Anthropic spend across all 4 eval pillars (detection + diagnosis + recommendation + regression) running K=10 per anomaly × 3 seeded anomalies. Recommendation eval alone: 34:50 runtime for K=10 across 3 anomalies. This is the first real "what does an end-to-end investigation cost" data the codebase has — though it's measured against `OlistDataSource` (hermetic SQLite), not the production Bloomreach path. The 30s `AbortSignal.timeout(30_000)` added on the Olist side at `lib/data-source/olist-data-source.ts:151` is the first per-call timeout in the codebase (Bloomreach side still has no per-call timeout — asymmetric coverage).
+
+**Parallel-execution incident (real perf anecdote, 2026-06-15):** K=10 eval was kicked off twice in parallel during Phase 3 PR E — main session ran K=10 from Bash while a sub-agent ALSO ran K=10. Detected via `ps aux`; killed PIDs 30039/30040 before they overwrote results. Mitigation: `EVAL_RUN_TAG` env var added for result-dir namespace separation. The eval suite is now the codebase's first concrete "parallel runs of the same expensive operation will collide" experience.
+
+What's still `not yet exercised`:
 - Load testing (no k6, no autocannon, no synthetic baseline)
 - Profiler integration (no clinic, no 0x, no `--inspect`)
 - Per-investigation summary (the `collected: AgentEvent[]` array at `app/api/agent/route.ts:171` has the inputs but never aggregates)
 - APM / Sentry / Datadog
 - Web Vitals (no `useReportWebVitals`, no Vercel Speed Insights)
+- No per-call timeout on Bloomreach side (only on Olist side)
 
 → see `04-synthesize-as-cost-concentration.md` for the deep walk on the dominant unmeasured cost line and why the meter is load-bearing
 
@@ -69,7 +74,7 @@ The deliberate absence of a database is the load-bearing architectural choice �
 
 **Two real caches plus one persistence-as-cache layer.** No batching opportunity. No backpressure (the spacing gate looks like it but isn't).
 
-- **TTL cache (60s, exact-match).** `McpClient.cache` keyed on `${name}:${JSON.stringify(args)}` (`lib/mcp/client.ts:80,102-110`). On a hit: `durationMs: 0, fromCache: true` — bypasses both spacing gate AND network. Errors are NOT cached (`lib/mcp/client.ts:137-145`) — a rate-limit error would otherwise poison the cache for 60s; bypassing caching for errors lets the next call retry immediately after spacing.
+- **TTL cache (60s, exact-match).** Code moved during Phase 2 PR A — now at `lib/data-source/bloomreach-data-source.ts:122,144-148` (was `lib/mcp/client.ts`; the old path is a 17-line backwards-compat shim). Keyed on `${name}:${JSON.stringify(args)}`. On a hit: `durationMs: 0, fromCache: true` — bypasses both spacing gate AND network. Errors are NOT cached — a rate-limit error would otherwise poison the cache for 60s; bypassing caching for errors lets the next call retry immediately after spacing.
 - **Schema cache (per-instance, no TTL).** `let cached: WorkspaceSchema | null = null` at `lib/mcp/schema.ts:131`. Populated on first `bootstrapSchema` call (~6-12s), reused forever (until instance death). Saves the bootstrap cost per warm request.
 - **Investigation replay store.** `mem: Map<string, AgentEvent[]>` at `lib/state/investigations.ts:11`. Three-source fallback: in-memory → dev cache file → committed demo JSON. This is *replay/persistence*, not a perf cache — a live re-run would produce different events.
 
@@ -108,7 +113,7 @@ Ranked by consequence × likelihood. The discipline is *forcing the rank* — if
 **Top three (HIGH consequence).**
 
 1. **Cost concentration on `synthesize()`** — `lib/agents/diagnostic.ts:87-126`, `lib/agents/recommendation.ts:82-132`. Output-heavy structured JSON, fires whenever the loop fails to emit valid JSON. Unmeasured because no `res.usage` logging. Fix: requires #2 to land first. → see `04-synthesize-as-cost-concentration.md`
-2. **No `res.usage` logging anywhere** — 5 call sites (`lib/agents/base.ts:102`, `lib/agents/diagnostic.ts:97`, `lib/agents/recommendation.ts:96`, `lib/agents/intent.ts:18`). The cheapest fix in the codebase (5 `console.log` lines) for the most consequential blind spot. Unblocks #1, #3, and every soft budget.
+2. **`res.usage` logging — partially landed 2026-06-15** — 3 of 5 sites now log (`lib/agents/base.ts:135` runAgentLoop, `base.ts:257` runRecoveryTurn, `lib/agents/intent.ts:36` intent classifier). 2 sites remaining are `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` synthesize() retries — the exact call sites #1 suspects of dominating. ~2 `console.log` lines closes it. Phase 3 also produced the first real per-investigation cost data: ~$10-15 total across K=10 eval across 4 pillars.
 3. **300s route budget pinned at ceiling** — `app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`. Zero headroom for retry storms. Fix: queue + worker (requires DB) or tighten `maxToolCalls`. → see `01-300s-vercel-budget-as-hard-ceiling.md`
 
 **Middle four (MEDIUM consequence).**
@@ -128,6 +133,9 @@ Ranked by consequence × likelihood. The discipline is *forcing the rank* — if
 
 ## Top 3 ranked findings
 
-1. **No `res.usage` logging anywhere** — `lib/agents/base.ts:102`, `lib/agents/diagnostic.ts:97`, `lib/agents/recommendation.ts:96`, `lib/agents/intent.ts:18` — add `console.log` of `res.usage` per call site (~5 lines total). Cheapest fix in the codebase for the most consequential blind spot. Unblocks cost budgeting and confirms or refutes #2.
+1. **`res.usage` logging — partially landed 2026-06-15** — 3 of 5 sites now log (`base.ts:135`, `base.ts:257`, `intent.ts:36`). Close the remaining 2 (`diagnostic.ts:87-126`, `recommendation.ts:82-132` synthesize() retries) to finish unblocking #2.
 2. **Cost concentration on `synthesize()`** — `lib/agents/diagnostic.ts:87-126`, `lib/agents/recommendation.ts:82-132` — suspected dominant per-investigation cost (long structured JSON output, fires when loop fails to parse). Cannot be confirmed or fixed until #1 lands. Once measured, lever is tightening `maxToolCalls` (fewer forced syntheses) or reshaping the JSON output (smaller schema).
 3. **300s route budget at ceiling, zero headroom** — `app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17` — pinned at Vercel Pro's max. Typical ~100-115s, worst-case retry storm (~280-300s+) crosses the ceiling and the route dies mid-stream. Cheap fix: tighten `maxToolCalls`. Architectural fix: queue + worker (requires DB).
+
+---
+Updated: 2026-06-16 — `res.usage` logging partially landed (3 of 5 sites). Cache code moved to `lib/data-source/bloomreach-data-source.ts` post Phase 2 PR A. Phase 3 produced first measured per-investigation cost data (~$10-15 across K=10 × 4 eval pillars). K=10 parallel-run race condition + `EVAL_RUN_TAG` mitigation added as real concurrent-execution anecdote. Asymmetric per-call timeout: Olist has 30s, Bloomreach still has none.

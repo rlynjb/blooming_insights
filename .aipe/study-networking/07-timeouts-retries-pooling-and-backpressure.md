@@ -491,7 +491,7 @@ return {
 
 ### What's absent (and the verdict)
 
-  → **No `AbortController` / per-call timeout.** Grep returns `lib/hooks/useInvestigation.ts:34` (a comment about React StrictMode cleanup), `lib/mcp/client.ts:151` (the spacing sleep), and route file replay delays. No `signal:` parameter on any fetch. Verdict: `not yet exercised`; insertion point is `lib/mcp/transport.ts:24-36`'s `makeCapturingFetch`.
+  → **Per-call timeout: asymmetric coverage (Phase 2, 2026-06-15).** The `DataSource` interface now accepts an optional `AbortSignal` (`callTool(name, args, opts?: { signal? })`). **Olist side**: `lib/data-source/olist-data-source.ts:151` composes the caller signal with `AbortSignal.timeout(30_000)` — every call has a 30s timeout. **Bloomreach side**: the Bloomreach adapter (`lib/data-source/bloomreach-data-source.ts`, formerly `lib/mcp/client.ts`) still has NO per-call timeout — only the 300s route ceiling above. Closing the asymmetry is a ~10-line mirror of the Olist pattern; the cheapest production-grade networking fix in the codebase. Insertion point is the Bloomreach adapter's `callTool` (mirroring the Olist `composeSignals` helper).
   → **No connection pool config.** Grep for `Dispatcher`, `Agent(`, `pool`, `keepAliveMsecs` returns no app hits. Verdict: `not yet exercised`.
   → **No backpressure / queue.** Grep for `Semaphore`, `pLimit`, `queue` returns no app hits. The single in-process Map cache + spacing gate are the only shared-resource discipline. Verdict: `not yet exercised`; would matter if two users hit the same warm instance.
 
@@ -549,3 +549,6 @@ No per-call `AbortController`. If a Bloomreach socket hangs at minute 2, we eat 
   → `01-network-map.md` — where this client sits in the system.
   → `03-tcp-udp-connections-and-sockets.md` — the (absent) connection pool layer below this.
   → `08-networking-red-flags-audit.md` — the audit ranks the missing per-call timeout as risk #1.
+
+---
+Updated: 2026-06-16 — per-call timeout finding flipped from "not yet exercised" to "asymmetric coverage" — Olist side closed (30s AbortSignal.timeout at olist-data-source.ts:151), Bloomreach side still open. ~10-line mirror is the cheapest production-grade fix.

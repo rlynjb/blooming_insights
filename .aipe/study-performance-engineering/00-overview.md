@@ -3,7 +3,7 @@
 **Industry name(s):** performance audit · capacity audit · cost-and-latency map
 **Type:** Industry standard · Language-agnostic
 
-> blooming insights is bounded by **three measurable ceilings and one unmeasured cost line**. The ceilings: `maxDuration = 300s` per route (`app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`), `minIntervalMs = 1100` Bloomreach spacing (`lib/mcp/connect.ts:92`), and per-agent `maxToolCalls` (6/6/6/4). The unmeasured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON, with no `res.usage` logging on any Anthropic call site. The load-bearing gap is the missing meter: ~5 lines of `console.log` would unblock every cost-related decision in this guide.
+> blooming insights is bounded by **three measurable ceilings and one partially-measured cost line**. The ceilings: `maxDuration = 300s` per route, `minIntervalMs = 1100` Bloomreach spacing, and per-agent `maxToolCalls` (6/6/6/4). The partially-measured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON; **3 of 5 Anthropic call sites now log `res.usage`** as of 2026-06-15 (`base.ts:135` runAgentLoop, `base.ts:257` runRecoveryTurn, `intent.ts:36` intent classifier), but the 2 synthesize() sites — the ones #1 suspects of dominating — still don't. **New real cost data point**: ~$10-15 total across K=10 × 4 Phase 3 eval pillars, against the Olist (SQLite) adapter. The load-bearing gap is now narrower: ~2 lines of `console.log` would close the meter.
 
 ---
 
@@ -86,19 +86,25 @@ The audit is the one-pass survey. The pattern files are the deep walks on the pa
 Three findings dominate; everything else is small by comparison.
 
 ```
-  1. NO res.usage LOGGING ANYWHERE
-     - the four Anthropic call sites (lib/agents/base.ts:102,
-       diagnostic.ts:97, recommendation.ts:96, intent.ts:18)
-       all RECEIVE res.usage and NONE READ IT
-     - fix: ~5 lines of console.log (the cheapest fix in the codebase)
-     - unblocks: cost budgets, R1 measurement, soft budgets in file 01
+  1. res.usage LOGGING — PARTIALLY LANDED 2026-06-15
+     - 3 of 5 sites now log:
+         lib/agents/base.ts:135     runAgentLoop
+         lib/agents/base.ts:257     runRecoveryTurn
+         lib/agents/intent.ts:36    intent classifier
+     - 2 sites remaining:
+         lib/agents/diagnostic.ts:87-126      synthesize() retry
+         lib/agents/recommendation.ts:82-132  synthesize() retry
+     - Phase 3 evals produced first measured per-investigation cost:
+         ~$10-15 total across K=10 × 4 pillars (Olist adapter)
+     - finish line: ~2 lines of console.log; unblocks #2 confirmation
 
   2. COST CONCENTRATION on synthesize()
      - the synthesize() call (lib/agents/diagnostic.ts:87-126,
        lib/agents/recommendation.ts:82-132) emits long structured-JSON
        output — output tokens are several × input
      - runs whenever the agent loop's parse fails (forceFinal turn missed JSON)
-     - SUSPECTED dominant cost line, NOT CONFIRMED (requires #1 to land)
+     - STILL SUSPECTED (not confirmed) — the 2 unmeasured sites are
+       precisely the suspect call sites
      - see 04-synthesize-as-cost-concentration.md
 
   3. 300s ROUTE BUDGET AT CEILING, ZERO HEADROOM
@@ -107,6 +113,12 @@ Three findings dominate; everything else is small by comparison.
      - bad-day retry storms (~280s) scrape the ceiling
      - beyond 300s: Vercel kills mid-stream, user sees no diagnosis
      - see 01-300s-vercel-budget-as-hard-ceiling.md
+
+  4. NEW: ASYMMETRIC PER-CALL TIMEOUT (Phase 2)
+     - Olist side has AbortSignal.timeout(30_000) at
+       lib/data-source/olist-data-source.ts:151
+     - Bloomreach side has none
+     - ~10-line mirror would close the asymmetry
 ```
 
 ---
@@ -123,9 +135,12 @@ Three findings dominate; everything else is small by comparison.
   → Bundle-size measurement (no @next/bundle-analyzer config)
   → Web Vitals (no LCP/INP/CLS measurement, no Vercel Speed Insights)
   → APM (no Datadog/Sentry/New Relic; only `console.error` for failures)
-  → Cost telemetry (no res.usage logging anywhere)
+  → Cost telemetry (partial — 3 of 5 sites; ~$10-15 measured for K=10 × 4 eval pillars)
   → Backpressure (single-flight serial calls; no queue, no semaphore)
 ```
+
+---
+Updated: 2026-06-16 — `res.usage` partially landed (3/5 sites); Phase 3 evals produced first measured per-investigation cost (~$10-15 across K=10 × 4 pillars on Olist adapter); asymmetric per-call timeout finding added (Olist 30s, Bloomreach none).
 
 The pattern: blooming insights makes **bound-by-judgment** decisions (the 300s budget, the 16k truncation, the 60s TTL) — it has not yet entered the **bound-by-measurement** phase. The audit's `measurement-baselines-and-profiling` lens names which measurements would change which decisions.
 
