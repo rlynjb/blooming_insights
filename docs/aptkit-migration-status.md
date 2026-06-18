@@ -84,17 +84,17 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
 
 ## Known Notes
 
-- AptKit core is being moved from GitHub Packages to public npmjs as `@rlynjb/aptkit-core@0.1.0`.
-- Blooming can keep its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@0.1.0`.
+- AptKit core is published to public npmjs as `@rlynjb/aptkit-core@0.1.0`.
+- Blooming keeps its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@^0.1.0`.
 - Because the package is public on npmjs, Vercel does not need a package registry token to install it.
-- `package.json` currently still points `@aptkit/core` at a local tarball path: `file:../../../../private/tmp/aptkit-packs/aptkit-core-0.0.0.tgz`. Keep this until `@rlynjb/aptkit-core@0.1.0` is published to npmjs, then run `npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.1.0` to regenerate `package-lock.json`.
+- `package.json` and `package-lock.json` now resolve `@aptkit/core` from the public npm package, not the temporary local tarball.
 - Full `npm run lint` still has unrelated existing lint debt outside the migration path. Touched migration files have been linted as part of each step.
 - Active code comments and older docs still mention `runAgentLoop` in historical context. That is expected in old plan docs and tests, but future docs should refer to AptKit runtime for active behavior.
 
 ## Recommended Next Steps
 
-1. Publish `@rlynjb/aptkit-core@0.1.0` to npmjs and switch Blooming from the temporary local tarball to `@aptkit/core@npm:@rlynjb/aptkit-core@0.1.0`.
-   This removes the package registry token requirement from Vercel deploys.
+1. Verify the next Vercel production deployment installs `@aptkit/core` from public npmjs.
+   Local `npm ci`, `npm run build`, and `npm test` pass with the public package.
 
 2. Audit `lib/mcp/tools.ts` against AptKit tool policies.
    Decide whether Blooming should keep local allowlists for route/API safety or import policy constants from AptKit where possible.
