@@ -84,14 +84,18 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
 
 ## Known Notes
 
-- `package.json` currently points `@aptkit/core` at a local tarball path: `file:../../../../private/tmp/aptkit-packs/aptkit-core-0.0.0.tgz`. This is fine for local migration testing but should be replaced by a stable GitHub URL, workspace path, or registry package before sharing the repo broadly.
+- AptKit core is published through GitHub Packages as `@rlynjb/aptkit-core@0.1.0`.
+- Blooming can keep its existing `@aptkit/core` imports by installing the GitHub package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@0.1.0`.
+- `.npmrc` routes the `@rlynjb` scope to GitHub Packages and reads `GITHUB_PACKAGES_TOKEN` for install auth.
+- `package.json` currently still points `@aptkit/core` at a local tarball path: `file:../../../../private/tmp/aptkit-packs/aptkit-core-0.0.0.tgz`. Keep this until `package-lock.json` can be regenerated with a GitHub Packages token available.
+- Before Vercel production deploy, add `GITHUB_PACKAGES_TOKEN` to Vercel and run `npm install @aptkit/core@npm:@rlynjb/aptkit-core@0.1.0` locally with the same token available so `package-lock.json` records the registry package.
 - Full `npm run lint` still has unrelated existing lint debt outside the migration path. Touched migration files have been linted as part of each step.
 - Active code comments and older docs still mention `runAgentLoop` in historical context. That is expected in old plan docs and tests, but future docs should refer to AptKit runtime for active behavior.
 
 ## Recommended Next Steps
 
-1. Decide packaging source for `@aptkit/core` in Blooming.
-   Use a stable GitHub/package source instead of the temporary `/private/tmp` tarball before external install or deployment.
+1. Switch Blooming from the temporary local tarball to `@aptkit/core@npm:@rlynjb/aptkit-core@0.1.0`.
+   This requires `GITHUB_PACKAGES_TOKEN` during local install so `package-lock.json` can be regenerated against GitHub Packages.
 
 2. Audit `lib/mcp/tools.ts` against AptKit tool policies.
    Decide whether Blooming should keep local allowlists for route/API safety or import policy constants from AptKit where possible.
