@@ -18,6 +18,7 @@ The migration is intentionally non-destructive. Legacy Blooming implementations 
 | Query agent | `lib/agents/query.ts` | `QueryAgent` from `@aptkit/core` | `lib/agents/query-legacy.ts` |
 | Intent classification | `lib/agents/intent.ts` | `parseIntent` / `classifyIntent` from `@aptkit/core` | `lib/agents/intent-legacy.ts` |
 | Category coverage | `lib/agents/categories.ts` | ecommerce category registry and coverage helpers from `@aptkit/core` | `lib/agents/categories-legacy.ts` |
+| Regression structural diff | `eval/scripts/lib/structural-diff.ts` | `getPath` from `@aptkit/core` | none |
 | Agent runtime loop | `lib/agents/base.ts` only exports model/type glue | AptKit runtime via core agents | `lib/agents/base-legacy.ts` |
 | Legacy prompts | active agents use AptKit prompt packages | `@aptkit/prompts` via core agents | `lib/agents/legacy-prompts/` |
 | Legacy output validators | active agents use AptKit validators | AptKit validators via core agents | `lib/agents/legacy-validate.ts` |
@@ -100,7 +101,7 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
    Decide whether Blooming should keep local allowlists for route/API safety or import policy constants from AptKit where possible.
 
 3. Classify eval scripts.
-   Keep product-specific regression scripts in Blooming, but consider emitting AptKit-compatible replay artifacts so Studio/eval tooling can inspect them.
+   Keep product-specific regression scripts in Blooming, but consider emitting AptKit-compatible replay artifacts so Studio/eval tooling can inspect them. The Olist detection scorer remains local because its aliases, seeded anomaly ids, and dataset week math are product fixtures rather than reusable AptKit behavior.
 
 4. Decide legacy retention window.
    Keep legacy files until at least one real OpenAI/AptKit-backed end-to-end replay has been promoted and reviewed.

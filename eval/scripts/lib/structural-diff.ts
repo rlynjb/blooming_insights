@@ -23,6 +23,8 @@
 // recommendations than the golden, the missing indices become
 // missing_required_fields entries — which is the desired failure mode.
 
+import { getPath } from '@aptkit/core';
+
 /** Verdict for one structural comparison. */
 export interface StructuralDiffResult {
   /** Overall pass: no missing required fields, no type mismatches. */
@@ -47,33 +49,6 @@ export interface StructuralDiffConfig {
   /** When true, also report top-level fields in `newOutput` that aren't in
    *  `goldenOutput` as `unexpected_fields`. Doesn't change pass/fail. */
   strict: boolean;
-}
-
-/** Get the value at a dotted path inside an unknown object. Returns the
- *  sentinel `MISSING` (a private symbol) when any segment along the path
- *  is null/undefined or otherwise unreachable. */
-const MISSING = Symbol('structural-diff.missing');
-
-function getByPath(target: unknown, path: string): unknown | typeof MISSING {
-  if (path.length === 0) return target;
-  const segments = path.split('.');
-  let cur: unknown = target;
-  for (const seg of segments) {
-    if (cur == null) return MISSING;
-    // Numeric segment = array index.
-    if (/^\d+$/.test(seg)) {
-      if (!Array.isArray(cur)) return MISSING;
-      const idx = Number(seg);
-      if (idx < 0 || idx >= cur.length) return MISSING;
-      cur = cur[idx];
-      continue;
-    }
-    if (typeof cur !== 'object') return MISSING;
-    const obj = cur as Record<string, unknown>;
-    if (!(seg in obj)) return MISSING;
-    cur = obj[seg];
-  }
-  return cur;
 }
 
 /** Stable type-name for diff comparison. JSON sees a small alphabet:
@@ -115,15 +90,15 @@ export function structuralDiff(
 
   // 1. Required fields: present + type-matched.
   for (const path of config.requiredFields) {
-    const newVal = getByPath(newOutput, path);
-    const goldenVal = getByPath(goldenOutput, path);
+    const newPath = getPath(newOutput, path);
+    const goldenPath = getPath(goldenOutput, path);
 
-    if (newVal === MISSING) {
+    if (!newPath.exists) {
       result.missing_required_fields.push(path);
       result.pass = false;
       continue;
     }
-    if (goldenVal === MISSING) {
+    if (!goldenPath.exists) {
       // Required field is in `requiredFields` list but isn't actually in the
       // captured golden. That's a fixture-config bug, not a regression — but
       // we can still check that the new value's type is sane (just record a
@@ -134,8 +109,8 @@ export function structuralDiff(
       continue;
     }
 
-    const newType = typeOf(newVal);
-    const goldenType = typeOf(goldenVal);
+    const newType = typeOf(newPath.value);
+    const goldenType = typeOf(goldenPath.value);
     if (newType !== goldenType) {
       result.type_mismatches.push({ path, expected: goldenType, got: newType });
       result.pass = false;
