@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.99.0",
+    "@aptkit/core": "file:../../../../private/tmp/aptkit-packs/aptkit-core-0.0.0.tgz",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.10.1",
     "lucide-react": "^1.17.0",
