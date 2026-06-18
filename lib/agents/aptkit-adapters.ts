@@ -25,13 +25,19 @@ export type AptKitAgentHooks = {
 /** Adapts Blooming's Anthropic SDK client to AptKit's provider-neutral ModelProvider. */
 export class AnthropicModelProviderAdapter implements ModelProvider {
   readonly id = 'anthropic';
-  readonly defaultModel = AGENT_MODEL;
+  readonly defaultModel: string;
+  private readonly logSite: string;
 
   constructor(
     private readonly anthropic: Anthropic,
-    private readonly agent: AgentName,
+    agent: AgentName,
     private readonly sessionId?: string,
-  ) {}
+    model = AGENT_MODEL,
+    logSite = `agents/${agent}:aptkit-model`,
+  ) {
+    this.defaultModel = model;
+    this.logSite = logSite;
+  }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
@@ -49,7 +55,7 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
     );
 
     console.log(JSON.stringify({
-      site: `agents/${this.agent}:aptkit-model`,
+      site: this.logSite,
       sessionId: this.sessionId,
       usage: response.usage,
     }));
