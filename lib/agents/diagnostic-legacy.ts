@@ -6,7 +6,7 @@ import { runAgentLoop, buildSynthesisInstruction } from './base-legacy';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { diagnosticTools } from '../mcp/tools';
-import { parseAgentJson, isDiagnosis } from '../mcp/validate';
+import { parseAgentJson, isDiagnosis } from './legacy-validate';
 import { diagnosisConfidence } from '../insights/derive';
 import type { Anomaly, Diagnosis, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';

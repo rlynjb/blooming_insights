@@ -6,7 +6,7 @@ import { runAgentLoop, buildSynthesisInstruction } from './base-legacy';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { monitoringTools } from '../mcp/tools';
 import type { AnomalyCategory } from './categories';
-import { parseAgentJson, isAnomalyArray } from '../mcp/validate';
+import { parseAgentJson, isAnomalyArray } from './legacy-validate';
 import type { Anomaly, Severity, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
 

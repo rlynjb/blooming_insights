@@ -6,7 +6,7 @@ import { runAgentLoop, buildSynthesisInstruction } from './base-legacy';
 import { schemaSummary } from './monitoring';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { recommendationTools } from '../mcp/tools';
-import { parseAgentJson, isRecommendationArray } from '../mcp/validate';
+import { parseAgentJson, isRecommendationArray } from './legacy-validate';
 import type { AgentHooks } from './diagnostic';
 import type { Anomaly, Diagnosis, Recommendation, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';

@@ -1,7 +1,7 @@
 {
   "_meta": {
     "purpose": "Reference recommendations per seeded anomaly for the PR F judge. One valid answer shape per anomaly — the judge scores candidate recommendation arrays against the 3-criterion rubric in eval/judges/recommendation-judge.md (plausible action / specific / impact-sized), NOT literal match.",
-    "shape": "Each entry is an ARRAY (1-3 items) matching the canonical Recommendation type the agent emits (lib/mcp/types.ts + lib/mcp/validate.ts isRecommendationArray). No `id` field — the agent emits id-less; ids are assigned post-validation in production.",
+    "shape": "Each entry is an ARRAY (1-3 items) matching the canonical Recommendation type the legacy agent emits (lib/mcp/types.ts + lib/agents/legacy-validate.ts isRecommendationArray). No `id` field — the agent emits id-less; ids are assigned post-validation in production.",
     "currency_note": "Reais (R$). The Olist DB stores monetary fields in cents; reference impact figures here are written in Reais (whole-Reais rounding) per the PR E finding that the diagnostic agent has a known cents-vs-Reais misquote bug — references are in Reais so the judge has the right unit to score `impact_sized` against."
   },
   "sp-revenue-drop-w4": [

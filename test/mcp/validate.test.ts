@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAgentJson, isAnomalyArray, isDiagnosis, isRecommendationArray } from '../../lib/mcp/validate';
+import { parseAgentJson, isAnomalyArray, isDiagnosis, isRecommendationArray } from '../../lib/agents/legacy-validate';
 
 describe('parseAgentJson', () => {
   it('extracts a json array from a fenced ```json block', () => {
