@@ -1,16 +1,19 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  AnomalyMonitoringAgent as AptKitAnomalyMonitoringAgent,
+  type MonitoringAnomaly,
+  type MonitoringAnomalyCategory,
+} from '@aptkit/core';
 import type { McpCaller } from './base';
-import { runAgentLoop, buildSynthesisInstruction } from './base';
-import { filterToolSchemas, type McpToolDef } from './tool-schemas';
-import { monitoringTools } from '../mcp/tools';
+import {
+  AnthropicModelProviderAdapter,
+  BloomingToolRegistryAdapter,
+  BloomingTraceSinkAdapter,
+} from './aptkit-adapters';
+import type { McpToolDef } from './tool-schemas';
 import type { AnomalyCategory } from './categories';
-import { parseAgentJson, isAnomalyArray } from '../mcp/validate';
-import type { Anomaly, Severity, ToolCall } from '../mcp/types';
+import type { Anomaly, CategoryId, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
-
-const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/monitoring.md'), 'utf8');
 
 /** Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema). */
 export function schemaSummary(schema: WorkspaceSchema): string {
@@ -56,8 +59,6 @@ export function schemaSummary(schema: WorkspaceSchema): string {
   ].join('\n');
 }
 
-const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
-
 /** Streaming hooks fired as the monitoring loop runs (used to stream live status
  *  to the feed). All optional; mirror runAgentLoop's hook surface. The optional
  *  `signal` is threaded down to `runAgentLoop` so the route layer's `req.signal`
@@ -79,60 +80,37 @@ export class MonitoringAgent {
   ) {}
 
   async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
-    // Build the runnable-category checklist injected into the prompt. The route
-    // gates out unsupported categories first, so the agent never spends EQL
-    // budget on a category this workspace's events can't support.
-    const checklist = categories.length
-      ? categories
-          .map(
-            (c) =>
-              `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} recipe: \`${c.eql(this.schema.projectId)}\`. ` +
-              `flag when |Δ| ≥ ${c.thresholds.warning}% (critical ≥ ${c.thresholds.critical}%).`,
-          )
-          .join('\n')
-      : '(no checklist provided — scan for any significant recent change)';
-
-    const system = PROMPT
-      .replace('{schema}', schemaSummary(this.schema))
-      .replace(/\{project_id\}/g, this.schema.projectId)
-      .replace('{categories}', checklist);
-
-    const { finalText } = await runAgentLoop({
-      anthropic: this.anthropic,
-      dataSource: this.dataSource,
-      agent: 'monitoring',
-      system,
-      userPrompt:
-        'Work through your category checklist (each as 90d vs prior 90d) and return the anomaly ' +
-        'JSON array — stamp each flagged anomaly with its `category`.',
-      toolSchemas: filterToolSchemas(this.allTools, monitoringTools),
-      onToolCall: hooks?.onToolCall,
-      onToolResult: hooks?.onToolResult,
-      onText: hooks?.onText,
-      signal: hooks?.signal,
-      maxTurns: 8,
-      maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
-      synthesisInstruction: buildSynthesisInstruction(
-        'Stop querying now and output your final answer. ' +
-          'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
-          'meaningful), based on the data you have already gathered — anchored on revenue / ' +
-          'order_count / payment_value over time, filtered by state / category / payment_type as ' +
-          'relevant to the data shown.',
-      ),
-      sessionId: this.sessionId,
+    const toolRegistry = new BloomingToolRegistryAdapter(this.dataSource, this.allTools);
+    const agent = new AptKitAnomalyMonitoringAgent({
+      model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+      tools: toolRegistry,
+      workspace: this.schema,
+      trace: new BloomingTraceSinkAdapter(hooks ?? {}, 'monitoring'),
+      categories: categories.length ? toAptKitCategories(categories, this.schema.projectId) : [],
     });
 
-    // Degrade gracefully: if the agent produced no parseable/valid anomaly array
-    // (e.g. stale data with nothing recent to report, or it exhausted its call
-    // budget mid-exploration), treat it as "no anomalies" rather than failing the
-    // whole briefing. The route's `trace` still records what the agent did.
-    let parsed: unknown;
-    try {
-      parsed = parseAgentJson(finalText);
-    } catch {
-      return [];
-    }
-    if (!isAnomalyArray(parsed)) return [];
-    return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
+    return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
   }
+}
+
+function toAptKitCategories(
+  categories: AnomalyCategory[],
+  projectId: string,
+): MonitoringAnomalyCategory[] {
+  return categories.map((category) => ({
+    id: category.id,
+    label: category.label,
+    requires: category.requires,
+    enriches: category.enriches,
+    whyItMatters: category.whyItMatters,
+    queryRecipe: category.eql(projectId),
+    thresholds: category.thresholds,
+  }));
+}
+
+function toBloomingAnomaly(anomaly: MonitoringAnomaly): Anomaly {
+  return {
+    ...anomaly,
+    category: anomaly.category as CategoryId | undefined,
+  };
 }
