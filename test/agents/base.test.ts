@@ -1,8 +1,8 @@
 // test/agents/base.test.ts
 import { describe, it, expect, vi } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
-import { runAgentLoop, AGENT_MODEL } from '../../lib/agents/base';
-import type { McpCaller } from '../../lib/agents/base';
+import { runAgentLoop, AGENT_MODEL } from '../../lib/agents/base-legacy';
+import type { McpCaller } from '../../lib/agents/base-legacy';
 
 // ---------------------------------------------------------------------------
 // Helpers to build scripted fake Anthropic instances

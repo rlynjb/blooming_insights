@@ -18,7 +18,7 @@ export interface AgentHooks {
   onText?: (text: string) => void;
   onToolResult?: (tc: ToolCall) => void;
   /** Cancellation signal threaded from the route's `req.signal` down through
-   *  `runAgentLoop` to Anthropic and MCP. Optional — existing callers compile
+   *  AptKit's agent loop to Anthropic and MCP. Optional — existing callers compile
    *  + pass unchanged. */
   signal?: AbortSignal;
 }

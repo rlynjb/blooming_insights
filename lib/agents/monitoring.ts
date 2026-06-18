@@ -60,8 +60,8 @@ export function schemaSummary(schema: WorkspaceSchema): string {
 }
 
 /** Streaming hooks fired as the monitoring loop runs (used to stream live status
- *  to the feed). All optional; mirror runAgentLoop's hook surface. The optional
- *  `signal` is threaded down to `runAgentLoop` so the route layer's `req.signal`
+ *  to the feed). All optional; mirror AptKit's hook surface. The optional
+ *  `signal` is threaded down to the AptKit loop so the route layer's `req.signal`
  *  cancels in-flight Anthropic + MCP calls when the client navigates away. */
 export interface MonitorHooks {
   onToolCall?: (tc: ToolCall) => void;

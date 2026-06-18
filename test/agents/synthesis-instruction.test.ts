@@ -9,7 +9,7 @@
 // prefix "You have NO more tool calls available. " and shared closer
 // " Do not say you need more queries." were lifted into the helper.
 import { describe, it, expect } from 'vitest';
-import { buildSynthesisInstruction } from '../../lib/agents/base';
+import { buildSynthesisInstruction } from '../../lib/agents/base-legacy';
 
 describe('buildSynthesisInstruction — byte-identity with pre-lift inline strings', () => {
   it('monitoring: assembles the exact pre-lift string', () => {

@@ -1,8 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { McpCaller } from './base';
-import { runAgentLoop, buildSynthesisInstruction } from './base';
+import type { McpCaller } from './base-legacy';
+import { runAgentLoop, buildSynthesisInstruction } from './base-legacy';
 import { filterToolSchemas, type McpToolDef } from './tool-schemas';
 import { monitoringTools } from '../mcp/tools';
 import type { AnomalyCategory } from './categories';
