@@ -162,10 +162,10 @@ function loadSimilarityJudgePrompt(): string {
  *  the prompt changed under us" cases. */
 function promptHash(agent: AgentKind): string {
   const map: Record<AgentKind, string | null> = {
-    monitoring: 'lib/agents/prompts/monitoring.md',
-    diagnostic: 'lib/agents/prompts/diagnostic.md',
-    recommendation: 'lib/agents/prompts/recommendation.md',
-    query: 'lib/agents/prompts/query.md',
+    monitoring: 'lib/agents/legacy-prompts/monitoring.md',
+    diagnostic: 'lib/agents/legacy-prompts/diagnostic.md',
+    recommendation: 'lib/agents/legacy-prompts/recommendation.md',
+    query: 'lib/agents/legacy-prompts/query.md',
     intent: null, // classifier prompt is inline in intent.ts; hash that file instead
   };
   const relPath = map[agent] ?? 'lib/agents/intent.ts';

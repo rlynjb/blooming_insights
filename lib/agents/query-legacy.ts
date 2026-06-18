@@ -10,7 +10,7 @@ import { queryTools } from '../mcp/tools';
 import type { Intent } from './intent';
 import type { WorkspaceSchema } from '../mcp/schema';
 
-const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/query.md'), 'utf8');
+const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/legacy-prompts/query.md'), 'utf8');
 
 export class QueryAgent {
   constructor(

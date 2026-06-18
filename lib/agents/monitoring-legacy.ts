@@ -10,7 +10,7 @@ import { parseAgentJson, isAnomalyArray } from '../mcp/validate';
 import type { Anomaly, Severity, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
 
-const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/monitoring.md'), 'utf8');
+const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/legacy-prompts/monitoring.md'), 'utf8');
 
 /** Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema). */
 export function schemaSummary(schema: WorkspaceSchema): string {

@@ -11,7 +11,7 @@ import type { AgentHooks } from './diagnostic';
 import type { Anomaly, Diagnosis, Recommendation, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
 
-const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/recommendation.md'), 'utf8');
+const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/legacy-prompts/recommendation.md'), 'utf8');
 
 /** Recommendations as the agent emits them - id is assigned by us after validation. */
 type IdlessRecommendation = Omit<Recommendation, 'id'>;

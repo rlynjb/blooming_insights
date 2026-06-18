@@ -11,7 +11,7 @@ import { diagnosisConfidence } from '../insights/derive';
 import type { Anomaly, Diagnosis, ToolCall } from '../mcp/types';
 import type { WorkspaceSchema } from '../mcp/schema';
 
-const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/prompts/diagnostic.md'), 'utf8');
+const PROMPT = readFileSync(join(process.cwd(), 'lib/agents/legacy-prompts/diagnostic.md'), 'utf8');
 
 const FALLBACK: Diagnosis = {
   conclusion: 'Insufficient data to determine a cause for this change.',
