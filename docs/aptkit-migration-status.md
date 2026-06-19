@@ -18,7 +18,6 @@ The migration is intentionally non-destructive. Legacy Blooming implementations 
 | Query agent | `lib/agents/query.ts` | `QueryAgent` from `@aptkit/core` | `lib/agents/query-legacy.ts` |
 | Intent classification | `lib/agents/intent.ts` | `parseIntent` / `classifyIntent` from `@aptkit/core` | `lib/agents/intent-legacy.ts` |
 | Category coverage | `lib/agents/categories.ts` | ecommerce category registry and coverage helpers from `@aptkit/core` | `lib/agents/categories-legacy.ts` |
-| Regression structural diff | `eval/scripts/lib/structural-diff.ts` | `getPath` from `@aptkit/core` | none |
 | Agent runtime loop | `lib/agents/base.ts` only exports model/type glue | AptKit runtime via core agents | `lib/agents/base-legacy.ts` |
 | Legacy prompts | active agents use AptKit prompt packages | `@aptkit/prompts` via core agents | `lib/agents/legacy-prompts/` |
 | Legacy output validators | active agents use AptKit validators | AptKit validators via core agents | `lib/agents/legacy-validate.ts` |
@@ -68,7 +67,6 @@ This file is still app-specific and should remain in Blooming unless AptKit late
 
 - `lib/mcp/tools.ts`: tool allowlists overlap conceptually with AptKit's tool policies. AptKit currently enforces policies inside each agent, but Blooming still uses local lists for API allowlists and tool coverage checks.
 - `lib/agents/tool-schemas.ts`: still useful for legacy code and MCP allowlists. Active AptKit agents receive full tool definitions and apply AptKit policies internally.
-- `eval/scripts/*`: Blooming-specific eval harnesses still call the app's wrappers. These could remain as product regression tests or migrate gradually to AptKit replay/eval artifacts.
 - `lib/agents/monitoring.ts` `schemaSummary`: still exported for tests and legacy agents import `schemaSummary` from the active monitoring wrapper. AptKit has its own schema summary, but Blooming's copy remains for compatibility.
 
 ### Legacy-Only
