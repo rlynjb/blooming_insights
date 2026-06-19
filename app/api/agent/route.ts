@@ -3,10 +3,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
-import { makeDataSource, type LiveMode } from '@/lib/data-source';
+import { makeDataSource, parseLiveMode, type LiveMode } from '@/lib/data-source';
 import { redactSecrets, formatError } from '@/lib/mcp/transport';
-// `bootstrapSchema` + `olistWorkspaceSchema` are now consumed indirectly via
-// the DataSource factory's per-mode `bootstrap()` — see lib/data-source/index.ts.
+// `bootstrapSchema` is now consumed indirectly via the DataSource factory's
+// `bootstrap()` — see lib/data-source/index.ts.
 import { DiagnosticAgent } from '@/lib/agents/diagnostic';
 import { RecommendationAgent } from '@/lib/agents/recommendation';
 import { QueryAgent } from '@/lib/agents/query';
@@ -154,14 +154,14 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
   }
 
-  // Resolve the live mode from `?mode=`. Default is `'live-sql'` per PR C's
-  // bi:mode extension; tests + legacy clients with no param land here too.
-  const modeParam = req.nextUrl.searchParams.get('mode');
-  const mode: LiveMode = modeParam === 'live-bloomreach' ? 'live-bloomreach' : 'live-sql';
+  // `live-bloomreach` uses the real Bloomreach MCP server. `live-synthetic`
+  // keeps the real model/agent loop but swaps the data source to Blooming-owned
+  // fake data. Legacy values fall back to Bloomreach.
+  const mode: LiveMode = parseLiveMode(req.nextUrl.searchParams.get('mode'));
 
-  // Construct the DataSource via the factory (PR C). Wrapped so a setup throw
-  // (e.g. missing AUTH_SECRET breaking cookie encryption in production, or
-  // mcp-server-olist not built) returns the real message instead of a bare 500.
+  // Construct the DataSource via the factory. Wrapped so a setup throw (e.g.
+  // missing AUTH_SECRET breaking cookie encryption in production) returns the
+  // real message instead of a bare 500.
   let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
   try {
     dsResult = await makeDataSource(mode, sid);
@@ -230,10 +230,8 @@ export async function GET(req: NextRequest) {
           q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
         stepFor(leadAgent, 'thought', 'reading the workspace schema…');
         const t_schema = performance.now();
-        // The factory's per-mode bootstrap: Bloomreach runs the live
-        // orchestrator (list_cloud_organizations / get_event_schema / …);
-        // Olist returns a synthesized Brazilian-e-commerce schema because the
-        // mcp-server-olist server intentionally exposes only domain tools.
+        // The factory's bootstrap runs the Bloomreach orchestrator
+        // (list_cloud_organizations / get_event_schema / …).
         const schema = await bootstrap(req.signal);
         recordPhase('schema_bootstrap', t_schema);
         req.signal.throwIfAborted();
@@ -317,10 +315,10 @@ export async function GET(req: NextRequest) {
           message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,
         });
       } finally {
-        // Tear the per-request DataSource down. For Olist this kills the
-        // mcp-server-olist subprocess; for Bloomreach it's a no-op (the OAuth
-        // client outlives the request via the cookie store). Best-effort —
-        // a teardown error must NOT swallow the route-level error above.
+        // Tear the per-request DataSource down. Currently a no-op for the
+        // Bloomreach adapter (the OAuth client outlives the request via the
+        // cookie store). Best-effort — a teardown error must NOT swallow the
+        // route-level error above.
         try {
           await disposeDataSource();
         } catch (disposeErr) {

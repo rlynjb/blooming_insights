@@ -1,5 +1,10 @@
 # 05 — LLM eval as testing
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry names:** Offline eval / LLM-as-judge / golden + adversarial set / rubric-scored regression. **Type:** Industry standard for AI products; project-specific in how it's wired into the `DataSource` seam.
 
 ## Zoom out, then zoom in

@@ -51,16 +51,15 @@ export default function HomePage() {
   // lib/hooks/useReconnectPolicy.ts.
   const reconnectPolicy = useReconnectPolicy();
 
-  // Demo vs live (Olist SQL) vs live (Bloomreach), toggled at RUNTIME (persisted
-  // in localStorage). Demo serves the cached snapshot — instant + reliable, ideal
-  // for a presentation. live-sql runs the agents against the local mcp-server-olist
-  // (the Phase 2 default, real data, no OAuth). live-bloomreach runs the agents
-  // against Bloomreach (real data, but the alpha server may need a reconnect; the
-  // dormant adapter is kept switchable). NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo
-  // and hides the toggle. The legacy `'live'` localStorage value migrates to
-  // `'live-sql'` so existing users transition transparently.
+  // Demo vs live, toggled at RUNTIME (persisted in localStorage).
+  // Demo serves the cached snapshot — instant + reliable, ideal for a presentation
+  // and the default. live-bloomreach runs the agents against Bloomreach (real
+  // data, but the alpha server may need a reconnect). live-synthetic runs the
+  // same agents/model against deterministic fake data owned by this app.
+  // NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle. Legacy
+  // `'live'` and `'live-sql'` localStorage values migrate to `'live-bloomreach'`.
   const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
-  const [mode, setMode] = useState<BriefingMode>('live-sql');
+  const [mode, setMode] = useState<BriefingMode>('demo');
   const [ready, setReady] = useState(false);
   const isDemo = mode === 'demo';
 
@@ -74,11 +73,11 @@ export default function HomePage() {
         const saved = localStorage.getItem('bi:mode');
         if (saved === 'demo') setMode('demo');
         else if (saved === 'live-bloomreach') setMode('live-bloomreach');
-        else if (saved === 'live-sql') setMode('live-sql');
-        else if (saved === 'live') setMode('live-sql'); // legacy → Olist SQL
-        // any other value (or null) → default `'live-sql'` stays
+        else if (saved === 'live-synthetic') setMode('live-synthetic');
+        else if (saved === 'live-sql' || saved === 'live') setMode('live-bloomreach'); // legacy
+        // any other value (or null) → default `'demo'` stays
       } catch {
-        /* localStorage blocked — default to live-sql */
+        /* localStorage blocked — default to demo */
       }
     }
     setReady(true);
@@ -169,8 +168,8 @@ export default function HomePage() {
               {(
                 [
                   { value: 'demo', label: 'demo' },
-                  { value: 'live-sql', label: 'live · olist' },
                   { value: 'live-bloomreach', label: 'live · bloomreach' },
+                  { value: 'live-synthetic', label: 'live · synthetic' },
                 ] as const
               ).map((m) => (
                 <button
@@ -202,8 +201,8 @@ export default function HomePage() {
             >
               {isDemo
                 ? 'cached snapshot · instant'
-                : mode === 'live-sql'
-                  ? 'live · olist (sql) via local mcp server'
+                : mode === 'live-synthetic'
+                  ? 'live agent · synthetic workspace data'
                   : 'live · real bloomreach workspace data'}
             </span>
           </div>

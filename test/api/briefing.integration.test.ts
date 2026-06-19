@@ -58,12 +58,11 @@ vi.mock('../../lib/mcp/connect', () => ({
   completeAuth: vi.fn(async () => {}),
 }));
 
-// PR C wraps connectMcp behind a `makeDataSource(mode, sid)` factory. The
+// connectMcp is wrapped behind a `makeDataSource(mode, sid)` factory. The
 // integration tests still mock `connectMcp` to drive the Bloomreach branch's
 // happy/error paths; the factory mock below maps each `mode` onto the
 // existing `currentConn`/`currentMcp` state so test arrange-steps don't have
-// to change. Olist mode is not exercised by the integration suite — its
-// behaviour is covered in test/data-source/olist.integration.test.ts.
+// to change.
 vi.mock('../../lib/data-source', async () => {
   const real = await vi.importActual<typeof import('../../lib/data-source')>(
     '../../lib/data-source',

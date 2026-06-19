@@ -92,12 +92,13 @@ export interface UseBriefingStreamResult {
   demoSuffix: string;
 }
 
-/** The three runtime modes the briefing supports:
+/** The runtime modes the briefing supports:
  *   - `demo`            → replay the committed snapshot (no MCP/Anthropic).
- *   - `live-sql`        → the Olist MCP server (PR C default; Phase 2 swap goal).
- *   - `live-bloomreach` → the dormant Bloomreach adapter (still switchable).
- *  Legacy `'live'` reads from localStorage migrate to `'live-sql'` in page.tsx. */
-export type BriefingMode = 'demo' | 'live-sql' | 'live-bloomreach';
+ *   - `live-bloomreach` → run the agents against the Bloomreach MCP server.
+ *   - `live-synthetic`  → run the real agents/model against local fake data.
+ *  Legacy `'live'` and `'live-sql'` reads from localStorage migrate to
+ *  `'live-bloomreach'` in page.tsx. */
+export type BriefingMode = 'demo' | 'live-bloomreach' | 'live-synthetic';
 
 export function useBriefingStream(
   mode: BriefingMode,
@@ -132,9 +133,8 @@ export function useBriefingStream(
     if (!ready) return; // wait until the persisted mode is resolved
 
     const isDemo = mode === 'demo';
-    // demo → cached snapshot (instant, no auth); live-* → run the agents,
-    // tagged with `?mode=<live-sql|live-bloomreach>` so the route picks the
-    // adapter via the DataSource factory.
+    // demo → cached snapshot (instant, no auth); live → run the agents,
+    // tagged with `?mode=` so the route picks the matching DataSource branch.
     const search = isDemo ? '?demo=cached' : `?mode=${mode}`;
     setDemoSuffix(isDemo ? '&demo=cached' : `&mode=${mode}`);
 

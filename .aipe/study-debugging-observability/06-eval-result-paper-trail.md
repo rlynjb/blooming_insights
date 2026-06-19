@@ -1,5 +1,10 @@
 # Eval result paper trail
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry name(s):** offline observability, committed eval artifact, regression baseline, LLM-as-judge signal, post-hoc trace
 **Type:** Industry standard (the broad shape) · Project-specific (the result-dir naming + EVAL_RUN_TAG + judge-as-debug-signal mix is this repo's design)
 

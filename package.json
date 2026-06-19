@@ -7,17 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run",
-    "eval:detection": "tsx eval/scripts/run-detection.ts",
-    "eval:diagnosis": "tsx eval/scripts/run-diagnosis.ts",
-    "eval:recommendation": "tsx eval/scripts/run-recommendation.ts",
-    "eval:regression": "tsx eval/scripts/run-regression.ts"
+    "test": "vitest run"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.99.0",
-    "@aptkit/core": "npm:@rlynjb/aptkit-core@^0.2.0",
+    "@aptkit/core": "npm:@rlynjb/aptkit-core@^0.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^12.10.1",
     "lucide-react": "^1.17.0",
     "next": "16.2.6",
     "react": "19.2.4",
@@ -25,14 +20,12 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",
-    "tsx": "^4.22.4",
     "typescript": "^5",
     "vitest": "^4.1.7"
   }

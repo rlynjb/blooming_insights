@@ -1,5 +1,12 @@
 # Phase 3 plan — Eval (prove it correct)
 
+> **RETIRED 2026-06-18.** Phase 3 (eval pipeline) has been removed from the
+> codebase along with the Olist MCP server it depended on. The 4 portfolio
+> numbers it produced (detection 37%/33%, diagnosis 53.3%, recommendation 100%,
+> regression 30%) and the committed result paper trail at
+> `eval/results/2026-06-15*/` are gone. This plan is preserved as a historical
+> record of what was built and measured.
+
 > Execution plan for **Phase 3 (Eval)** of `blooming-insights-portfolio-hardening-plan.md`.
 > Phase 3's goal: report detection precision/recall and diagnosis rubric pass-rate as
 > numbers, generated against data you control (the 3 seeded anomalies in

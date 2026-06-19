@@ -156,14 +156,17 @@ export function useInvestigation(id: string | undefined, step: InvestigationStep
         let url = `/api/agent?insightId=${id}&step=${step}`;
         try {
           const saved = typeof window !== 'undefined' ? localStorage.getItem('bi:mode') : null;
-          // Legacy `'live'` migrates to live-sql to match page.tsx's read site.
+          // Match the feed's live mode so investigate/recommend uses the same
+          // data source. Legacy values still migrate to Bloomreach.
           const liveMode =
-            saved === 'live' || saved === 'live-sql' || saved === 'live-bloomreach';
+            saved === 'live-synthetic'
+              ? 'live-synthetic'
+              : saved === 'live' || saved === 'live-sql' || saved === 'live-bloomreach'
+                ? 'live-bloomreach'
+                : null;
           if (liveMode) {
             url += '&live=1';
-            // Tag the mode so the route picks the adapter via the DataSource factory.
-            const resolved = saved === 'live' ? 'live-sql' : saved;
-            url += `&mode=${resolved}`;
+            url += `&mode=${liveMode}`;
             const stashed = sessionStorage.getItem(`bi:insight:${id}`);
             if (stashed) url += `&insight=${encodeURIComponent(stashed)}`;
             if (step === 'recommend' && handedDiagnosis) {

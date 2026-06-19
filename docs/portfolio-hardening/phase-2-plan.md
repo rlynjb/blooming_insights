@@ -1,5 +1,12 @@
 # Phase 2 plan — DataSource seam + Olist MCP server
 
+> **RETIRED 2026-06-18.** The Olist MCP server, eval pipeline, and `live-sql`
+> bi:mode were removed from the codebase. The `DataSource` seam itself survives
+> (still wraps `BloomreachDataSource`) but the second adapter and the
+> `mcp-server-olist/` package no longer exist. This plan is preserved as a
+> historical record of what was built — see commits between Phase 2 PR A and
+> the removal commit on the `remove-olist-mcp-server` branch.
+
 > Execution plan for **Phase 2 (Swap)** of `blooming-insights-portfolio-hardening-plan.md`.
 > Phase 2's goal: blooming insights runs live end-to-end against your own MCP server over Olist,
 > with the Bloomreach adapter dormant but switchable.

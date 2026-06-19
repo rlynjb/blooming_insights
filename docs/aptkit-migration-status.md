@@ -85,8 +85,8 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
 
 ## Known Notes
 
-- AptKit core is published to public npmjs as `@rlynjb/aptkit-core@0.1.0`.
-- Blooming keeps its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@^0.1.0`.
+- AptKit core is published to public npmjs as `@rlynjb/aptkit-core@0.3.0`.
+- Blooming keeps its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@^0.3.0`.
 - Because the package is public on npmjs, Vercel does not need a package registry token to install it.
 - `package.json` and `package-lock.json` now resolve `@aptkit/core` from the public npm package, not the temporary local tarball.
 - Full `npm run lint` still has unrelated existing lint debt outside the migration path. Touched migration files have been linted as part of each step.
@@ -100,8 +100,7 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
 2. Audit `lib/mcp/tools.ts` against AptKit tool policies.
    Decide whether Blooming should keep local allowlists for route/API safety or import policy constants from AptKit where possible.
 
-3. Classify eval scripts.
-   Keep product-specific regression scripts in Blooming, but consider emitting AptKit-compatible replay artifacts so Studio/eval tooling can inspect them. The Olist detection scorer remains local because its aliases, seeded anomaly ids, and dataset week math are product fixtures rather than reusable AptKit behavior.
+3. ~~Classify eval scripts.~~ **Done 2026-06-18:** the entire `eval/` directory and the Olist MCP server it scored against were removed from the codebase. Whatever AptKit-compatible replay strategy lands later starts from a clean slate.
 
 4. Decide legacy retention window.
    Keep legacy files until at least one real OpenAI/AptKit-backed end-to-end replay has been promoted and reviewed.
