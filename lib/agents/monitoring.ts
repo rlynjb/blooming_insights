@@ -37,9 +37,9 @@ export function schemaSummary(schema: WorkspaceSchema): string {
   const MAX_CPROPS = 30;
   const customerPropsText = schema.customerProperties.slice(0, MAX_CPROPS).join(', ');
 
-  // Synthetic datasets (Olist) ship with a known horizon — surface it inline
-  // so the model anchors `time_range` to dates that actually exist, instead
-  // of pulling 2017-2018 Kaggle dates from training memory.
+  // If a workspace ships with a known horizon, surface it inline so the model
+  // anchors `time_range` to dates that actually exist. (Bloomreach workspaces
+  // typically don't set this; left in place for future datasets that do.)
   const horizonLine = schema.dataHorizon
     ? `Data horizon: ${schema.dataHorizon.from} → ${schema.dataHorizon.to} (${schema.dataHorizon.durationDays} days; \`to\` exclusive). ALL queries MUST land inside this window.`
     : null;

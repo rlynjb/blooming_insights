@@ -1,18 +1,19 @@
 // lib/data-source/types.ts
 //
-// The DataSource seam — abstract surface every backend (Bloomreach today,
-// Olist tomorrow) must implement. Defined by what the agents + bootstrapSchema
-// actually consume from the existing McpClient surface — so adapters can swap
-// in without any caller (agent, route handler, bootstrap helper) caring which
-// concrete protocol is on the other side.
+// The DataSource seam — abstract surface every backend adapter must implement.
+// Defined by what the agents + bootstrapSchema actually consume from the
+// existing McpClient surface, so future adapters could swap in without any
+// caller (agent, route handler, bootstrap helper) caring which concrete
+// protocol is on the other side. Currently `BloomreachDataSource` is the only
+// implementation — an Olist (SQL-backed) adapter previously lived behind this
+// seam and was removed.
 //
 // The {result, durationMs, fromCache} envelope mirrors McpClient's return shape
 // exactly so the rename does not change behavior — adapters that don't track
 // duration or cache hits return fromCache=false and a real or 0 durationMs.
 
 /** A single tool exposed by a data source. Mirrors the MCP `Tool` shape but is
- *  protocol-agnostic so SQL-backed (or any other) adapters can describe their
- *  tools to the model without leaking MCP-specific fields. */
+ *  protocol-agnostic. */
 export interface ToolDef {
   name: string;
   description?: string;
@@ -55,12 +56,10 @@ export interface DataSourceCallResult {
   fromCache: boolean;
 }
 
-/** Abstract surface every data source must implement. Adapters in this repo:
- *    - BloomreachDataSource — the live MCP client over Bloomreach Engagement
- *    - OlistDataSource      — coming in PR B, MCP server over SQLite/Olist
- *
- *  Agents (monitoring, diagnostic, recommendation, query) hold a DataSource
- *  reference, never a concrete adapter. */
+/** Abstract surface every data source must implement. Only adapter in this
+ *  repo today is `BloomreachDataSource` (the live MCP client over Bloomreach
+ *  Engagement). Agents (monitoring, diagnostic, recommendation, query) hold a
+ *  DataSource reference, never the concrete adapter. */
 export interface DataSource {
   callTool(
     name: string,

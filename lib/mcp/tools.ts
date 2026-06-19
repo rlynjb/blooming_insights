@@ -1,12 +1,6 @@
 // Per-agent MCP tool subsets. Each agent is granted only the tools relevant to
 // its job (monitoring detects, diagnostic investigates, recommendation proposes).
 // bootstrapTools are used once at session start for schema discovery.
-//
-// Both adapters' tool catalogs are listed in one set per agent — the agent runs
-// against whichever adapter the route picked, and `filterToolSchemas` only
-// surfaces the tools actually present in `listTools()`. Mixing names is safe:
-// the Bloomreach server will never advertise `get_metric_timeseries` and the
-// Olist server will never advertise `execute_analytics_eql`.
 
 // Bloomreach (EQL-shaped) ↓
 const monitoringToolsBloomreach = [
@@ -40,17 +34,9 @@ const recommendationToolsBloomreach = [
   'get_frequency_policies',
 ] as const;
 
-// Olist (SQL-backed) — three domain tools the mcp-server-olist server exposes.
-// `get_metric_timeseries` for trends, `get_segments` for discovery,
-// `get_anomaly_context` for the diagnostic loop's evidence gathering. The
-// recommendation agent has no Olist-side tool catalog — recommendations are
-// derived from the diagnosis text alone (the existing-feature checks were a
-// Bloomreach-specific affordance).
-const olistTools = ['get_metric_timeseries', 'get_segments', 'get_anomaly_context'] as const;
-
-export const monitoringTools = [...monitoringToolsBloomreach, ...olistTools] as const;
-export const diagnosticTools = [...diagnosticToolsBloomreach, ...olistTools] as const;
-export const recommendationTools = [...recommendationToolsBloomreach, ...olistTools] as const;
+export const monitoringTools = monitoringToolsBloomreach;
+export const diagnosticTools = diagnosticToolsBloomreach;
+export const recommendationTools = recommendationToolsBloomreach;
 
 // Broad, de-duplicated union granted to the free-form query agent so it can
 // answer anything (monitoring + diagnostic + recommendation surfaces combined).

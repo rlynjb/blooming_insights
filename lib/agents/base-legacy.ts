@@ -12,9 +12,9 @@ export const AGENT_MODEL = 'claude-sonnet-4-6';
 /**
  * The agent-facing subset of `DataSource` — just `callTool`. The full
  * DataSource surface (which adds `listTools`) is implemented by adapters
- * (BloomreachDataSource today, OlistDataSource next) and consumed by the
- * route handlers; the agent loop never lists tools at runtime (the catalog
- * arrives pre-fetched as `allTools` in each agent's constructor).
+ * (currently only `BloomreachDataSource`) and consumed by the route handlers;
+ * the agent loop never lists tools at runtime (the catalog arrives pre-fetched
+ * as `allTools` in each agent's constructor).
  *
  * Pre-Phase 2 this was a standalone shape; lifting it to a Pick of DataSource
  * keeps the two surfaces aligned — any DataSource is automatically a McpCaller,
