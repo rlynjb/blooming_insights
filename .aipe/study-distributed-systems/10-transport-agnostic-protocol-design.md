@@ -1,5 +1,10 @@
 # 10 — transport-agnostic protocol design
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry name(s):** transport-agnostic protocol · heterogeneous-backend adapter · adapter pattern · subprocess-as-service · JSON-RPC over arbitrary transports
 **Type:** Industry standard · Language-agnostic · Project-specific (the `DataSource` seam + `makeDataSource` factory are this codebase's expression of the pattern)
 

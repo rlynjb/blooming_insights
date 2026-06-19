@@ -1,5 +1,10 @@
 # Embedded SQLite as Test Fixture
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 ## Subtitle
 
 The data layer as a deterministic, hermetic, committed binary one process away · Project-specific (pattern: data-as-fixture).

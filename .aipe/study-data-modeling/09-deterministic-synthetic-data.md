@@ -1,5 +1,10 @@
 # Deterministic synthetic data + ground-truth records
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry name(s):** Deterministic synthetic data · seeded PRNG · ground-truth records · golden-set data model · eval data contract · result schema as contract
 **Type:** Industry standard · Language-agnostic · Project-specific (the mulberry32 + seeded_anomalies + golden-fixtures combination)
 

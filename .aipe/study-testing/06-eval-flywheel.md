@@ -1,5 +1,10 @@
 # 06 — The eval flywheel
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry names:** Eval-driven development / measure-fix-remeasure loop / model-quality regression tracking. **Type:** Industry-emerging discipline, project-specific cadence.
 
 ## Zoom out, then zoom in

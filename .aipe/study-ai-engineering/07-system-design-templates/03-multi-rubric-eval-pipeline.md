@@ -1,5 +1,10 @@
 # Multi-rubric LLM eval pipeline
 
+> **RETIRED 2026-06-18.** This file was authored against the Olist MCP
+> server / Phase 3 eval pipeline, both removed from the codebase. The
+> patterns it teaches are real, but the code anchors it cites no longer
+> exist. Preserved as a historical record of what was studied.
+
 **Industry name(s):** LLM evaluation pipeline, multi-rubric eval suite, eval flywheel, golden-set + judge harness, calibrated quality measurement
 **Type:** Industry standard · Senior-level system design
 
