@@ -3,7 +3,7 @@
 **Industry name(s):** idempotency keys · at-most-once / at-least-once / effective-once · request deduplication
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** the codebase gets idempotency *for free* because **every MCP tool it actually calls is a read** (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach; `get_metric_timeseries`, `get_segments`, `get_anomaly_context` on Olist). Reads are idempotent by definition — retry as many times as you like, the world doesn't change. The 60s TTL cache in `BloomreachDataSource` is the **only** deduplication mechanism (the Olist adapter currently has none — every call hits the subprocess fresh), keyed by `${toolName}:${JSON.stringify(args)}`. There is **no idempotency key**, **no request ID**, and no server-side dedup on either backend because no write call is being made. The moment the app adds a write — `update_segmentation`, `create_voucher`, `trigger_campaign` — this entire chapter changes from "not a concern" to "the central concern." Recommendations are currently *proposed*, not *executed*; that boundary is the load-bearing safety.
+> **Verdict-first:** the codebase gets idempotency *for free* because **every MCP tool it actually calls is a read** (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach). Reads are idempotent by definition — retry as many times as you like, the world doesn't change. The 60s TTL cache in `BloomreachDataSource` is the **only** deduplication mechanism, keyed by `${toolName}:${JSON.stringify(args)}`. There is **no idempotency key**, **no request ID**, and no server-side dedup because no write call is being made. The moment the app adds a write — `update_segmentation`, `create_voucher`, `trigger_campaign` — this entire chapter changes from "not a concern" to "the central concern." Recommendations are currently *proposed*, not *executed*; that boundary is the load-bearing safety. (Historical note: at the previous refresh this section described an asymmetric cache story across two adapters — `BloomreachDataSource` cached, `OlistDataSource` didn't. The Olist adapter was deleted in PR #8 on 2026-06-18, so the asymmetry is gone; the in-process `SyntheticDataSource` that replaced it returns deterministic fixture data with no cache, by construction.)
 
 ---
 
@@ -19,16 +19,15 @@
                             │
   ┌─ Service layer ─────────▼───────────────────────────────┐
   │  ★ BloomreachDataSource cache (60s TTL, name+args) ★    │ ← we are here
-  │      (on the Bloomreach side only)                       │
-  │   OlistDataSource has NO cache — every call is fresh     │
   │  agent loop: NO request ID, NO idempotency key           │
+  │  SyntheticDataSource: in-process; no cache (deterministic │
+  │  fixtures return identically per-call by construction)   │
   └─────────────────────────┬───────────────────────────────┘
                             │
   ┌─ Provider layer ────────▼───────────────────────────────┐
   │  Bloomreach MCP — every called tool is a READ            │
-  │  mcp-server-olist — every exposed tool is a READ         │
   │  (writes exist in Bloomreach catalog but NOT YET         │
-  │   EXERCISED on either side)                              │
+  │   EXERCISED)                                             │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -45,7 +44,7 @@
 **Seams.** Two real, one absent.
 
 - **Seam: client effect ↔ network.** `startedRef.current = true` collapses two effect runs into one fetch. Without it, StrictMode would issue two parallel `/api/agent` requests for the same investigation, doubling MCP call cost.
-- **Seam: in-process call ↔ provider.** `BloomreachDataSource.cache` (`lib/data-source/bloomreach-data-source.ts:122, 144-152`) collapses repeated identical calls within 60s into one network round-trip. Cache key is `${name}:${JSON.stringify(args)}`. `OlistDataSource` has no cache — every call dispatches afresh over stdio, since the subprocess is local and the round-trip is cheap (no rate-limit budget to absorb).
+- **Seam: in-process call ↔ provider.** `BloomreachDataSource.cache` (`lib/data-source/bloomreach-data-source.ts:122, 144-152`) collapses repeated identical calls within 60s into one network round-trip. Cache key is `${name}:${JSON.stringify(args)}`. The in-process `SyntheticDataSource` has no cache and doesn't need one — every `callTool` returns deterministic fixture data via a synchronous `switch`, so a duplicate call costs effectively zero.
 - **Seam: idempotency key ↔ provider** — *does not exist*. No request ID is sent, no `Idempotency-Key` header. Bloomreach has no way to dedup a duplicate write even if it wanted to. Currently fine; becomes load-bearing the moment writes are added.
 
 ```
@@ -395,7 +394,7 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 - `02-partial-failure-timeouts-and-retries.md` — why the cache MUST skip error results: retries depend on it
 - `04-consistency-models-and-staleness.md` — the 60s TTL is also a staleness window
 - `08-sagas-outbox-and-cross-boundary-workflows.md` — the user-driven step 2 → step 3 flow has dedup of its own
-- `10-transport-agnostic-protocol-design.md` — why the Bloomreach side has a cache and the Olist side doesn't
+- `10-transport-agnostic-protocol-design.md` — RETIRED; the Phase-2 record of the no-longer-extant two-adapter cache asymmetry
 - `.aipe/study-system-design/audit.md#caching-and-invalidation` — the architectural take on caching
 - `.aipe/study-testing/` — the cache + retry tests live in `test/data-source/bloomreach-data-source.test.ts` (and friends)
 

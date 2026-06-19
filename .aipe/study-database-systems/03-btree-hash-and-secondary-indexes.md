@@ -31,58 +31,28 @@ How a database finds rows without scanning the whole table · Industry standard.
 
 ### Verdict for this codebase
 
-**Exercised — but only inside `mcp-server-olist/`. Main app still has no indexes.**
-
-Two altitudes:
-
-- **Main app:** every `Map.get(key)` call is a hash-lookup — `insights.get(id)`, `cache.get(cacheKey)`, `mem.get(insightId)`. We "use the hash index" for every lookup. No secondary indexes. When code wants to filter/sort, it does it in JS with `.filter()` / `.sort()`. Fine at 50 items, wrong at 50K.
-- **Olist SQLite:** **9 named B-tree indexes** in `mcp-server-olist/scripts/seed-olist.ts` L236-244, plus 7 implicit indexes on PRIMARY KEYs. Every tool query relies on at least one. The B-tree teaching has real code to anchor to now.
-
-```
-  the 9 secondary B-trees in olist.db (each one is real)
-
-  on orders:        idx_orders_purchase_ts  →  range scans for time_range
-                    idx_orders_customer     →  customer join (FK)
-
-  on order_items:   idx_items_order         →  order join (FK)
-                    idx_items_product       →  product join (FK)
-
-  on payments:      idx_payments_order      →  order join (FK)
-                    idx_payments_type       →  payment_type dimension filter
-
-  on reviews:       idx_reviews_order       →  order join (FK)
-
-  on customers:     idx_customers_state     →  state dimension filter
-
-  on products:      idx_products_category   →  category dimension filter
-```
-
-The dimension-filter indexes (`state`, `category`, `payment_type`) directly correspond to the three `DIMENSIONS` enum values in `mcp-server-olist/src/schemas.ts` L18. Every "group by dimension" query the agents can ask hits one of these.
+**Not yet exercised at the database-engine level.** No SQL, no B-trees, no secondary indexes. Every `Map.get(key)` call is a hash-lookup — `insights.get(id)`, `cache.get(cacheKey)`, `mem.get(insightId)`. We "use the hash index" for every lookup. When code wants to filter/sort, it does it in JS with `.filter()` / `.sort()`. Fine at 50 items, wrong at 50K.
 
 ### When this becomes load-bearing
 
-For the **main app**, three triggers still apply (timestamp range, user-scoped query, full-text). For the **Olist DB**, indexes are already load-bearing: drop `idx_orders_purchase_ts` and every `get_metric_timeseries` query becomes a full scan of the orders table.
+Three triggers flip this from `not yet exercised` to load-bearing:
+
+```
+  trigger                                index it forces
+
+  timestamp range queries                B-tree on (created_at) — descending
+   "show insights from the last 7 days"    for newest-first scans
+
+  user-scoped queries                    B-tree on (user_id, created_at DESC) —
+   "show MY saved insights"                composite index, leftmost-prefix rule
+
+  full-text search                       GIN index on a tsvector column
+   "find insights mentioning 'churn'"      (Postgres-specific primitive)
+```
 
 ## Structure pass
 
-```
-  axis: "how does this code find the rows it needs?"
-
-  ┌─ main app — Map ──────────────────────────────┐
-  │  hash table by primary key only.              │  → no secondary indexes
-  │  list/filter = full O(N) scan in JS           │     possible
-  └────────────────────────────────────────────────┘
-              │  cross into the Olist SQLite tier
-              ▼
-  ┌─ olist.db — B-tree everywhere ────────────────┐
-  │  PK = clustered B-tree (one per table)         │  → SQLite picks an index
-  │  9 secondary B-trees on FK + dim columns       │     per query via the
-  │  range scans, equality lookups, JOIN paths     │     cost-based planner
-  │   all hit indexes                              │     (see 04)
-  └────────────────────────────────────────────────┘
-```
-
-The axis flips at the MCP subprocess boundary: from "no secondary indexes possible" to "the query planner picks one per JOIN."
+Skipped — no codebase instance.
 
 ## How it works
 
@@ -146,74 +116,18 @@ Bridge: think of `Map.get(key)` (O(1) hash) vs `[...map.entries()].sort()` (O(N 
 
 ## Primary diagram
 
-```
-  olist.db — the index landscape
-
-  ┌─ orders ────────────────────────────────────────┐
-  │  PK B-tree: orders.id                            │  ← clustered, the heap
-  │  idx_orders_purchase_ts  →  range scans          │
-  │  idx_orders_customer     →  customer join (FK)   │
-  └───────────────┬──────────────────────────────────┘
-                  │  JOIN orders.id = items.order_id
-                  ▼
-  ┌─ order_items ───────────────────────────────────┐
-  │  idx_items_order   →  the FK index               │
-  │  idx_items_product →  for product joins          │
-  └───────────────┬──────────────────────────────────┘
-                  │  JOIN items.product_id = products.id
-                  ▼
-  ┌─ products ──────────────────────────────────────┐
-  │  PK B-tree: products.id                          │
-  │  idx_products_category  →  category filter/group │
-  └──────────────────────────────────────────────────┘
-
-   every JOIN in get_metric_timeseries walks one of these B-trees;
-   every GROUP BY dimension hits the dim-column index.
-```
+Skipped — no codebase instance to recap.
 
 ## Implementation in codebase
 
 ### Use cases
 
-- **Every Olist tool query** uses at least one index. `get_metric_timeseries` with `dimension: 'state'`, `time_range: {...}` hits `idx_orders_purchase_ts` (range scan) + `idx_customers_state` (group/filter).
-- **Every Map lookup in the main app** uses the V8 hash-table primary key. `insights.get(id)`, `cache.get(cacheKey)`, `mem.get(insightId)`.
+The only "indexes" today are V8's internal hash tables backing every `Map`. The codebase doesn't write SQL, so there's nothing to teach about index selection in our code yet.
 
-### The real indexes (Olist)
-
-```
-  mcp-server-olist/scripts/seed-olist.ts  (lines 236–244)
-
-  CREATE INDEX idx_orders_purchase_ts ON orders(purchase_ts);
-  CREATE INDEX idx_orders_customer    ON orders(customer_id);
-  CREATE INDEX idx_items_order        ON order_items(order_id);
-  CREATE INDEX idx_items_product      ON order_items(product_id);
-  CREATE INDEX idx_payments_order     ON payments(order_id);
-  CREATE INDEX idx_reviews_order      ON reviews(order_id);
-  CREATE INDEX idx_customers_state    ON customers(state);
-  CREATE INDEX idx_products_category  ON products(category);
-  CREATE INDEX idx_payments_type      ON payments(type);
-       │
-       └─ five categories of index here, each load-bearing for a different
-          query shape:
-          
-          time-range scan:   idx_orders_purchase_ts (the ONE non-FK, non-dim
-                              index — without it every metric query is a full
-                              orders scan)
-          FK join paths:     idx_orders_customer, idx_items_order, idx_items_
-                              product, idx_payments_order, idx_reviews_order
-                              (SQLite does NOT auto-index FK columns; you must
-                              create these by hand)
-          dim filter/group:  idx_customers_state, idx_products_category,
-                              idx_payments_type — the three DIMENSIONS the
-                              schema exposes to agents
-          PK (implicit):     each table's PRIMARY KEY gets a B-tree for free
-          
-          dropping any FK index would force a full table scan on the joined
-          side for every metric query.
-```
+### Code side by side
 
 ```
-  lib/state/insights.ts  (lines 44–54)  — the main-app cousin, unchanged
+  lib/state/insights.ts  (lines 44–54)
 
   export function getInsight(id: string): Insight | null {
     return insights.get(id) ?? null;        ← O(1) hash lookup. The "index"
@@ -227,14 +141,12 @@ Bridge: think of `Map.get(key)` (O(1) hash) vs `[...map.entries()].sort()` (O(N 
   }
        │
        └─ at N=50 insights per briefing, fine. The migration target if this
-          ever needed secondary indexing is the Olist pattern: move to
-          SQLite (or Postgres), define indexes on (severity, timestamp DESC),
-          drop the JS-side filter. We've now done that pattern once in the
-          repo — Olist is the worked example.
+          ever needed secondary indexing is Postgres with a B-tree on
+          (severity, created_at DESC) — same shape, real engine, real index.
 ```
 
 ```
-  lib/mcp/client.ts  (lines 102–110)  — the MCP cache, also a hash
+  lib/mcp/client.ts  (lines 102–110)
 
   const cacheKey = `${name}:${JSON.stringify(args)}`;
   ...
@@ -259,11 +171,11 @@ Cross-link: `study-dsa-foundations` covers hash tables and trees as data structu
 ## Interview defense
 
 **Q: "What indexes does this app have?"**
-Two altitudes. The main Next.js app has no indexes — JavaScript Maps give us hash lookup by primary key, nothing else. The sibling Olist MCP server has nine named B-tree indexes in `mcp-server-olist/scripts/seed-olist.ts` L236-244: one for time-range scans on `orders.purchase_ts`, five for foreign-key joins (SQLite doesn't auto-index FK columns), and three on the dimension columns the agents can filter by — `customers.state`, `products.category`, `payments.type`. Every domain tool query relies on at least one. Drop `idx_orders_purchase_ts` and every metric timeseries query becomes a full scan.
+None at the database level — we don't have a database. JavaScript Maps give us hash lookup by primary key, and that's the only "index" present. When the code wants to sort or filter, it does it in JS against the Map's `values()` — full scan, fine at the scale we run (~50 items per briefing). The day we add Postgres for saved insights, the first index I'd write is a B-tree on `(user_id, created_at DESC)` — that's the dominant access pattern for any "show me my recent stuff" query.
 
-Diagram: the index-landscape from the Primary diagram, showing how a metric query walks orders → items → products via three index B-trees.
+Diagram: a 2-table picture with no indexes drawn, then a slide labeled "+saved_insights → +B-tree on (user_id, created_at DESC)."
 
-Anchor: `mcp-server-olist/scripts/seed-olist.ts` L236-244 for the CREATE INDEX statements; `mcp-server-olist/src/tools/get_metric_timeseries.ts` for the join shape they support.
+Anchor: `lib/state/insights.ts` L4-6 for the Maps; `package.json` for the absence of DB drivers.
 
 **Q: "If you added a saved-insights table, what indexes would you put on it?"**
 Primary key on `id`. Secondary B-tree on `(user_id, created_at DESC)` — that's the dominant access pattern ("give me my recent saved insights"). I'd hold off on more indexes until a query proves it needs one. Every secondary index taxes writes; the worst mistake is having ten indexes "just in case."
@@ -284,10 +196,9 @@ Anchor: there is no such table today; this is hypothetical, and I'd say so in th
 
 ## See also
 
-- `02-records-pages-and-storage-layout` — where the rows live, that the index points at
-- `04-query-planning-and-execution` — how SQLite's planner picks among these 9 indexes
-- `10-embedded-sqlite-fixture` — why we chose SQLite + 9-index design here
+- `02-records-pages-and-storage-layout` — where the rows would live, that the index would point at
+- `04-query-planning-and-execution` — also not exercised
 - `study-dsa-foundations` — hash tables and trees as data structures
 
 ---
-Updated: 2026-06-16 — now exercised; 9 named B-tree indexes in mcp-server-olist/scripts/seed-olist.ts L236-244 grounded with shape + use case per index.
+Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." The 9-index Olist landscape is gone; section returns to teaching the concept generically with V8 Map hash-lookup as the only present cousin.

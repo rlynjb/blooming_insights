@@ -445,8 +445,8 @@ The order of the writes also matters: push first, enqueue second. If `enqueue` t
 - `01-ndjson-agentevent-discriminated-union.md` — the typed shape both writes preserve.
 - `02-replay-from-snapshot-with-paced-emission.md` — the consumer that reads the persisted buffer.
 - `03-three-rung-mem-file-seed-store.md` — where the buffer lands after `saveInvestigation`.
-- `06-eval-result-paper-trail.md` — the eval runner does its own dual-write conceptually (candidate output → judge call + on-disk JSON); the seam between live-emission and post-hoc-measurement is where the offline surface attaches.
+- `06-eval-result-paper-trail.md` (RETIRED) — the eval runner once did its own dual-write conceptually (candidate output → judge call + on-disk JSON); the seam between live-emission and post-hoc-measurement was where the offline surface attached. The runner is gone (PR #8 / 62c24d7); the pattern still teaches the source-capture-into-two-destinations discipline at offline scope.
 - `.aipe/study-system-design/05-streaming-ndjson.md` — the wire half of the dual-write (system-design angle).
 
 ---
-Updated: 2026-06-16 — cross-link to `06-` added; the source-capture discipline of the dual-write is the same principle the eval runner extends offline.
+Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this dual-write is now the only place the trace gets captured-while-emitted in the repo.

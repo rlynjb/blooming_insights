@@ -3,7 +3,7 @@
 **Industry name(s):** risk register · failure-mode audit · partial-failure inventory
 **Type:** Audit — opinionated, ranked
 
-> **Verdict-first:** the four load-bearing distributed-systems risks in this codebase, in order of how soon they bite: **(1) cross-instance state silently missing** when Vercel routes a request to a different instance than the one that holds the in-memory `Map` (the same finding `study-system-design/` ranks as its #1 CRITICAL); **(2) no per-tool timeout on the Bloomreach adapter** — a hung Bloomreach connection consumes the route's whole 300s budget with no upstream signal (the Olist adapter has the per-call 30s `AbortSignal.timeout` already, so this gap is now *adapter-asymmetric*); **(3) no idempotency story for any future write** — the moment the recommendation agent gets an "execute" button, the absence of an idempotency key per click becomes a data-corruption bug; **(4) subprocess lifecycle hazards on the Olist adapter** — `dispose()` is best-effort, no respawn on child crash, and a forgotten dispose leaks a child process. Everything else (no retry on Anthropic, no per-tool TTL tuning, sessionStorage tab-only handoff, no resume-on-disconnect for NDJSON streams, the K=10 parallel-eval race that already bit us) is real but ranks below these four.
+> **Verdict-first:** the three load-bearing distributed-systems risks in this codebase, in order of how soon they bite: **(1) cross-instance state silently missing** when Vercel routes a request to a different instance than the one that holds the in-memory `Map` (the same finding `study-system-design/` ranks as its #1 CRITICAL); **(2) no per-tool timeout on the Bloomreach MCP call** — a hung Bloomreach connection consumes the route's whole 300s budget with no upstream signal; **(3) no idempotency story for any future write** — the moment the recommendation agent gets an "execute" button, the absence of an idempotency key per click becomes a data-corruption bug. Everything else (no retry on Anthropic, no per-tool TTL tuning, sessionStorage tab-only handoff, no resume-on-disconnect for NDJSON streams) is real but ranks below these three. **Resolved by deletion (2026-06-18):** RISK 10 (subprocess lifecycle hazards on the Olist adapter) and RISK 9 (K=10 parallel-eval race) — the Olist adapter was deleted in PR #8 and the eval pipeline was retired with it.
 
 ---
 
@@ -19,14 +19,11 @@
                             │
   ┌─ Service layer ─────────▼────────────────────────────────┐
   │  ★ RISK 1: cross-instance state loss (CRITICAL) ★         │ ← top risk
-  │  ★ RISK 2: no per-tool timeout on BLOOMREACH adapter      │
-  │    (HIGH) — Olist side is fixed; gap is asymmetric ★      │
+  │  ★ RISK 2: no per-tool timeout on the MCP call (HIGH) ★   │
   │  ★ RISK 3: no idempotency for future writes (HIGH) ★      │
-  │  ★ RISK 10: subprocess lifecycle hazards on Olist (MED) ★ │
   │  RISK 4: no retry on Anthropic transport errors           │
   │  RISK 6: no per-tool TTL tuning                           │
-  │  RISK 9: parallel-eval race (LOW — already mitigated by   │
-  │          EVAL_RUN_TAG)                                    │
+  │  (RISK 9 + RISK 10 retired — Olist adapter deleted)       │
   └─────────────────────────┬────────────────────────────────┘
                             │
   ┌─ Provider layer ────────▼────────────────────────────────┐
@@ -74,17 +71,15 @@
 
 ---
 
-### RISK 2 — no per-tool timeout on the BLOOMREACH adapter (HIGH; adapter-asymmetric)
+### RISK 2 — no per-tool timeout on the MCP call (HIGH)
 
 **Where:** `lib/data-source/bloomreach-data-source.ts:190-205`, `lib/mcp/transport.ts:47-59`
 
 **The failure:** `BloomreachDataSource.liveCall` awaits `transport.callTool(name, args, { signal })` with only the route-level cancellation signal (not a per-call timer). If Bloomreach's MCP server accepts the TCP connection but then hangs (no response, no FIN), the await hangs. The only ceiling is the route's `maxDuration = 300` (`app/api/agent/route.ts:20`). A single hung MCP call burns the whole 5-minute budget; from the user's perspective, the briefing or investigation appears stuck for 5 minutes then errors out (or, in production, gets killed with no observable error if Vercel's process kill doesn't propagate to a clean stream close).
 
-**The asymmetry worth naming:** `OlistDataSource` does *not* have this gap — it composes `AbortSignal.timeout(30_000)` onto every call (`lib/data-source/olist-data-source.ts:151`). So the partial-failure posture is now **per-adapter**: the Olist side has a per-call deadline, the Bloomreach side does not. The right fix for RISK 2 is to lift the same `AbortSignal.timeout` pattern into `BloomreachDataSource.liveCall` — the building block is already used in the codebase.
-
 **Why it's HIGH and not CRITICAL:** Bloomreach almost certainly has its own server-side timeouts, so in practice the hang would resolve within seconds — but you have no contract on this from your side. A hang under Bloomreach incident conditions IS plausible and would burn budget for every concurrent user.
 
-**Right next move:** Mirror the Olist pattern. Compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`; throw `McpToolError` with a "tool timeout" detail on timeout. ~10 lines.
+**Right next move:** Compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`; throw `McpToolError` with a "tool timeout" detail on timeout. ~10 lines. (Historical note: the now-deleted `OlistDataSource` adapter already used this pattern; the building block is well-trodden, just never lifted into the Bloomreach side.)
 
 **Why it's not done:** Same reason as much of the codebase's distributed-systems hardening — hackathon scale hasn't exercised it. A single incident's worth of "the demo froze for 5 minutes" would justify the 10 lines.
 
@@ -92,9 +87,9 @@
 
 ### RISK 3 — no idempotency story for any future write (HIGH, conditional)
 
-**Where:** `lib/agents/recommendation.ts`, `lib/agents/diagnostic.ts`, `lib/data-source/bloomreach-data-source.ts`, `lib/data-source/olist-data-source.ts` — all currently read-only
+**Where:** `lib/agents/recommendation.ts`, `lib/agents/diagnostic.ts`, `lib/data-source/bloomreach-data-source.ts` — all currently read-only
 
-**The failure:** Currently the codebase only calls read tools (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach; `get_metric_timeseries`, `get_segments`, `get_anomaly_context` on Olist). Every retry is safe because rereading data has no effect. The moment a write tool is added — `create_voucher`, `start_campaign`, `update_segmentation` — the absence of idempotency means a retried write creates a duplicate. The `BloomreachDataSource.callTool` retry loop (file 02) would happily retry a 429 on a write, potentially creating two vouchers from one user click.
+**The failure:** Currently the codebase only calls read tools (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach). Every retry is safe because rereading data has no effect. The moment a write tool is added — `create_voucher`, `start_campaign`, `update_segmentation` — the absence of idempotency means a retried write creates a duplicate. The `BloomreachDataSource.callTool` retry loop (file 02) would happily retry a 429 on a write, potentially creating two vouchers from one user click.
 
 **Why it's HIGH and conditional:** The failure cannot fire today (no writes). The day a write is added, it fires immediately. That makes this a "ready to bite the moment a feature ships" risk — worth tracking even though it's currently inert.
 
@@ -164,36 +159,19 @@
 
 ---
 
-### RISK 9 — parallel-eval race (LOW; already mitigated)
+### RISK 9 — parallel-eval race (RETIRED — eval pipeline removed)
 
-**Where:** `eval/scripts/run-detection.ts:87-100`, `run-diagnosis.ts:118-127`, `run-recommendation.ts:136-145`, `run-regression.ts:178-187`
+The K=10 parallel-eval race documented at the previous refresh (two eval scripts overwriting `eval/results/<date>/`) was resolved by deletion: the Olist adapter and the eval pipeline that tested it were retired in PR #8 (2026-06-18). The `EVAL_RUN_TAG` convention is gone with the scripts. Kept here only as an explanatory marker so a reader who saw this risk at the previous refresh knows where it went.
 
-**The failure:** Two eval scripts running in parallel on the same day write into the same date-stamped results directory (`eval/results/<YYYY-MM-DD>/`), clobbering each other's per-run JSON and `summary.md`. This bit the team for real once: the main session ran K=10 from Bash while a sub-agent ALSO ran K=10 in parallel. Detected via `ps aux`; the rogue PIDs were killed before they finished overwriting each other.
-
-**Why it's LOW:** The mitigation is in place. Every eval script honors `process.env.EVAL_RUN_TAG`; setting `EVAL_RUN_TAG=after-fix npm run eval:detection` lands results in `eval/results/2026-06-15-after-fix/`. Two parallel runs with different tags don't collide.
-
-**Why it's still worth listing:** (a) The fix is convention, not enforcement — if a future eval script doesn't honor `EVAL_RUN_TAG`, the race re-appears silently. (b) The lesson — namespace separation as a coordination primitive — generalises beyond the eval scripts to any future cross-instance scenario in the Vercel app (file 05, Part 6).
-
-**Right next move (if scale demanded it):** Promote the `makeResultsDir()` shape into a shared helper so all eval scripts share the same `EVAL_RUN_TAG`-honoring logic; document the convention in the eval README. Add a CI check that any new `mkdirSync` under `eval/` uses the helper. None of these are urgent.
+**Lesson worth keeping:** Namespace separation as a coordination primitive (the `EVAL_RUN_TAG` trick) generalises — if a future cross-process scenario lands, the pattern is "give each process a unique tag and namespace the output directory by it." Cheap, enforces zero-shared-state by construction.
 
 ---
 
-### RISK 10 — subprocess lifecycle hazards on the Olist adapter (MEDIUM, new in Phase 2)
+### RISK 10 — subprocess lifecycle hazards on the Olist adapter (RETIRED — adapter removed)
 
-**Where:** `lib/data-source/olist-data-source.ts:93-197`, `lib/data-source/index.ts:73-109`
+The Olist subprocess adapter was deleted in PR #8 (2026-06-18). All three previously-listed hazards (forgotten dispose leaks, no respawn on crash, silent dispose) are gone with the code. Kept here as an explanatory marker so a reader who saw RISK 10 at the previous refresh knows it's resolved-by-deletion, not "fixed-in-place." The `SyntheticDataSource` that replaced the Olist adapter has no subprocess lifecycle (it's an in-process JS object), so the failure modes that defined this risk are not reachable.
 
-**The failure:** `OlistDataSource` owns a child process. Three hazards live in that ownership:
-
-- **Forgotten dispose leaks a child.** Routes that construct an `OlistDataSource` via `makeDataSource('live-sql', sid)` get a `dispose: () => Promise<void>` in the result envelope. If the route forgets the `finally` block, the subprocess outlives the request. On Vercel this is bounded (instance recycling reaps orphans), but the route ought to clean up explicitly. The briefing route does (`app/api/briefing/route.ts:312` calls `disposeDataSource()` in finally); a future route that copies the construct-but-not-dispose pattern would leak.
-- **No respawn on child crash.** If the child process crashes mid-call, the adapter surfaces `OlistToolError` but does not restart. The `client` and `transport` fields remain set; the next `connect()` short-circuits because `this.client` is truthy. The user retries by issuing a fresh `callTool`, which dispatches into a half-dead client. No automatic recovery.
-- **Best-effort dispose swallows errors.** Both `client.close()` and `transport.close()` are wrapped in `try { } catch { /* best-effort */ }` (`olist-data-source.ts:182-195`). A dispose that fails (zombie child, EPIPE) leaves no observability trail. Currently fine; under any future "we want to know when subprocess teardowns fail" requirement, this is the gap.
-
-**Why it's MEDIUM:** All three hazards are real but bounded. Leak: bounded by Vercel recycling. No respawn: the user-driven retry resets the route, which constructs a fresh `OlistDataSource`. Silent dispose: cosmetic for now.
-
-**Right next move:**
-1. Add a respawn-on-crash path: detect `EPIPE` / closed transport in `callTool` and reset the adapter state to allow a fresh `connect()`.
-2. Log dispose errors to a single line on stderr (not throw — best-effort is right, but observable best-effort is better).
-3. Document the dispose contract in the `DataSource` interface so any future adapter inherits the discipline.
+**Lesson worth keeping (in case a future adapter brings a subprocess back):** lazy + idempotent + concurrency-safe `connect()`; explicit `dispose()` exposed on the factory result; route handlers must call `dispose` in `finally`. Document the contract on the `DataSource` interface the day any new adapter brings a real lifetime back.
 
 ---
 
@@ -210,13 +188,9 @@
   │                                         │                 │
   │ UNDER ANY HANG / INCIDENT:              │                 │
   │  ★ RISK 2: no Bloomreach call timeout  │ one request     │
-  │    burns 300s budget (Olist side ok)    │ visible freeze  │
+  │    burns 300s budget                    │ visible freeze  │
   │  RISK 4: no Anthropic retry             │ one request     │
   │  RISK 8: Bloomreach incident            │ all users       │
-  │                                         │                 │
-  │ ON A LIVE-SQL ROUTE THAT FORGETS:       │                 │
-  │  ★ RISK 10: subprocess lifecycle       │ leaked child    │
-  │    (leak, no respawn, silent dispose)   │ + opaque fails  │
   │                                         │                 │
   │ THE DAY A WRITE FEATURE SHIPS:          │                 │
   │  ★ RISK 3: no idempotency              │ data corruption │
@@ -226,16 +200,16 @@
   │  RISK 5: sessionStorage tab-only        │ one user        │
   │  RISK 7: no NDJSON resume               │ one user        │
   │                                         │                 │
-  │ ALREADY MITIGATED (lesson worth keeping):│                │
-  │  RISK 9: parallel-eval race            │ corrupt results │
-  │    fix: EVAL_RUN_TAG (already in place) │ (mitigated)     │
-  │                                         │                 │
   │ NEVER FOR THIS WORKLOAD:                │                 │
   │  RISK 6: fixed 60s TTL                  │ none today      │
   │                                         │                 │
+  │ RETIRED (resolved by deletion):         │                 │
+  │  RISK 9 / RISK 10 — Olist adapter +    │ n/a             │
+  │    eval pipeline removed in PR #8       │                 │
+  │                                         │                 │
   └─────────────────────────────────────────┴─────────────────┘
 
-  the top 4 (RISKs 1, 2, 3, 10) are the ones worth fixing first;
+  the top 3 (RISKs 1, 2, 3) are the ones worth fixing first;
   everything below is honest about the bound on impact
 ```
 
@@ -248,8 +222,8 @@
 | 1 (CRITICAL) | `lib/state/insights.ts` | 4-6 | per-process Map; no cross-instance link |
 | 1 | `lib/state/investigations.ts` | 11, 22-41 | mem-first fallback chain; misses on cold instance |
 | 1 | `app/api/agent/route.ts` | 37-62 | `resolveAnomaly` — the fallback chain that silently misses |
-| 2 (HIGH) | `lib/data-source/bloomreach-data-source.ts` | 190-205 | `liveCall` — no `AbortSignal.timeout` composed in (the Olist side has it) |
-| 2 | `app/api/agent/route.ts` | 20 | `maxDuration = 300` — the only ceiling on Bloomreach side |
+| 2 (HIGH) | `lib/data-source/bloomreach-data-source.ts` | 190-205 | `liveCall` — no `AbortSignal.timeout` composed in |
+| 2 | `app/api/agent/route.ts` | 20 | `maxDuration = 300` — the only ceiling on the MCP call |
 | 3 (HIGH cond.) | `lib/data-source/types.ts` | 38-40 | `DataSourceCallOptions` has no idempotency key field |
 | 3 | `lib/agents/base.ts` | 144-156 | tool-call dispatch — no per-call idempotency |
 | 4 (MED) | `lib/agents/base.ts` | 102 | `anthropic.messages.create` — no retry wrapper |
@@ -259,9 +233,8 @@
 | 7 (LOW) | `app/api/agent/route.ts` | 169-264 | stream has no event ID or resume |
 | 7 | `lib/hooks/useInvestigation.ts` | 184-208 | consumer has no Last-Event-ID logic |
 | 8 (LOW ext.) | external | — | no circuit breaker on `BloomreachDataSource` for non-429 |
-| 9 (LOW mit.) | `eval/scripts/run-detection.ts` | 87-100 | namespace separation via EVAL_RUN_TAG (convention, not enforcement) |
-| 10 (MED) | `lib/data-source/olist-data-source.ts` | 93-197 | subprocess lifecycle: leak / no respawn / silent dispose |
-| 10 | `app/api/briefing/route.ts` | 312-314 | the dispose-in-finally pattern that future routes must copy |
+| 9 (retired) | — | — | eval pipeline removed in PR #8; `EVAL_RUN_TAG` gone with it |
+| 10 (retired) | — | — | `OlistDataSource` deleted in PR #8; subprocess lifecycle moot |
 
 ---
 
@@ -271,11 +244,11 @@ If you had a week:
 
 1. **Vercel KV-backed state store.** Swap `lib/state/insights.ts`'s `Map` and `lib/state/investigations.ts`'s `mem` for KV reads/writes keyed by `bi_session + id`. Fixes RISK 1 outright and partially fixes RISK 5 (diagnosis handoff can also live in KV). Probably 100-150 lines of code with tests.
 
-2. **Per-tool timeout in `BloomreachDataSource`.** Mirror the Olist pattern: compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`. Throw `McpToolError` with timeout detail. Closes the adapter asymmetry — both sides will have the same per-call deadline. Fixes RISK 2. ~10 lines.
+2. **Per-tool timeout in `BloomreachDataSource`.** Compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`. Throw `McpToolError` with timeout detail. Fixes RISK 2. ~10 lines.
 
 3. **Anthropic retry wrapper.** Wrap `anthropic.messages.create` in `lib/agents/base.ts` with up to 2 retries on 5xx and 429 with 1s + 5s backoff. Fixes RISK 4. ~20 lines.
 
-After these three, the codebase's distributed-systems posture goes from "honestly named hackathon-scale" to "production-aware single-tenant." The remaining work (idempotency for writes, circuit breaker, SSE with resume, subprocess respawn) becomes feature-driven rather than infrastructure-driven.
+After these three, the codebase's distributed-systems posture goes from "honestly named hackathon-scale" to "production-aware single-tenant." The remaining work (idempotency for writes, circuit breaker, SSE with resume) becomes feature-driven rather than infrastructure-driven.
 
 ---
 
@@ -308,13 +281,16 @@ The day someone adds a write tool — `create_voucher`, `start_campaign`, anythi
 ## See also
 
 - `01-distributed-system-map.md` — the map that puts these risks in spatial context
-- `02-partial-failure-timeouts-and-retries.md` — RISK 2 in mechanism depth; the adapter asymmetry
+- `02-partial-failure-timeouts-and-retries.md` — RISK 2 in mechanism depth
 - `03-idempotency-deduplication-and-delivery-semantics.md` — RISK 3 in mechanism depth
 - `04-consistency-models-and-staleness.md` — RISK 5 in mechanism depth
-- `05-replication-partitioning-and-quorums.md` — RISK 1's structural cause; RISK 9 (the parallel-eval anecdote)
-- `10-transport-agnostic-protocol-design.md` — RISK 10 in mechanism depth (subprocess lifecycle)
+- `05-replication-partitioning-and-quorums.md` — RISK 1's structural cause
+- `10-transport-agnostic-protocol-design.md` — RETIRED; the Phase-2 two-transport design RISK 10 attached to
 - `.aipe/study-system-design/audit.md#system-design-red-flags-audit` — the system-design twin of this audit
 - `.aipe/study-security/` — security-shaped risks at the same boundaries
 
 ---
 Updated: 2026-06-16 — RISK 2 reframed as adapter-asymmetric (Olist fixed, Bloomreach not); added RISK 9 (parallel-eval race + EVAL_RUN_TAG mitigation) and RISK 10 (subprocess lifecycle); table extended with both new risks; "first three fixes" updated to point at the now-mirrorable Olist timeout pattern.
+
+---
+Updated: 2026-06-19 — RISK 9 and RISK 10 RETIRED (resolved-by-deletion: Olist adapter and eval pipeline removed in PR #8 on 2026-06-18). RISK 2 reverts to a single non-asymmetric finding ("no per-tool timeout on the MCP call"). Top-3 ordering replaces top-4; primary diagram, "first three fixes," and implementation table updated; retired-risk markers kept so readers who saw the previous refresh can trace what happened.

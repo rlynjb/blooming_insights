@@ -3,55 +3,58 @@
 **Industry name(s):** Dependency inversion, Strategy pattern, Adapter pattern, ports-and-adapters (hexagonal)
 **Type:** Industry standard · Language-agnostic
 
-> Code that depends on a thin interface it owns — not on a specific vendor SDK — can be tested with a plain object fake AND swapped to a different backend without touching callers. The blooming-insights repo now exercises both halves of that promise: 269 tests run offline because of the seam below the Bloomreach adapter, and the agent layer drives Bloomreach OR a SQLite-backed Olist MCP server because of the seam above it.
+> Code that depends on a thin interface it owns — not on a specific vendor SDK — can be tested with a plain-object fake AND swapped to a different backend without touching callers. The blooming-insights repo exercises both halves of that promise: the agent layer drives Bloomreach OR an in-process Blooming-owned synthetic adapter because of the seam above the adapters, and `BloomreachDataSource`'s internals (cache, spacing, retry) test offline because of the seam below it.
 
 
 ---
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** The provider abstraction is a **vertical stack of two seams**, not one. The upper seam is the new load-bearing one: `DataSource` (`lib/data-source/types.ts`) — a three-method surface (`callTool`, `listTools`, `dispose`) that every agent depends on via `runAgentLoop`'s `mcp` parameter. Two real implementations live under it: `BloomreachDataSource` (the live MCP client over Bloomreach Engagement — formerly `McpClient` in `lib/mcp/client.ts`, relocated to `lib/data-source/bloomreach-data-source.ts` and aliased back as `McpClient` from a 17-line shim) and `OlistDataSource` (a brand-new adapter that spawns the `mcp-server-olist` subprocess over `StdioClientTransport`). The lower seam is the older `McpTransport` — still there, still useful, but now scoped to the inside of `BloomreachDataSource`: it isolates the `@modelcontextprotocol/sdk` HTTP client so the Bloomreach adapter itself stays unit-testable. Two seams, two jobs: the upper one swaps **backends**; the lower one swaps the **HTTP SDK** inside the Bloomreach adapter.
+**Zoom out — the bigger picture.** The provider abstraction is a **vertical stack of two seams**, not one. The upper seam is the load-bearing one: `DataSource` (`lib/data-source/types.ts`) — a two-method surface (`callTool`, `listTools`) that every agent depends on via the `BloomingToolRegistryAdapter` bridge into `@aptkit/core`. Three implementations live under it — two real, one purely abstract: `BloomreachDataSource` (the live MCP client over Bloomreach Engagement; `lib/data-source/bloomreach-data-source.ts`; the old `McpClient` from `lib/mcp/client.ts` is now a backwards-compat shim re-exporting it) and `SyntheticDataSource` (a Blooming-owned in-process adapter with ~516 LOC of deterministic ecommerce fixture data, no transport, no auth, no network — `lib/data-source/synthetic-data-source.ts`). The third "implementation" is the abstract `DataSource` interface itself, satisfied structurally by test fakes everywhere in the test suite. The lower seam is the older `McpTransport` — still there, still useful, but scoped to the inside of `BloomreachDataSource`: it isolates the `@modelcontextprotocol/sdk` HTTP client so the Bloomreach adapter itself stays unit-testable. Two seams, two jobs: the upper one swaps **backends**; the lower one swaps the **HTTP SDK** inside the Bloomreach adapter.
 
 ```
 Zoom out — the two-seam vertical stack
 
-┌─ Agent loop ───────────────────────────────────┐
-│  runAgentLoop(opts: { anthropic, mcp, ... })   │
+┌─ Agent layer ──────────────────────────────────┐
+│  AptKit agent classes ← BloomingToolRegistry-  │
+│                          Adapter ← DataSource  │
 │  depends on ↓                                  │
-│  ★ DataSource ★  (lib/data-source/types.ts)    │ ← UPPER seam (NEW)
+│  ★ DataSource ★  (lib/data-source/types.ts)    │ ← UPPER seam
 │        │                 │              │       │   backend swap
 │        │                 │              │       │
-│  BloomreachDataSource  OlistDataSource  fakes  │
-│  (live-bloomreach)    (live-sql)        (test) │
+│  BloomreachDataSource  SyntheticData    fakes  │
+│  (live-bloomreach)     Source           (test) │
+│                        (live-synthetic)        │
 └─────────────────────┬──────────────────────────┘
                       │
-                      │  inside BloomreachDataSource:
-┌─ Bloomreach internals ▼────────────────────────┐  ← we are here too
+                      │  inside BloomreachDataSource only:
+┌─ Bloomreach internals ▼────────────────────────┐
 │  cache · spacing · retry · auth                │
 │  depends on ↓                                  │
-│  ★ McpTransport ★ (lib/mcp/transport.ts L7)   │ ← LOWER seam (older)
+│  ★ McpTransport ★ (lib/mcp/transport.ts)      │ ← LOWER seam (older)
 │         │                  │                   │   HTTP SDK swap
 │    SdkTransport     fakeTransport (test)       │
 │   (prod)            client.test.ts             │
 └─────────────────────┬──────────────────────────┘
                       │
 ┌─ Vendor edges ─────────────────────────────────┐
-│  Anthropic SDK · MCP SDK · stdio transport ·   │
-│  HTTP transport · subprocess (mcp-server-olist)│
+│  Anthropic SDK · MCP SDK · HTTP transport      │
+│  (no subprocess; SyntheticDataSource is in-    │
+│   process, no underlying transport)            │
 └────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is no longer just "how do you test code that drives a vendor SDK?" It's now also "how do you run the same agent stack against two genuinely different backends — a live HTTPS MCP server with OAuth AND a child-process SQLite-backed MCP server — without the agent layer noticing?" The answer is the `DataSource` interface above and a `makeDataSource(mode, sessionId)` factory in `lib/data-source/index.ts` that returns the adapter pre-connected, along with a `bootstrap(signal)` method (Bloomreach calls real schema-discovery tools; Olist returns a synthesized `olistWorkspaceSchema()` because the Olist server intentionally doesn't expose discovery tools) and a `dispose()` (closes the Olist subprocess; no-op for Bloomreach because the OAuth session outlives the request). Three runtime modes (`bi:mode = 'demo' | 'live-sql' | 'live-bloomreach'`), two live adapters, one interface. The next sections walk both seams and the factory that stitches them together.
+**Zoom in — narrow to the concept.** The question is no longer just "how do you test code that drives a vendor SDK?" It's also "how do you run the same agent stack against two genuinely different backends — a live HTTPS MCP server with OAuth AND a deterministic in-process synthetic data source with no network at all — without the agent layer noticing?" The answer is the `DataSource` interface above and a `makeDataSource(mode, sessionId)` factory in `lib/data-source/index.ts` that returns the adapter pre-connected, along with a `bootstrap(signal)` method (Bloomreach calls real schema-discovery tools; Synthetic returns a hardcoded `syntheticWorkspaceSchema` const because the adapter knows its own schema upfront) and a `dispose()` (both branches are no-ops at present — Bloomreach because the OAuth session outlives the request via the cookie store; Synthetic because there's no resource to release). Three runtime modes (`bi:mode = 'demo' | 'live-bloomreach' | 'live-synthetic'`), two live adapters, one interface. The next sections walk both seams and the factory that stitches them together.
 
 ---
 
 ## Structure pass
 
-**Layers.** Five layers, two seams. The **caller** (any agent code — `runAgentLoop` and the four agent classes), the **upper owned interface** (`DataSource` — the backend-swap port), the **adapter** (`BloomreachDataSource` OR `OlistDataSource` OR a fake), the **lower owned interface** (`McpTransport` — only inside `BloomreachDataSource`, the HTTP-SDK-swap port), and the **vendor edge** (`@modelcontextprotocol/sdk` Client, `StdioClientTransport` for Olist, `StreamableHTTPClientTransport` for Bloomreach). Five layers; two seams; one factory (`makeDataSource(mode, sessionId)`) that hides which adapter the route handler got.
+**Layers.** Five layers, two seams. The **caller** (any agent code — the five `lib/agents/{monitoring,diagnostic,recommendation,query,intent}.ts` classes and `BloomingToolRegistryAdapter` in `lib/agents/aptkit-adapters.ts`), the **upper owned interface** (`DataSource` — the backend-swap port), the **adapter** (`BloomreachDataSource` OR `SyntheticDataSource` OR a fake), the **lower owned interface** (`McpTransport` — only inside `BloomreachDataSource`, the HTTP-SDK-swap port), and the **vendor edge** (`@modelcontextprotocol/sdk` Client, `StreamableHTTPClientTransport` for Bloomreach; no vendor for Synthetic because it's in-process). Five layers; two seams; one factory (`makeDataSource(mode, sessionId)`) that hides which adapter the route handler got.
 
-**Axis: dependency.** Which direction does the type-arrow point at each layer boundary? This is the right axis because the entire reason this abstraction exists is dependency *inversion* — flipping who points at whom. In a naive design, the agent would import `Client` from `@modelcontextprotocol/sdk` (or worse, import a concrete Olist adapter when SQL mode is wanted); here the agent depends on a type *this codebase owns* (`DataSource`), and every concrete adapter is the thing that depends on satisfying it. That arrow-flip is what makes 269 tests run offline AND what lets the same agent stack drive two different backends without an `if (mode === ...)` inside the agent.
+**Axis: dependency.** Which direction does the type-arrow point at each layer boundary? This is the right axis because the entire reason this abstraction exists is dependency *inversion* — flipping who points at whom. In a naive design, the agent would import `Client` from `@modelcontextprotocol/sdk` (or worse, import a concrete adapter when synthetic mode is wanted); here the agent depends on a type *this codebase owns* (`DataSource`), and every concrete adapter is the thing that depends on satisfying it. That arrow-flip is what makes the test suite run offline AND what lets the same agent stack drive two different backends without an `if (mode === ...)` inside the agent.
 
-**Seams.** Two seams, both load-bearing, but they do **different jobs**. **Seam 1 (upper, NEW): caller → `DataSource`.** Dependency flips from "agent imports a concrete adapter" to "agent imports a type"; the *adapter* can now be Bloomreach or Olist or a fake. This is the **backend swap seam** — it's what made the SQL mode possible without rewriting the agent layer. **Seam 2 (lower, older): `BloomreachDataSource` → `McpTransport`.** Dependency flips from "Bloomreach adapter imports the MCP HTTP SDK" to "Bloomreach adapter imports a transport type"; the transport can be `SdkTransport` or `fakeTransport`. This is the **HTTP-SDK swap seam** — it's why the Bloomreach adapter's own unit tests don't need network. The two seams compose: Olist doesn't need the lower seam at all (its transport is stdio, and the SQL is read straight from `better-sqlite3` — no HTTP), so it implements `DataSource` directly without an `McpTransport` underneath. That asymmetry is the load-bearing detail: a thin, *truly* abstract upper interface that doesn't leak Bloomreach-isms is what lets a second adapter be shaped completely differently inside.
+**Seams.** Two seams, both load-bearing, but they do **different jobs**. **Seam 1 (upper, load-bearing): caller → `DataSource`.** Dependency flips from "agent imports a concrete adapter" to "agent imports a type"; the *adapter* can now be Bloomreach or Synthetic or a fake. This is the **backend swap seam** — it's what makes the synthetic mode possible without rewriting the agent layer. **Seam 2 (lower, older): `BloomreachDataSource` → `McpTransport`.** Dependency flips from "Bloomreach adapter imports the MCP HTTP SDK" to "Bloomreach adapter imports a transport type"; the transport can be `SdkTransport` or `fakeTransport`. This is the **HTTP-SDK swap seam** — it's why the Bloomreach adapter's own unit tests don't need network. The two seams compose: **Synthetic doesn't need the lower seam at all** (it has no transport — its `callTool` dispatches through a switch statement to in-memory fixture data), so it implements `DataSource` directly without an `McpTransport` underneath. That asymmetry is the load-bearing detail: a thin, *truly* abstract upper interface that doesn't leak Bloomreach-isms is what lets a second adapter be shaped completely differently inside.
 
 ```
 Structure pass — provider abstraction (two seams)
@@ -67,8 +70,8 @@ Structure pass — provider abstraction (two seams)
 └───────────────────────────┬────────────────────────────┘
                             │  trace across layers, find flips
 ┌─ 3. SEAMS ───────────────▼─────────────────────────────┐
-│  S1: caller → DataSource ★load-bearing (NEW)           │
-│      backend swap: Bloomreach OR Olist OR fake          │
+│  S1: caller → DataSource ★load-bearing                  │
+│      backend swap: Bloomreach OR Synthetic OR fake      │
 │  S2: BloomreachDataSource → McpTransport               │
 │      HTTP-SDK swap, Bloomreach-only (lower seam)        │
 └───────────────────────────┬────────────────────────────┘
@@ -79,15 +82,15 @@ Structure pass — provider abstraction (two seams)
 ```
 S1 seam — "which backend satisfies DataSource?" answered three ways
 
-┌─ DataSource ──────┐    seam     ┌─ Adapter ───────────────────────┐
-│  callTool(name,   │ ═════╪═════►│  live-bloomreach: HTTPS + OAuth │
-│    args, opts)    │  (it flips) │  live-sql:        stdio + SQLite│
-│  listTools(opts)  │             │  test:            plain object  │
-│  dispose()        │             └─────────────────────────────────┘
-└───────────────────┘                         ▲
-        ▲                                     │
+┌─ DataSource ──────┐    seam     ┌─ Adapter ────────────────────────────┐
+│  callTool(name,   │ ═════╪═════►│  live-bloomreach: HTTPS + OAuth      │
+│    args, opts)    │  (it flips) │  live-synthetic:  in-process switch  │
+│  listTools(opts)  │             │  test:            plain object       │
+└───────────────────┘             └──────────────────────────────────────┘
+        ▲                                       ▲
         └──── same axis (dependency), three answers ─┘
-              → backend swap + 269 tests run offline
+              → backend swap (prod vs offline-dev)
+              → tests structurally satisfy DataSource
               → makeDataSource(mode, sessionId) picks one
 ```
 
@@ -97,45 +100,46 @@ The skeleton is mapped — the rest of this file walks the mechanics that hang o
 
 ## How it works
 
-**Verdict first.** Two seams stacked vertically, doing different jobs. The upper (`DataSource`) is the one that pays off the abstraction — it's why the same agents drive Bloomreach in prod AND a SQLite-backed Olist server in eval, with a runtime switch. The lower (`McpTransport`) is the one that pays off the testability — it's why the Bloomreach adapter itself runs in unit tests without a network. The factory (`makeDataSource(mode, sessionId)`) is the third moving part: it lives at the upper seam and hides which adapter the route handler got, plus owns connect/bootstrap/dispose. The load-bearing question for the upper seam is *how thin can the interface stay while still being useful?* — the answer drives the rest of the file.
+**Verdict first.** Two seams stacked vertically, doing different jobs. The upper (`DataSource`) is the one that pays off the abstraction — it's why the same agents drive Bloomreach in prod AND a deterministic in-process synthetic adapter for development/demo, with a runtime switch. The lower (`McpTransport`) is the one that pays off the testability — it's why the Bloomreach adapter itself runs in unit tests without a network. The factory (`makeDataSource(mode, sessionId)`) is the third moving part: it lives at the upper seam and hides which adapter the route handler got, plus owns bootstrap/dispose. The load-bearing question for the upper seam is *how thin can the interface stay while still being useful?* — the answer drives the rest of the file.
 
 ```
 ┌────────────────────────────────────────────────┐
-│                   Agent code                    │
-│  (runAgentLoop, MonitoringAgent, …)             │
+│              Agent code                        │
+│  (lib/agents/*.ts → BloomingToolRegistry-      │
+│   Adapter → DataSource.callTool)                │
 └──────────────────────┬─────────────────────────┘
                        │ depends on DataSource only
                        ▼
           ┌────────────────────────┐
-          │  DataSource (upper)    │   3 methods:
-          │  callTool, listTools,  │   callTool / listTools / dispose
-          │  dispose               │
+          │  DataSource (upper)    │   2 methods:
+          │  callTool, listTools   │   callTool / listTools
           └────────┬───────────────┘
                    │
        ┌───────────┼────────────────────────┐
        ▼           ▼                        ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
-│Bloomreach    │  │ Olist        │  │   Fake / test    │
-│DataSource    │  │ DataSource   │  │   plain object   │
-│(prod, live-  │  │ (eval, live- │  │   (tests)        │
-│ bloomreach)  │  │  sql)        │  └──────────────────┘
-└──────┬───────┘  └──────┬───────┘
-       │                  │
-       │ depends on       │ depends on
-       │ McpTransport     │ Client + StdioClientTransport
-       ▼                  ▼ (no lower seam — stdio is the wire)
-┌──────────────┐   ┌──────────────────────┐
-│ SdkTransport │   │ mcp-server-olist     │
-│ (HTTP MCP)   │   │ subprocess (Node)    │
-└──────────────┘   │ + better-sqlite3     │
-                   └──────────────────────┘
+┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│Bloomreach    │  │ Synthetic        │  │   Fake / test    │
+│DataSource    │  │ DataSource       │  │   plain object   │
+│(prod, live-  │  │ (live-synthetic) │  │   (tests)        │
+│ bloomreach)  │  │  in-process,     │  └──────────────────┘
+│              │  │  ~516 LOC of     │
+│              │  │  fixture data    │
+└──────┬───────┘  └──────────────────┘
+       │              (no transport — switch-dispatch)
+       │ depends on
+       │ McpTransport
+       ▼
+┌──────────────┐
+│ SdkTransport │
+│ (HTTP MCP)   │
+└──────────────┘
 ```
 
-The upper interface sits between the agent layer and any backend. The lower interface (`McpTransport`) only matters inside `BloomreachDataSource` — Olist doesn't use it because its wire is stdio + JSON-RPC frames, not HTTP. The asymmetry is the load-bearing detail: keeping `DataSource` truly abstract (no Bloomreach-isms, no MCP-isms) is what lets the Olist adapter be shaped completely differently inside. The fake at the upper seam is still 5 lines; the fake at the lower seam is still 5 lines; that's the testability dividend.
+The upper interface sits between the agent layer and any backend. The lower interface (`McpTransport`) only matters inside `BloomreachDataSource` — `SyntheticDataSource` doesn't use it because there IS no wire to swap; tool calls dispatch through an in-process switch statement against `const`-defined fixture data. The asymmetry is the load-bearing detail: keeping `DataSource` truly abstract (no Bloomreach-isms, no MCP-isms) is what lets the Synthetic adapter be shaped completely differently inside. The fake at the upper seam is still ~5 lines; the fake at the lower seam is still ~5 lines; that's the testability dividend.
 
 ### The DataSource interface (the upper seam)
 
-The new upper seam is a three-method surface defined in `lib/data-source/types.ts` and consumed by every agent:
+The upper seam is a two-method surface defined in `lib/data-source/types.ts` and consumed by every agent (via the AptKit tool-registry adapter bridge in `lib/agents/aptkit-adapters.ts`):
 
 ```
 interface DataSource:
@@ -143,11 +147,9 @@ interface DataSource:
         → Promise<{ result, durationMs, fromCache }>
     listTools(opts?: { signal? })
         → Promise<unknown>
-    dispose()
-        → Promise<void>
 ```
 
-Three methods. No MCP types in the signature (the `unknown` return on `listTools` is deliberate — neither caller cares about MCP-specific `Tool` shape; the agent's `tool-schemas.ts` flattens it). The result envelope `{ result, durationMs, fromCache }` matches what `BloomreachDataSource` already returned, so the seam was extracted, not invented — Olist returns `fromCache: false` and a real `durationMs`; tests can return whatever they want.
+Two methods. No MCP types in the signature (the `unknown` return on `listTools` is deliberate — neither caller cares about MCP-specific `Tool` shape; the agent's `tool-schemas.ts` flattens it). The result envelope `{ result, durationMs, fromCache }` matches what `BloomreachDataSource` already returned, so the seam was extracted, not invented — `SyntheticDataSource` returns `fromCache: false` and a real `durationMs` (it computes `Date.now() - started`, which lands at ~0–1 ms); tests can return whatever they want. `dispose` is NOT on the interface — it's added per-adapter where the lifecycle demands it, and the factory exposes it on its own return shape so route handlers can call it symmetrically without the interface itself caring.
 
 ```
 DataSource interface (upper seam)
@@ -156,29 +158,26 @@ DataSource interface (upper seam)
 │    → Promise<{result, durationMs, fromCache}>    │
 │  listTools(opts?)                                │
 │    → Promise<unknown>                            │
-│  dispose()                                       │
-│    → Promise<void>                               │
 └─────────────────────────────────────────────────┘
-         ▲                  ▲                   ▲
-         │ implements        │ implements        │ structurally satisfies
-  BloomreachDataSource  OlistDataSource    fake DataSource
-  (live-bloomreach)     (live-sql)         (tests)
+         ▲                    ▲                ▲
+         │ implements          │ implements    │ structurally satisfies
+  BloomreachDataSource  SyntheticDataSource    fake DataSource
+  (live-bloomreach)     (live-synthetic)       (tests)
 ```
 
 ### The factory — `makeDataSource(mode, sessionId)`
 
-The factory in `lib/data-source/index.ts` is the single entry point the route handlers use. It owns three responsibilities: picking the adapter for the requested mode, connecting it, and returning a `bootstrap` + `dispose` symmetric across both modes.
+The factory in `lib/data-source/index.ts` is the single entry point the route handlers use. It owns three responsibilities: picking the adapter for the requested mode, preparing it for use, and returning a `bootstrap` + `dispose` symmetric across both modes.
 
 ```
 makeDataSource(mode, sessionId):
-    if mode == 'live-sql':
-        ds = new OlistDataSource()
-        ds.connect()                        # spawns the subprocess
+    if mode == 'live-synthetic':
+        ds = new SyntheticDataSource()      # nothing to connect — in-process
         return {
           ok: true,
           dataSource: ds,
-          bootstrap: () -> olistWorkspaceSchema(),   # synthesized, no I/O
-          dispose: () -> ds.dispose(),
+          bootstrap: () -> syntheticWorkspaceSchema,   # module-level const, no I/O
+          dispose: () -> {},                # no resource to release
         }
     if mode == 'live-bloomreach':
         conn = connectMcp(sessionId)        # OAuth round-trip
@@ -187,14 +186,14 @@ makeDataSource(mode, sessionId):
         return {
           ok: true,
           dataSource: conn.mcp,
-          bootstrap: (sig) -> bootstrapSchema(conn.mcp, sig),  # 4 MCP calls
+          bootstrap: (sig) -> bootstrapSchema(conn.mcp, sig),  # 4+ MCP calls
           dispose: () -> {},                # session-scoped; lives across requests
         }
 ```
 
-The asymmetry in `dispose` is honest: Olist owns a subprocess that the route must tear down; Bloomreach owns a session-scoped client whose lifetime is the cookie, not the request. A no-op dispose on the Bloomreach branch keeps the call-site symmetric (`finally { await result.dispose() }`) without forcing the OAuth session to be re-established on the next request.
+The asymmetry in `bootstrap` is the load-bearing detail: Bloomreach runs four+ sequential MCP calls (`list_cloud_organizations` → `list_projects` → `get_event_schema` → `get_customer_property_schema` → `list_catalogs` → `get_project_overview`); Synthetic just returns its compile-time-known `syntheticWorkspaceSchema` const. Same `Promise<WorkspaceSchema>` return type — different ways of producing it. **Same shape, different failure model:** Bloomreach's bootstrap can fail with rate-limit retries, OAuth expiry, or network 5xx; Synthetic's can't fail at all (it's a property read on a module-level const). The result is the agent layer treats both identically: `const schema = await result.bootstrap(req.signal);`.
 
-The asymmetry in `bootstrap` is the same shape: Bloomreach runs four sequential MCP calls (`list_cloud_organizations` → `list_projects` → `get_event_schema` → `get_customer_property_schema` → `list_catalogs` → `get_project_overview`); Olist synthesizes the schema in-memory because the `mcp-server-olist` server *intentionally* exposes only three domain tools — no schema-discovery surface. (See `10-authored-mcp-server.md` for why that's a design choice and not a gap.)
+Both modes' `dispose` is currently a no-op — Bloomreach because the session outlives the request via the cookie store; Synthetic because there's nothing to release. The call-site keeps the symmetric shape (`finally { await result.dispose() }`) anyway so a future adapter that DOES need teardown (a hypothetical websocket-backed adapter, a subprocess-backed one) plugs in without changing the route.
 
 ```
 factory return shape (symmetric across modes)

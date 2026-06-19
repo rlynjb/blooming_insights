@@ -27,9 +27,7 @@ How a database keeps multiple copies of data in sync and what reads see across t
 
 **Not yet exercised in the database sense — but the same FAMILY of problem (read consistency across multiple stores) does exist here, and it's the second-most-real database concern we have after the rate limit (06).**
 
-There is no primary database, so no replica. The Olist SQLite is a single file, single process, no replicas — but multiple eval worker processes COULD attach to the same DB file simultaneously (WAL mode would let that work without blocking, see 07). That's not "replication" — it's "shared-file multi-reader" — but it's worth naming for the eval suite's future scaling story.
-
-What we DO have, that exhibits the same shape of problem: **every warm Vercel instance has its own in-memory state.** Two users hitting two instances see two different "current briefings" — not because of replication lag, but because there's no shared store at all.
+There is no primary database, so no replica. What we DO have, that exhibits the same shape of problem: **every warm Vercel instance has its own in-memory state.** Two users hitting two instances see two different "current briefings" — not because of replication lag, but because there's no shared store at all.
 
 This is one altitude up from classical replication. Classical replication: one primary, N replicas, eventually consistent under network lag. Ours: N stateless functions, each with their own private cache, no replica relationship at all. The reader-side problem (stale data, divergence) is the same family — the cause is different.
 
@@ -290,11 +288,10 @@ Anchor: hypothetical; flag in interview.
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — the same problem at a finer altitude
-- `07-wal-durability-and-recovery` — replication ships the WAL; Olist uses WAL locally
-- `10-embedded-sqlite-fixture` — readonly fixture, no replicas, single source-of-truth file
+- `07-wal-durability-and-recovery` — replication ships the WAL
 - `01-database-systems-map` — the per-instance Maps that DON'T replicate
 - `study-distributed-systems` — consensus algorithms when you need them
 - `study-system-design` — when to reach for KV vs Postgres vs nothing
 
 ---
-Updated: 2026-06-16 — added a one-paragraph Olist note (single-file shared-readers is the not-quite-replication concern for eval scaling). Main-app divergence story unchanged.
+Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app cross-instance divergence story unchanged; it's the load-bearing teaching here.

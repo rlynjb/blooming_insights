@@ -1,9 +1,9 @@
 # Access patterns and storage choice
 
-**Industry name(s):** Storage choice · access-pattern fit · in-memory store · key-value · document store · serverless cold-start · session-scoped state · relational analytics warehouse
-**Type:** Industry standard · Language-agnostic · Project-specific (the session-keyed-in-memory variant + the local SQLite analytics variant)
+**Industry name(s):** Storage choice · access-pattern fit · in-memory store · key-value · document store · serverless cold-start · session-scoped state · in-process synthetic fixture
+**Type:** Industry standard · Language-agnostic · Project-specific (the session-keyed-in-memory variant + the in-process synthetic adapter)
 
-> The storage choice question: **does the storage shape match the read/write pattern?** This repo now has **three storage layers**. (1) **Session-scoped in-memory** `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` for live UI state — by-id reads within a session, per-session isolation between users. (2) **Olist SQLite** on disk under `mcp-server-olist/data/olist.db` — a real relational analytics warehouse with FKs, indexes, NOT NULL, read-only at runtime. (3) **Committed demo seeds** (`lib/state/demo-*.json`) and **eval result snapshots** (`eval/results/<date>/*.json`) — git-tracked, durable forever. The access pattern is **layered by lifetime**: per-request UI state in (1), per-machine analytics state in (2), per-commit fixtures in (3). The classic mismatch from the 2026-06-01 version — "per-process memory on serverless" — is partly bridged by the session-scoping (multi-user safety) and by the wire-format-as-state pattern (the browser carries the data across cold starts). The mismatch hasn't been retired; it's been bounded.
+> The storage choice question: **does the storage shape match the read/write pattern?** This repo has **three storage layers** as of 2026-06-19 (the Olist SQLite tier from the 2026-06-16 audit was removed in PR #8). (1) **Session-scoped in-memory** `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` for live UI state — by-id reads within a session, per-session isolation between users. (2) **Committed demo seeds** (`lib/state/demo-*.json`) — git-tracked, durable forever. (3) **In-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`) — const literals returned through the DataSource interface; the live-synthetic mode uses this when the user wants the real agent loop against fake data. A dev-only `.investigation-cache.json` also exists and survives `npm run dev` restarts but never reaches production (Vercel FS is read-only). The access pattern is **layered by lifetime**: per-request UI state in (1), per-commit fixtures in (2), per-process fake data in (3). The classic mismatch from the 2026-06-01 version — "per-process memory on serverless" — is partly bridged by the session-scoping (multi-user safety) and by the wire-format-as-state pattern (the browser carries the data across cold starts). The mismatch hasn't been retired; it's been bounded.
 
 ---
 
@@ -30,21 +30,27 @@
 
   ┌─ The three storage layers (in priority order) ───────────┐
   │                                                            │
-  │   1. in-memory Maps                                        │
+  │   1. session-scoped in-memory Maps                         │
   │      lib/state/insights.ts                                 │
+  │      Map<sessionId, SessionFeed>                           │
   │      lifetime: one process instance (Vercel: warm only)    │
   │      ephemeral; lost on cold start; no I/O cost            │
   │                                                            │
-  │   2. dev file cache                                        │
-  │      .investigation-cache.json                             │
-  │      lifetime: across `npm run dev` restarts (DEV ONLY)    │
-  │      production = NEVER (Vercel FS is read-only)           │
-  │                                                            │
-  │   3. committed demo seed                                   │
+  │   2. committed demo seed                                   │
   │      lib/state/demo-insights.json                          │
   │      lib/state/demo-investigations.json                    │
   │      lifetime: forever (git-tracked)                       │
-  │      shipped fixture; offline mode; test data              │
+  │      shipped fixture; offline mode; replayed for demo path │
+  │                                                            │
+  │   3. in-process synthetic fixture                          │
+  │      lib/data-source/synthetic-data-source.ts              │
+  │      const literals returned through DataSource.callTool() │
+  │      lifetime: one process instance; deterministic         │
+  │      used in live-synthetic mode (real agent loop / fake   │
+  │      data); see file 11                                    │
+  │                                                            │
+  │   (also: a dev-only .investigation-cache.json; NEVER ships │
+  │    to production — Vercel FS is read-only)                 │
   │                                                            │
   └────────────────────────────────────────────────────────────┘
 ```
@@ -157,31 +163,37 @@ The shape has been refactored from "three module-level Maps shared by all reques
     test/state/insights.test.ts has explicit isolation tests.
 ```
 
-#### `mcp-server-olist/data/olist.db` — the SQLite analytics warehouse (NEW)
+#### `lib/data-source/synthetic-data-source.ts` — the in-process synthetic fixture (NEW)
 
-A real relational store, on disk, owned by the repo. Read-only at runtime (only the seeder writes). Three tools query it (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`); the agent loop calls those tools when `LiveMode === 'live-sql'`.
+A pure in-process adapter. No disk. No DB. No PRNG. The `SyntheticDataSource` class implements the same `DataSource` interface as `BloomreachDataSource`, dispatches on tool name in a switch, and returns hand-authored const literals through the standard `{ structuredContent, content }` result envelope. The agent loop above this seam cannot tell the difference between this and a live MCP call — same shape, same envelope, same `listTools()` surface. File 11 walks the pattern.
 
 ```
-  the Olist SQLite layer
+  the in-process synthetic layer
 
-  reads:  prepared statements over 7 tables via better-sqlite3 (sync)
-          plans use the 9 indexes (file 03 walks them)
-          PRAGMA foreign_keys = ON, journal_mode = WAL
+  reads:  via DataSource.callTool(name, args)
+          dispatched by switch in SyntheticDataSource.dispatch()
+          returns const literals (analyticsResult, customers, segments,
+          campaigns, scenarios, catalogItems, ...)
 
-  writes: ONLY by mcp-server-olist/scripts/seed-olist.ts
-          drop-and-rebuild pattern — the file is destroyed and recreated
-          deterministic: mulberry32(seed=42) → byte-identical every time
+  writes: NONE at runtime — every payload is source code
+          to change the data: edit lib/data-source/synthetic-data-source.ts
+          + restart the process (or wait for Next.js HMR)
 
   lifetime semantics:
-    file lives until git clean or manual unlink
-    every npm run seed REPLACES the file (no incremental writes)
-    survives Vercel cold starts ONLY when the file is on disk
-      (in Vercel serverless: the DB file is NOT shipped — the Olist
-       mode is local-development-and-eval only)
+    in-memory for the lifetime of the process; trivially restored on
+    reload (the literals are part of the bundle, not a file the FS
+    has to ship)
+    survives Vercel cold starts implicitly — the data IS the code
 
-  what this is for: Phase 3 evals (eval/scripts/run-detection.ts spawns
-  a fresh mcp-server-olist subprocess and grades the monitoring agent's
-  output against the seeded_anomalies table). NOT for production UI.
+  what this is for: the live-synthetic mode in
+  lib/data-source/index.ts (makeDataSource → SyntheticDataSource) gives
+  the user the real agent loop against fake data, without the OAuth
+  dance and without the 1 req/s Bloomreach rate limit.
+
+  determinism contract: not asserted in code. The data is stable today
+  because the literals are stable; nothing prevents a future edit
+  from introducing Math.random() inside dispatch(). See finding #7 in
+  the audit (file 07).
 ```
 
 #### `lib/state/investigations.ts` — the dev file cache (secondary)
@@ -562,7 +574,7 @@ What this repo would look like with Drizzle + Vercel Postgres: schema in `lib/db
 ## Interview defense
 
 **Q: Walk me through the storage choice in this repo.**
-A: Three layers. **(1) Session-scoped in-memory** in `lib/state/insights.ts` — `Map<sessionId, SessionFeed>` where each `SessionFeed` is three inner Maps (`insights`, `anomalies`, `investigations`). Per-session isolation: one user's `putInsights` clears only that session's sub-maps. Reads are two-level `state.get(sessionId)?.insights.get(id)` (O(1) hash lookups). **(2) Olist SQLite on disk** under `mcp-server-olist/data/olist.db` — real relational analytics warehouse, FKs + WAL + read-only at runtime + designed-against-queries indexes. **(3) Committed seeds** (`lib/state/demo-*.json`, `eval/results/<date>/*.json`, `eval/fixtures/regression-golden/*.json`) — git-tracked, durable forever. Durability across Vercel cold starts: layer 1 dies, layer 2 lives if the file ships, layer 3 always lives. The route's `resolveAnomaly` walks four sources (wire-format param → per-session anomalies → per-session insights → demo seed) to bridge the layer-1 ephemeral gap.
+A: Three layers. **(1) Session-scoped in-memory** in `lib/state/insights.ts` — `Map<sessionId, SessionFeed>` where each `SessionFeed` is three inner Maps (`insights`, `anomalies`, `investigations`). Per-session isolation: one user's `putInsights` clears only that session's sub-maps. Reads are two-level `state.get(sessionId)?.insights.get(id)` (O(1) hash lookups). **(2) Committed demo seeds** (`lib/state/demo-*.json`) — git-tracked, durable forever; the demo path replays these as plain JSON. **(3) In-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`) — const literals returned through `DataSource.callTool()`, no PRNG, no disk; used by the live-synthetic mode for the real agent loop against fake data. Durability across Vercel cold starts: layer 1 dies, layers 2 and 3 always live (one is committed JSON, the other is bundled source). The route's `resolveAnomaly` walks four sources (wire-format param → per-session anomalies → per-session insights → demo seed) to bridge the layer-1 ephemeral gap.
 
 **Q: What's the wire-format bridge and why does it exist?**
 A: When the user clicks an insight on the briefing, the browser puts the entire Insight JSON in `sessionStorage` AND ships it back as a `?insight=<JSON>` URL param when navigating to the investigate page. The route prefers this param over its in-memory store. It exists because Vercel cold starts mean the in-memory store can't be trusted — a briefing computed on instance A may not be visible to instance B. Letting the browser carry the state across the cold-start boundary makes the route stateless-for-correctness while keeping the in-memory Maps as a pure optimization for warm hits. The cost is a long URL (~500 bytes) and the `insightToAnomaly` leak (the route converts the lossy `Insight` back to `Anomaly`, dropping 4 fields). Net: cheap, correct, no infrastructure.
@@ -595,13 +607,15 @@ A: When the user clicks an insight on the briefing, the browser puts the entire 
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the entities stored in each layer.
+- `01-the-data-model-and-its-shape.md` — the entities stored in each layer; `WorkspaceSchema` dual derivation (Bloomreach + Synthetic).
 - `02-normalization-and-duplication.md` — the wire-format leak is now the load-bearing one (the schema-side fix shipped); session-scoped state makes a server-side lookup safe.
-- `04-transactions-and-integrity.md` — session-scoped sub-maps + Olist FK/WAL; the integrity invariants per layer.
-- `05-migrations-and-evolution.md` — drop-and-reseed is the Olist "migration"; deterministic synthesis is why it's legitimate.
-- `08-the-olist-relational-schema.md` — the schema living in `mcp-server-olist/data/olist.db`.
-- `09-deterministic-synthetic-data.md` — why the DB is regenerable + the eval result shapes that live in `eval/results/`.
+- `04-transactions-and-integrity.md` — session-scoped sub-maps; the integrity invariants per layer.
+- `05-migrations-and-evolution.md` — git-evolves-types is the only migration story now.
+- `08-the-olist-relational-schema.md` — RETIRED. Historical second-domain.
+- `09-deterministic-synthetic-data.md` — RETIRED. Pattern still applies; anchors gone.
+- `11-in-process-synthetic-fixture.md` — the `SyntheticDataSource` pattern: same agent interface as the live adapter, const literals as the data.
 - `study-system-design/*` — the system-design side of this question (which datastore, scaling, replication).
 
 ---
 Updated: 2026-06-16 — added the session-scoped state refactor and the Olist SQLite analytics layer; primary store layer count moved from 3 (in-memory / dev-file / demo-seed) to 5 (per-session in-memory / Olist SQLite / dev-file cache / committed demo seed / committed eval results).
+Updated: 2026-06-19 — Olist SQLite layer removed (PR #8); re-ranked to three layers (session-scoped in-memory / committed demo seed / in-process synthetic fixture); interview answer and storage table updated; cross-links pointed at retired files and the new file 11.

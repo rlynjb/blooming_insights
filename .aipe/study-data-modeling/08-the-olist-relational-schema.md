@@ -4,6 +4,14 @@
 > server / Phase 3 eval pipeline, both removed from the codebase. The
 > patterns it teaches are real, but the code anchors it cites no longer
 > exist. Preserved as a historical record of what was studied.
+>
+> **What replaced this:** nothing. There is no relational schema in this
+> repo today. The patterns this file teaches (3NF, designed-against-queries
+> indexing, FK + WAL + NOT NULL as the integrity stack) are still real,
+> but they're not anchored anywhere in `blooming_insights` anymore.
+> The closest cousin in the current repo is the in-process synthetic
+> fixture (file 11) — same "data is owned by the repo" intent, but no
+> tables, no joins, no FKs, no indexes.
 
 **Industry name(s):** Relational schema · 3NF · entity-relationship model · transactional schema · designed-against-queries
 **Type:** Industry standard · Language-agnostic · Project-specific (the Phase 2 authored MCP server)

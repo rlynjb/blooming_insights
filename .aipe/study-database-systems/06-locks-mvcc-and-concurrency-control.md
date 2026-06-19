@@ -23,14 +23,11 @@ How a database lets many writers proceed without corrupting each other's data ·
 
 ### Verdict for this codebase
 
-**Main app: mostly not yet exercised — one real concurrency gap. Olist: read-only single-process — no contention by design.**
+**Mostly not yet exercised — one real concurrency gap.**
 
-Two altitudes:
+`putInsights()` calls `insights.clear()` then `insights.set()` in a loop. Within a single Node tick on one instance, that's atomic — the event loop won't preempt mid-loop. Across **two warm Vercel instances**, both can hit `/api/briefing` at the same wall-clock moment, both run their own `putInsights()`, and a third request landing on either instance sees whichever instance's last `set()` won. There's no coordination, because there's no shared store.
 
-- **Main app gap:** `putInsights()` calls `insights.clear()` then `insights.set()` in a loop. Within a single Node tick on one instance, that's atomic — the event loop won't preempt mid-loop. Across **two warm Vercel instances**, both can hit `/api/briefing` at the same wall-clock moment, both run their own `putInsights()`, and a third request landing on either instance sees whichever instance's last `set()` won. There's no coordination, because there's no shared store.
-- **Olist side:** `mcp-server-olist/src/db.ts` opens the DB `readonly: true` and the MCP subprocess handles one tool call at a time. **There is no write contention.** WAL mode IS enabled (L40) — which would give MVCC-style reader/writer non-blocking if we had any writers — but we don't, so the property is dormant. Future-proofing, not a current mechanism.
-
-This still isn't "MVCC isn't tuned." It's "no concurrency control is needed at this scale, and the only real engine we have is opened single-writer-zero-writers." Row locks, version columns, snapshot isolation — all available in SQLite's WAL mode, none reached for.
+This isn't "MVCC isn't tuned." It's "no concurrency control is needed at this scale, and there's no engine to tune." Row locks, version columns, snapshot isolation — all primitives we'd reach for once there was a DB. None reached for today.
 
 ### When this becomes load-bearing
 
@@ -329,12 +326,10 @@ Diagram: the version-column UPDATE pattern.
 ## See also
 
 - `05-transactions-isolation-and-anomalies` — the contract concurrency control enforces
-- `07-wal-durability-and-recovery` — WAL mode in Olist (dormant; would enable MVCC reads)
 - `08-replication-and-read-consistency` — the cross-instance divergence problem at a higher altitude
-- `10-embedded-sqlite-fixture` — readonly single-process design choice for the Olist server
 - `01-database-systems-map` — the storage layout that has none of these primitives
 - `study-distributed-systems` — coordination across processes
 - `study-runtime-systems` — Node's event loop and the within-tick atomicity claim
 
 ---
-Updated: 2026-06-16 — added Olist note (readonly + WAL = no contention by design; MVCC available but dormant). Main-app concurrency gap unchanged.
+Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app concurrency gap unchanged; the rate-limit-budget-per-instance finding is still the load-bearing concurrency story here.

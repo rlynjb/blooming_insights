@@ -1,9 +1,9 @@
 # 01 — the distributed system map
 
-**Industry name(s):** coordination map · trust + failure topology · ownership boundaries · heterogeneous-backend topology
+**Industry name(s):** coordination map · trust + failure topology · ownership boundaries
 **Type:** Industry standard · Language-agnostic
 
-> **Verdict-first:** blooming insights has *four* real distributed boundaries and *one* coordination gap pretending not to exist. Three of the four boundaries are over the internet (Bloomreach MCP, Anthropic, Bloomreach IdP). The fourth is over a Unix pipe to a local Node child process (mcp-server-olist). The gap is the assumption that one Vercel instance's in-memory `Map` is the same `Map` the next request will hit — it isn't, and the app has no mechanism that would notice when it isn't. Phase 2 added the subprocess boundary behind the same `DataSource` interface the Bloomreach client implements; `makeDataSource(mode, sid)` picks one. Every other distributed-systems concept in this guide attaches to one of those five spots.
+> **Verdict-first:** blooming insights has *three* real distributed boundaries and *one* coordination gap pretending not to exist. All three boundaries are over the internet (Bloomreach MCP, Anthropic, Bloomreach IdP). The gap is the assumption that one Vercel instance's in-memory `Map` is the same `Map` the next request will hit — it isn't, and the app has no mechanism that would notice when it isn't. `makeDataSource(mode, sid)` picks one of two adapters — `BloomreachDataSource` (the one distributed adapter, HTTP+SSE) or `SyntheticDataSource` (in-process fake; does NOT cross a hop). The earlier stdio subprocess adapter (`OlistDataSource`) that briefly added a fourth boundary was removed in PR #8 (2026-06-18). Every other distributed-systems concept in this guide attaches to one of those four spots (three boundaries + the gap).
 
 ---
 
@@ -22,15 +22,15 @@ The map is the orientation. Every other file in this guide picks one of the boxe
   ┌─ Service layer ─────────▼────────────────────────────┐
   │  Vercel instance(s) · in-memory Maps                  │
   │  makeDataSource(mode, sid) → BloomreachDataSource     │
-  │                            OR OlistDataSource         │
-  └────────────┬───────────────────────────┬──────────────┘
-               │ HTTPS (3 partners)        │ stdio (1 child process)
-  ┌─ Provider layer ───────▼──────────┐ ┌──▼─────────────────────┐
-  │  Bloomreach MCP                    │ │  mcp-server-olist       │
-  │  Anthropic API                     │ │  (Node subprocess,      │
-  │  Bloomreach IdP                    │ │   SQLite-backed, no     │
-  │                                    │ │   auth, no rate limit)  │
-  └────────────────────────────────────┘ └─────────────────────────┘
+  │                            OR SyntheticDataSource     │
+  │                              (in-process fake)        │
+  └────────────┬─────────────────────────────────────────┘
+               │ HTTPS (3 partners)
+  ┌─ Provider layer ───────▼──────────┐
+  │  Bloomreach MCP                    │
+  │  Anthropic API                     │
+  │  Bloomreach IdP                    │
+  └────────────────────────────────────┘
 ```
 
 **Zoom in.** The map answers: *what coordinates with what, who owns what, and where can the answer go wrong?* This file names the boxes and arrows. The other files in the guide pick one boundary or one ownership flip and walk the mechanism.
@@ -39,23 +39,22 @@ The map is the orientation. Every other file in this guide picks one of the boxe
 
 ## Structure pass
 
-**Layers.** Three. Client · Service (your Vercel instance) · Providers (Bloomreach MCP, Anthropic, Bloomreach IdP, mcp-server-olist subprocess). Multi-instance is implicit at the service layer — Vercel scales horizontally, but the code treats each instance as if it were the only one.
+**Layers.** Three. Client · Service (your Vercel instance) · Providers (Bloomreach MCP, Anthropic, Bloomreach IdP). Multi-instance is implicit at the service layer — Vercel scales horizontally, but the code treats each instance as if it were the only one.
 
-**Axis: ownership.** Hold one question across every layer: *who owns this piece of state, and how long does it survive?* This is the right axis because the most consequential bug-shapes in this codebase come from ownership confusion — the server thinks it owns the diagnosis between steps 2 and 3 (it doesn't; the client does), and any new feature that assumes the in-memory `Map` is durable is wrong. With Phase 2 it also surfaces a *new* ownership question: who owns the subprocess? Answer: one `OlistDataSource` instance owns one child process; `dispose()` is the only termination signal.
+**Axis: ownership.** Hold one question across every layer: *who owns this piece of state, and how long does it survive?* This is the right axis because the most consequential bug-shapes in this codebase come from ownership confusion — the server thinks it owns the diagnosis between steps 2 and 3 (it doesn't; the client does), and any new feature that assumes the in-memory `Map` is durable is wrong.
 
-**Seams.** Five boundaries; the ownership answer flips at four of them.
+**Seams.** Four boundaries; the ownership answer flips at three of them.
 
 - **Seam A — browser ↔ Vercel instance.** Ownership flips from "client React state + tab-local sessionStorage" to "request-scoped variables + (sometimes) process-local `Map`." Cookies cross both directions.
 - **Seam B — instance ↔ instance.** Implicit and uncrossed. There IS no mechanism that crosses this seam. Two concurrent requests on two instances each see their own `Map`. This is the gap.
 - **Seam C — instance ↔ Bloomreach MCP.** Ownership flips from "ours (cache, lastCallAt counter, spacing budget)" to "theirs (rate-limit window, workspace data, the truth)." Transport: HTTPS+SSE.
 - **Seam D — instance ↔ Anthropic.** Ownership flips from "ours (the prompt + tool schemas we built)" to "theirs (the model's output, their rate limits)." Transport: HTTPS.
 - **Seam E — instance ↔ Bloomreach IdP.** Ownership flips from "ours (the PKCE verifier, the redirect_uri we registered)" to "theirs (the auth code, the access + refresh tokens)." Transport: HTTPS (OAuth).
-- **Seam F — instance ↔ mcp-server-olist subprocess.** Ownership flips from "ours (the parent process, the `Client` handle, the per-call 30s `AbortSignal.timeout`, the `dispose()` budget)" to "theirs (the child process, its SQLite file handle, its stdout/stderr)." Transport: stdio (a Unix pipe between two processes on the same host).
 
-Seams C, D, E, F are the four real distributed boundaries. Seam B is the gap. Seam A is the workaround for Seam B (the client carries state precisely because the server can't be trusted to remember it). Seam F is the *new* boundary added in Phase 2 — same protocol (MCP/JSON-RPC 2.0) as Seam C, different transport (stdio vs HTTP+SSE), completely different failure ontology (process-crash vs network-error).
+Seams C, D, E are the three real distributed boundaries. Seam B is the gap. Seam A is the workaround for Seam B (the client carries state precisely because the server can't be trusted to remember it). The previous Seam F (instance ↔ mcp-server-olist subprocess, stdio transport) was removed when the Olist adapter was deleted in PR #8 (2026-06-18); the `SyntheticDataSource` adapter that replaced it lives entirely inside the Vercel instance and never crosses a seam.
 
 ```
-  Structure pass — ownership flips at four boundaries, one gap
+  Structure pass — ownership flips at three boundaries, one gap
 
   ┌─ client ────────────────────────────────────────────┐
   │  owns: React state, sessionStorage (per tab)         │
@@ -64,18 +63,15 @@ Seams C, D, E, F are the four real distributed boundaries. Seam B is the gap. Se
   ┌─ Vercel inst1 ──▼───────┐  ┌─ Vercel inst2 ───────┐
   │  owns: req-scoped vars,  │  │  owns: req-scoped     │
   │        in-memory Map(s)  │  │        vars, OWN Map  │
-  │        OWN subprocess if │  │        OWN subprocess │
-  │        OlistDataSource   │  │        if Olist       │
   └────────┬─────────────────┘  └───────────────────────┘
            │  no seam B — these never coordinate
            │
-   ┌───────┼──────────┬──────────┬──────────┐
-   │   C   │      D   │      E   │      F   │
-   ▼       ▼          ▼          ▼          ▼
-  MCP   Anthropic   IdP    olist-subproc  (each owns its own truth)
-  HTTPS HTTPS       HTTPS  STDIO          (transport varies; protocol
-                                           Seam C and Seam F both
-                                           speak MCP/JSON-RPC 2.0)
+   ┌───────┼──────────┬──────────┐
+   │   C   │      D   │      E   │
+   ▼       ▼          ▼          ▼
+  MCP   Anthropic   IdP            (each owns its own truth)
+  HTTPS HTTPS       HTTPS          (Seam C carries MCP/JSON-RPC 2.0
+                                    over HTTPS+SSE)
 ```
 
 ---
@@ -170,41 +166,15 @@ Same shape as the MCP box: HTTPS, Bearer token, can rate-limit, can latency-spik
 
 OAuth + PKCE + Dynamic Client Registration. The interesting part is that the *connect* request and the *callback* request are two separate HTTP requests, possibly landing on two different Vercel instances. The PKCE code verifier is generated during connect and must be readable during callback. The encrypted `bi_auth` cookie (`lib/mcp/auth.ts:86-104`) is what bridges Seam D — without it, callback fails with "no PKCE code_verifier stored for this session" because the instance that ran connect already recycled or never ran callback.
 
-#### The mcp-server-olist subprocess box
+#### The SyntheticDataSource (in-process; NOT a distributed box)
 
-You already know `child_process.spawn`. This is the same idea, dressed in the MCP SDK's `StdioClientTransport` (`lib/data-source/olist-data-source.ts:127-133`): the adapter spawns a Node child with `command: process.execPath, args: [serverEntry]`, inherits stderr (so child logs reach the parent), and reserves stdin/stdout for JSON-RPC 2.0 frames. The child reads SQLite read-only and serves three tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`). Lifecycle is **lazy-connect on first `callTool` / `listTools`, reuse across calls, kill on `dispose()`** — one child per `OlistDataSource` instance.
-
-```
-  Olist subprocess boundary — what crosses, what fails
-
-  ┌─ OlistDataSource ──┐  spawn + JSON-RPC over stdin   ┌─ child Node proc ─┐
-  │ owns: parent proc, │ ────────────────────────────── │ owns: SQLite      │
-  │ Client handle,     │ ◄───────────────────────────── │ read handle,      │
-  │ per-call 30s       │  responses over stdout (NDJSON │ stdout JSON-RPC   │
-  │ AbortSignal        │   of JSON-RPC frames)          │ stderr logs       │
-  └────────────────────┘                                └───────────────────┘
-
-  failure modes:
-   • spawn error (entry not found)  → thrown at connect(), surfaces with
-                                       "Run 'npm run build' in
-                                       mcp-server-olist/ first"
-   • child crashes mid-call          → broken pipe / EPIPE; await rejects;
-                                       tagged as OlistToolError
-   • per-call timeout (30s)          → AbortSignal fires, await rejects;
-                                       tagged as OlistToolError
-   • parent forgets to dispose       → orphaned child process leaks until
-                                       the parent exits (Vercel will reap
-                                       on instance recycle, but locally
-                                       this leaks)
-```
-
-Two design choices worth naming. First, `connect()` is idempotent — concurrent callers share one in-flight promise (`olist-data-source.ts:109-118`) so the subprocess is spawned **exactly once per instance** even under concurrent first calls. Second, the per-call 30s `AbortSignal.timeout` composed in (`olist-data-source.ts:151, 172`) means the Olist side **has** the per-tool timeout that the Bloomreach side **does not** — closing one of the long-standing gaps (file 02, RISK 2 in file 09) on this seam only.
+Worth naming what's NOT a distributed boundary. The `SyntheticDataSource` adapter (`lib/data-source/synthetic-data-source.ts:314-331`) implements the same `DataSource` interface as `BloomreachDataSource` and is picked by `makeDataSource('live-synthetic', sid)`. But it lives entirely inside the Vercel JS process — no IPC, no subprocess, no network. `callTool` is a synchronous dispatch over a giant `switch` returning deterministic fixture data. There is no Seam F here; the synthetic adapter is hidden behind Seam B (the cosmetic in-process boundary). It's listed here so future readers don't draw it as an external box.
 
 ---
 
 ### Move 3 — the principle
 
-A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box on it is a thing that can be slow, dead, or lying. Every arrow is a guarantee that can fail. The work of distributed-systems engineering is making each arrow's failure mode survivable for the boxes on either side. blooming insights does this well for Seam C (`BloomreachDataSource`'s parsed-retry), well for Seam F (per-call timeout + idempotent connect + explicit dispose), well for Seam E (the encrypted cookie), badly for Seam B (no mechanism at all), and not yet for Anthropic-the-box (no retry, no timeout, no fallback). The Phase 2 addition is worth a beat: the *same* protocol can ride two *different* transports with *different* failure ontologies, and the `DataSource` interface is the seam where heterogeneous backends become uniform to the caller.
+A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box on it is a thing that can be slow, dead, or lying. Every arrow is a guarantee that can fail. The work of distributed-systems engineering is making each arrow's failure mode survivable for the boxes on either side. blooming insights does this well for Seam C (`BloomreachDataSource`'s parsed-retry), well for Seam E (the encrypted cookie), badly for Seam B (no mechanism at all), and not yet for Anthropic-the-box (no retry, no timeout, no fallback). The earlier Phase-2 expansion to two distributed transports was reverted in PR #8 (2026-06-18); the `DataSource` interface still demonstrates the adapter pattern, but only Bloomreach actually crosses a process boundary now.
 
 ---
 
@@ -216,7 +186,7 @@ A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box o
   ┌─ Client (browser) ──────────────────────────────────────────────────┐
   │   React state (this render)                                           │
   │   sessionStorage:  bi:diag:<id>   bi:insight:<id>   bi:inv:<step>:<id>│
-  │   localStorage:    bi:mode  (demo / live-sql / live-bloomreach)       │
+  │   localStorage:    bi:mode  (demo / live-synthetic / live-bloomreach) │
   │   cookies:         bi_session  bi_auth (encrypted)                    │
   └──────────────────┬────────────────────────────┬──────────────────────┘
                      │  HTTPS + cookies            │  HTTPS + cookies
@@ -228,19 +198,21 @@ A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box o
   │   Map<id, AgentEvent[]>        │   │   Map<id, AgentEvent[]>         │
   │   cached: WorkspaceSchema      │   │   cached: WorkspaceSchema       │
   │   makeDataSource(mode, sid)    │   │   makeDataSource(mode, sid)     │
-  └─────┬───────┬───────┬───────┬─┘   └────── (no link between them) ───┘
-        │       │       │       │
-        │ MCP   │ Anthr.│ IdP   │ stdio (live-sql only)
-        ▼       ▼       ▼       ▼
-  ┌─ Bloomreach ─┐  ┌─ Anthropic ─┐  ┌─ IdP ──┐  ┌─ olist subproc ─┐
-  │  MCP server   │  │  API         │  │ OAuth   │  │ Node child       │
-  │  1 req/s/user │  │  rate-       │  │ +DCR    │  │ JSON-RPC over    │
-  │  GLOBAL       │  │  limited     │  │ +PKCE   │  │ stdio pipe       │
-  │  429 carries  │  │  + variable  │  │         │  │ SQLite read-only │
-  │  retry hint   │  │  latency     │  │         │  │ EPIPE / crash    │
-  │  HTTP+SSE     │  │              │  │         │  │ on failure       │
-  │  JSON-RPC 2.0 │  │              │  │         │  │ JSON-RPC 2.0     │
-  └───────────────┘  └──────────────┘  └─────────┘  └──────────────────┘
+  │   (live-synthetic stays in-    │   │                                 │
+  │    process; not drawn)         │   │                                 │
+  └─────┬───────┬───────┬──────────┘   └────── (no link between them) ───┘
+        │       │       │
+        │ MCP   │ Anthr.│ IdP
+        ▼       ▼       ▼
+  ┌─ Bloomreach ─┐  ┌─ Anthropic ─┐  ┌─ IdP ──┐
+  │  MCP server   │  │  API         │  │ OAuth   │
+  │  1 req/s/user │  │  rate-       │  │ +DCR    │
+  │  GLOBAL       │  │  limited     │  │ +PKCE   │
+  │  429 carries  │  │  + variable  │  │         │
+  │  retry hint   │  │  latency     │  │         │
+  │  HTTP+SSE     │  │              │  │         │
+  │  JSON-RPC 2.0 │  │              │  │         │
+  └───────────────┘  └──────────────┘  └─────────┘
 
   guarantees that cross:
     Seam A (client↔inst):  cookies (auth, session), JSON request body
@@ -250,9 +222,6 @@ A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box o
     Seam D (inst↔Anthr):   API key, prompt + tool schemas
     Seam E (inst↔IdP):     PKCE verifier (saved in cookie at connect,
                            read from cookie at callback)
-    Seam F (inst↔olist):   stdin: JSON-RPC frame; stdout: JSON-RPC reply
-                           per-call AbortSignal.timeout(30s);
-                           transport: stdio pipe (same host, no network)
 ```
 
 ---
@@ -382,12 +351,15 @@ Cross-instance coordination. The `Map` in `lib/state/insights.ts` is per-process
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — Seam C in depth: how `BloomreachDataSource` handles the 429; Seam F's per-call timeout
+- `02-partial-failure-timeouts-and-retries.md` — Seam C in depth: how `BloomreachDataSource` handles the 429
 - `04-consistency-models-and-staleness.md` — Seam A: what the client carries that the server can't remember
-- `05-replication-partitioning-and-quorums.md` — Seam B (the gap): why NOT YET EXERCISED is honest; the K=10 parallel-eval race anecdote
-- `09-distributed-systems-red-flags-audit.md` — ranked risks across all five seams
-- `10-transport-agnostic-protocol-design.md` — the `DataSource` interface, the `makeDataSource` factory, subprocess lifecycle as a distributed primitive
+- `05-replication-partitioning-and-quorums.md` — Seam B (the gap): why NOT YET EXERCISED is honest
+- `09-distributed-systems-red-flags-audit.md` — ranked risks across all four seams
+- `10-transport-agnostic-protocol-design.md` — RETIRED; preserved as a record of the Phase-2 two-transport design (Olist subprocess) that was reverted in PR #8
 - `.aipe/study-system-design/00-overview.md` — the architectural map (shape + storage); this file is its distributed-systems sibling
 
 ---
 Updated: 2026-06-16 — Added Seam F (subprocess pipe to mcp-server-olist); refactored zoom-out and structure pass to cover heterogeneous backends; new subprocess box walked in How it works; line refs migrated from `lib/mcp/client.ts` to `lib/data-source/bloomreach-data-source.ts`.
+
+---
+Updated: 2026-06-19 — Seam F (stdio subprocess to mcp-server-olist) REMOVED after PR #8 deleted the Olist adapter. Boundaries revert to three (MCP, Anthropic, IdP) + one gap (cross-instance). Zoom-out diagram, structure pass, primary diagram revised; subprocess-box section replaced with a "what's NOT distributed" note covering the in-process `SyntheticDataSource`. `bi:mode` enum updated from `live-sql` → `live-synthetic`.

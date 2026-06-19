@@ -414,9 +414,9 @@ Attack: for *debugging* a captured run, the original pause IS the diagnostic sig
 - `01-ndjson-agentevent-discriminated-union.md` — the typed shape replay preserves.
 - `03-three-rung-mem-file-seed-store.md` — the cache the replay reads from.
 - `04-dual-write-send-to-stream-and-store.md` — the dual-write that produced the snapshot the replay consumes.
-- `06-eval-result-paper-trail.md` — replay-from-snapshot operates on ONE request's events; the eval surface operates on K iterations of the same shape across a fixture. Same primitive, different scope.
+- `06-eval-result-paper-trail.md` (RETIRED) — replay-from-snapshot operates on ONE request's events; the eval surface once operated on K iterations of the same shape across a fixture. Same primitive, different scope. The eval surface is gone from this repo (PR #8 / 62c24d7); the pattern teaches the K-iteration scope.
 - `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` — same replay flow from the LLM-observability angle.
 - `.aipe/study-system-design/05-streaming-ndjson.md` — the NDJSON carrier (system-design angle).
 
 ---
-Updated: 2026-06-16 — cross-link to `06-` added; replay is the single-request analog to the eval surface's K-iteration capture.
+Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; replay-from-snapshot is now the only reproduction primitive in this repo.

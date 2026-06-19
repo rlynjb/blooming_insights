@@ -270,6 +270,8 @@ Three real moments the union earns its keep:
 
 - **The briefing route extends the vocabulary.** `BriefingEvent` (declared locally in `app/api/briefing/route.ts:54–58`) is `AgentEvent` plus three extra variants (`coverage_item`, `insight`, `workspace`). The extension is clean because the shared union stays closed and the extras are scoped to the route. No conflict, no shape drift; the discriminator distinguishes everything.
 
+- **AptKit traces converge onto this same surface.** `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) implements AptKit's `CapabilityTraceSink`. It receives AptKit's `CapabilityEvent`s (`step` / `tool_call_start` / `tool_call_end`) and calls Blooming's existing `onText`/`onToolCall`/`onToolResult` hooks — which emit `reasoning_step`/`tool_call_start`/`tool_call_end` variants on the same NDJSON stream. The system grew a new agent runtime but did NOT grow a new observability surface. One stream, multiple producers; the closed union is what makes that work — AptKit had to map its event types into ours rather than co-existing as a parallel format.
+
 ### Code side by side, with a line-by-line read
 
 The declaration — 8 variants, 2 helpers, one file:
@@ -438,9 +440,9 @@ Two reasons. First, NDJSON is symmetric: the same `JSON.stringify(e) + '\n'` sha
 - `02-replay-from-snapshot-with-paced-emission.md` — the cache replay path that consumes the same union.
 - `03-three-rung-mem-file-seed-store.md` — the persistence layer that stores `AgentEvent[]`.
 - `04-dual-write-send-to-stream-and-store.md` — the route handler's `send` closure that emits the union to two destinations at once.
-- `06-eval-result-paper-trail.md` — the fourth observability surface; the eval transcripts post-hoc serialize this same `AgentEvent[]` shape at K-iteration scope.
+- `06-eval-result-paper-trail.md` (RETIRED) — once a fourth observability surface where eval transcripts post-hoc serialized this same `AgentEvent[]` shape at K-iteration scope. The Olist pipeline that produced those transcripts was removed in PR #8 / 62c24d7; the file is preserved as a historical record of the pattern.
 - `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` — the same union from the LLM-telemetry angle.
 - `.aipe/study-system-design/05-streaming-ndjson.md` — NDJSON as the transport (system-design angle).
 
 ---
-Updated: 2026-06-16 — cross-link to `06-` (eval result paper trail) added; union still the foundational shape every observability surface consumes.
+Updated: 2026-06-19 — kept cross-link to `06-` with RETIRED treatment after PR #8 removed the Olist eval pipeline; added an introductory note in How it works that AptKit's traces also produce events on this same surface via `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) — same NDJSON contract, additional producer.

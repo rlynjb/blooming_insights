@@ -3,7 +3,7 @@
 **Industry name(s):** evaluation methods / metrics, exact-match, fuzzy match, rubric grading, LLM-as-judge, pairwise comparison, human evaluation
 **Type:** Industry standard · Language-agnostic
 
-> Once you have an eval set, you need a way to turn an output into a score; the methods form a ladder from cheap-and-strict (exact-match) to expensive-and-nuanced (human review), and the right rung depends on the surface. blooming insights now wires four of the rungs in production evals: detection uses set-overlap precision/recall (`eval/scripts/lib/scorer.ts`), diagnosis and recommendation use per-criterion rubric grading by LLM-as-judge (`eval/judges/{diagnosis,recommendation}-judge.md`), regression uses structural diff + similarity-judge two-mode (`eval/judges/similarity-judge.md` + `structural-diff.ts`). Pairwise A/B is the un-built rung.
+> Once you have an eval set, you need a way to turn an output into a score; the methods form a ladder from cheap-and-strict (exact-match) to expensive-and-nuanced (human review), and the right rung depends on the surface. blooming insights briefly wired four of these rungs (set-overlap for detection, per-criterion rubric + LLM-judge for diagnosis and recommendation, structural diff + similarity judge for regression) — all gone in PR #8 (commit 62c24d7) along with the Olist MCP server they ran against. **Evals are Case B again.** Read this file as study material; the exercises name the cheapest rung to rebuild over the in-process `SyntheticDataSource`.
 
 
 ---
@@ -34,11 +34,10 @@
   │  noise-free numbers a team will actually act on   │
   └──────────────────────────────────────────────────┘
 
-  Currently in this codebase: 269 Vitest tests guard plumbing,
-  AND four eval runners under `eval/scripts/` score quality —
-  set-overlap (detection), per-criterion rubric + judge
-  (diagnosis/recommendation), structural diff + similarity judge
-  (regression). All four rungs walked below are wired.
+  Currently in this codebase: 221 Vitest tests guard plumbing.
+  No eval runners — PR #8 removed `eval/` along with the Olist
+  MCP server. Every rung walked below is study material; the
+  exercises name the cheapest one to rebuild.
 ```
 
 **Zoom in — narrow to the concept.** The question is: for each surface in blooming insights, which scoring method is strict enough to catch real regressions but loose enough not to fail correct-but-differently-worded answers? The wrong method makes your eval set lie — exact-match on prose creates noise, LLM-judge on enums is expensive and biased. Method choice is what makes the score *trustworthy*. How it works walks each method, the surface it fits, and the trap of using a single scorer for everything.
@@ -247,38 +246,26 @@ One harness, many methods. The cheap rungs stay local and free; only diagnosis/r
 
 ## Implementation in codebase
 
-**Case A — four rungs wired.** blooming insights ships a real scoring layer under `eval/scripts/lib/` that selects the rung per surface. The 269 Vitest tests under `test/` still assert *shape* and control flow against fakes; the eval suite under `eval/` is the parallel quality layer.
+**Case B — no scorer wired today.** PR #8 (commit 62c24d7) removed the entire `eval/` tree along with the Olist MCP server. The 221 Vitest tests under `test/` still assert *shape* and control flow against fakes; there is no parallel scoring layer running against the live model. What was there briefly, and what would be the right rung per surface if it were rebuilt:
 
-### Set overlap for detection (Rung 2 — fuzzy / F1 family)
+### What used to be wired (now gone)
 
-- **File:** `eval/scripts/lib/scorer.ts` + `eval/scripts/run-detection.ts`
-- **What it does:** for each of the K=10 monitoring-agent runs, compares the agent's `Anomaly[]` output to the 3 seeded anomalies under **two matchers**: LOOSE (2-of-3 — metric + segment + time-window) and STRICT (3-of-3). Computes precision, recall, and a per-anomaly hit-rate. Reports loose and strict separately because they answer different questions.
-- **Result paper trail:** `eval/results/2026-06-15/detection-K10-{loose,strict,raw}.json` + `summary.md`; the post-prompt-fix re-run lives at `eval/results/2026-06-15-after-fix/` (5× lift in loose recall).
+- **Set overlap for detection (Rung 2)** — `eval/scripts/lib/scorer.ts` + `eval/scripts/run-detection.ts` scored `Anomaly[]` output against 3 seeded anomalies under loose/strict matchers. Removed in PR #8.
+- **Rubric + LLM-as-judge for diagnosis (Rungs 3 + 4)** — `eval/scripts/lib/judge.ts` + `eval/scripts/run-diagnosis.ts` + `eval/judges/diagnosis-judge.md` ran a 5-criterion rubric (hypothesis / evidence / sizing / calibration / fabrication). Removed in PR #8.
+- **Rubric + LLM-as-judge for recommendation (Rungs 3 + 4)** — `eval/scripts/lib/judge-rec.ts` + `eval/scripts/run-recommendation.ts` + `eval/judges/recommendation-judge.md` ran a 3-criterion rubric (plausible / specific / impact_sized). Removed in PR #8.
+- **Structural diff + similarity judge for regression (Rung 1 + custom)** — `eval/scripts/run-regression.ts` + `eval/judges/similarity-judge.md` did capture-then-score with a two-mode comparator. Removed in PR #8.
 
-### Rubric + LLM-as-judge for diagnosis (Rungs 3 + 4)
+### The right rung per surface — if rebuilt over `SyntheticDataSource`
 
-- **File:** `eval/scripts/lib/judge.ts` + `eval/scripts/run-diagnosis.ts` + `eval/judges/diagnosis-judge.md`
-- **What it does:** for each candidate diagnosis, sends the anomaly metadata, the reference-diagnosis shape, the candidate, and the tool-call transcript to a Sonnet-4.6 judge under a **5-criterion rubric**: hypothesis 0-2, evidence 0-2, sizing 0-2, calibration 0-1, fabrication 0-2 (total 0-9; pass threshold 7). Each criterion's score and rationale is captured for spot-check calibration.
-- **Result paper trail:** `eval/results/2026-06-15/diagnosis-K10-{candidates,judge,summary}.json` + `diagnosis-summary.md`. **Calibration receipt:** 8/8 manual-vs-judge agreement on a stratified sample (2 per anomaly + 2 mid-pack). Mean 6.37/9, 53.3% pass.
+- **Intent classifier** → exact-match (`===`). `classifyIntent` (`lib/agents/intent.ts:17–31`) returns one of three enum words capped at `max_tokens: 16`. Pure Rung 1; no tolerance needed.
+- **Monitoring scan** → fuzzy / F1. `MonitoringAgent.scan` (`lib/agents/monitoring.ts:73–93` in the AptKit-wired wrapper) returns an `Anomaly[]`. Set overlap precision/recall, weighted by severity, is the right rung.
+- **Diagnostic agent** → per-criterion rubric (Rung 3). A `Diagnosis` decomposes naturally into checkable points; the previous 5-criterion rubric is the right starting shape.
+- **Recommendation agent** → per-criterion rubric (Rung 3). Same shape, smaller rubric.
+- **Prompt-edit / model A/B** → pairwise (Rung 5). Always the right tool for "did this change help?"; never wired in this codebase.
 
-### Rubric + LLM-as-judge for recommendation (Rungs 3 + 4)
+### What's deliberately NOT here
 
-- **File:** `eval/scripts/lib/judge-rec.ts` + `eval/scripts/run-recommendation.ts` + `eval/judges/recommendation-judge.md`
-- **What it does:** for each candidate recommendation set (the agent returns up to 3), scores each one on a **3-criterion rubric** — plausible 0-2, specific 0-2, impact_sized 0-1 (total 0-5; pass threshold 4). The rubric specifically asks "is the impact figure credible, not just numeric?" — which is what let the judge catch the BRL cents-vs-Reais regression at run 8 of electronics-spike-w2 (R$131,965 AOV → impact_sized=0).
-- **Result paper trail:** `eval/results/2026-06-15/recommendation-K10-{candidates,judge,summary}.json` + `recommendation-summary.md`. **Calibration receipt:** 3/3 manual-vs-judge agreement on a stratified sample including the BRL-bug catch (proves the judge isn't rubber-stamping).
-
-### Structural diff + similarity judge for regression (Rung 1 + custom)
-
-- **File:** `eval/scripts/lib/structural-diff.ts` + `eval/scripts/lib/similarity-judge.ts` + `eval/scripts/run-regression.ts` + `eval/judges/similarity-judge.md`
-- **What it does:** for each of 10 golden fixtures, runs the current agent and scores the candidate against the captured golden in **two modes**: structural diff (types match, required fields present — Rung 1 equivalent for shape) AND similarity judge (does the *conclusion* materially match — a custom rung tuned for "did my prompt edit change the answer's substance"). Outputs structural-pass / semantic-pass / overall-pass per fixture.
-- **Result paper trail:** `eval/results/2026-06-15-capture/` (the capture run) and `eval/results/2026-06-15-score-baseline/regression-summary.md` (the score-against-self baseline: 100% structural, 30% semantic).
-- **Why two modes:** structural diff catches type / required-field regressions for free (no LLM call); the similarity judge catches conclusion-level drift that the structural diff cannot see (e.g., "platform-wide surge" flipped to "electronics-specific event" on identical inputs). See `05-regression-evals.md` for the full pattern walk.
-
-### What's NOT wired
-
-- **Pairwise (Rung 5)** — no `--compare promptA promptB` mode exists yet. The exercise below adds it.
-- **Exact-match (Rung 1)** on `classifyIntent` — covered by regression fixture `10-intent-classify-investigation.json` (the only fixture with semantic_pass=true reliably, because the output space is one enum word), but no dedicated `eval/scripts/run-intent.ts`.
-- **Human-eval calibration as a standing harness** — the calibration receipts in `eval/results/2026-06-15/diagnosis-summary.md` and `recommendation-summary.md` are stratified manual spot-checks, not a recurring run.
+Without a scorer wired, the 221 Vitest tests are the only assertions in the repo. They guard plumbing only; the model boundary is faked. The cheapest re-entry to Case A is the golden-set exercise in `01-eval-set-types.md` (one fixture file, one runner, one rung — no LLM-as-judge yet).
 
 ---
 
@@ -321,22 +308,22 @@ The method tracks the *entropy* of the correct-answer space. A single enum has n
 
 ## Project exercises
 
-### Add severity-weighted recall to the detection scorer
+### Build a minimal F1 scorer for monitoring over `SyntheticDataSource`
 
-- **Exercise ID:** B3.1 (adapted) — sharpen the wired detection eval.
-- **What to build:** extend `eval/scripts/lib/scorer.ts` to weight recall on `critical` severity above `warning` and `info` (asymmetric error cost). Today the aggregate hides which class of miss is happening; today's 33.3% loose recall is averaged across all three seeded anomalies, but missing a `critical` should hurt more than missing an `info`. Surface a `weightedRecall` field alongside the raw one.
-- **Why it earns its place:** the F1-hides-the-error-type lesson is in this file's "Where this breaks down" section. The eval already exists — closing this loop turns a bare aggregate into something you can act on.
-- **Files to touch:** `eval/scripts/lib/scorer.ts`, `eval/scripts/lib/summary.ts` (render the weighted number in `summary.md`), `mcp-server-olist/data/seeds/anomalies.ts` (expected severity per seeded anomaly).
-- **Done when:** a re-run of `npm run eval:detection -- --K=10` prints both raw and severity-weighted recall, and the next dated dir under `eval/results/` carries both.
-- **Estimated effort:** <1 day
+- **Exercise ID:** B3.1 (adapted) — the cheapest Rung-2 entry to re-open Case A.
+- **What to build:** an `eval/scripts/lib/scorer.ts` that takes the `Anomaly[]` from `MonitoringAgent.scan` (now wired via `@aptkit/core`) and computes precision/recall/F1 against 3–5 hand-curated golden anomalies for the synthetic workspace. No LLM-judge yet, no K=10 yet — one run, one number, severity-weighted recall as the headline.
+- **Why it earns its place:** the previous 4-pillar suite died with Olist; rebuilding the cheapest deterministic rung over the in-process `SyntheticDataSource` is the entry point for everything else. Severity-weighted recall hits the F1-hides-the-error-type lesson from "Where this breaks down."
+- **Files to touch:** `eval/scripts/lib/scorer.ts`, `eval/scripts/run-monitoring.ts`, `eval/fixtures/golden-monitoring.json`, `package.json` (`eval:monitoring` script).
+- **Done when:** `npm run eval:monitoring` runs once against `SyntheticDataSource`, prints precision / recall / F1 / severity-weighted recall, and writes JSON to `eval/results/<date>/monitoring.json`.
+- **Estimated effort:** 1 day
 
-### Add a pairwise prompt-edit A/B mode (the un-built rung)
+### Add a pairwise prompt-edit A/B mode (the rung the previous suite never built)
 
 - **Exercise ID:** B3.3 (adapted) — pairwise comparison for prompt iteration.
-- **What to build:** a `--compare promptA promptB` mode for `run-diagnosis.ts` / `run-recommendation.ts` that runs each seeded anomaly through two versions of `lib/agents/prompts/diagnostic.md` (or `recommendation.md`), judges each case pairwise via a new `eval/scripts/lib/pairwise-judge.ts` + `eval/judges/pairwise-judge.md`, and reports a win-rate with order randomized per case (and ideally swap-and-average).
-- **Why it earns its place:** demonstrates the exact decision tooling for "did my prompt change help?" — turning vibes into a measured A/B. The Phase 2.5 DATA HORIZON fix was measured by **running detection twice with two prompt versions** (`eval/results/2026-06-15/` vs `…-after-fix/`) — pairwise is the same idea formalized at per-case granularity.
-- **Files to touch:** `eval/scripts/run-diagnosis.ts` (compare mode), `eval/scripts/lib/pairwise-judge.ts`, `eval/judges/pairwise-judge.md`, reads two variants of `lib/agents/prompts/diagnostic.md`.
-- **Done when:** `npm run eval:diagnosis -- --compare prompts/diagnostic-v1.md prompts/diagnostic-v2.md` prints a win-rate with order-randomized cases and writes results to a dated dir.
+- **What to build:** a `--compare promptA promptB` mode that runs each golden case through two versions of a prompt (e.g., two variants of `@aptkit/prompts`' diagnostic prompt or a locally-overridden copy), judges each case pairwise via a new `eval/scripts/lib/pairwise-judge.ts` + `eval/judges/pairwise-judge.md`, and reports a win-rate with order randomized per case (ideally swap-and-average).
+- **Why it earns its place:** demonstrates the exact decision tooling for "did my prompt change help?" — turning vibes into a measured A/B. Pairwise (relative) beats absolute scoring when you don't have a calibrated 1–5 scale.
+- **Files to touch:** `eval/scripts/run-diagnosis.ts`, `eval/scripts/lib/pairwise-judge.ts`, `eval/judges/pairwise-judge.md`, plus a fixture pointing at two prompt variants.
+- **Done when:** `npm run eval:diagnosis -- --compare promptA.md promptB.md` prints a win-rate with order-randomized cases and writes results to a dated dir.
 - **Estimated effort:** 1–2 days
 
 ---

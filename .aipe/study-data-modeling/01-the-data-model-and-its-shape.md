@@ -3,7 +3,7 @@
 **Industry name(s):** Schema · entity model · data model · TypeScript interface as schema · duck-typed interface (the `WorkspaceSchema` bridge)
 **Type:** Industry standard · Language-agnostic · Project-specific (the typed-schema variant)
 
-> The model. Two persistence layers now share this file. The **agent contract** is 8 TypeScript interfaces in `lib/mcp/types.ts` that pin every shape the four agents pass between each other — this section walks them. The **Olist relational schema** is 7 SQLite tables defined in `mcp-server-olist/scripts/seed-olist.ts` (`SCHEMA_SQL`) — file 08 zooms in on those. The bridge between them is `WorkspaceSchema`, one interface in `lib/mcp/schema.ts` derived two different ways: `bloomreachWorkspaceSchema(...)` from MCP introspection, and `olistWorkspaceSchema()` hand-derived from the SQLite columns. Same shape, two sources — the duck-typed-interface pattern, applied to "this is what an analyst-readable workspace looks like." The compiler enforces the model across module boundaries; the only seam where it can't see is the LLM output (file 04). The center of gravity for the agent contract is `Insight`, the enriched view of `Anomaly` the UI consumes.
+> The model. The **agent contract** is 8 TypeScript interfaces in `lib/mcp/types.ts` that pin every shape the four agents pass between each other — this file walks them. As of 2026-06-19, the Olist SQLite second domain is gone (PR #8, commit 62c24d7); the dual-derivation `WorkspaceSchema` story now bridges **Bloomreach** (live MCP) and the **in-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`). The bridge interface is the same `WorkspaceSchema` in `lib/mcp/schema.ts` derived two different ways: `bootstrapSchema(BloomreachDataSource)` from MCP introspection, and `syntheticWorkspaceSchema` — a top-level `const` literal in `synthetic-data-source.ts`. Same shape, two sources — the duck-typed-interface pattern, applied to "this is what an analyst-readable workspace looks like." The compiler enforces the model across module boundaries; the only seam where it can't see is the LLM output (file 04). The center of gravity for the agent contract is `Insight`, the enriched view of `Anomaly` the UI consumes. File 11 zooms in on the synthetic fixture as a data-modeling-for-test pattern.
 
 ---
 
@@ -128,13 +128,13 @@ The model has 8 interfaces. Walk each by what role it plays. **One operation per
 
 #### `WorkspaceSchema` — one interface, two derivations (duck-typed bridge)
 
-`WorkspaceSchema` is a single TypeScript shape that two completely different domains derive into. The **Bloomreach** domain calls `parseWorkspaceSchema(...)` on the JSON returned by `get_event_schema` + `get_project_overview` + friends (a ~112KB nested tree from MCP introspection). The **Olist** domain calls `olistWorkspaceSchema()` — a *literal constant* hand-derived from `mcp-server-olist/src/db.ts` columns plus a hard-coded `dataHorizon`. Both produce the same shape; both feed the same `schemaCapabilities()` projection; the agent loop above this seam cannot tell which one it's reading.
+`WorkspaceSchema` is a single TypeScript shape that two completely different domains derive into. The **Bloomreach** domain calls `bootstrapSchema(dataSource)` which fans out across the MCP introspection tools and projects the result into the typed shape. The **Synthetic** domain is the *literal constant* `syntheticWorkspaceSchema` exported from `lib/data-source/synthetic-data-source.ts` — no I/O, no DB read, no derivation: 10 events with their property lists, customer properties, two catalogs, totals, and a `dataHorizon` are baked into the source. Both produce the same shape; both feed the same `schemaCapabilities()` projection; the agent loop above this seam cannot tell which one it's reading.
 
 ```
   the duck-typed bridge — same shape, two domains
 
   ┌─ BLOOMREACH derivation ─────────────────────────────────┐
-  │  bootstrapSchema(dataSource)                              │
+  │  bootstrapSchema(BloomreachDataSource)                    │
   │    list_cloud_organizations  ─┐                           │
   │    list_projects              │  4 MCP round-trips        │
   │    get_event_schema           ├─ parseWorkspaceSchema()   │
@@ -149,19 +149,33 @@ The model has 8 interfaces. Walk each by what role it plays. **One operation per
          events: { name, properties[], eventCount }[],
          customerProperties[], catalogs[],
          totalCustomers, totalEvents, oldestTimestamp,
-         dataHorizon?: { from, to, durationDays }      ← ★ ONLY Olist sets it
+         dataHorizon?: { from, to, durationDays }      ← ★ Synthetic sets it
        }
                ▲
                │
-  ┌─ OLIST derivation ──────────────────────────────────────┐
-  │  olistWorkspaceSchema()      ← pure, no I/O, no DB read │
-  │    3 hand-derived "events":                              │
-  │      'order'   (properties: state, category, payment_type,│
-  │                              purchase_ts, price_brl)     │
-  │      'payment' (properties: type, installments, value_brl)│
-  │      'review'  (properties: score, ts)                   │
-  │    dataHorizon: 2025-12-01 → 2026-06-01 (182 days, hard-coded)│
-  │  (totals are 0 — the agents only surface them in passing)│
+  ┌─ SYNTHETIC derivation ──────────────────────────────────┐
+  │  syntheticWorkspaceSchema   ← top-level const literal    │
+  │    (lib/data-source/synthetic-data-source.ts L85–L108)   │
+  │    projectId  = 'synthetic-blooming-project'              │
+  │    projectName = 'Synthetic Blooming Workspace'           │
+  │    10 events (with hand-authored property lists):         │
+  │      'purchase'      52,840  total_price, product_id,     │
+  │                              category, payment_type,      │
+  │                              state, campaign_id,          │
+  │                              voucher_code, inventory_level│
+  │      'view_item'    241,900  product_id, category, state,│
+  │                              device_type, referrer        │
+  │      'session_start' 198,400 device_type, state,         │
+  │                              utm_source, campaign_id,     │
+  │                              landing_page                 │
+  │      'cart_update'   91,360  product_id, category,        │
+  │                              quantity, cart_value, state  │
+  │      'checkout'      73,610  · 'search'        44,220    │
+  │      'email_open'    38,540  · 'voucher_redeemed' 9,420  │
+  │      'return'         4,860  · 'payment_failure' 2,360   │
+  │    totalEvents     = 757,710                              │
+  │    totalCustomers  = 126,420                              │
+  │    dataHorizon: 2025-12-01 → 2026-06-01 (182 days)        │
   └────────────┬────────────────────────────────────────────┘
                │
                ▼ both feed:
@@ -169,9 +183,9 @@ The model has 8 interfaces. Walk each by what role it plays. **One operation per
        schemaSummary()       ← interpolated into agent prompts
 ```
 
-The interesting part is `dataHorizon` — present on the Olist branch, absent on Bloomreach. The Olist seed window is known (we own the seeder); the Bloomreach branch is open-ended (live workspace, data flows in). The agent prompts read `dataHorizon` if present and anchor `time_range` inside it; without the field, the prompts fall back to "90-day windows of recent data." This is **forward-compatible extension** — the optional field carries domain-specific information the universal interface deliberately leaves open.
+The interesting part is `dataHorizon` — set on the synthetic branch, absent on Bloomreach. The synthetic window is fixed (we own the const); the Bloomreach branch is open-ended (live workspace, data flows in). The agent prompts read `dataHorizon` if present and anchor `time_range` inside it; without the field, the prompts fall back to "90-day windows of recent data." This is **forward-compatible extension** — the optional field carries domain-specific information the universal interface deliberately leaves open.
 
-What breaks if `WorkspaceSchema` is wrong: the prompt the agent sees (`schemaSummary` interpolates this shape) becomes inconsistent with what the tools can actually query. Wrong on the Bloomreach side, the agent writes EQL against events that don't exist. Wrong on the Olist side (specifically the `dataHorizon`), the agent picks `time_range` outside the seeded window and every query returns zeros — the exact failure mode the field was added to prevent.
+What breaks if `WorkspaceSchema` is wrong: the prompt the agent sees (`schemaSummary` interpolates this shape) becomes inconsistent with what the tools can actually query. Wrong on the Bloomreach side, the agent writes EQL against events that don't exist. Wrong on the synthetic side (specifically the event-property lists), the agent issues `execute_analytics_eql` calls referencing properties the dispatcher in `SyntheticDataSource.dispatch()` never returns — and every query collapses to the same fixed `analyticsResult` constant. File 11 walks the in-process synthetic fixture pattern; the rest of this section stays on the agent contract.
 
 What breaks if a third derivation appears (say, a Shopify adapter): no compiler-level enforcement that the new derivation produces the same shape — only TypeScript's structural typing. Today there's no abstract base class, no Zod schema both branches conform to; the contract is "produce something with these fields." That's enough for two derivations; at three or more, the unenforced parallel structure would start to drift.
 
@@ -461,11 +475,13 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
 ## See also
 
 - `02-normalization-and-duplication.md` — the Insight↔Anomaly story, now partly fixed; the wire-format leak that still lives.
-- `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam; what FK + WAL do on the Olist side; what the session-scoped `Map`s now enforce.
-- `05-migrations-and-evolution.md` — how the typed schema evolves under git + how the Olist DB rebuilds from a deterministic seed.
-- `08-the-olist-relational-schema.md` — the second domain: 7 tables, FKs, the indexes that match the tool queries.
-- `09-deterministic-synthetic-data.md` — `mulberry32(seed=42)` + the `seeded_anomalies` table as ground-truth records.
+- `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam; what the session-scoped `Map`s now enforce.
+- `05-migrations-and-evolution.md` — how the typed schema evolves under git.
+- `08-the-olist-relational-schema.md` — RETIRED. Historical pattern.
+- `09-deterministic-synthetic-data.md` — RETIRED. The pattern still applies (see file 11); the mulberry32/SQLite anchors are gone.
+- `11-in-process-synthetic-fixture.md` — the SyntheticDataSource as a data-modeling-for-test pattern: same agent-facing interface as the live adapter, in-process deterministic data.
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.
 
 ---
 Updated: 2026-06-16 — added `WorkspaceSchema` dual-derivation section; flagged the leak as code-fixed (colocated + tested) with the wire-format follow-on still live.
+Updated: 2026-06-19 — swapped Olist for the in-process synthetic fixture as the second derivation of `WorkspaceSchema`; anchored event/property lists to `lib/data-source/synthetic-data-source.ts`; added file-11 cross-link.

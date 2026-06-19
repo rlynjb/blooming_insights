@@ -439,8 +439,8 @@ The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the even
 - `01-ndjson-agentevent-discriminated-union.md` — the typed shape the store persists.
 - `02-replay-from-snapshot-with-paced-emission.md` — the consumer of this store (the cache-first replay path).
 - `04-dual-write-send-to-stream-and-store.md` — the upstream that captures into this store.
-- `06-eval-result-paper-trail.md` — the offline cousin of this store. Both persist `AgentEvent`-shaped evidence; this store serves single-request replay, `eval/results/<date>[-<tag>]/` serves K-iteration measurement.
+- `06-eval-result-paper-trail.md` (RETIRED) — once the offline cousin of this store. Both persisted `AgentEvent`-shaped evidence; this store served single-request replay, `eval/results/<date>[-<tag>]/` served K-iteration measurement. The eval surface is gone from this repo (PR #8 / 62c24d7); the pattern still teaches the offline-fixture discipline.
 - `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern (system-design angle).
 
 ---
-Updated: 2026-06-16 — cross-link to `06-` added; the seed-as-fixture discipline here is the spiritual precursor to the eval-result-dir-as-fixture discipline.
+Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this 3-rung store is now the only persistence layer for trace evidence in the repo.

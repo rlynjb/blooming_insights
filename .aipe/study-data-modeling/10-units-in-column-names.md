@@ -4,6 +4,17 @@
 > server / Phase 3 eval pipeline, both removed from the codebase. The
 > patterns it teaches are real, but the code anchors it cites no longer
 > exist. Preserved as a historical record of what was studied.
+>
+> **What replaced this:** nothing. This was the 2026-06-16 audit's #1
+> CRITICAL finding (a measured downstream cost in the recommendation
+> judge's `impact_sized` score). It is **resolved-by-deletion**: the
+> Olist schema is gone, the `_brl` columns are gone, the eval pipeline
+> that measured the cost is gone. The current repo has no column whose
+> name lies about its storage unit. The pattern itself — "column names
+> the LLM reads as authoritative; in-name unit + in-storage unit drift
+> causes 100× scale errors in narration" — is still a real anti-pattern
+> worth knowing about; that's why the file is preserved. The audit
+> (file 07) treats this as resolved-by-deletion and reranked accordingly.
 
 **Industry name(s):** Unit-in-name anti-pattern · column-name lies · the cents-vs-Reais bug · LLM-readable schema · data-modeling-meets-AI-eval
 **Type:** Industry standard · Language-agnostic · Project-specific (the Phase 3 eval-grounded finding)

@@ -4,6 +4,15 @@
 > server / Phase 3 eval pipeline, both removed from the codebase. The
 > patterns it teaches are real, but the code anchors it cites no longer
 > exist. Preserved as a historical record of what was studied.
+>
+> **What replaced this:** the determinism-in-test-data pattern is still
+> real — it now lives in `11-in-process-synthetic-fixture.md`, anchored
+> to `lib/data-source/synthetic-data-source.ts`. The new pattern is
+> in-process (no SQLite, no `mulberry32`, no `seed=42`) and the
+> ground-truth-records half is gone with the eval pipeline. The
+> `SyntheticDataSource` is deterministic by construction — every payload
+> is a source-code const literal, so there's no PRNG to seed. The audit's
+> finding #7 names the missing contract test for that determinism.
 
 **Industry name(s):** Deterministic synthetic data · seeded PRNG · ground-truth records · golden-set data model · eval data contract · result schema as contract
 **Type:** Industry standard · Language-agnostic · Project-specific (the mulberry32 + seeded_anomalies + golden-fixtures combination)

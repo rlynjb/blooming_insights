@@ -4,6 +4,18 @@
 > server / Phase 3 eval pipeline, both removed from the codebase. The
 > patterns it teaches are real, but the code anchors it cites no longer
 > exist. Preserved as a historical record of what was studied.
+>
+> **What replaced this:** the `DataSource` interface still demonstrates
+> the adapter pattern — `BloomreachDataSource` (HTTP+SSE; the one real
+> distributed adapter) and `SyntheticDataSource` (in-process; landed
+> 2026-06-18) both implement it, and `makeDataSource(mode, sessionId)`
+> picks one. But the in-process synthetic adapter does NOT cross a process
+> boundary — no IPC, no subprocess, no network — so the "one protocol,
+> two transports with two failure ontologies" lesson this file teaches is
+> no longer exercised in code. Only ONE transport actually crosses a
+> process boundary now. The seam survives; the second transport does not.
+> See `01-distributed-system-map.md` and `02-partial-failure-timeouts-and-retries.md`
+> for the current one-distributed-adapter shape.
 
 **Industry name(s):** transport-agnostic protocol · heterogeneous-backend adapter · adapter pattern · subprocess-as-service · JSON-RPC over arbitrary transports
 **Type:** Industry standard · Language-agnostic · Project-specific (the `DataSource` seam + `makeDataSource` factory are this codebase's expression of the pattern)

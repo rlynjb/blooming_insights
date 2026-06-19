@@ -437,13 +437,13 @@ The first move is the smallest and highest-leverage. The second is preventive (c
 
 ## See also
 
-- `audit.md` — the broader lens audit; this incident is named in incident-analysis-and-prevention alongside two newer ones (the BRL bug, the parallel-run race).
+- `audit.md` — the broader lens audit; this incident is named in incident-analysis-and-prevention as the only documented incident in the repo.
 - `01-ndjson-agentevent-discriminated-union.md` — the typed-event discipline that's the runtime-incident analog of "tracked mutation."
 - `03-three-rung-mem-file-seed-store.md` — the snapshot machinery as a regression-diagnosis substrate for runtime incidents.
 - `04-dual-write-send-to-stream-and-store.md` — the dual-write that captures runtime evidence (the analog of the test runner's reporter output for runtime bugs).
-- `06-eval-result-paper-trail.md` — the model-level and process-level incident anecdotes. The BRL cents-vs-Reais bug (judge-detected at PR E run 8, recurring at PR F run 8) and the parallel-run K=10 race (`ps aux` + `kill 30039 30040`) are the other two incidents in the repo's growing post-mortem corpus.
+- `06-eval-result-paper-trail.md` (RETIRED) — once held two additional incident anecdotes (the BRL cents-vs-Reais model-level bug surfaced by the judge, and the parallel-run K=10 race detected via `ps aux`). Both incidents were RESOLVED-BY-DELETION when PR #8 removed the Olist pipeline. The anecdotes remain instructive in the historical file; they no longer describe a live system.
 - `.aipe/study-testing/` — the testing discipline that this flake-fix exemplifies; that guide owns the testing lessons, this one owns the incident lessons.
 - `.aipe/study-security/` — the auth/crypto layer the test was exercising (`_authCookieCrypto`).
 
 ---
-Updated: 2026-06-16 — cross-link to `06-` added; this is no longer the *only* documented incident — the BRL bug (model-level) and the parallel-run race (process-level) join it as the repo's three-incident post-mortem corpus.
+Updated: 2026-06-19 — reverted framing to "the only documented incident in the repo" after PR #8 removed the Olist pipeline; the BRL bug and parallel-run race noted in the previous refresh are RESOLVED-BY-DELETION; cross-link to `06-` retained with RETIRED treatment.

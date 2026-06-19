@@ -140,26 +140,6 @@ The takeaway for anatomy: do not assume all four prompts are the identical six-s
 
 ---
 
-### The Phase 2.5 anatomy receipt: a `## DATA HORIZON` section earned by eval numbers
-
-The monitoring prompt now also carries a `## DATA HORIZON` section right under `## Role` — an explicit "READ BEFORE QUERYING" block that names the synthetic Olist dataset's `2025-12-01 → 2026-06-01` window and bans 2017/2018 dates from training memory. This is anatomy as a real prompt-engineering case study, because the section earned its place through a *measured* before/after eval pass:
-
-```
-   PRE Phase 2.5                       POST Phase 2.5
-   ──────────────────────────          ──────────────────────────
-   ## Role …                            ## Role …
-   ## Your category checklist           ## DATA HORIZON      ← NEW anchor
-   ## Hard rules …                      ## Your category checklist
-                                        ## Hard rules …
-
-   loose recall:    6.7%                loose recall:    33.3%  (+26.6, 5x)
-   voucher detect:  1/10                voucher detect:  10/10
-```
-
-Two architecture details worth internalizing. First, the `Data horizon: <from> → <to>` line is *also* injected dynamically — `schemaSummary()` emits it as a one-liner at the bottom of the `{schema}` placeholder when the live adapter is Olist (synthetic, fixed-horizon) and omits it when the live adapter is Bloomreach (open-ended). So the `## DATA HORIZON` *section* is a constant prompt block at Layer A, and the date values inside the `{schema}` slot are Layer B per-call injection — the section and its values arrive on two different layers, on purpose, so swapping adapters at runtime never leaves the prompt referencing the wrong horizon. Second, the section *itself* (the human-authored "READ BEFORE QUERYING" header + the framing rules + the worked recent/baseline-window examples) is what the eval scored — the Phase 2.5 fix added BOTH the section and a 3-dimension scan plan ("state, category, payment_type — skip any, miss its anomaly") to the same prompt. Loose recall lifted 5x; the eval credits the combination, not either alone. That is the receipt — a real before/after eval pass tied to a specific structural addition. (Full numbers and the honest partial-win framing live in → 05-eval-driven-iteration.md.)
-
----
-
 ### The decomposition rule: every Role disclaims the others
 
 Here is the part that separates this from a generic template. Each `## Role` does not just say what the agent does — it explicitly says what it does *not* do, naming the other agents' jobs:
@@ -268,32 +248,36 @@ The shape is authored once; the bytes the model receives are assembled per turn 
 
 ## Implementation in codebase
 
-**Case A — implemented (richly).**
+**Case A — implemented (richly).** Two paths share the same anatomy. The **active** path imports prompts from `@aptkit/prompts` (npm, via `@aptkit/core@0.3.0`); the **legacy** path keeps the prior markdown under `lib/agents/legacy-prompts/` and is loaded by the `*-legacy.ts` agents. The anatomy concept reads the same on both; only the source location moves.
 
-### The shared anatomy (the four prompt files)
+### The shared anatomy (legacy markdown — still in-repo for the *-legacy agents)
 
-- **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md`
-- **Function / class:** the prompt source itself (the constant Layer 1)
-- **Line range:** Role at L3–5 in all four; Hard rules at `monitoring.md` L13 (pushed down by its extra `## Your category checklist` section at L7) / L7 in the other three; method at `monitoring.md` L20 / `diagnostic.md` L18 / `recommendation.md` L29 / `query.md` L13; EQL reminders at `monitoring.md` L49 / `diagnostic.md` L27 / `query.md` L23 (recommendation swaps in "Available tools" L15); Output at `monitoring.md` L69 / `diagnostic.md` L59 / `recommendation.md` L47 / `query.md` L47; `{schema}` at `monitoring.md` L101 / `diagnostic.md` L105 / `recommendation.md` L93 / `query.md` L53.
-- **Role:** the constant system prompt, one job per file, each Role disclaiming the others (`monitoring.md` L5, `diagnostic.md` L5, `recommendation.md` L5). `monitoring.md` alone carries a seventh section — `## Your category checklist` (L7) with a `{categories}` injection slot (L11) — making it the one prompt that isn't a clean six-section instance.
+- **File:** `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md`
+- **Function / class:** the prompt source itself (the constant Layer 1) for the legacy path
+- **Line range:** Role at L3–5 in all four; Hard rules at `monitoring.md` L13 (pushed down by its `## Your category checklist` section at L7) / L7 in the other three. (Olist-specific sections — `## DATA HORIZON`, the 3-dim scan plan, dual-adapter examples — were removed in commit 03fba57; the legacy prompts are Bloomreach-only.)
+- **Role:** the constant system prompt for the legacy agents, one job per file, each Role disclaiming the others. `monitoring.md` alone carries a seventh section — `## Your category checklist` (L7) with a `{categories}` injection slot (L11) — making it the one prompt that isn't a clean six-section instance.
 
-### Layer 2 — per-call injection
+### The shared anatomy (active path — imported from @aptkit/prompts)
 
-- **File:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts`
+- **File:** `node_modules/@aptkit/core/node_modules/@aptkit/prompts/dist/src/{monitoring,diagnostic,recommendation,query}.js`
+- **Function / class:** prompt strings exported by the package; consumed by `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` via the `@aptkit/core` adapters
+- **Role:** the same six-section anatomy, sourced from a versioned npm package instead of the repo's `prompts/` folder. The seam moved from `readFileSync` to package import; the anatomy did not. See file 14 for what shipping the prompts as a package actually changes.
+
+### Layer 2 — per-call injection (legacy path)
+
+- **File:** `lib/agents/{monitoring-legacy,diagnostic-legacy,recommendation-legacy,query-legacy}.ts`
 - **Function / class:** the `.replace` chain that builds `system` before `runAgentLoop`
-- **Line range:** `monitoring.ts` L83–86 (`{schema}`, `{project_id}`, and `{categories}` — the runtime checklist built at L69–86); `diagnostic.ts` L45–48 (adds `{anomaly}`); `recommendation.ts` L41–44 (adds `{diagnosis}`); `query.ts` L25–28 (adds `{intent}`). `userPrompt` passed separately: `monitoring.ts` L93, `diagnostic.ts` L56, `recommendation.ts` L51, `query.ts` L35 (the raw `query`).
-- **Role:** stamps runtime values into the closed placeholder set; keeps `userPrompt` out of the `.md`.
+- **Role:** stamps runtime values into the closed placeholder set on the legacy path; `userPrompt` passed separately so it stays out of the `.md`. On the active path, the AptKit adapter performs the equivalent injection inside the package boundary.
 
 ### Layer 3 — synthesis append
 
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop` forced-final-turn system assembly
-- **Line range:** L96–98 (`${system}\n\n${synthesisInstruction}`); tools removed at L101; per-agent synthesis text at `monitoring.ts` L75–78, `diagnostic.ts` L62–66, `recommendation.ts` L58–62, `query.ts` L42–44.
-- **Role:** appends the hard-stop instruction last, on the one turn the model must answer.
+- **File:** `lib/agents/base-legacy.ts` (legacy loop) / `lib/agents/base.ts` (active adapter wiring)
+- **Function / class:** the forced-final-turn system assembly — `${system}\n\n${synthesisInstruction}` with tools removed on the one turn
+- **Role:** appends the hard-stop instruction last, on the one turn the model must answer. Identical mechanic on both paths.
 
 ### Why this is a codebase strength
 
-The anatomy is uniform enough that adding an agent is mechanical: copy the six sections, write the disclaimer, add the placeholder, wire one `.replace`. The placeholder set is closed and greppable (`grep -rn '{[a-z_]*}' lib/agents/prompts`), so you can audit injection coverage. And the system-vs-user boundary is enforced by code, not convention: the constant is a file, the per-call task is a function argument.
+The anatomy is uniform enough that adding an agent is mechanical: copy the six sections, write the disclaimer, add the placeholder, wire one `.replace`. On the legacy path the placeholder set is closed and greppable (`grep -rn '{[a-z_]*}' lib/agents/legacy-prompts`); on the active path the same closed-set property is enforced inside the AptKit package. The system-vs-user boundary is enforced by code, not convention: the constant is a file or a package export, the per-call task is a function argument.
 
 ---
 
@@ -433,3 +417,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added the Phase 2.5 anatomy receipt: monitoring.md gained a `## DATA HORIZON` section (constant Layer A) whose date values arrive via `schemaSummary()` inside the `{schema}` placeholder (per-call Layer B). The section earned its place through a measured 5x loose-recall lift on the eval suite — anatomy choices now carry receipts.
+Updated: 2026-06-19 — Removed the Phase 2.5 DATA HORIZON receipt section (the Olist anchor + the 5x loose-recall lift are no longer reproducible — commit 03fba57 rewrote `legacy-prompts/` to Bloomreach-only, and the `eval/` suite is gone). Rewrote Implementation block to name both the active path (`@aptkit/prompts` via `@aptkit/core@0.3.0`) and the legacy path (`lib/agents/legacy-prompts/`); the anatomy itself is unchanged on both sides.

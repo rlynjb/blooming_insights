@@ -25,43 +25,15 @@ How a database guarantees a group of operations behaves like one · Industry sta
 
 ### Verdict for this codebase
 
-**Partially exercised — Olist seed wraps a bulk insert in `db.transaction(...)`. Main app has none.**
+**Not yet exercised — no `BEGIN` / `COMMIT` anywhere in the repo.** Every state mutation is a single Map operation:
 
-Two altitudes:
+- `putInsights()` calls `clear()` then sets entries (not atomic, see 06)
+- `saveInvestigation()` is one `mem.set()` plus an optional file write
+- `patchState()` in auth is one `writeAll()` call
 
-- **Main app:** still no `BEGIN` / `COMMIT`. Every state mutation is a single Map operation:
-  - `putInsights()` calls `clear()` then sets entries (not atomic, see 06)
-  - `saveInvestigation()` is one `mem.set()` plus an optional file write
-  - `patchState()` in auth is one `writeAll()` call
-- **Olist seed** (`mcp-server-olist/scripts/seed-olist.ts` L508-544): one explicit ACID transaction wraps all ~30k inserts across 7 tables. SQLite's default isolation is **serializable** (one writer at a time, full isolation), so this is the strongest level by default.
+The closest transaction-shaped code is `withAuthCookies` in `lib/mcp/auth.ts` — a 2-phase wrapper that reads the cookie, mutates an in-memory store, and writes once on exit. That's the shape of a transaction; it's not ACID.
 
-```
-  the one real transaction in this repo
-  (mcp-server-olist/scripts/seed-olist.ts L508-544)
-
-  const allInsert = db.transaction(() => {
-    for (const c of customers) insertCustomer.run(...);    ← 5000 inserts
-    for (const p of products) insertProduct.run(...);      ← 800 inserts
-    for (const o of allOrders) {                            ← ~10000 orders
-      insertOrder.run(...);
-      for (const it of o.items) insertItem.run(...);        ← items per order
-      for (const p of o.payments) insertPayment.run(...);   ← payments per order
-      if (o.review) insertReview.run(...);
-    }
-    for (const a of SEEDED_ANOMALIES) insertAnomaly.run(...);
-  });
-  allInsert();    ← BEGIN; ... 30k inserts ...; COMMIT
-       │
-       └─ better-sqlite3's db.transaction(fn) returns a wrapped function. when
-          called, it BEGINs, runs the body, COMMITs on success, ROLLBACKs on
-          throw. ~30k inserts in one transaction is the right shape: rolling
-          back 30k separate auto-commits would be 30k fsync hits; one transaction
-          is one fsync at COMMIT. The seed takes <2s on a laptop because of this.
-```
-
-### When this becomes load-bearing for the main app
-
-### When this becomes load-bearing for the main app
+### When this becomes load-bearing
 
 The trigger is **any feature where two related rows must change together or not at all.**
 
@@ -164,46 +136,7 @@ Skipped — no codebase instance.
 
 ### Use cases
 
-- **`mcp-server-olist/scripts/seed-olist.ts`** wraps the entire ~30k-row bulk insert in `db.transaction(() => { ... })()` (L508-544). One BEGIN, one COMMIT, one fsync at the end. The seed runs in <2s because of this; without the transaction it would be 30k auto-commits = 30k fsync hits = minutes.
-- **Read-only tool calls** from the MCP server are NOT wrapped in explicit transactions — SQLite gives each `db.prepare(sql).all(...)` an implicit read transaction, which under WAL mode is a consistent snapshot of the DB.
-- **Main-app cookie writes** in `lib/mcp/auth.ts` `withAuthCookies` — the closest transaction-shaped code in the main app (read-modify-write coalesced per request).
-
-### The real transaction — Olist seed
-
-```
-  mcp-server-olist/scripts/seed-olist.ts  (lines 508–544)
-
-  const allInsert = db.transaction(() => {
-    for (const c of customers) insertCustomer.run(c.id, c.state, c.city);
-    for (const p of products) insertProduct.run(p.id, p.category, p.weight_g);
-    const knownCustomerIds = new Set(customers.map((c) => c.id));
-    for (const o of allOrders) {
-      if (!knownCustomerIds.has(o.customer.id)) {
-        insertCustomer.run(o.customer.id, o.customer.state, o.customer.city);
-        knownCustomerIds.add(o.customer.id);
-      }
-      insertOrder.run(o.id, o.customer.id, o.status, o.purchase_ts, o.delivered_ts);
-      for (const it of o.items) insertItem.run(...);
-      for (const p of o.payments) insertPayment.run(...);
-      if (o.review) insertReview.run(...);
-    }
-    for (const a of SEEDED_ANOMALIES) insertAnomaly.run(...);
-  });
-  allInsert();
-       │
-       └─ what each ACID property means here:
-          A (atomicity)   — if any of the 30k inserts fail (FK violation,
-                            unique constraint), ALL roll back. No half-seeded
-                            DB possible.
-          C (consistency) — FK constraints checked at COMMIT; PRAGMA foreign_keys
-                            is ON when the seed reopens the DB (db.ts L41).
-          I (isolation)   — SQLite is serializable by default. No other writer
-                            could interleave (and we have none here anyway —
-                            the seed is the only writer).
-          D (durability)  — at COMMIT, SQLite fsyncs the WAL; the DB file then
-                            gets checkpointed later. The committed binary
-                            in git captures the post-commit state.
-```
+None at the database level. The closest transaction-shaped code in the repo is `withAuthCookies` — a read-once, mutate-in-memory, write-once wrapper. The closest "atomicity by accident" is any function body with no awaits inside `lib/state/insights.ts`, which Node's event loop guarantees runs to completion before any other handler can observe its mutations (see 06 for the full concurrency story).
 
 ### The closest cousin — Node's single-threaded "isolation" (main app)
 
@@ -225,13 +158,13 @@ Skipped — no codebase instance.
           on the same instance can observe intermediate state. that's the
           closest thing to "transaction isolation" we have, and it only
           holds because the body has zero awaits.
-          
+
           if you added an `await` between clear() and the forEach loop,
           another concurrent request handler could run during the await,
           observe insights.size === 0, and act on it. Node's single-thread
           gives you atomicity FOR FREE only when there's no await inside
           the critical section.
-          
+
           across TWO instances (Vercel scale-out) there's no isolation at
           all — both can race, both can clear and re-fill in interleaved
           order, and the resulting Map state on each is a partial mix.
@@ -256,7 +189,7 @@ Skipped — no codebase instance.
           BEGIN: read the cookie, decrypt to a request-scoped store
           BODY:  fn() runs with the store as the source of truth
           COMMIT: if dirty, re-encrypt and write the cookie back
-          
+
           it's a 2-phase pattern: read once, mutate in-memory many times,
           flush once. Without it, every provider call (saveTokens,
           saveClientInformation, saveCodeVerifier) would read-modify-write
@@ -277,11 +210,11 @@ Cross-link: `06-locks-mvcc-and-concurrency-control` is the mechanism that implem
 ## Interview defense
 
 **Q: "Do you have any transactional code in this app?"**
-One real one. The Olist seed script (`mcp-server-olist/scripts/seed-olist.ts` L508-544) wraps ~30k inserts across 7 tables in `db.transaction(() => { ... })`. better-sqlite3 emits BEGIN at function entry, COMMIT on return, ROLLBACK on throw. The seed runs in <2s because of this — without the transaction, 30k auto-commits would be 30k fsync hits and take minutes. SQLite's default isolation is serializable, so this is the strongest level by default. In the main Next.js app there's no engine, so no BEGIN/COMMIT — the closest pattern is the `withAuthCookies` wrapper in `lib/mcp/auth.ts` L86-104, which is 2-phase-shape (read once, mutate in memory, write once at exit) without being ACID.
+Not in the ACID sense — we don't have a database. The closest transaction-shaped code is `withAuthCookies` in `lib/mcp/auth.ts` L86-104: it reads the cookie once at the start of a request, lets the OAuth provider mutate an in-memory store throughout the request, and writes the cookie back once at the end. That's a 2-phase pattern with no rollback (errors just don't write), but the SHAPE is transactional. The actual mutations in `lib/state/insights.ts` are "atomic by accident" — Node's event loop runs each handler body to completion before any other handler observes anything, but only when there's no await inside the critical section. Add any await and the atomicity disappears.
 
-Diagram: the BEGIN-body-COMMIT shape, with `db.transaction(() => ...)` named explicitly.
+Diagram: the BEGIN-body-COMMIT shape, with `withAuthCookies` labeled "transactional in shape, not ACID."
 
-Anchor: `mcp-server-olist/scripts/seed-olist.ts` L508-544 (real transaction); `lib/mcp/auth.ts` L86-104 (transaction-shaped, not ACID).
+Anchor: `lib/mcp/auth.ts` L86-104 (transactional shape); `lib/state/insights.ts` L30-42 (atomic-by-accident).
 
 **Q: "If you added a save-favorites feature with Postgres, what isolation level would you pick?"**
 Read committed, the Postgres default. Save-favorites is a single-row insert per favorite — there's no multi-row invariant. If we later added "your top 10 favorites" with a hard cap, I'd reach for `SERIALIZABLE` on just the insert path (or `SELECT FOR UPDATE` on the cap check) — but I wouldn't pay the cost across all queries.
@@ -303,9 +236,8 @@ Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — how isolation actually gets enforced
-- `07-wal-durability-and-recovery` — the D in ACID (now exercised in Olist)
-- `10-embedded-sqlite-fixture` — better-sqlite3's `db.transaction(fn)` API
+- `07-wal-durability-and-recovery` — the D in ACID
 - `01-database-systems-map` — the Map state that today has neither A, C, I, nor D
 
 ---
-Updated: 2026-06-16 — partially exercised; Olist seed transaction at mcp-server-olist/scripts/seed-olist.ts L508-544 named with all four ACID properties grounded. Main-app verdict unchanged.
+Updated: 2026-06-19 — Olist seed transaction removed (file gone); verdict reverts to "not yet exercised" at the engine level. `withAuthCookies` remains the transaction-shaped cousin; the `putInsights` event-loop-atomicity walk stands.

@@ -6,7 +6,7 @@
 
 Every AI feature in blooming insights — diagnosis, recommendation, monitoring scan, query answer, intent classification — runs Claude in a multi-turn loop with tool use. The model's output is non-deterministic. To test the *agent code that wraps* the model, you build a fake `messages.create` that returns a *queued* list of pre-written responses and inject it as the SDK. The real agent code runs end-to-end against the script; the test author controls every turn.
 
-This pattern was extended in the Phase 2 swap with **two new test files** that share the same shape: `synthesis-instruction.test.ts` (4 tests pinning the forced-synthesis behaviour against scripted multi-turn flows) and `tool-schemas.test.ts` (3 tests on the schema-aware tool registration that the harness depends on). 40 tests now share the buildFakeAnthropic helper, up from 31.
+The pattern is shared across the agent test suite: `buildFakeAnthropic` is the harness builder, and five agent test files build directly on it — `base.test.ts` (8 tests), `monitoring.test.ts` (10), `diagnostic.test.ts` (5), `recommendation.test.ts` (5), `query.test.ts` (3). **31 tests total** depend on this harness shape. (`synthesis-instruction.test.ts` and `tool-schemas.test.ts` test sibling concerns and don't take the harness; `intent.test.ts` and `categories.test.ts` mock the SDK at a different layer.)
 
 ```
 Zoom out — where this pattern sits in the system
@@ -23,8 +23,8 @@ Zoom out — where this pattern sits in the system
   │  lib/agents/{base,diagnostic,recommendation,monitoring,  │
   │              query}.ts                                    │
   │                                                           │ ← we are here
-  │  Tested via: scripted Anthropic + fake McpCaller          │
-  │  40 tests across 6 files                                   │
+  │  Tested via: scripted Anthropic + fake DataSource         │
+  │  31 tests across 5 files                                   │
   └─────────────────────────────────────────────────────────┘
                                 ▲ tool calls
   ┌─ External (faked at the SDK seam) ──────────────────────┐
@@ -186,7 +186,7 @@ Without this, you can only test the agent's *return value*. With it, you can tes
 
 #### The DataSource fake (the second seam — renamed in Phase 2)
 
-The agent doesn't call the MCP SDK directly. It calls through a `DataSource` interface (`lib/data-source/types.ts`) — three methods, structurally typed. A test satisfies it with a 5-line object literal. No `implements` keyword required; TypeScript accepts the shape match. *(Historical note: v1 of this guide called the interface `McpCaller`. The Phase 2 swap renamed it to `DataSource` when the second implementation — `OlistDataSource` — was added. Mechanics unchanged; same shape match, same five-line fake works.)*
+The agent doesn't call the MCP SDK directly. It calls through a `DataSource` interface (`lib/data-source/types.ts`) — three methods, structurally typed. A test satisfies it with a 5-line object literal. No `implements` keyword required; TypeScript accepts the shape match. *(Historical note: v1 of this guide called the interface `McpCaller`. The Phase 2 swap renamed it to `DataSource` when a second implementation was added. Mechanics unchanged; same shape match, same five-line fake works. The second implementation today is `SyntheticDataSource`; the brief stint with `OlistDataSource` is gone with the Olist removal.)*
 
 ```
 The McpCaller seam — interface is the contract
@@ -206,7 +206,7 @@ The McpCaller seam — interface is the contract
 
 The compression matters: the real `BloomreachDataSource` (formerly `McpClient`, now living at `lib/data-source/bloomreach-data-source.ts`) does retries, caching, rate-limit parsing, error tagging — fifty lines of behaviour. The interface narrows it to one method. The test gets to ignore all the production-side complexity and focus on what the agent *does* with the result. That's the seam.
 
-The Phase 2 payoff: this same seam is now used by **two production implementations** (`BloomreachDataSource`, `OlistDataSource`) AND **two test paths** (the in-process fake here in Pillar 1, the real `OlistDataSource` over stdio in Pillar 2's eval suite). One interface, four consumers. The `DataSource` extraction is the load-bearing refactor that lets both pillars run against the same agents.
+The seam still pays off post-Olist-removal: two production implementations (`BloomreachDataSource` for live, `SyntheticDataSource` for the in-process demo/test path) AND a test convention where every agent test passes a hand-rolled five-line fake. One interface, multiple consumers; the `DataSource` extraction is the load-bearing refactor that keeps the agent layer testable without touching its production code path.
 
 ### Move 2 variant — the load-bearing skeleton
 
@@ -350,7 +350,7 @@ test/agents/base.test.ts  (lines 361–383 — the load-bearing test)
   });
 ```
 
-**Use case B — covering all four agents with one pattern.** The same harness builder appears at the top of `base.test.ts` (8 tests on `runAgentLoop`), `diagnostic.test.ts` (5 tests on `DiagnosticAgent.investigate` including the synthesis fallback), `monitoring.test.ts` (10 tests on `MonitoringAgent.scan`), `recommendation.test.ts` (5 tests on `RecommendationAgent.propose`), and `query.test.ts` (3 tests on `QueryAgent.answer`). **31 tests total** depend on this pattern. Strip the harness and the agent layer has zero tests.
+**Use case B — covering all four agents with one pattern.** The same harness builder appears at the top of `base.test.ts` (8 tests on `runAgentLoop`), `diagnostic.test.ts` (5 tests on `DiagnosticAgent.investigate` including the synthesis fallback), `monitoring.test.ts` (10 tests on `MonitoringAgent.scan`), `recommendation.test.ts` (5 tests on `RecommendationAgent.propose`), and `query.test.ts` (3 tests on `QueryAgent.answer`). **31 tests total** depend on this pattern. Strip the harness and the agent layer has zero deterministic coverage.
 
 ```
 test/agents/diagnostic.test.ts  (lines 273–291 — the synthesis fallback)
@@ -374,8 +374,10 @@ test/agents/diagnostic.test.ts  (lines 273–291 — the synthesis fallback)
        │
        └─ this proves the WRAPPER's fallback path works when the loop output
           is unusable. What it does NOT prove: that the real model's output
-          would ever look like the scripted JSON. That's the eval gap (file
-          06 + study-ai-engineering/05).
+          would ever look like the scripted JSON. That's the model-quality
+          gap — once filled by the (now-deleted) Phase 3 eval suite; today
+          unmeasured in this repo. See `study-ai-engineering/05-evals-and-
+          observability/` for the testing discipline that would close it.
   });
 ```
 
@@ -428,8 +430,9 @@ The fake / real boundary in one diagram
 - `audit.md#testing-ai-features` — the deterministic-vs-eval seam this pattern straddles
 - `02-fixture-driven-schema-parser.md` — the fixture-driven unit pattern (Level 2), one rung below this on the pyramid
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard rejection discipline that the harness's `isDiagnosis` validation step depends on
-- `05-llm-eval-as-testing.md` — Pillar 2; uses the *real* DataSource against the same agents this harness fakes the DataSource for
-- (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the model-architecture / rubric-design deep walk
+- `05-llm-eval-as-testing.md` — **RETIRED.** Historical record of LLM-as-judge testing discipline; the in-repo eval suite it references was deleted in PR #8
+- (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the model-architecture / rubric-design deep walk; the only place this repo still teaches model-quality measurement
 
 ---
 Updated: 2026-06-16 — Test count 31→40 (synthesis-instruction + tool-schemas added). `McpCaller` renamed to `DataSource` in Phase 2 swap — mechanics unchanged, paragraph added explaining the rename. Backwards-compat shim at `lib/mcp/client.ts` not surfaced here (lives in audit's design-pressure lens). Added See-also link to 05.
+Updated: 2026-06-19 — Olist removal (PR #8): reverted test count to 31 (synthesis-instruction + tool-schemas don't use buildFakeAnthropic; the 40 claim was inaccurate). Removed Olist references — second DataSource implementation today is `SyntheticDataSource`, not `OlistDataSource`. Reframed the "AI-eval gap" callout from "see file 06" to "see study-ai-engineering/05" since 06 is RETIRED. See-also link to 05 marked RETIRED.

@@ -3,7 +3,7 @@
 **Industry name(s):** Normalization · single source of truth · denormalization · the "same fact, two places" smell · derived data
 **Type:** Industry standard · Language-agnostic
 
-> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. The original framing of this file (2026-06-01) was "this repo has no relational store, but the pattern shows up in the typed shapes — the **Insight↔Anomaly field-copy list** lives in three files and the round-trip is silently lossy." Two things have changed since then. **(1) The schema-side leak has been partly fixed**: `insightToAnomaly` is now colocated with `anomalyToInsight` in `lib/state/insights.ts`, a doc comment names the drop, and `test/state/insights.test.ts` carries the round-trip. The field-copy list now lives in *two* files (the interface and the colocated functions), not three, and the drift is tested. **(2) A real relational store has shipped** — `mcp-server-olist/` — and it gives this guide a place to point at properly normalized data (3NF, file 08). The pattern's been promoted from "no relational analog here" to "two relational analogs, one in TS, one in SQL." This file still walks the schema-side story; the textbook denormalization-vs-normalization tradeoff now lives in file 08.
+> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. The original framing of this file (2026-06-01) was "this repo has no relational store, but the pattern shows up in the typed shapes — the **Insight↔Anomaly field-copy list** lives in three files and the round-trip is silently lossy." Two things have changed since then. **(1) The schema-side leak has been partly fixed**: `insightToAnomaly` is now colocated with `anomalyToInsight` in `lib/state/insights.ts`, a doc comment names the drop, and `test/state/insights.test.ts` carries the round-trip. The field-copy list now lives in *two* files (the interface and the colocated functions), not three, and the drift is tested. **(2) The brief 2026-06-16 second domain (Olist SQL, 3NF + FKs) is gone** as of PR #8 (commit 62c24d7). The "two relational analogs" framing is back to "one typed-shape analog"; the textbook 3NF contrast case no longer exists in this repo. This file still walks the schema-side story; the wire-format leak is still where the cost remains.
 
 ---
 
@@ -533,10 +533,12 @@ A: Correct when (a) there's a named single owner, (b) the denormalization is for
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces and where the truth source lives for each shape.
-- `04-transactions-and-integrity.md` — the per-session sub-maps now make the cross-Map invariant safe across users; what FK + WAL do for the Olist side.
+- `04-transactions-and-integrity.md` — the per-session sub-maps now make the cross-Map invariant safe across users; runtime guards at the LLM seam.
 - `06-access-patterns-and-storage-choice.md` — the wire-format decision that's now the leak source; the move to `?id=` plus per-session lookup.
-- `08-the-olist-relational-schema.md` — a properly normalized model (3NF, FKs) as the contrast case; what the typed-schema layer would look like if the field-copy were declarative.
+- `08-the-olist-relational-schema.md` — RETIRED. Historical pattern (3NF, FKs as the contrast case).
+- `11-in-process-synthetic-fixture.md` — the SyntheticDataSource: no normalization story (in-memory const literal, no FK, no joins) — the contrast case is now "flat fixture vs typed agent contract."
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem.
 
 ---
 Updated: 2026-06-16 — schema-side leak status moved from "WORST" to "partly fixed in code"; added Move 2.5 on the wire format as the remaining leak source.
+Updated: 2026-06-19 — dropped the Olist 3NF contrast-case framing (the schema is removed); the file's core story (Insight↔Anomaly + wire-format leak) is unchanged.

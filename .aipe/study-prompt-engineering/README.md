@@ -2,7 +2,7 @@
 
 The third companion to [`study-system-design/`](../study-system-design/README.md) and [`study-ai-engineering/`](../study-ai-engineering/README.md). Same per-concept template, but a different voice — **working AI engineer**, not staff engineer: first-person, concrete about bugs, skeptical of advice that only works in demos. 13 concepts, the complete list for the discipline.
 
-The subject is blooming insights' four prompts — `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md` — read as the versioned, budgeted, validated components they are. Start with [`00-overview.md`](00-overview.md) for the discipline map and the per-concept failure modes.
+The subject is blooming insights' four agent prompts — now shipped via `@aptkit/prompts` (the active path, pulled in through `@aptkit/core@0.3.0`) with the previous markdown preserved under `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md` (the legacy path) — read as the versioned, budgeted, validated components they are. Start with [`00-overview.md`](00-overview.md) for the discipline map and the per-concept failure modes.
 
 ## Reading order
 
@@ -14,7 +14,7 @@ Operational discipline first (you can't iterate a prompt you can't budget or eva
 2. **[02-structured-outputs.md](02-structured-outputs.md)** — extracting a typed contract from prose: fence-strip, validate, retry; why prompt-instructed JSON survives here. *NEW Tier 1.*
 3. **[03-prompts-as-code.md](03-prompts-as-code.md)** — prompts as version-controlled source; the prompt+model-version pairing gap. *NEW Tier 1.*
 4. **[04-token-budgeting.md](04-token-budgeting.md)** — counting tokens as basic hygiene; schema/result/tool-call caps; the unused prefix-cache. *NEW Tier 1.*
-5. **[05-eval-driven-iteration.md](05-eval-driven-iteration.md)** — iterate against a golden set, not vibes; the 4-pillar eval suite under `eval/` (detection + diagnosis judge + recommendation judge + regression) with measured receipts from the Phase 2.5 monitoring-prompt fix (loose recall 6.7% → 33.3%, voucher 1/10 → 10/10, framing limit honestly named). *NEW Tier 1.*
+5. **[05-eval-driven-iteration.md](05-eval-driven-iteration.md)** — iterate against a golden set, not vibes; the PATTERN is real prompt-engineering, but there is no in-repo eval harness now (the previous `eval/` suite was removed). The CRITICAL/Never/Do NOT blocks in the legacy prompts are informal regression encoding; the formal harness is the buildable Case B target. *NEW Tier 1.*
 
 **Specific techniques**
 
@@ -29,11 +29,12 @@ Operational discipline first (you can't iterate a prompt you can't budget or eva
 
 ## Case A vs Case B
 
-**Case A** (implemented, cited to real `file:line`): anatomy, structured outputs, single-purpose chains, output-mode mismatch, token budgeting, chain-of-thought, eval-driven iteration (Phase 3 — the 4-pillar `eval/` suite with measured receipts), and the negative-constraint half of forbidden-patterns. **Case A-partial:** prompts-as-code (no model pairing logged), few-shot (format-shaping only; the classifier is zero-shot).
+**Case A** (implemented, cited to real `file:line`): anatomy, structured outputs, single-purpose chains, output-mode mismatch, token budgeting, chain-of-thought, and the negative-constraint half of forbidden-patterns. **Case A-partial:** prompts-as-code (no model pairing logged; package-version → output co-log is the new gap), few-shot (format-shaping only; the classifier is zero-shot).
 
-**Case B** (full study material + a blooming-insights-targeted buildable exercise): self-critique (only recovery exists), meta-prompting (prompts are hand-written), prompt-injection defense (open `?q=`, bounded by read-only tools + validators), and the rotating-formulas half of forbidden-patterns.
+**Case B** (full study material + a blooming-insights-targeted buildable exercise): eval-driven iteration (no in-repo harness now — the previous `eval/` was removed; the CRITICAL blocks in the prompts are still informal regression encoding), self-critique (only recovery exists), meta-prompting (prompts are hand-written), prompt-injection defense (open `?q=`, bounded by read-only tools + validators), and the rotating-formulas half of forbidden-patterns.
 
 > Curriculum-loaded: each file carries a `## Project exercises` block citing `aieng-curriculum.md` concept IDs (C1.7, C1.10, C1.12, C3.1–C3.3, C5.7, plus the NEW Tier-1/Tier-2 concepts) for provenance, with every exercise targeting blooming insights' own files.
 
 ---
 Updated: 2026-06-16 — Flipped eval-driven iteration (05) from Case B → Case A (Phase 3 ships the 4-pillar `eval/` suite with measured Phase 2.5 monitoring-prompt receipts: loose recall 6.7% → 33.3%).
+Updated: 2026-06-19 — AptKit migration + eval/ removal: prompts now ship via `@aptkit/prompts` (active path, via `@aptkit/core@0.3.0`); previous markdown lives at `lib/agents/legacy-prompts/`. Reverted 05 (eval-driven iteration) from Case A → Case B — the `eval/` harness and its 6.7% → 33.3% receipt are no longer in the repo.

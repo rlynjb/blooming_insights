@@ -1,16 +1,19 @@
 # Prompt engineering — the discipline, mapped to this codebase
 
-Prompt engineering, the way it survives production, is not "wording tricks" — it is the engineering discipline of treating a prompt as a versioned, budgeted, evaluated, injectable component with a typed boundary around it. blooming insights is a clean specimen: four prompts live as `.md` files in `lib/agents/prompts/`, each loaded as source, assembled into a Claude call with injected context, bounded by a tool-call budget, and parsed back through a validator that refuses to trust the model's prose. This guide reads those four prompts as the artifact they are, and names — for each of the 13 concepts — what the codebase does, what it deliberately doesn't, and the production failure mode the concept exists to prevent.
+Prompt engineering, the way it survives production, is not "wording tricks" — it is the engineering discipline of treating a prompt as a versioned, budgeted, injectable component with a typed boundary around it. blooming insights is a clean specimen, but with a twist worth naming up front: the **active prompts now ship through an npm package** (`@aptkit/prompts`, pulled in via `@aptkit/core@0.3.0`), while the previous markdown prompts are preserved under `lib/agents/legacy-prompts/` and exercised by the four `*-legacy.ts` agents only. Both paths assemble a Claude call with injected context, are bounded by a tool-call budget, and parse back through a validator that refuses to trust the model's prose. This guide reads those prompts — package-shipped and legacy alike — as the artifact they are, and names, for each of the 13 concepts, what the codebase does, what it deliberately doesn't, and the production failure mode the concept exists to prevent.
 
 ```
 ┌─ authoring (source) ──────────────────────────────────────────────┐
-│  lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md│
+│  active path:  @aptkit/prompts (npm package, via @aptkit/core)    │
+│  legacy path:  lib/agents/legacy-prompts/{monitoring,diagnostic,  │
+│                recommendation,query}.md                            │
 │   Role · Hard rules · method · EQL reminders · Output · {schema}   │
 └───────────────┬───────────────────────────────────────────────────┘
-                │ readFileSync (prompts-as-code)        [01,03,06,07]
+                │ active: package import        [01,03,06,07,14]
+                │ legacy: readFileSync at module load
                 ▼
 ┌─ assembly (per call) ─────────────────────────────────────────────┐
-│  system = file  +  injected {project_id}/{anomaly}/{diagnosis}/    │
+│  system = prompt  +  injected {project_id}/{anomaly}/{diagnosis}/  │
 │  {intent}/{schema}  +  userPrompt   +  synthesisInstruction(final) │
 │  budget: maxToolCalls 6/6/4/6 · max_tokens 4096/2048/16            │
 │   anatomy [01] · token budget [04] · few-shot/EQL [08] · CoT [09]  │
@@ -23,29 +26,24 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 │   structured outputs [02] · output-mode mismatch [07]             │
 │  query path: prose, NO validator, user ?q= interpolated  [12]      │
 └───────────────┬───────────────────────────────────────────────────┘
-                │ orthogonal: SCORED off-path (Phase 3)
+                │ no in-repo eval harness; scoring is off-path
                 ▼
-┌─ eval/ suite ─────────────────────────────────────────────────────┐
-│  detection runner + LOOSE/STRICT scorer  (precision/recall)       │
-│  diagnosis judge (5-criterion, ~350 LOC) + recommendation (3-crit)│
-│  receipt: monitoring Phase 2.5 fix → loose recall 6.7%→33.3% [05] │
-└───────────────┬───────────────────────────────────────────────────┘
-                │ what's STILL MISSING (the buildable gaps)
-                ▼
-   self-critique [10] · meta-prompting [11]
-   injection delimiters [12] · rotating formulas if a digest is added [13]
-   judge-vs-human validation tier · CI gate on eval scores
+   what's MISSING (the buildable gaps)
+   eval-driven iteration harness [05] · self-critique [10]
+   meta-prompting [11] · injection delimiters [12]
+   rotating formulas if a digest is added [13]
+   prompt-package version → output co-logging [03,14]
 ```
 
 ## The 13 concepts — grouped, with the failure mode each prevents
 
 **Operational discipline (read first):**
 
-- **[01 anatomy](01-anatomy.md)** — *Prevents:* prompt drift, where mixing constant and per-call content into one blob makes every change a guess. blooming insights: the shared Role/Hard-rules/Output/`{schema}` shape across four files. **Case A.**
+- **[01 anatomy](01-anatomy.md)** — *Prevents:* prompt drift, where mixing constant and per-call content into one blob makes every change a guess. blooming insights: the shared Role/Hard-rules/Output/`{schema}` shape, now sourced from `@aptkit/prompts` on the active path and preserved as `.md` files on the legacy path. **Case A.**
 - **[02 structured outputs](02-structured-outputs.md)** — *Prevents:* the parser breaking when a courteous model wraps JSON in a markdown fence. blooming insights: prompt-instructed fenced JSON + `parseAgentJson` fence-strip + type guards + retry. **Case A.**
-- **[03 prompts as code](03-prompts-as-code.md)** — *Prevents:* a prompt that worked on one model silently breaking on the next, with no record of the pairing. blooming insights: `.md` files under version control; the model-ID pairing is the honest gap. **Case A-partial.**
+- **[03 prompts as code](03-prompts-as-code.md)** — *Prevents:* a prompt that worked on one model silently breaking on the next, with no record of the pairing. blooming insights: prompts live in source — either as a versioned npm package (`@aptkit/prompts`) on the active path or as `.md` files in `lib/agents/legacy-prompts/`; the model-ID pairing and the package-version → output co-log are the honest gaps. **Case A-partial.**
 - **[04 token budgeting](04-token-budgeting.md)** — *Prevents:* a chain that worked on small inputs truncating or timing out at scale because nobody counted. blooming insights: `schemaSummary` caps, char budgets, tool-call caps — no prefix caching. **Case A.**
-- **[05 eval-driven iteration](05-eval-driven-iteration.md)** — *Prevents:* iterating by vibes and shipping a "better" prompt that regresses an untracked edge case. blooming insights: Phase 3 ships `eval/` — 4-pillar suite (detection LOOSE/STRICT + 5-crit diagnosis judge + 3-crit recommendation judge + regression golden-set). Receipt: Phase 2.5 monitoring prompt fix drove loose recall 6.7% → 33.3% (voucher 1/10 → 10/10), with sp-revenue/electronics 0/10 strict honestly named as a framing limit. **Case A.**
+- **[05 eval-driven iteration](05-eval-driven-iteration.md)** — *Prevents:* iterating by vibes and shipping a "better" prompt that regresses an untracked edge case. blooming insights: the PATTERN is real prompt-engineering work, but there is no in-repo eval harness now — the `eval/` suite and its receipts are gone. The CRITICAL/Never/Do NOT blocks in the legacy prompts are still informal regression encoding; the formal harness is the buildable target. **Case B.**
 
 **Specific techniques:**
 
@@ -62,3 +60,4 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 
 ---
 Updated: 2026-06-16 — Updated the eval row to Case A (Phase 3 `eval/` ships) and rebuilt the `what's MISSING` diagram band into "eval/ suite (Phase 3)" + a smaller residual gap list. Real receipt: monitoring Phase 2.5 fix → loose recall 6.7% → 33.3% with framing limit honestly named.
+Updated: 2026-06-19 — AptKit migration + Olist removal: prompts now ship via `@aptkit/prompts` (active) with `lib/agents/legacy-prompts/` preserving the previous markdown (legacy). The Phase 3 `eval/` harness and its 6.7% → 33.3% receipt are gone — reverted 05 to Case B and removed the eval band from the architecture diagram. Updated 01 and 03 lines to name the package boundary as the new authoring seam.
