@@ -85,8 +85,8 @@ These exist to preserve old behavior and tests while the active app uses AptKit.
 
 ## Known Notes
 
-- AptKit core is published to public npmjs as `@rlynjb/aptkit-core@0.1.0`.
-- Blooming keeps its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@^0.1.0`.
+- AptKit core is published to public npmjs as `@rlynjb/aptkit-core@0.3.0`.
+- Blooming keeps its existing `@aptkit/core` imports by installing the npm package through an npm alias: `@aptkit/core@npm:@rlynjb/aptkit-core@^0.3.0`.
 - Because the package is public on npmjs, Vercel does not need a package registry token to install it.
 - `package.json` and `package-lock.json` now resolve `@aptkit/core` from the public npm package, not the temporary local tarball.
 - Full `npm run lint` still has unrelated existing lint debt outside the migration path. Touched migration files have been linted as part of each step.
