@@ -1,5 +1,12 @@
 # Next moves — post-Phase 3
 
+> **SUPERSEDED 2026-06-18.** Phase 2 (Olist MCP server) and Phase 3 (eval
+> pipeline) were removed from the codebase on the `remove-olist-mcp-server`
+> branch. The 6 B-candidate fix targets named in this file no longer
+> apply — they were all eval-surfaced findings against the now-removed
+> Olist substrate. Preserved as a record of the post-Phase-3 decision
+> snapshot.
+
 > Decision artifact, not an execution plan. Captures the three honest
 > next-move paths after the portfolio-hardening arc (Phases 1+2+3)
 > shipped to main. Pick one when there's appetite; revisit when

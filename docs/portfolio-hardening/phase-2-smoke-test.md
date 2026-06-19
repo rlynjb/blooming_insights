@@ -1,5 +1,9 @@
 # Phase 2 smoke test — partial verification (2026-06-15)
 
+> **RETIRED 2026-06-18.** Phase 2 (Olist MCP server) has been removed from
+> the codebase. This smoke-test evidence is preserved as a historical record
+> of the receipts captured before opening the original Phase 2 PR.
+
 > Evidence captured before opening the Phase 2 PR. Covers what's verifiable
 > without a browser or live Anthropic API. The browser smoke test
 > (per `phase-2-plan.md` section 2c.4) is still required before merge.

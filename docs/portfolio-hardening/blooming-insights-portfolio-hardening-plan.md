@@ -1,5 +1,12 @@
 # blooming insights — portfolio hardening path
 
+> **PHASES 2 + 3 RETIRED 2026-06-18.** The authored Olist MCP server (Phase 2)
+> and the eval pipeline scored against it (Phase 3) were removed from the
+> codebase. Phase 1 (study) is unaffected. The phase-2-plan.md,
+> phase-2-smoke-test.md, phase-3-plan.md, and next-moves.md docs carry their
+> own retirement banners and remain as historical records. The umbrella plan
+> below is preserved unchanged for the same reason.
+
 - **book:** blooming-insights-hardening
 - **summary:** Study the architecture until you can defend it cold, then make it source-agnostic by authoring your own MCP server, then prove it correct with evals. Each phase ships before the next starts.
 
