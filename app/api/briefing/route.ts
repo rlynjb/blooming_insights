@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
-import { makeDataSource, type LiveMode } from '@/lib/data-source';
+import { makeDataSource, parseLiveMode, type LiveMode } from '@/lib/data-source';
 import { redactSecrets, formatError } from '@/lib/mcp/transport';
 // `bootstrapSchema` is now consumed indirectly via the DataSource factory's
 // `bootstrap()` — see lib/data-source/index.ts.
@@ -156,11 +156,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
   }
 
-  // The factory now only constructs the Bloomreach adapter; the legacy
-  // `?mode=` param is accepted but ignored (the previously-supported
-  // `'live-sql'` Olist adapter has been removed). Legacy clients sending no
-  // param or `live-sql` fall through to Bloomreach.
-  const mode: LiveMode = 'live-bloomreach';
+  // `live-bloomreach` uses the real Bloomreach MCP server. `live-synthetic`
+  // keeps the real model/agent loop but swaps the data source to Blooming-owned
+  // fake data. Legacy values fall back to Bloomreach.
+  const mode: LiveMode = parseLiveMode(req.nextUrl.searchParams.get('mode'));
 
   // Construct the DataSource via the factory BEFORE committing to a stream so
   // a Bloomreach auth-gate can return 401 JSON the feed redirects on. Wrapped

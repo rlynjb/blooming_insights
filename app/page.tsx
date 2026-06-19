@@ -51,13 +51,13 @@ export default function HomePage() {
   // lib/hooks/useReconnectPolicy.ts.
   const reconnectPolicy = useReconnectPolicy();
 
-  // Demo vs live (Bloomreach), toggled at RUNTIME (persisted in localStorage).
+  // Demo vs live, toggled at RUNTIME (persisted in localStorage).
   // Demo serves the cached snapshot — instant + reliable, ideal for a presentation
   // and the default. live-bloomreach runs the agents against Bloomreach (real
-  // data, but the alpha server may need a reconnect). NEXT_PUBLIC_DEMO_ONLY=1
-  // hard-locks demo and hides the toggle. Legacy `'live'` and `'live-sql'`
-  // localStorage values migrate to `'live-bloomreach'` so existing users
-  // transition transparently.
+  // data, but the alpha server may need a reconnect). live-synthetic runs the
+  // same agents/model against deterministic fake data owned by this app.
+  // NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle. Legacy
+  // `'live'` and `'live-sql'` localStorage values migrate to `'live-bloomreach'`.
   const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
   const [mode, setMode] = useState<BriefingMode>('demo');
   const [ready, setReady] = useState(false);
@@ -73,6 +73,7 @@ export default function HomePage() {
         const saved = localStorage.getItem('bi:mode');
         if (saved === 'demo') setMode('demo');
         else if (saved === 'live-bloomreach') setMode('live-bloomreach');
+        else if (saved === 'live-synthetic') setMode('live-synthetic');
         else if (saved === 'live-sql' || saved === 'live') setMode('live-bloomreach'); // legacy
         // any other value (or null) → default `'demo'` stays
       } catch {
@@ -168,6 +169,7 @@ export default function HomePage() {
                 [
                   { value: 'demo', label: 'demo' },
                   { value: 'live-bloomreach', label: 'live · bloomreach' },
+                  { value: 'live-synthetic', label: 'live · synthetic' },
                 ] as const
               ).map((m) => (
                 <button
@@ -199,7 +201,9 @@ export default function HomePage() {
             >
               {isDemo
                 ? 'cached snapshot · instant'
-                : 'live · real bloomreach workspace data'}
+                : mode === 'live-synthetic'
+                  ? 'live agent · synthetic workspace data'
+                  : 'live · real bloomreach workspace data'}
             </span>
           </div>
         )}

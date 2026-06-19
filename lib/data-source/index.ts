@@ -4,7 +4,7 @@
 // already-connected. The route handlers branch on `bi:mode` (passed through as
 // `?mode=`) before they reach this factory: the `'demo'` branch never gets here
 // (it replays the committed snapshot directly), so the factory's mode universe
-// is just the live Bloomreach adapter.
+// is the live Bloomreach adapter plus a local synthetic adapter.
 //
 // Lifecycle:
 //   - `'live-bloomreach'`  → defers to `connectMcp(sessionId)`. The Bloomreach
@@ -12,6 +12,10 @@
 //                            the per-session cookie store) so it does NOT need
 //                            disposing the same way — leaving the result alive
 //                            matches existing route behavior.
+//   - `'live-synthetic'`   → uses Blooming-owned deterministic fake data while
+//                            keeping the real agent/model loop. This replaces
+//                            the old Olist-style local data path without
+//                            putting ecommerce fixtures into AptKit core.
 //
 // Why a factory at all: the route handlers used to construct BloomreachDataSource
 // directly via connectMcp; the factory centralizes construction + the connect()
@@ -22,9 +26,10 @@
 import { connectMcp } from '../mcp/connect';
 import type { ConnectResult } from '../mcp/connect';
 import { bootstrapSchema, type WorkspaceSchema } from '../mcp/schema';
+import { SyntheticDataSource, syntheticWorkspaceSchema } from './synthetic-data-source';
 import type { DataSource } from './types';
 
-export type LiveMode = 'live-bloomreach';
+export type LiveMode = 'live-bloomreach' | 'live-synthetic';
 
 /** Result envelope from `makeDataSource`. Bloomreach can fail to connect (OAuth
  *  expired / never authorized) — surfaced as `{ ok: false, authUrl }` so the
@@ -44,6 +49,10 @@ export type MakeDataSourceResult =
     }
   | { ok: false; mode: 'live-bloomreach'; authUrl: string };
 
+export function parseLiveMode(raw: string | null): LiveMode {
+  return raw === 'live-synthetic' ? 'live-synthetic' : 'live-bloomreach';
+}
+
 /**
  * Constructs a DataSource for the given live mode.
  *
@@ -59,6 +68,17 @@ export async function makeDataSource(
   mode: LiveMode,
   sessionId: string,
 ): Promise<MakeDataSourceResult> {
+  if (mode === 'live-synthetic') {
+    const dataSource = new SyntheticDataSource();
+    return {
+      ok: true,
+      mode,
+      dataSource,
+      bootstrap: async () => syntheticWorkspaceSchema,
+      dispose: async () => {},
+    };
+  }
+
   // live-bloomreach — defer to the existing connect path. It owns the OAuth
   // dance, including the case where the session has no valid tokens (returns
   // `{ ok: false, authUrl }` so the route can redirect).
@@ -80,4 +100,5 @@ export async function makeDataSource(
 }
 
 export { BloomreachDataSource } from './bloomreach-data-source';
+export { SyntheticDataSource, syntheticWorkspaceSchema } from './synthetic-data-source';
 export type { DataSource } from './types';
