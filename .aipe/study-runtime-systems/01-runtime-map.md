@@ -426,3 +426,6 @@ A: `AsyncLocalStorage<RequestStore>` in `lib/mcp/auth.ts:47`. It's the only thin
 
 ---
 Updated: 2026-06-16 — added subprocess runtime band (Olist child, stdio, JSON-RPC), tsx/eval scripts, dispose() lifecycle.
+
+---
+Updated: 2026-06-19 — Phase 2 subprocess (mcp-server-olist/) and offline eval/tsx runtime referenced in this file no longer exist after PR #8. Active runtime is one Node process containing route handlers, the in-process SyntheticDataSource, and the AptKit-backed agents. The diagram in this file still pictures the Phase 2 topology as historical reference; the verdict in 00-overview.md is the current truth.

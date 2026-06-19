@@ -125,3 +125,6 @@ The consolidated triage, by severity and section. Each row was named with file:l
 
 ---
 Updated: 2026-06-16 — Phase 2 subprocess (mcp-server-olist/) named as a 4th trust boundary with negligible attack surface (hardcoded path, no user input, no shell, read-only SQLite, PII-free synthetic data). No new findings; the 10 existing medium-severity findings stand.
+
+---
+Updated: 2026-06-19 — The "4th trust boundary" (subprocess Olist server) added last refresh is GONE (PR #8 deleted mcp-server-olist/). Revert to 3 trust boundaries (browser → route, route → Bloomreach, model output → typed value). New SyntheticDataSource is in-process Blooming-owned synthetic data — no new attack surface vs the legacy single-process design. No new findings; the 10 existing medium-severity findings stand.

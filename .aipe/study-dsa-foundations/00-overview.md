@@ -153,3 +153,6 @@ A working vocabulary for every standard interview DSA category, anchored to a re
 
 ---
 Updated: 2026-06-16 — Phase 3 eval scorer (eval/scripts/lib/scorer.ts) noted as real worked example for set-intersection primitives the codebase already exercises; structural-diff.ts adds light tree-traversal-flavored code. Neither in production hot path; overall codebase DSA shape unchanged.
+
+---
+Updated: 2026-06-19 — The Phase 3 eval scorer reference (eval/scripts/lib/scorer.ts as a set-intersection worked example) is GONE — eval/ deleted in PR #8. Codebase reverts to baseline DSA shape: hash maps + linear scans + comparator sort + one-level recursion, no trees/graphs/heaps. Overall verdict unchanged.

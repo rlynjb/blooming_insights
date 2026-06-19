@@ -8,7 +8,7 @@ Three things actually move over the network in blooming insights, and only three
 2. **This app's serverless functions ↔ Bloomreach MCP** (`https://loomi-mcp-alpha.bloomreach.com/mcp/`) over HTTPS via `StreamableHTTPClientTransport` from `@modelcontextprotocol/sdk@1.29.0`. Auth is OAuth 2.1 + PKCE + Dynamic Client Registration (RFC 7591).
 3. **This app's serverless functions ↔ Anthropic API** (`api.anthropic.com`) over HTTPS via the official `@anthropic-ai/sdk@0.99.0`. Used by every agent run inside `/api/briefing` and `/api/agent`.
 
-That's the entire **network** wire surface. As of Phase 2 (2026-06-15) there is one additional transport — **stdio IPC** to a local `mcp-server-olist/` subprocess via `StdioClientTransport` from `@modelcontextprotocol/sdk`. That's a Unix pipe, not a network socket, so it falls outside this guide; the deep walk lives in `study-distributed-systems/10-transport-agnostic-protocol-design.md`. The MCP protocol (JSON-RPC 2.0) is the same on both transports; the failure ontologies differ (network errors vs subprocess crashes / EPIPE). Beyond stdio: no realtime network transport (no WebSocket, no SSE, no gRPC), no service mesh, no internal RPC, no message queue.
+That's the entire wire surface. The Phase 2 stdio IPC transport to `mcp-server-olist/` was deleted in PR #8 (commit 62c24d7), so the network story collapses back to three. The current synthetic data path (`SyntheticDataSource` in `lib/data-source/synthetic-data-source.ts`) is fully in-process — no wire crossings at all. No realtime network transport (no WebSocket, no SSE, no gRPC), no service mesh, no internal RPC, no message queue.
 
 ```
 System map — every network boundary that actually exists
@@ -92,3 +92,6 @@ Honest about absence — if you reach for it from training data, it's not here.
 
 ---
 Updated: 2026-06-16 — added cross-link to stdio IPC transport (Phase 2 mcp-server-olist subprocess via StdioClientTransport); deep walk lives in study-distributed-systems/10-transport-agnostic-protocol-design.md. The MCP protocol is same on both wires; stdio is IPC not networking, hence out-of-scope here.
+
+---
+Updated: 2026-06-19 — Phase 2 stdio IPC transport deleted in PR #8 (mcp-server-olist subprocess gone). Wire surface reverts to three (browser↔routes, routes↔Bloomreach MCP, routes↔Anthropic). Synthetic data source is in-process; no new wire crossings. Cross-link to study-distributed-systems/10-transport-agnostic-protocol-design.md still valid but that file is RETIRED.

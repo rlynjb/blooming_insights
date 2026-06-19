@@ -50,7 +50,7 @@
 | Live UI | `useState` | per mount | `setInsights`, `setItems`, `setCoverage` |
 | Run-once latch | `useRef` | per mount | `startedRef` in `useInvestigation.ts:43` and `StreamingResponse.tsx:19` |
 | Per-tab durable | `sessionStorage` | per tab | `bi:insight:<id>`, `bi:diag:<id>`, `bi:inv:<step>:<id>`, `bi:reconnecting` |
-| Per-browser durable | `localStorage` | per browser | `bi:mode` — now 3 values: `'demo' \| 'live-sql' \| 'live-bloomreach'`, default `'live-sql'`; legacy `'live'` migrates to `'live-sql'` (`app/page.tsx:74-78`) |
+| Per-browser durable | `localStorage` | per browser | `bi:mode` — 3 values: `'demo' \| 'live-bloomreach' \| 'live-synthetic'`, default `'demo'`; legacy `'live'` and `'live-sql'` migrate to `'live-bloomreach'` |
 
 **Who owns each transition.**
 
@@ -343,3 +343,6 @@ End of audit.
 
 ---
 Updated: 2026-06-16 — Top findings #1 (page-decomposition / 14 useState slots) and #2 (NDJSON kernel duplication) RESOLVED in production code via page-decomposition refactor + `lib/streaming/ndjson.ts` hoist. Finding #5 (feed `<aside>` hand-rolled) promoted to top live finding. `bi:mode` value tier updated to 3-mode `'demo' \| 'live-sql' \| 'live-bloomreach'`.
+
+---
+Updated: 2026-06-19 — bi:mode union changed: `'live-sql'` removed (Olist), `'live-synthetic'` added (the new Blooming-owned in-process synthetic adapter). 3-value toggle is now demo | live-bloomreach | live-synthetic. UI surface otherwise unchanged.

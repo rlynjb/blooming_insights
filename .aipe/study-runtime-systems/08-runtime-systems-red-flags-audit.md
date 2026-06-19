@@ -484,3 +484,6 @@ If you handed me a one-day budget and said "harden the runtime":
 
 ---
 Updated: 2026-06-16 — added Risk 2.5 (orphan subprocess on parent crash) and Risk 2.6 (parallel eval-script clobber); corrected Risk 2 to "half-wired"; updated seam diagram to four seams; added composeSignals dedup to one-day priority.
+
+---
+Updated: 2026-06-19 — Olist subprocess (StdioClientTransport), per-call AbortSignal.timeout(30_000) on the Olist side, and the K=10 eval parallel-run incident are all RESOLVED-BY-DELETION (PR #8). The Bloomreach side still has no per-call timeout — that finding stands. Other Phase 2 / 2.5 / 3 risks named in last refresh (subprocess cleanup gap, composeSignals duplication, tsx-vs-ts-node) are also N/A now.

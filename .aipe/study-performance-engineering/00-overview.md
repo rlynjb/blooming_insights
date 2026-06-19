@@ -175,3 +175,6 @@ A finding belongs here when the question is *"how big? how fast? how often? how 
 - `.aipe/study-system-design/audit.md#scale-bottlenecks-and-evolution` — the three scale ceilings
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — why spacing isn't backpressure
 - `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — the token-economics layer
+
+---
+Updated: 2026-06-19 — Phase 3 eval cost data point (~$10-15 across K=10 × 4 pillars) RESOLVED-BY-DELETION (eval/ gone in PR #8). Asymmetric per-call timeout finding (Olist 30s, Bloomreach none) collapses: Olist side deleted. Bloomreach side still has no per-call timeout — that finding stands. Synthetic data source is in-process; zero network/spawn cost. res.usage logging at 3 of 5 sites unchanged.

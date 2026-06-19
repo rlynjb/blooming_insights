@@ -139,3 +139,6 @@ Ranked by consequence × likelihood. The discipline is *forcing the rank* — if
 
 ---
 Updated: 2026-06-16 — `res.usage` logging partially landed (3 of 5 sites). Cache code moved to `lib/data-source/bloomreach-data-source.ts` post Phase 2 PR A. Phase 3 produced first measured per-investigation cost data (~$10-15 across K=10 × 4 eval pillars). K=10 parallel-run race condition + `EVAL_RUN_TAG` mitigation added as real concurrent-execution anecdote. Asymmetric per-call timeout: Olist has 30s, Bloomreach still has none.
+
+---
+Updated: 2026-06-19 — Eval/ pipeline deleted in PR #8. The Phase 3 measured spend (~$10-15) and the K=10 parallel-run race condition incident are no longer reproducible. Cache code moved to lib/data-source/bloomreach-data-source.ts (Phase 2 PR A). Three ceilings (300s / 1100ms spacing / maxToolCalls) still hold; res.usage logging at 3 of 5 sites still partial (the 2 remaining sites are still diagnostic + recommendation synthesize() retries).

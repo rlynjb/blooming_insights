@@ -623,3 +623,6 @@ The full picture — the synthesize call's role, the four unread `res.usage` sit
 
 ---
 Updated: 2026-06-16 — 3 of 5 Anthropic call sites now log `res.usage` (`base.ts:135`, `base.ts:257`, `intent.ts:36`); the 2 suspect synthesize() retries are the only remaining unmeasured sites. Phase 3 evals produced ~$10-15 aggregate cost data but no per-call decomposition. Gap is narrower; finish line is 2 more `console.log` lines.
+
+---
+Updated: 2026-06-19 — Phase 3 evals (the source of the ~$10-15 measured cost data) are GONE; per-call attribution remains uncomputed. The 2 unmeasured synthesize() sites are still the only remaining unmeasured Anthropic call sites. ~2 lines of console.log still closes the gap.
