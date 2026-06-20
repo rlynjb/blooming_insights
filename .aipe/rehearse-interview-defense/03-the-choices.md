@@ -19,9 +19,21 @@ Hold the whole decision set as one tree before defending any single branch — t
                                                        cost: Vercel coupling
 
   agent orchestration  ┌─ LangChain / agent framework
-                       └─ ▶ own runAgentLoop on the   ── control + testable
-                            MCP SDK                      with fakes,
-                                                         cost: you write the loop
+                       ├─ own runAgentLoop          ── (started here; now
+                       │   on the MCP SDK              legacy at base-legacy.ts)
+                       └─ ▶ @aptkit/core's runtime  ── library owns the loop,
+                            + 3 Blooming-owned         I own the boundary;
+                            adapter classes            ~200 LOC of adapters;
+                                                       cost: depends on AptKit's
+                                                       generic-primitive shape
+
+  data source seam     ┌─ direct McpClient call
+                       │   from every agent
+                       └─ ▶ DataSource interface +  ── one abstract surface,
+                            adapter pattern             3 adapters today
+                                                        (Bloomreach + Synthetic
+                                                        + interface); cost: one
+                                                        more layer to think in
 
   model                ┌─ one model for everything
                        ├─ OpenAI GPT-4 class
@@ -34,17 +46,21 @@ Hold the whole decision set as one tree before defending any single branch — t
                        ├─ poll
                        └─ ▶ NDJSON over a            ── POST + simple line
                             ReadableStream (fetch)      framing + one wire
-                                                         format, cost: no
-                                                         auto-reconnect
+                                                         format (readNdjson
+                                                         hoisted to shared
+                                                         lib/streaming/ndjson.ts);
+                                                         cost: no auto-reconnect
 
   state / storage      ┌─ Postgres / SQLite
                        ├─ Redis
-                       └─ ▶ in-memory maps +         ── zero infra, creds-free
-                            committed demo snapshot     demo path, cost:
-                                                         per-instance cache loss
+                       └─ ▶ in-memory maps keyed     ── zero infra, creds-free
+                            by session +                demo path, no
+                            committed demo snapshot     concurrent-user wipe;
+                                                         cost: per-instance
+                                                         cache loss
 ```
 
-Five branches, five highlighted picks, five costs. Walk them one at a time.
+Six branches, six highlighted picks, six costs. Walk them one at a time.
 
 ---
 
@@ -93,30 +109,66 @@ There's a second-order honesty here worth pre-loading, because a sharp interview
 
 ---
 
-## Choice 2 — Your own agent loop, not a framework
+## Choice 2 — Hand-rolled loop first, then a generic agent library + my own adapter boundary
 
 > ┌─────────────────────────────────────────────────────────────┐
 > │ THEY ASK                                                      │
 > │   "Why hand-roll the agent loop instead of LangChain or a     │
-> │    framework?"                                                │
+> │    framework? — or did you end up using a framework after     │
+> │    all?"                                                      │
 > │                                                               │
 > │ WHAT THEY'RE TESTING                                          │
 > │   Do you understand what an agent loop actually is, or did    │
 > │   you reach for a framework to avoid understanding it? Can    │
 > │   you justify build-vs-buy on more than "I felt like it"?     │
+> │   And — the senior probe — can you tell a decision you've     │
+> │   revisited from one you've defended unchanged?               │
 > └─────────────────────────────────────────────────────────────┘
 
 In your voice:
 
-"An agent loop is small when you write it for one purpose: call the model with a tool schema, run the tool calls it asks for, feed results back, repeat until it answers or you cut it off. That's `runAgentLoop` — one function all four agents share. Each agent is just a prompt, a subset of tools, and an output validator. I built it myself for two reasons. First, control: I needed a hard `maxToolCalls` budget and a forced final synthesis turn, because the MCP server is rate-limited at roughly one request a second and I can't let an agent wander. Second, testability — because the loop takes the MCP client and the Anthropic client as injected dependencies, I test all four agents against fakes with no network. That's how the suite is 169 tests across 18 files with zero live calls. A framework would have hidden the loop I specifically needed to control, and made the fakes harder."
+"Two-part answer, because this is a decision I made twice. First version: I built `runAgentLoop` myself. An agent loop is small when you write it for one purpose — call the model with a tool schema, run the tool calls it asks for, feed results back, repeat until it answers or you cut it off — and I needed two things a framework would have hidden. One, a hard `maxToolCalls` budget and a forced final synthesis turn so an agent couldn't wander against a rate-limited server. Two, testability — the loop takes the model client and the data source as injected dependencies, so every agent gets tested against fakes with no network.
+
+Second version: once `@aptkit/core` existed with a clean generic-primitive surface — `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink` — I migrated the active path to it and kept my own adapter classes on this side of the boundary. `lib/agents/aptkit-adapters.ts` is three small classes: `AnthropicModelProviderAdapter` turns my Anthropic client into AptKit's `ModelProvider`, `BloomingToolRegistryAdapter` turns my `DataSource` into AptKit's `ToolRegistry`, `BloomingTraceSinkAdapter` turns AptKit's trace events back into my NDJSON streaming hooks. The Blooming agent classes (`monitoring.ts`, `diagnostic.ts`, …) collapsed to thin wrappers that hand AptKit a prompt + a tool subset + a validator. My original `runAgentLoop` is preserved at `lib/agents/base-legacy.ts` and the test suite that used to pin its contracts still runs.
+
+The decision-mode story is what matters here: the hand-roll was **deliberate** for the reasons above; the migration to AptKit was **evaluated-and-accepted** — I read its primitive surface, confirmed the budget + forced-synthesis discipline survives, kept the adapter boundary on my side. I didn't reach for a framework to avoid understanding the loop; I owned the loop first, then handed it off when there was a clean primitive to hand it to. The cost I'm paying is honest: I now depend on AptKit's generic-primitive shape continuing to be the right contract; if it drifts, I peel the adapter boundary off and the legacy loop is right there."
 
 ```
-┃ I didn't avoid the agent framework because frameworks are
-┃ bad — I avoided it because the loop is the part I needed
-┃ to control, and it's about forty lines.
+┃ I own the boundary; AptKit owns the loop. Three small
+┃ adapter classes, ~200 LOC, and the legacy loop is preserved
+┃ for the day I need to peel back to it.
 ```
 
-This is **deliberate** mode — your decision, made for named reasons. Say "I built it" with a flat voice. No apology for not using the popular tool.
+This is the single most senior answer in the chapter, because it shows you've revisited a decision you originally defended hard and can name *why the revisit was the right move* — without burying the original work.
+
+---
+
+## Choice 2.5 — DataSource seam + 3 adapters
+
+> ┌─────────────────────────────────────────────────────────────┐
+> │ THEY ASK                                                      │
+> │   "Why an abstract DataSource interface — couldn't your agents│
+> │    just call the MCP client directly?"                        │
+> │                                                               │
+> │ WHAT THEY'RE TESTING                                          │
+> │   Do you over-architect, or did you pay the abstraction cost  │
+> │   for a real reason? Can you point at the value the interface │
+> │   bought you — preferably with receipts, not "future-proofing"?│
+> └─────────────────────────────────────────────────────────────┘
+
+In your voice:
+
+"`lib/data-source/types.ts` defines a `DataSource` interface — `callTool(name, args, opts?)`, `listTools(opts?)`, `dispose()`. Three adapters live behind it today: `BloomreachDataSource` is the live MCP path (OAuth, ~1 req/s spacing, 60s TTL cache, bounded retry); `SyntheticDataSource` is in-process and Blooming-owned, a deterministic synthetic ecommerce dataset that lets the agent loop run without the upstream; and the interface itself, which is what the agents and the bootstrap helper hold a reference to. The route picks the adapter via `makeDataSource(mode, sessionId)` — `bi:mode` carries the choice.
+
+The defense is the receipt: this seam has survived two adapter swaps without changing the caller surface. I once added an Olist subprocess adapter behind it (a separately-spawned MCP server over stdio), measured what that bought me, then removed it when the in-process Synthetic adapter turned out to be the better shape — and *none of the agents, none of the route handlers, none of the prompts changed* across either swap. The interface didn't have to grow. That's the senior-grade payoff: the abstraction earned its weight by absorbing changes that would otherwise have been caller rewrites. The cost is real and small — one more layer to think in, plus the discipline to keep the interface tight enough not to leak adapter specifics. I'd defend the layer the same way today as the day I added it."
+
+```
+┃ The DataSource seam survived two adapter swaps without
+┃ changing the caller surface. That's the receipt; not
+┃ "future-proofing," but absorbed changes I can name.
+```
+
+This is **deliberate** mode. The probe is whether you can defend abstraction with concrete payoff — say what the seam absorbed, name the cost, and stop.
 
 ---
 
@@ -202,7 +254,7 @@ That's the senior move: you didn't just list why your choice is good, you named 
 
 In your voice:
 
-"There's no relational data to model here — the workspace data lives in Bloomreach, and I read it ad-hoc through the MCP server. What I'd persist is the briefing results and investigations, and for the demo that's a committed JSON snapshot the app replays. Live state is in-memory maps. I made this call deliberately for the context: a hackathon against an alpha MCP server that revokes tokens after a few minutes. The committed snapshot isn't just convenience — it's the *reliable* path, because it runs with no auth and no upstream at all. The cost I'm paying is real and I'll name it: on Vercel, state is per-instance, so a cold start re-bootstraps the schema and investigations cached on one instance aren't visible to another. The moment this is genuinely multi-user, the first thing I add is a shared store — Redis for the cache, a persistent store for investigations. That's my top counterfactual."
+"There's no relational data to model here — the workspace data lives in Bloomreach (or in the in-process Synthetic adapter), and I read it ad-hoc. What I'd persist is the briefing results and investigations, and for the demo that's a committed JSON snapshot the app replays. Live state is in-memory maps, keyed by session — I had a concurrent-user wipe bug in an earlier version where a single global `Map` plus a `clear()` at the top of every briefing write meant user A's briefing would wipe user B's mid-session; I fixed that by session-keying (`Map<sessionId, SessionFeed>` in `lib/state/insights.ts`), so the per-instance state is correct at any current scale. I made the no-DB call deliberately for the context: a hackathon against an alpha MCP server that revokes tokens after a few minutes. The committed snapshot isn't just convenience — it's the *reliable* path, because it runs with no auth and no upstream at all. The cost I'm still paying is real and I'll name it: on Vercel, state is per-instance, so a cold start re-bootstraps the schema and investigations cached on one instance aren't visible to another. The moment this is genuinely multi-instance, the first thing I add is a shared store — Redis for the cache, a persistent store for investigations. That's my top counterfactual."
 
 You said the cost out loud and named the trigger for changing it. That converts "no database" from a gap into a decision. We come back to this in Chapter 7 — here you're defending the choice; there you're owning what you'd redo.
 
@@ -285,18 +337,22 @@ The most reconsiderable choice in this chapter is the fixed roughly-one-second s
 
 **The choices covered:**
 - **Next.js 16** — for first-class streaming from route handlers co-located with the UI; cost: Vercel coupling + the 300s cap.
-- **Own agent loop, not a framework** — for the `maxToolCalls` control and fake-injected testability; deliberate.
+- **Hand-rolled loop → AptKit's runtime + my own adapter boundary** — deliberate first, evaluated-and-accepted second; ~200 LOC of adapters; legacy loop preserved.
+- **DataSource seam + 3 adapters** — abstraction paid off by absorbing two adapter swaps without changing caller surface; deliberate.
 - **sonnet-4-6 agents + haiku-4-5 intent** — match the model to the job; evaluated-and-accepted; one-line `AGENT_MODEL` swap.
-- **NDJSON over fetch, not SSE** — POST + simple framing + one wire format; gave up auto-reconnect I'd have replaced anyway.
-- **No database** — in-memory + committed demo snapshot; deliberate for the context; cost is per-instance cache loss; Redis is the trigger-based fix.
+- **NDJSON over fetch, not SSE** — POST + simple framing + one wire format (shared `readNdjson` kernel); gave up auto-reconnect I'd have replaced anyway.
+- **No database** — in-memory maps keyed by session + committed demo snapshot; deliberate for the context; per-instance cache loss is the remaining cost; Redis is the trigger-based fix.
 
 **Pull quotes:**
 - "It's good for this kind of thing" is the sound of a forgotten reason — every defense names a criterion and a cost.
+- I own the boundary; AptKit owns the loop. The legacy loop is preserved for the day I need to peel back to it.
+- The DataSource seam survived two adapter swaps without changing the caller surface.
 - I gave up EventSource's free reconnect on purpose — it wouldn't re-auth against a token-revoking server.
 
-**What you'd change:** Move the fixed ~1.1s MCP spacing to an adaptive/token-bucket limiter if the rate limit were stable and documented.
+**What you'd change:** Move the fixed ~1.1s Bloomreach spacing to an adaptive/token-bucket limiter if the rate limit were stable and documented.
 
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-06-02 — Test-count precision: "around 170 tests" → "169 tests across 18 files" to match the current vitest suite per study-testing audit.
 Updated: 2026-06-03 — Added a "framework runtime, not its data primitives" paragraph to Choice 1 (Next.js) absorbing the study-frontend-engineering audit's "framework underused" finding — preempts "why no Suspense / Server Components?" with the fit-for-purpose defense (this product is a 30-90s NDJSON stream, not a request-response shape).
+Updated: 2026-06-20 — Choice 2 (own agent loop) reframed as a two-step decision: deliberate hand-roll first, then evaluated-and-accepted migration to @aptkit/core's runtime + 3 Blooming-owned adapter classes (lib/agents/aptkit-adapters.ts); runAgentLoop preserved at base-legacy.ts. New Choice 2.5 added: DataSource seam + 3 adapters, defended with the receipt that the seam survived two adapter swaps (Olist added/removed; Synthetic added) without changing the caller surface. Choice 5 (no DB) updated: insights.ts race condition is RESOLVED via session-keying (Map<sessionId, SessionFeed>); per-instance cache loss remains the named cost. One-page summary updated to 6 choices.

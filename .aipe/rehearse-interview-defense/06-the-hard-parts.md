@@ -10,14 +10,18 @@ So this chapter teaches you to do three things on demand: walk a real bug from s
 │  HIGH — you built this deliberately, you can whiteboard it cold                  │
 │  ┌────────────────────────────────────────────────────────────────────────┐   │
 │  │ NDJSON streaming trace        useInvestigation StrictMode fix            │   │
-│  │ (events.ts, reader loop)      (started-guard + no-cancel-on-cleanup)     │   │
-│  │ coverage gate (categories.ts) shared runAgentLoop (base.ts)             │   │
+│  │ (events.ts + shared           (started-guard + no-cancel-on-cleanup)     │   │
+│  │  lib/streaming/ndjson.ts)     coverage gate (categories.ts)             │   │
+│  │ DataSource seam + 3 adapters  AptKit adapter boundary                   │   │
+│  │ (lib/data-source/types.ts)    (lib/agents/aptkit-adapters.ts)            │   │
 │  │ demo-vs-live split            coverage_item per-tile reveal (briefing)   │   │
+│  │ SyntheticDataSource           Phase 3 eval flywheel (built, used,       │   │
+│  │ (516 LOC, in-process)         surfaced bugs, removed substrate)         │   │
 │  └────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                  │
 │  MEDIUM — you chose it on purpose but the tuning is approximate                  │
 │  ┌────────────────────────────────────────────────────────────────────────┐   │
-│  │ ~1.1s inter-call spacing      retry/backoff math (client.ts L121-132)    │   │
+│  │ ~1.1s inter-call spacing      retry/backoff math                         │   │
 │  │ 60s cache TTL                 the agent prompts / synthesis instruction  │   │
 │  │ maxToolCalls budget = pick    the AES cookie store I wrote around auth   │   │
 │  └────────────────────────────────────────────────────────────────────────┘   │
@@ -25,6 +29,8 @@ So this chapter teaches you to do three things on demand: walk a real bug from s
 │  LOW — I use it correctly but I do not know it at the byte level                 │
 │  ┌────────────────────────────────────────────────────────────────────────┐   │
 │  │ MCP wire protocol internals   OAuth PKCE + DCR mechanics (SDK provider)  │   │
+│  │ AptKit's runtime internals    (I built the adapter boundary, not the     │   │
+│  │ (the loop they own)           runtime — clear line, same shape as MCP)   │   │
 │  │ distributed scale / multi-region / hot-path queues / load balancing      │   │
 │  └────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                  │
@@ -225,7 +231,11 @@ My honest answer: the part I'm least confident defending at depth is the MCP wir
 
 That distinction — *defaulted-to the SDK for the protocol, deliberate for the wrapper* — is the senior move. I'm not claiming to have implemented OAuth; I'm claiming to know precisely where the SDK's responsibility ends and mine begins.
 
-There's a second answer here that's actually sharper, and I'd offer it second if they let me, because it's the answer a staff interviewer would respect most: **the part I'm least confident defending isn't a protocol — it's the eval gap.** There is no `evals/` directory in this repo. No goldset, no judge, no agreement rate. Every prompt edit and every model swap ships with zero quality measurement, and the 169 tests prove plumbing, not output quality. The infrastructure to do evals well is actually built — the NDJSON trace is a span sequence, `lib/state/investigations.ts` replays it deterministically, `parseAgentJson` gives me typed agent outputs to score, the scripted-Anthropic harness proves the seam works against a fake — five seams, all cut. The keystone module is the only one missing. So if an L4 interviewer asks "how do you know any of the agent outputs are good," the honest answer today is "I don't, beyond eyeballing the trace" — and the move I'd respect from a candidate is to say that flatly and then describe the harness I'd build, not to dodge into the test count. I have the recipe written down (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md` — 10-case goldset, LLM-as-judge, measured agreement rate, ~5 hours). Owning the gap with a concrete recipe is the L5 move; pretending the unit tests cover it is the L1 collapse.
+There's a second answer here that's actually sharper, and I'd offer it second if they let me, because it's the answer a staff interviewer would respect most: **the part I'm least confident defending is the absence of a current eval harness — but the story underneath it is the strongest part of my answer.** There is no `eval/` directory in this repo today. Every prompt edit and every model swap ships with zero in-repo quality measurement, and the 221 unit tests prove plumbing, not output quality.
+
+What makes that not a confession but a *story* is what happened before the absence: I built the harness. The Phase 3 work added a four-pillar eval suite — detection precision/recall, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score — running K=10 against three seeded anomalies in a SQLite substrate, with LLM-as-judge calibrated by 8/8 + 3/3 manual spot-check agreement. The flywheel surfaced real bugs (a BRL cents-vs-Reais unit-narration bug the judge caught at run 8; a binary calibration breakdown in 29/30 diagnosis runs; conclusion instability at 30% regression baseline). The substrate was the Olist MCP server. When I retired Olist (the in-process Synthetic adapter is a cleaner shape for the same job), the eval suite went with it — its scorer was hard-coded to Olist's seeded anomaly ids. So today: same gap as before I started Phase 3, but with the experience of having shipped the harness, used it to find bugs, and learned what the next version should look like (against the Synthetic substrate, decoupled from any one adapter's seed data).
+
+So if an L4 interviewer asks "how do you know any of the agent outputs are good," my honest answer is: "Today, by eyeballing the trace — same as before. But I built it once, surfaced three real bugs via the flywheel, retired it with the substrate, and the next version goes against the Synthetic adapter so it's not coupled to a removed seed." Owning the gap *with the receipt of having done the work* is a stronger L5 move than promising to build something. The retired files carry RETIRED banners in `.aipe/study-*` as a paper trail.
 
 One more honest gap, while we're here: a11y on the streaming surfaces. The reasoning trace, the coverage grid resolving live, the insight cards dropping in — none of those streamed regions is wrapped in `aria-live`, `role="status"`, or `role="log"`. A screen-reader user gets silence while a sighted user watches the agent think. That's not a regret; it's a discipline I didn't build into the project, and the fix is small (the regions exist; they just need the right ARIA roles). If they push, I'd own it the same way as the eval gap — name what's there, name what isn't, and name the cheap concrete fix.
 
@@ -361,7 +371,7 @@ If I redid the hardest-bug work, the change isn't to the fix — the started-gua
 | Hardest bug? | StrictMode double-fetch in `useInvestigation.ts`: my started-guard and cleanup-cancel fought — cancelled the only fetch, then blocked the remount. Fix: guard + no-cancel-on-cleanup. |
 | Trickier in prod? | Briefing bare-500: demo=200 vs live=500 isolated it to the credentialed setup; `aesKey()` threw on unset `AUTH_SECRET`, unguarded. Wrapped setup, returned the real message. |
 | Proudest part? | The streamed reasoning trace — an analyst that shows its work — backed by the coverage gate that ghosts categories the data can't support instead of faking them. |
-| Least confident? | Two honest answers: (1) **the eval gap** — no `evals/`, no goldset, no agreement rate; 169 tests prove plumbing, not output quality; I have the harness recipe written down and would build it next. (2) MCP/OAuth protocol internals — defaulted-to the SDK's provider; I defend the wrapper, not the byte-level handshake. Streaming a11y is the same shape of admission: no `aria-live` on the trace, fix is small. |
+| Least confident? | Two honest answers: (1) **the current eval gap** — no `eval/` in repo today; 221 tests prove plumbing, not output quality. But the receipt: I shipped the 4-pillar eval suite in Phase 3, surfaced 3 real bugs via the flywheel (BRL cents-vs-Reais, calibration binary, conclusion instability), retired the harness when the Olist substrate was retired (it was hard-coded to those seeded anomaly ids); next version goes against the Synthetic adapter. (2) MCP/OAuth protocol internals + AptKit runtime internals — defaulted-to the SDK / library; I defend the wrappers and adapters, not the byte-level handshake or the loop internals. |
 | Subtle debug? | Coverage "loaded all at once": measured per-line arrival, proved the server streamed fine, the grid waited on one bulk event. Fix: `coverage_item` per tile — honestly only paced in the demo. |
 
 **Pull quotes:**
@@ -375,3 +385,4 @@ If I redid the hardest-bug work, the change isn't to the fix — the started-gua
 ---
 Updated: 2026-05-29 — created
 Updated: 2026-06-03 — Prompt 3 ("least confident defending") absorbed two new honest gaps from the recon + a11y audits: (1) the eval gap as the sharper L4-grade answer (five substrate seams cut, the harness keystone missing — recipe written in `.aipe/drills/evals-observability-*.md`); (2) streaming-surface a11y (no `aria-live` on the trace/coverage/insights) as a clean "what I'd add" admission. One-page summary updated to match.
+Updated: 2026-06-20 — Confidence map updated: DataSource seam (3 adapters) + AptKit adapter boundary added to HIGH (you built both); SyntheticDataSource and the Phase-3 eval flywheel added to HIGH (built, used, surfaced bugs, removed substrate); AptKit runtime internals added to LOW (clean line — you built the adapter boundary, not the loop). MAJOR REFRAME: "least confident — the eval gap" is no longer the unbuilt-keystone framing. The harness was BUILT in Phase 3, used the flywheel to surface 3 real bugs (BRL cents-vs-Reais, calibration binary, conclusion instability), then retired with the Olist substrate it scored against. Today's gap is the same as before Phase 3 — but with the receipts of having shipped the harness, found bugs, and learned what the next version against the Synthetic adapter should look like. That's a stronger L5 answer than promising to build.

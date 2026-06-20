@@ -28,22 +28,32 @@ Every chapter leans on this picture; when you lose the thread mid-interview, thi
 
 ```
 ┌─ UI (Next.js 16 App Router · React 19) ───────────────────────────────────────┐
-│  feed (CoverageGrid + InsightCard + StatusLog)                                 │
+│  feed (CoverageGrid + InsightCard + StatusLog) — 461 LOC across page.tsx +     │
+│  useBriefingStream + useReconnectPolicy + useDemoCapture (3 extracted hooks)   │
 │  investigate/[id] (diagnose)   …/recommend (decide)                            │
-│       │ fetch /api/briefing       │ fetch /api/agent?step=…   (NDJSON reader)   │
+│       │ fetch /api/briefing       │ fetch /api/agent?step=…   (readNdjson)      │
 └───────│───────────────────────────│────────────────────────────────────────────┘
-        ▼  NDJSON over a ReadableStream — fetch + reader loop, not EventSource
+        ▼  NDJSON over a ReadableStream — lib/streaming/ndjson.ts:readNdjson,
+           shared by all 4 streaming surfaces
 ┌─ Route handlers (Vercel · maxDuration = 300) ─────────────────────────────────┐
 │  /api/briefing: bootstrap schema → coverage gate → monitoring scan → insights  │
 │  /api/agent (step=diagnose|recommend): cache-replay (demo) OR live             │
-│       ▼ runAgentLoop — one shared Claude tool-use loop (maxToolCalls + synth)   │
-│   monitoring · diagnostic · recommendation · query   (claude-sonnet-4-6)        │
-│       ▼ McpClient: 60s cache · ~1.1s spacing · bounded backoff · no-cache-on-err│
-│   OAuthClientProvider (PKCE + DCR) · prod auth = AES-256-GCM `bi_auth` cookie    │
-└──── state: in-memory maps + committed demo-*.json (NO DB) ── Bloomreach MCP · Anthropic ─┘
+│       ▼ Active spine: @aptkit/core's runtime (AnomalyMonitoringAgent +          │
+│         DiagnosticInvestigationAgent + RecommendationAgent + QueryAgent +       │
+│         parseIntent), glued in via 3 Blooming-owned adapter classes in          │
+│         lib/agents/aptkit-adapters.ts (Anthropic SDK → ModelProvider;           │
+│         DataSource → ToolRegistry; AptKit traces → Blooming NDJSON hooks).      │
+│         The Blooming-authored runAgentLoop is preserved at base-legacy.ts.      │
+│       ▼ DataSource seam (lib/data-source/types.ts) — abstract surface, 3        │
+│         adapters today: BloomreachDataSource (HTTPS+OAuth, 60s cache,           │
+│         ~1.1s spacing, bounded backoff, no-cache-on-error) + SyntheticData-     │
+│         Source (in-process Blooming-owned synthetic ecommerce) + interface      │
+│       OAuthClientProvider (PKCE + DCR) · prod auth = AES-256-GCM `bi_auth`      │
+│       cookie (Bloomreach side only; Synthetic needs none)                       │
+└──── state: in-memory maps keyed by session (NO DB) + committed demo-*.json ─── Bloomreach MCP · Anthropic ─┘
 ```
 
-The spine: **UI → route → one shared agent loop → one MCP choke-point → providers**, no database in the middle. Chapter 2 walks it band by band.
+The spine: **UI → route → AptKit runtime (via 3 Blooming adapters) → DataSource seam → 3 adapters → providers (Bloomreach HTTPS OR in-process synthetic)**, no database in the middle. Chapter 2 walks it band by band.
 
 ## The eight chapters
 
@@ -76,17 +86,27 @@ The spine: **UI → route → one shared agent loop → one MCP choke-point → 
 
 ## How this connects to the rest of the study system
 
-This book is the **wide opener** — it prepares you for the project-level questions that open an interview. When the interviewer stops asking about the project and drills into *one pattern* — the provider abstraction, the TTL cache, the schema-gated coverage — that's the **deep dive**, and those defenses live in the per-concept Interview-defense blocks inside:
+This book is the **wide opener** — it prepares you for the project-level questions that open an interview. When the interviewer stops asking about the project and drills into *one pattern* — the DataSource seam, the TTL cache, the schema-gated coverage, the AptKit primitive boundary — that's the **deep dive**, and those defenses live in the per-concept Interview-defense blocks inside the study guides:
 
 ```
-  .aipe/rehearse-interview-defense/  ← THIS book — the whole project, wide
-  .aipe/study-system-design/     ← per-concept deep dives (request flow,
-                                        caching, streaming, the coverage gate, …)
-                                        each concept file has its own Interview
-                                        defense block
+  .aipe/rehearse-interview-defense/   ← THIS book — the whole project, wide
+  .aipe/interview-notes.md             ← one-page AI-interview cheat sheet
+                                          (top 10 questions, gaps to pre-empt)
+  .aipe/study-system-design/           ← request flow, caching, streaming,
+                                          coverage gate, DataSource seam (the
+                                          load-bearing system-design lesson —
+                                          3 adapters behind one interface)
+  .aipe/study-agent-architecture/      ← ReAct, tool-use, the AptKit runtime
+                                          layer, multi-agent topology
+  .aipe/study-ai-engineering/          ← LLM foundations, prompts, cost,
+                                          rate limiting, prompt injection
+  .aipe/study-software-design/         ← 05-aptkit-primitive-adapter-boundary
+                                          (the AOSD case study for "library +
+                                           adapter pattern at the agent /
+                                           library boundary")
 ```
 
-Use both. This book gets you through the first fifteen minutes without rambling; the concept files get you through the follow-up that goes three layers down on a single decision. The reader who studies only this book sounds fluent and folds on the first deep follow-up; the reader who studies only the concept files freezes on "walk me through your project." Pair them.
+Use them together. This book gets you through the first fifteen minutes without rambling; the cheat sheet is the night-before review; the concept files get you through the follow-up that goes three layers down on a single decision. The reader who studies only this book sounds fluent and folds on the first deep follow-up; the reader who studies only the concept files freezes on "walk me through your project." Pair them.
 
 ```
 ┃ This book is the wide opener. The concept files are the
@@ -98,3 +118,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-31 — Migrated to /aipe:rehearse orchestrator (v1.50): directory renamed from .aipe/study-interview-defense/ to .aipe/rehearse-interview-defense/ per spec rename study-interview-defense.md → rehearse-interview-defense.md; cross-references updated. Content unchanged.
 Updated: 2026-06-02 — v1.59.2 drift refresh: surgical edits across chapters 2, 3, 4, 7, 8 to integrate the CRITICAL `lib/state/insights.ts` race condition (audit red flag), tighten the test count to 169 across 18 files, surface the ALS-scoped RequestStore in the architecture diagram, and verify cited line numbers still resolve. No restructuring; book shape unchanged.
 Updated: 2026-06-03 — Drift refresh absorbing the 2026-06-02 audit pile (recon L1+L2-spike verdict, audit-refactor "five seams cut one keystone missing" framing, cleanup afternoon list, a11y observations, FE-engineering "framework underused" finding). Edits in chapters 3, 6, 7, 8: Ch 3 absorbs the "framework runtime, not data primitives" defense for Next.js (preempts "why no Suspense?"); Ch 6 sharpens "least confident defending" with the eval gap as the L4-grade answer plus streaming-surface a11y; Ch 7 adopts the audit-refactor "eval-first re-ranking" in the closer and adds the cleanup afternoon list (3 fixes, ~110 LOC) as concrete grounding; Ch 8 promotes the eval harness gap with its written recipe into the "what you'd change" closer as the L5-grade owned-with-recipe answer. Book shape unchanged.
+Updated: 2026-06-20 — System-at-a-glance diagram updated: active spine is now @aptkit/core's runtime glued in via 3 Blooming adapter classes in lib/agents/aptkit-adapters.ts (runAgentLoop preserved at base-legacy.ts). DataSource seam now serves 3 adapters (Bloomreach + Synthetic + interface) — Olist added then retired via PR #8; Synthetic adapter (in-process, Blooming-owned, 516 LOC) replaced it. Page decomposition stays (461 LOC + 3 hooks); shared readNdjson kernel hoisted to lib/streaming/ndjson.ts. Cross-links added: interview-notes.md, study-agent-architecture, study-ai-engineering, study-software-design.

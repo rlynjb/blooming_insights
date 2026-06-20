@@ -32,9 +32,10 @@ Before you can compress it, hold the whole thing in one picture — this is what
 
    STACK                             SHAPE
    ─────                             ─────
-     Next.js 16 · React 19            4 agents on one shared loop
+     Next.js 16 · React 19            4 agents · shared runtime
      Anthropic claude-sonnet-4-6      NDJSON streamed to the UI
-     MCP SDK · NDJSON · no DB         demo (cached) / live toggle
+     MCP SDK · NDJSON · no DB         demo / live-bloomreach /
+                                      live-synthetic (3-way toggle)
 ```
 
 Everything below is this picture, said at three zoom levels.
@@ -106,7 +107,7 @@ In your voice:
 
 "A marketer on Bloomreach has to do three things by hand: notice a metric moved, hunt for the cause, and figure out which Bloomreach feature to reach for. blooming insights does that loop end-to-end and proactively.
 
-It's a Next.js 16 app built on Bloomreach's loomi connect MCP server. There are no saved dashboards in the workspace, so every metric is computed ad-hoc with EQL — which means the agents have to decide *what* to query. There are four agents on one shared tool-use loop: monitoring, diagnostic, recommendation, and a free-form query agent, all running claude-sonnet-4-6. Monitoring runs a fixed checklist of ecommerce anomaly categories, but only after a gate checks which categories the workspace's event schema can actually support — so it never wastes a query on data that isn't there.
+It's a Next.js 16 app built on Bloomreach's loomi connect MCP server, with a Blooming-owned synthetic adapter behind the same interface so the live path works without the upstream. There are no saved dashboards in the workspace, so every metric is computed ad-hoc with EQL — which means the agents have to decide *what* to query. There are four agents — monitoring, diagnostic, recommendation, and a free-form query agent — running claude-sonnet-4-6 on a shared agent runtime; I started with a hand-rolled loop and migrated the active path to a generic agent library, keeping three small adapter classes on my side that hide the Anthropic SDK, the data source, and the streaming hooks behind library primitives. Monitoring runs a fixed checklist of ecommerce anomaly categories, but only after a gate checks which categories the workspace's event schema can actually support — so it never wastes a query on data that isn't there.
 
 The part I'm proudest of is that the reasoning is a first-class UI surface. As an agent works, the exact EQL it runs, the current-vs-prior numbers, and its hypotheses stream to a side panel over NDJSON. You're not looking at a spinner and then an answer — you watch the analysis happen.
 
@@ -231,3 +232,4 @@ If you rebuilt the pitch itself, you'd cut the word "agents" from the thirty-sec
 
 ---
 Updated: 2026-05-29 — created
+Updated: 2026-06-20 — 90s pitch updated: "four agents on one shared tool-use loop" → "four agents on a shared agent runtime; started with a hand-rolled loop and migrated the active path to a generic agent library, keeping three small adapter classes." Adds the Synthetic adapter as the parenthetical "live path that works without the upstream." 10s and 30s versions unchanged (compression discipline). Project-at-a-glance diagram updated: 3-way mode toggle (demo / live-bloomreach / live-synthetic) replaces the demo/live binary.
