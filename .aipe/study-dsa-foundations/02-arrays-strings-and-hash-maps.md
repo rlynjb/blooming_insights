@@ -522,32 +522,7 @@ Yes, when N is small and stable. `CATEGORIES` in `lib/agents/categories.ts` is a
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the kernel ops for each primitive: Array (index, length, push/pop), String (length, slice, split, concat), Map (get, set, has, delete). For each, name one cost-surprise (e.g. "arr.includes is O(N)", "string concat in a loop allocates", "Map uses identity for object keys").
-
-### Level 2 — explain
-
-Open `lib/mcp/client.ts` L80 and `lib/agents/categories.ts` L116–L127. Both use hash-based structures (Map and Set). For each, explain (a) what the access pattern is, (b) why Set vs Map was the right choice (presence vs presence-with-value), and (c) what data structure you'd use instead if you needed ordered iteration *and* O(1) lookup.
-
-### Level 3 — apply
-
-**Scenario:** Add a new derived field to `Insight` — `relatedInsightIds: string[]`, the IDs of other insights in the same `category`. You need to compute this for all insights after the briefing has run. Walk through which primitive(s) you'd reach for: a Map<category, Insight[]>? An Array.filter inside a .map? Both? Cite the cost of each approach for N=10 insights with C=5 distinct categories. Where in the codebase would you write this? Reference `lib/state/insights.ts` L25 where insights are currently built.
-
-### Level 4 — defend
-
-A teammate says: "Replace all the `Map<string, T>` instances with `Record<string, T>` — it's simpler and faster." Defend the Map choice. Address: O(1) guarantee on any key, prototype-chain safety (`__proto__`, `constructor`, `hasOwnProperty`), iteration order, and `.size`. State without hedging when a plain object IS the right choice (hint: when the keys are known at compile time and the access pattern is `obj.knownKey`). Cite `lib/mcp/client.ts` L80.
-
-### Quick check
-
-- What does `arr.includes(x)` cost on an array of length N? (O(N).)
-- What does `set.has(x)` cost on a Set of size N? (O(1) average.)
-- Why does the TTL cache use `JSON.stringify(args)` instead of using `args` directly as the key? (Map uses identity for object keys; serialization converts to value equality.)
-- Three strings: `"hello"`, `"hel" + "lo"`, `["hel","lo"].join("")`. Same value? (yes — all `==='hello'`. Strings are interned by value when computed at compile-time, identical when computed at runtime.)
-- What is `[...new Set([1, 1, 2, 3, 2])]`? (`[1, 2, 3]` — first-occurrence order preserved.)
-
 ## See also
 
 → `01-complexity-and-cost-models.md` (the cost framework these primitives are evaluated under) · → `06-sorting-searching-and-selection.md` (where Array.prototype.sort and substring scan live) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Map case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Set case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the string-buffer case study)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

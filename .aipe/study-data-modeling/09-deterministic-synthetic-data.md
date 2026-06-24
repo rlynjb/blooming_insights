@@ -408,16 +408,6 @@ A: Because the eval and the agent read the same substrate. The Olist DB has 7 ta
                                     summary.md
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the three seeded anomalies (id, metric, segment, multiplier). For each, name the schema column that the detection query filters on, and the index that supports the query.
-
-2. **Explain.** Why does `mulberry32` count as "deterministic" when the underlying math involves uint32 overflow and bit shifts? What is the seed actually pinning?
-
-3. **Apply.** A new seeded anomaly is proposed: "delivery delays in week 8 for the BA segment, +30% delivery time." Trace: which table holds the data the agent would query, which columns carry the signal, what multiplier you'd apply in the seeder, and what row you'd add to `seeded_anomalies`.
-
-4. **Defend.** Someone argues the eval should use real Olist data (the Kaggle dataset) instead of a synthetic one. Defend the synthetic + seeded approach. (Hint: real data doesn't carry known-injected anomalies; you'd have no ground truth to measure recall against.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — `olistWorkspaceSchema()` is the agent's view of the data; this file covers the data behind that view.
@@ -429,3 +419,4 @@ A: Because the eval and the agent read the same substrate. The Olist DB has 7 ta
 
 ---
 Created: 2026-06-16 — new file covering deterministic synthetic data, seeded_anomalies as ground truth, and eval result schemas as data contracts.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

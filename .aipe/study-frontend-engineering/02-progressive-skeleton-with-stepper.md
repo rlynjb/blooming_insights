@@ -645,24 +645,6 @@ Honest answer: the primitives are too small to be worth a dependency. Skeleton i
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without opening the code: name the four tiers and the user-question each one answers. Draw the time axis (10ms, 100ms, 1s, 10s) and show which tier covers which time scale. Write the rule that explains why `CoverageGrid` doesn't need its own state.
-
-### Level 2 — explain
-
-Open `components/feed/CoverageGrid.tsx`. Explain why the component is stateless. Trace what happens when a `coverage_item` event arrives at the feed page: which prop changes, which `Map` rebuilds, which tile re-renders, and why the other 9 tiles are unaffected. Why does the component render all 10 categories every frame instead of only the reported ones?
-
-### Level 3 — apply
-
-Open `app/investigate/[id]/page.tsx`. The diagnose page reuses three of the four tiers (stepper + shape via EvidencePanel skeleton + trace via StatusLog). What replaces the tile layer here, and why? Then walk through `EvidencePanel.tsx:62-99` — describe how its skeleton is *shape-true* (mirrors the loaded panel) and explain how that reduces layout shift compared to the feed's generic `<Skeleton height={96} />` stack.
-
-### Level 4 — defend
-
-A reviewer says: "Just show a spinner — this composition is over-engineered for a loading state." Walk through what the user loses if you replace the four tiers with a single centered spinner during the 30-60s briefing run. Name three specific user questions that go unanswered. Name the trust-failure mode that fires at ~15s into a spinner-only experience. Cite `app/page.tsx:560-568, 624, 626-633, 743-808` for the four-tier evidence, then close with the rule the composition embodies.
-
 ---
 
 ## See also
@@ -676,3 +658,4 @@ A reviewer says: "Just show a spinner — this composition is over-engineered fo
 ---
 
 Generated: 2026-06-03 — `/aipe:study-frontend-engineering` (per `specs/study-frontend-engineering.md`).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -340,28 +340,6 @@ multi-provider required  → neutral interface + factory (then)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, name the two injected dependencies of `runAgentLoop`, the two interfaces (`McpCaller`, `McpTransport`), and state the one property the seam provides (testability) and the one it does not (portability).
-
-### Level 2 — Explain
-
-Out loud: why does the comment at `lib/agents/base.ts` L11–L14 say the interface lets tests "inject a fake without depending on the concrete McpClient class"? What does TypeScript's *structural* typing contribute (the client satisfies `McpCaller` without `implements`)?
-
-### Level 3 — Apply
-
-Scenario: a PM asks to "add OpenAI as a fallback when Anthropic is down." Open `lib/agents/base.ts` L92–L118. List exactly what is coupled to Anthropic's shape (request params, `tool_use` extraction) and explain why this is a refactor, not a swap of the injected `anthropic` argument.
-
-### Level 4 — Defend
-
-A colleague says: "We already inject the client, so we're provider-agnostic — let's advertise multi-provider support." Correct the overclaim precisely: name what the seam does provide, what it does not, and the concrete requirement that would justify building the missing neutral interface and factory.
-
-### Quick check — code reference test
-
-Is the `anthropic` parameter of `runAgentLoop` a vendor-neutral interface or a concrete SDK type, and what does that imply about provider-swapping? (Answer: the concrete `Anthropic` SDK type — `lib/agents/base.ts` L48–L49; swapping providers requires a vendor-neutral interface and translation layers that do not exist, so it is a refactor, not a config change.)
-
 ## See also
 
 → 01-what-an-llm-is.md · → 04-structured-outputs.md · → 06-token-economics.md · → 05-streaming.md
@@ -373,3 +351,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

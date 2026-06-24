@@ -526,16 +526,6 @@ A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a 
   are the migration log.
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: what's the policy comment at `lib/mcp/types.ts` L54, and what does it imply about how new fields can be added to the `Insight` interface?
-
-2. **Explain.** Why doesn't the demo seed `lib/state/demo-insights.json` need to be re-captured every time a field is added to `Insight`? What's the load-bearing property of every new field that makes this work?
-
-3. **Apply.** A new required field `affectedRevenuePerDay: number` is proposed for `Insight`. Trace what breaks: (a) the demo seed, (b) `isAnomalyArray` (or its sibling), (c) the agent prompt for monitoring. What's the migration plan? (Hint: you can't just add it; either re-capture the demo and backfill, or — better — add it as optional.)
-
-4. **Defend.** Someone proposes adding Zod to derive validators + a JSON Schema the prompts could lint against. Cost-vs-benefit at this repo's size? At what scale does it earn its place?
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces that evolve, and the dual-shape `Diagnosis` as a mid-migration smell.
@@ -548,3 +538,4 @@ A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a 
 
 ---
 Updated: 2026-06-16 — added the Olist "drop-and-reseed" pattern; named the determinism-and-read-only invariants that make it work; contrasted with the additive-evolution policy on the agent contract.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

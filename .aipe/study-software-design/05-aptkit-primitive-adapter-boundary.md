@@ -440,16 +440,6 @@ Interview-defense diagram — why the queue is load-bearing
             on every tool result                       UI renders complete card
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the three primitive interfaces AptKit defines and the three Blooming adapter classes that implement them. Which of the three adapters holds state, and why?
-
-2. **Explain.** Why does `BloomingToolRegistryAdapter` drop the `fromCache` field when forwarding from `DataSource.callTool` to AptKit's primitive return shape? (Hint: AptKit's `ToolRegistry.callTool` primitive doesn't expose `fromCache`; it's a Blooming-specific cache-hit telemetry that flows through the trace sink instead. Generic libraries shouldn't define cache semantics for their consumers.)
-
-3. **Apply.** Blooming decides to swap Anthropic for an OpenAI-compatible provider. Which file (and which lines) change? How many other files change? (Answer: `lib/agents/aptkit-adapters.ts:26-72` — `AnthropicModelProviderAdapter` is rewritten as `OpenAIModelProviderAdapter`. The four agent classes change the import and the constructor call once each — five lines total. AptKit's loops don't change. The route handlers don't change. The UI doesn't change.)
-
-4. **Defend.** A reviewer says "let's inline the three adapters into each agent class — it'd be one fewer file." Argue against. (Hint: invoke the depth ratio — three small adapter files have one job each and one constructor each. Inlining would duplicate each adapter four times (once per agent class, since each agent constructs the same three adapters). The duplication would be ~110 LOC × 4 = 440 LOC where there are now 206 — and a single fix to the trace-event translation would have to land in four places instead of one.)
-
 ## See also
 
 - `01-mcp-client-deep-module.md` — the parallel case study at the protocol boundary. The `DataSource` seam is the same adapter-pattern lesson at a different altitude.
@@ -458,3 +448,4 @@ Interview-defense diagram — why the queue is load-bearing
 
 ---
 Updated: 2026-06-19 — new file; documents `lib/agents/aptkit-adapters.ts` (206 LOC, 3 adapter classes) as the second instance of the APOSD "small interface, fat hidden body" pattern in this codebase, parallel to the `DataSource` seam in `01-mcp-client-deep-module.md`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

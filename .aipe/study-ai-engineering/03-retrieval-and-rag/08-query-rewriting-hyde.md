@@ -296,28 +296,6 @@ decomposition: question → sub-queries → retrieve each → RRF fuse
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the three query-rewriting levers (expand, decompose, HyDE) and state what each fixes. Explain why HyDE embeds an answer rather than the question.
-
-### Level 2 — Explain
-
-Out loud: why is query understanding (classify + translate to EQL) different from retrieval-query rewriting? Why is rewriting overhead for an exact query?
-
-### Level 3 — Apply
-
-Scenario: a fuzzy "find similar past work" feature retrieves poorly because users and old investigations use different words. Open `lib/agents/intent.ts` L17–L31 (`classifyIntent`, the cheap-model query understanding to reuse) and imagine the embedding retriever from `01`/`05`. Explain where HyDE would sit, which model tier it would use, and how you would measure the recall gain.
-
-### Level 4 — Defend
-
-A colleague wants to add HyDE to the EQL analytics path "to improve every query." Argue why it is overhead and risk for exact queries (no vocabulary gap, extra latency, mistranslation), and confine rewriting to fuzzy free-text retrieval. Then defend the codebase's existing classify-and-translate as the *correct* query understanding for exact analytics.
-
-### Quick check — code reference test
-
-What query-understanding does blooming insights do today, and why is retrieval-query rewriting (HyDE/expansion) not needed for it? (Answer: `classifyIntent` (`lib/agents/intent.ts` L17–L31) classifies the free-form `?q=` and the agent translates it into exact EQL; because EQL uses known schema names there is no user-vs-document vocabulary gap, so the expand/HyDE recall levers have nothing to fix.)
-
 ## See also
 
 → 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
@@ -325,3 +303,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

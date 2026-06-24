@@ -396,16 +396,10 @@ The diagnostic value of isolation
 
 **Q: Why `.toThrow()` instead of catching and asserting on the returned undefined?** Because the throw IS the contract. `parseAgentJson` throws on bad input by design — the agent classes wrap it in try/catch and run a synthesis fallback when it throws. If `parseAgentJson` returned `undefined` instead, the fallback path would never run; that's a different bug. The `.toThrow()` assertion pins the contract that downstream code depends on.
 
-## Validate
-
-1. **Reconstruct:** Without looking, list the three load-bearing parts of the acceptance + per-gate rejection pattern. Which one is most often missed?
-2. **Explain:** Why does the "rejects bad severity" test for `isAnomalyArray` use `{ ...good[0], severity: 'huge' }` instead of `{ severity: 'huge' }`?
-3. **Apply:** Write the missing isolated-gate rejection test for the case where the agent's `anthropic.messages.create` throws. Decide what shape of failure to assert (`.rejects.toThrow()` with what message?).
-4. **Defend:** A reviewer says the dual-shape coverage for `isRecommendationArray.estimatedImpact` is over-engineered — "just pick one shape and stick with it." Push back with the "the legacy string is still in production data" argument and the migration-trap value of the rejection test.
-
 ## See also
 
 - `audit.md#edge-cases-and-error-paths` — the lens this pattern anchors
 - `01-scripted-anthropic-harness.md` — the agent layer that depends on these guards as fallback triggers
 - `02-fixture-driven-schema-parser.md` — the parser output that flows into these guards (after parsing)
 - `03-vi-stubenv-isolation.md` — the test isolation that lets parallel-worker runs of validate.test.ts stay clean
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

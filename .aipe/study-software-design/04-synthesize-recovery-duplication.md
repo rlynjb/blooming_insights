@@ -444,16 +444,6 @@ Interview-defense diagram — helper vs lift
    (no synthesize() exists at the agent layer)
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the two agents that have a `synthesize()` recovery method. Which two parts of the recovery are shared, and which three are agent-specific?
-
-2. **Explain.** Why is "lift to the loop" stronger than "extract a shared helper"? What failure mode does the lift eliminate that the helper still allows?
-
-3. **Apply.** Look at `MonitoringAgent.scan` (`lib/agents/monitoring.ts:69-120`). It doesn't have a `synthesize()` method — on parse fail it returns `[]`. Decide: would lifting the recovery into the loop benefit monitoring too? (Hint: arguably yes — currently monitoring degrades to no anomalies if the model returns a malformed array, when one tool-less retry might recover useful items. The lift would let monitoring opt into recovery without writing its own copy.)
-
-4. **Defend.** Someone says "the two `synthesize()` methods are different — they return different types, take different inputs, use different prompts. They can't share code." Counter using the strategy axis. (Hint: the *return types* differ but the *recovery decision* doesn't. The lift parameterizes what differs — the parser is generic over T, the prompt is a function `(toolCalls) => string`. Strategies abstract; inputs parameterize. The fact that the prompts and parsers differ is exactly why they're inputs, not why the strategy can't be shared.)
-
 ## See also
 
 - `audit.md` — the errors-and-special-cases lens records the resolution and names a sibling instance (PR G goldens-empty pre-flight) where "design the safety in" was applied to infrastructure rather than agent flow.
@@ -462,3 +452,4 @@ Interview-defense diagram — helper vs lift
 
 ---
 Updated: 2026-06-16 — verdict RESOLVED; lift landed as predicted (parseResult + recoveryPrompt parameters on runAgentLoop; ~90 LOC deleted); kept as the canonical worked example of "define it out of existence" at the agent-loop seam, with a post-fix lesson on why this beat a shared helper.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

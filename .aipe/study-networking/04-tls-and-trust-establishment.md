@@ -367,13 +367,6 @@ The blob carries OAuth tokens with a 10-day lifetime. Risks ranked: (1) `AUTH_SE
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Without looking, list the three TLS hops and which side terminates each. Then list the AES-GCM round-trip steps (encrypt and decrypt).
-  2. **Explain.** Why is `Secure: true` load-bearing in production but omitted in development? What concretely breaks if you forget the dev exception?
-  3. **Apply.** A teammate proposes storing the encrypted cookie in `localStorage` "for easier access." Argue against it citing the exact security guarantees that would change.
-  4. **Defend.** Why does `decryptStore` return `{}` on failure instead of throwing? Trace the consequence through `withAuthCookies` and the request handler.
-
 ---
 
 ## See also
@@ -382,3 +375,4 @@ The blob carries OAuth tokens with a 10-day lifetime. Risks ranked: (1) `AUTH_SE
   → `02-dns-routing-and-addressing.md` — how the cert's hostname matches resolution.
   → `05-http-semantics-caching-and-cors.md` — the cookies' other flags and what they bind to.
   → `../study-security/` — for the application-level trust audit; this file covers the mechanism, that one covers whether it's enough.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

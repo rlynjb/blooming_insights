@@ -594,13 +594,6 @@ The idempotent `connect()`. Concurrent callers under the first call share one in
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, write the `DataSource` interface. Name what's on it, what's NOT (and why), and what the envelope shape is. Now describe how `BloomreachDataSource.callTool` and `OlistDataSource.callTool` differ in their failure handling.
-- **Explain.** Why does `makeDataSource` (`lib/data-source/index.ts:73-109`) have an `ok: false` arm for `live-bloomreach` but not for `live-sql`? Because the Bloomreach branch can fail at OAuth (token expired, never authorized) — that's a genuine "redirect the browser to re-auth" failure mode. The Olist branch has no auth, so the only failure modes are spawn errors (which throw, not return false). The union type encodes this asymmetry.
-- **Apply.** A new requirement: add a third adapter for a REST-only analytics provider (no MCP, no JSON-RPC). Walk through the changes. (Define a third adapter class implementing `DataSource`; the `callTool` body translates the MCP-style call to REST + back to the envelope. Add a third arm in `makeDataSource` for the new mode. The agent layer changes zero lines. The mock-test surface is the same — `DataSource` is mockable.)
-- **Defend.** Why share zero partial-failure code between the two adapters? Because their transports' failure ontologies are fundamentally different — retry-with-parsed-window is meaningful for HTTP 429s but meaningless for an EPIPE; per-call `AbortSignal.timeout` is meaningful for a hanging subprocess but redundant for HTTP if there's already a retry budget. Forcing shared mechanism would either force one side to over-engineer (Bloomreach: per-call timeout it doesn't need yet) or force the other to under-engineer (Olist: a retry loop that can't help). The right unit of reuse is the *interface*, not the mechanism.
-
 ---
 
 ## See also
@@ -616,3 +609,4 @@ The idempotent `connect()`. Concurrent callers under the first call share one in
 
 ---
 Updated: 2026-06-16 — Initial generation as the Phase 2 concept file. Covers the DataSource interface, the makeDataSource factory, the two-adapter shape with asymmetric failure ontologies, subprocess lifecycle as a distributed primitive, and JSON-RPC 2.0 over arbitrary transports.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

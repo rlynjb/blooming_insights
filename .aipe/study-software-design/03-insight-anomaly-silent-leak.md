@@ -409,16 +409,6 @@ Interview-defense diagram — surface fix vs deeper fix
   → leak retires entirely (insightToAnomaly deletes)
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the three files where the Anomaly/Insight field list is encoded. Which fields does `insightToAnomaly` silently drop?
-
-2. **Explain.** Why doesn't TypeScript catch the divergence between `anomalyToInsight` and `insightToAnomaly`? What property of the type system makes the leak invisible?
-
-3. **Apply.** A new field `affectedCustomers: number` is added to `Anomaly` in `lib/mcp/types.ts`. Trace what happens during a round-trip from monitoring → state → browser → `/api/agent` → diagnostic agent. At which step is the field silently lost?
-
-4. **Defend.** Someone says "the two converter functions live in different files because they have different responsibilities — the state mapping is for storage, the route mapping is for HTTP." Counter using the hiding test. (Hint: the *responsibility* differs, but the *knowledge* is the same — both functions encode "which fields cross the Anomaly/Insight boundary." Sharing knowledge across files without sharing a single source of truth IS the leak. Colocate them or — better — eliminate one by fixing the wire format.)
-
 ## See also
 
 - `audit.md` — the information-hiding-and-leakage lens records the resolution and names new hides added by Phase 2 (`makeDataSource` factory, domain-tool surface in `mcp-server-olist/`).
@@ -427,3 +417,4 @@ Interview-defense diagram — surface fix vs deeper fix
 
 ---
 Updated: 2026-06-16 — verdict RESOLVED; surface fix landed (colocation + intentional-drop comment + round-trip test); deeper wire-format fix deliberately not done; kept as worked example with post-fix lesson on comments as carriers of intent TypeScript can't enforce.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

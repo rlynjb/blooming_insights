@@ -365,28 +365,6 @@ No — and conflating them is the tell. Retry assumes the failure is transient; 
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, write the retry loop's three moving parts (the predicate that decides retryability, the bound, the wait computation). State how the wait is chosen (parsed Retry-After + 500ms preferred, else exponential backoff off a 10s base, capped at 20s). Then state the one refinement the wait lacks (jitter) and the one mechanism that is entirely absent (circuit breaker), with what each protects against.
-
-### Level 2 — Explain
-
-Out loud: explain why an un-jittered (deterministic) backoff still creates a thundering herd under concurrency and how jitter fixes it. Then explain why retry without a circuit breaker *amplifies* a sustained outage rather than surviving it.
-
-### Level 3 — Apply
-
-Scenario: Bloomreach is down and investigations are timing out instead of failing cleanly. Open `lib/mcp/client.ts` L122–L132 and `app/api/agent/route.ts` L20. Calculate the worst-case wait for a single `callTool` with no parsed hint (initial 1100 ms spacing + backoff 10s + 20s + 20s under the 20s ceiling ≈ 51s) and explain how a couple such calls eat a large slice of the 300s `maxDuration` budget. Then state where a breaker would short-circuit this (before `liveCall` at L113).
-
-### Level 4 — Defend
-
-A teammate says "the bounded retry with backoff is fine, we don't need a circuit breaker." Defend the breaker: cite the worst-case per-call retry tax (~51s, `lib/mcp/client.ts` L122–L132), explain how it amplifies an outage and threatens the 300s route budget (`app/api/agent/route.ts` L20), and name what the breaker adds that retry cannot — a fast-fail path during sustained failure.
-
-### Quick check — code reference test
-
-How many total transport attempts does `callTool` make in the worst case for a rate-limited call, and which constant determines it? (Answer: 4 — 1 initial + `maxRetries = 3`, `lib/mcp/client.ts` L89, loop L122–L132.)
-
 ## See also
 
 → 04-rate-limiting-backpressure.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
@@ -397,3 +375,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

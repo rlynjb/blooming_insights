@@ -184,16 +184,6 @@ Diagram: a B-tree with leaves linked, an arrow showing the range-scan walk.
 
 Anchor: there is no such table today; this is hypothetical, and I'd say so in the interview.
 
-## Validate
-
-**Level 1 — reconstruct.** From memory, draw a B-tree with three levels and explain why a range scan touches log N + range_size pages, not N.
-
-**Level 2 — explain.** Why don't we add an LRU eviction to `lib/mcp/client.ts`'s cache? (Answer: bounded TTL + bounded number of unique tool-call keys per session; the Map never grows large enough to need eviction in practice. If it ever did, you'd add a max-entries cap and an LRU.)
-
-**Level 3 — apply.** A feature lands where the feed shows insights filtered by `severity === 'critical'`. Today it's `listInsights().filter(...)` in `lib/state/insights.ts`. At what scale does that filter need to become an index, and what's the migration look like?
-
-**Level 4 — defend.** Argue against adding a "secondary index on severity" inside the in-memory `Map`s (i.e. maintaining a second `Map<Severity, Set<id>>`). (Answer: at current scale the filter is microseconds; the second Map is two writes per insert and a real chance of getting out of sync on the `clear()` calls. Wait until you're in a real DB before you reach for secondary indexes.)
-
 ## See also
 
 - `02-records-pages-and-storage-layout` — where the rows would live, that the index would point at
@@ -202,3 +192,4 @@ Anchor: there is no such table today; this is hypothetical, and I'd say so in th
 
 ---
 Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." The 9-index Olist landscape is gone; section returns to teaching the concept generically with V8 Map hash-lookup as the only present cousin.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

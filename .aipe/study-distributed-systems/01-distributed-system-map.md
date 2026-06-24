@@ -340,13 +340,6 @@ Cross-instance coordination. The `Map` in `lib/state/insights.ts` is per-process
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, draw the map: client, Vercel instance(s), three providers. Label each arrow with what crosses. Mark which seam is the gap.
-- **Explain.** What state in `lib/state/insights.ts:4-6` survives a Vercel instance recycle? (None.) What state in `lib/mcp/auth.ts:38-104` does? (The encrypted cookie, on the client — the server is stateless across recycles.)
-- **Apply.** A new feature needs the recommendation step to see step 2's diagnosis. The user might close the tab between steps and reopen later. Which seam fails? (Seam A — `sessionStorage` is per-tab; reopening doesn't restore it.) What's the minimum fix? (Persist the diagnosis server-side under a cross-instance store, e.g. Vercel KV.)
-- **Defend.** Why is the in-memory `Map` in `lib/state/insights.ts:4-6` "fine for now"? Because the briefing route runs once per user-session, the result IS the current feed, and the failure mode (cold instance has no `Map`) is silently masked by the demo snapshot fallback in `app/api/agent/route.ts:52-58`. It's a deliberate hackathon-scale call, not an oversight — but it's the first thing that breaks at multi-user scale.
-
 ---
 
 ## See also
@@ -363,3 +356,4 @@ Updated: 2026-06-16 — Added Seam F (subprocess pipe to mcp-server-olist); refa
 
 ---
 Updated: 2026-06-19 — Seam F (stdio subprocess to mcp-server-olist) REMOVED after PR #8 deleted the Olist adapter. Boundaries revert to three (MCP, Anthropic, IdP) + one gap (cross-instance). Zoom-out diagram, structure pass, primary diagram revised; subprocess-box section replaced with a "what's NOT distributed" note covering the in-process `SyntheticDataSource`. `bi:mode` enum updated from `live-sql` → `live-synthetic`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

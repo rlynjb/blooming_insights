@@ -380,13 +380,6 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, name the three idempotency patterns (natural / key / conditional) and which one would apply if `start_campaign` were called.
-- **Explain.** Why does `lib/data-source/bloomreach-data-source.ts:178-181` early-return without writing to the cache when `isError === true`? Because the result *is* a transient error that the next attempt may succeed past; caching it would prevent the retry.
-- **Apply.** A bug report says "I refreshed the investigation page and saw the diagnosis update slightly — the second time around, one of the EQL results differed." Walk through the dedup layers to find the cause. (sessionStorage stash hits first → bypasses /api/agent entirely; if cleared, the route's `getCachedInvestigation` hits next; if missing, a fresh agent run executes — the cached 60s TTL in McpClient only helps if the bootstrap or repeated EQL calls happen within 60s. Different timestamps → genuinely different results, expected.)
-- **Defend.** Why is there no `Idempotency-Key` header on MCP calls? Because no MCP call this app makes mutates state — they're all reads. The header would be no-op overhead. The day a write is added, the header (or its MCP-protocol equivalent) becomes required.
-
 ---
 
 ## See also
@@ -400,3 +393,4 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 
 ---
 Updated: 2026-06-16 — Verdict + zoom-out cover both adapters' dedup (Bloomreach: 60s TTL; Olist: none); line refs migrated to `lib/data-source/bloomreach-data-source.ts`; flagged the asymmetric cache as a deliberate design choice tied to transport cost.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

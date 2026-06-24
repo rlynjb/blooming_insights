@@ -288,28 +288,6 @@ periodic compaction/rebuild → restore recall
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the three incremental-index operations (upsert covering add+update, delete) keyed by id, and the change-detection that decides which to run. State what full rebuild costs vs. incremental.
-
-### Level 2 — Explain
-
-Out loud: why does change-detection (content hash) make incremental cost scale with the change rather than the corpus? What breaks if you skip the delete path?
-
-### Level 3 — Apply
-
-Scenario: a past investigation is edited and one section changes. Open `lib/state/investigations.ts` (`saveInvestigation` keyed upsert) and explain how you would extend it to an embedding index: where the hash compare goes, how chunk-level ids (`docId#chunkIndex`) let only the changed section re-embed, and where the delete path lives for removed investigations.
-
-### Level 4 — Defend
-
-A colleague proposes a nightly full re-embed of the whole corpus "for simplicity." Argue the cost (O(N) embedding calls, stale window during the rebuild) versus change-detection-driven upserts, and concede the cases where a full rebuild is still right (a model swap from `09`, or recovering from index drift).
-
-### Quick check — code reference test
-
-What keyed in-place update does blooming insights already perform, and what two things would an incremental embedding index add to it? (Answer: `saveInvestigation` upserts one investigation by key — `mem.set(insightId, events)` and the JSON merge `all[insightId] = events` in `lib/state/investigations.ts`; an incremental embedding index would add change-detection — a content hash to skip unchanged documents — and a delete path to evict vectors for removed documents.)
-
 ## See also
 
 → 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
@@ -317,3 +295,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

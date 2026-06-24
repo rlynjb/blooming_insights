@@ -399,13 +399,6 @@ Attack: for *debugging* a captured run, the original pause IS the diagnostic sig
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, write the 6-line kernel of the replay loop (the `start(controller)` body). Test: name the file and line range. Anchor: `app/api/agent/route.ts:131-138`.
-2. **Explain.** Why does the replay path skip the `process.env.ANTHROPIC_API_KEY` check that the live path requires? What does this enable for the demo workflow?
-3. **Apply to a scenario.** A captured investigation is replayed and the user reports the diagnosis looks different from what they saw on the original live run. List three categories of cause (cache, replay, live-mutation drift), ranked by likelihood.
-4. **Defend the decision.** Argue for adding a `?fidelity=original` query param. Then argue what the dominant use case really is and why pacing wins by default.
-
 ---
 
 ## See also
@@ -420,3 +413,4 @@ Attack: for *debugging* a captured run, the original pause IS the diagnostic sig
 
 ---
 Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; replay-from-snapshot is now the only reproduction primitive in this repo.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

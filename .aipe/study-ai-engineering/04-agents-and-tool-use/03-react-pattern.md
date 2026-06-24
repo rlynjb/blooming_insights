@@ -402,28 +402,6 @@ Yes, and candidates dodge because admitting it undercuts the demo. Every Observa
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the ReAct cycle and label each phase with (a) the model output that produces it, (b) the `runAgentLoop` hook that taps it, (c) the NDJSON event it becomes. Draw the feedback edge from Observation back to the next Thought.
-
-### Level 2 — Explain
-
-Out loud: explain why the Observation is pushed back into `messages` (`base.ts` L171), and why removing that line would turn the agent from ReAct into a blind actor that repeats itself.
-
-### Level 3 — Apply
-
-Scenario: the investigate page shows a `tool_call_start` for `get_funnel` but never a matching `tool_call_end`, and the stream hangs. Where do you look? Check `lib/agents/base.ts` L144–L159: did `mcp.callTool` resolve (the `try` at L143)? If it threw, L153 sets `tc.error` and `onToolResult` (L159) should still fire a `tool_call_end` with an `error`. If neither fired, the call is still in flight — check the MCP spacing/retry path. Trace which hook did not fire and why.
-
-### Level 4 — Defend
-
-A reviewer says: "Showing users the model's raw reasoning is a liability — it might be wrong and we are presenting it as fact." Defend the streamed trace as a debugging/UX surface while conceding the reviewer's point about faithfulness, and name where correctness is actually enforced (validators + evals, not the trace).
-
-### Quick check — code reference test
-
-Which line in `lib/agents/base.ts` turns an Observation into input for the model's next Thought, and what role does that message take? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`; the result enters as a `user` turn.)
-
 ## See also
 
 → 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../05-evals-and-observability/ · → ../../study-system-design/05-streaming-ndjson.md · → ../../study-system-design/06-multi-agent-orchestration.md
@@ -435,3 +413,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

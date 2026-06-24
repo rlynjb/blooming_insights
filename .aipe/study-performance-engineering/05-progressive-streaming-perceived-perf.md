@@ -615,16 +615,6 @@ The full picture — the streaming kernel, the four UX moves, the buffering risk
 
 ---
 
-## Validate
-
-**Level 1 — Reconstruct.** Name the four UX moves in blooming insights' perceived-perf strategy and the files where each lives. (Answer: (1) NDJSON streaming — `lib/hooks/useInvestigation.ts:184-208` (reader), `app/api/agent/route.ts:131-264` and `app/api/briefing/route.ts:97-258` (writer); (2) Skeleton placeholders — `components/shared/Skeleton.tsx`, `components/investigation/RecommendationCardSkeleton.tsx`; (3) ProcessStepper — `components/shared/ProcessStepper.tsx`; (4) StatusLog — `components/shared/StatusLog.tsx`.)
-
-**Level 2 — Explain.** Why is `Cache-Control: no-cache, no-transform` load-bearing for the streaming pattern? (Answer: `no-cache` prevents intermediaries from caching the response (an investigation is per-request unique). `no-transform` prevents intermediaries (CDN edges, proxies, gzip middleware) from buffering the response to compress or transform it more efficiently — buffering would defeat the streaming entirely, making the user wait until the full response is ready. Without `no-transform`, the user might see all events at ~100s instead of the first event at ~1-2s — same code, same agents, but the UX collapses silently.)
-
-**Level 3 — Apply.** A new agent type streams text deltas at ~50 events/sec (instead of the current ~1-2). What's the first thing that breaks, and what's the fix? (Answer: the per-event `setState` in the useInvestigation hook starts to dominate render time. At 50 events/sec × ~10ms per re-render of a growing list = ~500ms of CPU per second, which means lag and dropped frames. The fix: switch from per-event setState to a `useReducer` + buffered flush — accumulate events in a ref, flush every ~16ms (one animation frame) via `requestAnimationFrame`. Alternative: wrap each setState in `startTransition` to mark them as non-urgent, letting React skip them under pressure. Either approach trades per-event freshness for sustained framerate.)
-
-**Level 4 — Defend.** A reviewer says "the user waits 100 seconds — no UX is going to fix that. Show them a spinner and let them browse another tab." Defend the current design. (Answer: the empirical evidence (NN/g research, dozens of streaming UI deployments) is that users *do* perceive streamed work very differently from monolithic waits. A spinner at 100s is read as "broken or stuck"; a streaming log at 100s is read as "the system is working through my problem." The blooming insights design takes the second path — the user can read the agent's thoughts as they happen, which builds trust *and* fills the wait with content. The honest gap is that none of this is *measured*: we don't have time-to-first-event tracking, no Web Vitals, no validation that the strategy is working. The fix isn't "ship the spinner"; the fix is "add the meter so we know the streaming UX is doing its job.")
-
 ---
 
 ## See also
@@ -635,3 +625,4 @@ The full picture — the streaming kernel, the four UX moves, the buffering risk
 - `03-spacing-gate-as-rate-limit-compliance.md` — the floor that makes actual latency unavoidable
 - `04-synthesize-as-cost-concentration.md` — the same "design without measurement" gap on the server side
 - `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the NDJSON flow from the request-shape lens
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

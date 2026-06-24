@@ -448,45 +448,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three nested cache scopes (per-turn, intra-run, cross-run) plus the whole-run replay. Label which are built, which are absent, and the blast radius of each.
-
-Open the file. Compare.
-
-✓ Pass: you drew the three scopes nested by blast radius, labelled intra-run and whole-run as built, cross-run semantic and prompt-prefix as absent, and noted the blast radius widens as the scope does
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague asks "why don't you semantic-cache the EQL calls across investigations?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the blast-radius argument (stale hit feeds the model, every downstream turn inherits it)?
-- Distinguish "one trajectory affected" (intra-run) from "every matching trajectory affected" (cross-run)?
-- Name the bounded TTL on the intra-run cache (60s) as the reason that scope works?
-- Name the breakpoint at which cross-run could become safe (slow-moving data + freshness gates + measured hit-rate need)?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: a daily-batch aggregate over past investigations that updates every 24 hours. A user asks "show me the trend of cart abandonment across my last 10 investigations." Without opening the code: would a cross-run semantic cache earn its place here? Where would it slot in, and what freshness gate would you add?
-
-Write your answer (4–6 sentences). Then open `lib/mcp/client.ts` L97–L146 to see where the cache layer would sit relative to the existing intra-run cache.
-
-### Level 4 — Defend the decision you'd change
-"You said the prompt-prefix cache is a gap. If you had two hours to ship one cache improvement to this codebase, would you add `cache_control` on Claude messages or build the cross-run semantic cache for tool results? Walk the cost-benefit: what does each save, what does each risk?"
-
-Reference the code: point to `runAgentLoop` (`base.ts` L102) for where `cache_control` would slot on the Anthropic call, and `McpClient.callTool` (`client.ts` L97–L146) for where the semantic cache would intercept.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the intra-run cache and what's the TTL default?
-- What's the cache key format (the string passed to `Map.get`)?
-- What route file holds the whole-run replay branch, and what URL parameter bypasses it for a live re-run?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-fan-out-backpressure.md · → 03-per-tool-circuit-breaking.md · → single-call caching: `../../study-ai-engineering/06-production-serving/01-llm-caching.md`
@@ -497,3 +458,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

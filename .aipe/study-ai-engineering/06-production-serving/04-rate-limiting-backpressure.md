@@ -364,28 +364,6 @@ For one serial caller they are functionally identical — the caller never accum
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, write the four lines of `liveCall`'s spacing logic (measure elapsed, compare to interval, sleep the difference, update the timestamp). Then state the two things spacing does NOT provide (queue ordering, backpressure/shedding) and why each matters under concurrency.
-
-### Level 2 — Explain
-
-Out loud: explain why per-instance `lastCallAt` is correct for one serial caller but breaks for two concurrent serverless instances serving the same user. What state would have to be shared to fix it?
-
-### Level 3 — Apply
-
-Scenario: traffic grows and multiple users investigate at once. Open `lib/mcp/connect.ts` L91–L96 — each call builds a new `McpClient`. Explain precisely why this means the ~1 req/s/user limit is no longer guaranteed, and name the minimum change (a shared per-user limiter constructed at L91) that restores it.
-
-### Level 4 — Defend
-
-A teammate wants to replace the fixed delay with a token bucket to "handle bursts better." Defend the position that the bucket is the wrong fix: for a single serial caller it is functionally identical to the fixed delay, and the actual gap is the absence of a queue and load-shedding for concurrent callers — cite `lib/mcp/client.ts` L148–L163 and explain what a bounded queue adds that a bucket does not.
-
-### Quick check — code reference test
-
-What value is `minIntervalMs` set to for the live Bloomreach connection, and on which line? (Answer: 1100 ms, `lib/mcp/connect.ts` L92, in the construction at L91–L96.)
-
 ## See also
 
 → 05-retry-circuit-breaker.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
@@ -396,3 +374,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

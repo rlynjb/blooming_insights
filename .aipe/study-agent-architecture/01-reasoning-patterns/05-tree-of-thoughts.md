@@ -388,45 +388,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three positions from memory: pure ReAct (this repo's all-four-agents shape), beam-search ToT b=2 d=2 (the minimal worth-trying shape), and full ToT b=3 d=3 (the canonical worth-it shape). For each, label the cost multiplier and whether it fits the 300s ceiling under ~1 req/s MCP spacing.
-
-Open the file. Compare.
-
-✓ Pass: you have three positions, you label the cost multipliers (1×, 4×, 27×), and you correctly mark only pure ReAct as fitting the ceiling
-✗ Fail: re-read Move 2.4 and the budget arithmetic, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-Explain "why don't you use Tree of Thoughts" to a colleague who just asked. No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the cost shape (b^d × per-step)?
-- Cite the rate limit (~1 req/s) and time ceiling (300s — `app/api/agent/route.ts` L20)?
-- Explain why diagnostic answer surface is smooth?
-- Name at least one condition under which you'd reconsider?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Can the diagnostic agent try 3 different starting queries in parallel and pick the best one?" Without looking at the file: what shape is the PM asking for, what would it cost in MCP calls and wall time, and is there a cheaper way to get the same value?
-
-Write your answer (3–5 sentences). Then open `app/api/agent/route.ts` L18–L20 to confirm the time ceiling and `lib/agents/diagnostic.ts` L62 to confirm the per-loop `maxToolCalls`, and check whether the PM's "in parallel" assumption holds under MCP's serial rate limit.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today with a 600s ceiling (instead of 300s) and a 5 req/s MCP rate (instead of ~1), would ToT be on the table for the diagnostic agent? Why or why not? Which specific category of investigation would be the first candidate, and what would the scorer model be?"
-
-Reference the code: point to the current ReAct loop at `lib/agents/base.ts` L85–L172 for the baseline, and describe what a ToT-augmented branch generator + scorer would add structurally (a new file, a new prompt, a beam data structure).
-
-### Quick check — code reference test
-Without opening any files:
-- Does this repo use Tree of Thoughts? (No.)
-- What's the rate limit and time ceiling that rule it out?
-- Name the three conditions that would have to hold for ToT to earn its keep here.
-
-Open and verify. ✓ The "no" answer, the rate-limit / ceiling numbers, and the three conditions are what matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-react.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
@@ -438,3 +399,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the two reinforcing reasons blooming insights doesn't use ToT — smooth answer surface + rate-limit-kills-multiplier — alongside the strategy line, instead of waiting until Move 2.4's budget arithmetic).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -463,16 +463,6 @@ A: Two scores: severity (impact if left in place) and concreteness (clarity of t
   not yet exercised:    separate axis. fix the substrate, then revisit.
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: name the top 3 high red flags by their finding, location, and fix. Which one of them appears in three separate audits (this guide + two software-design files)?
-
-2. **Explain.** Why are items #8–11 ("no DB constraints," etc.) not listed as debt? What's the right framing for them, and when do they become real debt? Why was item #1 from the 2026-06-16 audit (`price_brl`) removed from the active ranking rather than re-ranked?
-
-3. **Apply.** Pretend you've been hired to spend one day on data-modeling debt in this repo. Pick the top 2 fixes you'd ship, justify the choice with severity-and-concreteness, and name the test you'd write to prevent regression.
-
-4. **Defend.** Someone proposes spending the day adding Zod + a migration tool. Push back: which findings from this audit would Zod/migration tooling actually retire today, and which would it just *prepare* for later? (Hint: Zod retires nothing on the current findings — the guards are loose by deliberate policy, not by sloppiness; migration tooling retires nothing because the storage substrate doesn't exist. Both are pre-investment, not debt-paydown.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces + `WorkspaceSchema` dual-derivation (Bloomreach + Synthetic).
@@ -490,3 +480,4 @@ A: Two scores: severity (impact if left in place) and concreteness (clarity of t
 ---
 Updated: 2026-06-19 — re-ranked after Olist removal; #1 (price_brl) resolved-by-deletion; #4 (seeded_anomalies drift) and #9 (EXPLAIN gate) removed (no Olist queries); wire-format leak promoted to #1; new #7 (SyntheticDataSource determinism contract).
 Updated: 2026-06-16 — re-ranked the audit post-Phase-2; added #1 (price_brl) and #4 (description drift); promoted "not yet exercised" items #8/#10/#11 to "activated"; named the new honest gaps.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

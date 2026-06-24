@@ -406,13 +406,6 @@ A: `AsyncLocalStorage<RequestStore>` in `lib/mcp/auth.ts:47`. It's the only thin
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw the three runtimes and label, on each, the longest-lived piece of state.
-2. **Explain.** Why does `lib/mcp/schema.ts:131` keep `cached` at module scope instead of attaching it to the request context, and what's the cost when Vercel cold-starts a new instance? (Hint: bootstrap is 4 sequential tool calls × 1.1s gate.)
-3. **Apply.** A new route needs a database. Where would you put the connection pool? (Module scope, with a `globalThis.__pool` guard against HMR re-init in dev. The repo has no such route today — this is the pattern you'd add.)
-4. **Defend.** Why is `useInvestigation` allowed to leak the in-flight `fetch` on unmount? Defend the choice against "you should always abort on cleanup." (Reference `lib/hooks/useInvestigation.ts:32-36`. StrictMode double-mount + started-guard race aborts before the first byte; the right move is to let the fetch finish — `setState`-after-unmount is a safe no-op in React 19.)
-
 ---
 
 ## See also
@@ -429,3 +422,4 @@ Updated: 2026-06-16 — added subprocess runtime band (Olist child, stdio, JSON-
 
 ---
 Updated: 2026-06-19 — Phase 2 subprocess (mcp-server-olist/) and offline eval/tsx runtime referenced in this file no longer exist after PR #8. Active runtime is one Node process containing route handlers, the in-process SyntheticDataSource, and the AptKit-backed agents. The diagram in this file still pictures the Phase 2 topology as historical reference; the verdict in 00-overview.md is the current truth.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -596,53 +596,6 @@ The cost of message passing — and the response
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw both models from memory: shared state (blackboard with agents on the outside) and message passing (agents in a chain with typed messages between them). Annotate which one blooming insights uses and what the message type is.
-
-Open the file. Compare.
-
-✓ Pass: you drew both models, named `Diagnosis` as the message in blooming insights, and pointed to message passing as the choice
-✗ Fail: re-read How it works Layers 1–2, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who asked "where does the agents' shared state live?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Correct the framing (there's no shared state; it's message passing)?
-- Name the `Diagnosis` type and where it's defined?
-- Name both carriers (function arg and sessionStorage)?
-- Name the tradeoff (schema design up front for context-cost win and debug-shape win)?
-
-If you skipped any: you accepted a wrong framing.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants the recommendation agent to know which EQL tools the diagnostic agent ran during its investigation. They suggest "just give the recommendation agent access to the diagnostic agent's message history."
-
-Without looking at the file: is that shared state or message passing? Which approach does blooming insights' architecture support? What would you change — the `Diagnosis` schema, the route's handoff, both? What's the right way to surface this information to the recommendation agent without re-introducing context bloat?
-
-Write your answer (3–5 sentences). Then open `lib/mcp/types.ts` L95–L104 (`Diagnosis`) and `app/api/agent/route.ts` L237–L247 (the handoff) and check whether adding a field is the cleanest fix.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were building this today and you knew the codebase would grow to 6 agents (e.g. adding a SummarizationAgent, a CritiqueAgent, and a HistoricalContextAgent), would you still use message passing, or would you adopt a graph runtime with a typed shared state from day one? Why? What's the cost of getting it wrong in either direction — premature graph state for 3 agents, or message-passing-then-rewrite when the agent count grows?"
-
-Reference the code: `lib/mcp/types.ts` L95–L104 (current Diagnosis schema), `app/api/agent/route.ts` L237–L247 (current in-process handoff), `lib/hooks/useInvestigation.ts` L138 (current cross-request handoff).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Does blooming insights use shared state or message passing?
-- What's the type of the inter-agent message between diagnostic and recommendation?
-- What's the key the client uses to persist the message between step 2 and step 3?
-- What function validates the message when the server resumes step 3?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md`
@@ -653,3 +606,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

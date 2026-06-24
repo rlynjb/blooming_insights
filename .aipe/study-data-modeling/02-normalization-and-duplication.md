@@ -520,16 +520,6 @@ A: The Insight↔Anomaly field-copy list. Same fact ("which fields make up the A
 **Q: When is denormalization correct vs leaked?**
 A: Correct when (a) there's a named single owner, (b) the denormalization is for a documented read-path win, and (c) the source of truth is still derivable from the input. The `anomalies` Map parallel to `insights` is correct denormalization — the raw `Anomaly` is needed for downstream agents that the lossy `Insight` shape can't feed. The Insight↔Anomaly field-copy is leaked because the same list lives in three files with no owner. The `revenueImpact` derived field is borderline: it's computed at write time AND the agent might also emit it, with implicit "spread last wins" precedence — make the precedence explicit and it's correct denormalization.
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: name the three locations where the Insight↔Anomaly field list lives. Which one is the truth source? Which two does TypeScript fail to enforce?
-
-2. **Explain.** Why is the parallel `anomalies` Map in `lib/state/insights.ts` an intentional denormalization rather than a leak? What's the source-of-truth answer ("which is the authoritative copy?") and what would break if you removed the parallel store?
-
-3. **Apply.** A new field `category: CategoryId` is added to `Anomaly` (it already is, in fact — trace it). Which files had to change? Which file was forgotten? (Hint: check `insightToAnomaly` — does it copy `category`?)
-
-4. **Defend.** Someone proposes deleting the `anomalies` Map and walking back from `Insight` whenever the diagnostic agent needs the raw evidence. Defend keeping the parallel store. (Hint: the headline and summary derivations are lossy; the `evidence` field is opaque to the compiler; the alternative is reconstructing the `Anomaly` from a strictly larger and partially-derived shape.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces and where the truth source lives for each shape.
@@ -542,3 +532,4 @@ A: Correct when (a) there's a named single owner, (b) the denormalization is for
 ---
 Updated: 2026-06-16 — schema-side leak status moved from "WORST" to "partly fixed in code"; added Move 2.5 on the wire format as the remaining leak source.
 Updated: 2026-06-19 — dropped the Olist 3NF contrast-case framing (the schema is removed); the file's core story (Insight↔Anomaly + wire-format leak) is unchanged.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

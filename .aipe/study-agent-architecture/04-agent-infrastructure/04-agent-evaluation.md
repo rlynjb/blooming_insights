@@ -424,46 +424,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw three boxes: loop-shape tests (221, what they assert), inspectable trajectory (what's in `AgentEvent`), the absent trajectory-grade harness (and what it would do). Label which file or directory each piece lives in.
-
-Open the file. Compare.
-
-✓ Pass: three boxes correctly labelled, with `test/` + `base.ts:14` `McpCaller` seam for box 1, `events.ts` + `BloomingTraceSinkAdapter` for box 2, and an honest "absent — was at `eval/` + `mcp-server-olist/`, removed in PR #8" for box 3
-✗ Fail: re-read How it works moves 1–3, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-Explain "how do you evaluate this agent today" to a colleague who just asked "do you have a benchmark?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Distinguish loop-shape testing (221 tests, unit-test-shaped) from output-quality eval (which would need a harness)?
-- Name the `AgentEvent[]` trajectory as the inspectable record AND name `BloomingTraceSinkAdapter` as where it comes from?
-- Honestly state that the automated harness was once present and is now absent?
-- Name what's required to bring it back (seeded dataset, runners, rubric prompts) and why the substrate makes it cheaper now than before (AptKit-backed agents are fully fake-able)?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new prompt for the diagnostic agent ships. It improves the conclusion's clarity in your spot-checks, but a week later the monthly bill is up 30%. Without looking at the file: how would you confirm the prompt change caused it, and what's the smallest piece of trajectory-eval infrastructure you'd build first to catch this kind of regression automatically in the future?
-
-Write your answer (3–5 sentences). Then open `lib/state/investigations.ts` and `lib/mcp/events.ts` to verify what data is already structured enough to compute "tool calls per investigation" from.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today with the same MCP host and team size, would you defer the trajectory-eval harness again, or build the minimum viable version up front so you have a baseline before the first prompt drift? What would 'minimum viable' include and what would it cost in build hours?"
-
-Reference: the absence of `langsmith`/`braintrust` in `package.json`, the existing `lib/state/demo-investigations.json` as a possible seed, the `SyntheticDataSource` at `lib/data-source/synthetic-data-source.ts` as a substrate for seeded ground truth.
-
-### Quick check — code reference test
-Without opening any files:
-- What type alias in `base.ts` is the test seam for fake tool calls, and what interface is it derived from?
-- What type holds the streamed trajectory records, and what file is it in?
-- What adapter class translates AptKit's `CapabilityEvent` into the Blooming `ToolCall` hook surface? What file is it in?
-- Why is there no automated trajectory eval in the repo today?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `01-context-engineering.md` · → `05-guardrails-and-control.md` · → `06-aptkit-runtime-layer.md` · → mechanics: `../../study-ai-engineering/05-evals-and-observability/04-llm-observability.md` · → `../../study-ai-engineering/05-evals-and-observability/01-eval-set-types.md` · → `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`
@@ -476,3 +436,4 @@ Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file 
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Phase 3 landed: replaced "trajectory-eval harness absent" framing with the four-pillar suite (detection precision/recall · diagnosis 5-criterion rubric · recommendation 3-criterion rubric · regression capture+score), anchored to `eval/scripts/run-*.ts` and `eval/judges/*.md`, with the four portfolio numbers (37%/33.3% · 53.3% · 100% · 30%) and the PR D→E→F→G flywheel as the load-bearing narrative. Test count updated 169 → 269 (226 app + 43 mcp-server-olist). McpCaller seam relocated to `lib/agents/base.ts:24` as `Pick<DataSource, 'callTool'>`. Same-family-judge bias re-spotlit as the live caveat on diagnosis/recommendation numbers.
 Updated: 2026-06-19 — Reverted Phase 3 framing: the `eval/` pipeline and the sibling `mcp-server-olist/` package were both removed in PR #8 commit 62c24d7. Removed all four portfolio numbers and the PR D→G flywheel narrative; replaced with honest "automated harness absent today" framing. Test count 269 → 221. Trajectory source updated: now `BloomingTraceSinkAdapter` (`aptkit-adapters.ts:100–142`) translating AptKit `CapabilityEvent` into the Blooming hook surface. `McpCaller` alias relocated to `lib/agents/base.ts:14` after the AptKit migration trimmed `base.ts`. Added pointer to `06-aptkit-runtime-layer.md` for the "fully fake-able agents" claim.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -396,46 +396,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the "window for one monitoring turn" picture from memory: the three slots in the system prompt (with their injection sources), the tool-definitions slot (filtered per agent), and the `messages[]` slot (with the truncation marker on tool results). Label which line in which file enforces each cap.
-
-Open the file. Compare.
-
-✓ Pass: you got the three injected slots, the per-agent tool filter, and the 16KB tool-result cap, with file/function names
-✗ Fail: re-read How it works moves 1–3, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-Explain "how does context engineering work in blooming insights?" to a colleague who just asked "wait, isn't that just prompts?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the specific caps and line numbers? → `monitoring.ts` L21/L22/L33 (schema), `base.ts` L29 (tool result), `route.ts` L99 (stream)
-- Say what the prompt injection (`.replace()`) actually does and where? → `monitoring.ts` L83–L86
-- Name the tradeoff against bigger windows in one sentence?
-- Distinguish context engineering from prompt engineering?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A user reports that the monitoring agent missed an obvious revenue drop in a workspace with 600 distinct event types. Without looking at the file: which of the three caps is the most likely culprit, and what would you check first to confirm? What would you change — the cap, the summary shape, or add a retrieval tool — and why?
-
-Write your answer (3–5 sentences). Then open `lib/agents/monitoring.ts` L16–L49 and check whether the schema summary's structure could plausibly hide a `purchase` event in that workspace's top 20.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today with the same MCP limit and a 200K context window, would you still apply hard caps on schema and tool results, or would you let the window fill and let the model pick what to attend to? Why? If you'd remove the caps, what would you replace them with to keep latency and reasoning quality bounded?"
-
-Reference the code: point to `monitoring.ts` L16 for the schema summary and `base.ts` L29 for the tool-result cap.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds `schemaSummary()` and roughly what line?
-- What constant in `base.ts` bounds tool-result size?
-- What's the name of the function that filters MCP tools to a per-agent subset?
-- Roughly what cap does the route's stream payload use?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `02-agent-memory-tiers.md` · → `03-tool-calling-and-mcp.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/02-context-and-prompts/01-context-window.md` · → `../../study-ai-engineering/02-context-and-prompts/02-lost-in-the-middle.md`
@@ -447,3 +407,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (ranked the four moves: bound-vs-pass-through at Move 1 is the load-bearing decision, the other three are hardening on top of that).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

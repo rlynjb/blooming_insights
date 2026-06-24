@@ -409,32 +409,6 @@ Honest answer: React Query solves the StrictMode dedupe and the per-step memo, b
 
 ---
 
-## Validate your understanding
-
-### Level 1 — reconstruct
-
-Without looking at the code, draw the three storage tiers (`useRef`, `useState`, `sessionStorage`) and the four `sessionStorage` keys. For each key, name which boundary it survives (StrictMode remount, client route change, cross-instance request, or agent step→step). Then write the two-line started-guard from memory.
-
-### Level 2 — explain
-
-Open `lib/hooks/useInvestigation.ts`. Explain why the effect declares closure mirrors (`cItems`, `cDiag`, `cRecs`, L65–L67) in addition to the React state. Why can the `done` handler (L130–L144) not just stash `items` from state? What would go stale if it tried?
-
-### Level 3 — apply
-
-Scenario: a user opens `/investigate/abc123` directly (bookmark, no feed visit) in live mode. Walk the hook: does `bi:inv:diagnose:abc123` exist? Does `bi:insight:abc123` exist? What does the `&insight=` portion of the URL look like? When `/api/agent` calls `resolveAnomaly` and `?insight=` is absent, what does it fall back to and why might that miss? Cite `lib/hooks/useInvestigation.ts` L160–L161 and `app/api/agent/route.ts` L37. Then state what `InvestigationSubject` renders (cite `components/investigation/InvestigationSubject.tsx` L17–L24).
-
-### Level 4 — defend
-
-A reviewer says: "Cancelling the fetch in the effect cleanup is the standard React pattern — add an `AbortController`." Walk through exactly what breaks under StrictMode if you do (cite `lib/hooks/useInvestigation.ts` L32–L36 and L47–L48), and state without hedging why the guard-and-let-it-complete approach is correct for a one-shot stream and what the real cost of the no-cancel choice is.
-
-### Quick check
-
-- What type is `startedRef` and why not `useState`? (A `useRef<boolean>` — changing it triggers no re-render and it survives the StrictMode remount.)
-- Name the four `sessionStorage` keys this flow uses. (`bi:insight:<id>`, `bi:inv:diagnose:<id>`, `bi:inv:recommend:<id>`, `bi:diag:<id>`.)
-- Which key is read by `InvestigationSubject`? (`bi:insight:<id>` — `components/investigation/InvestigationSubject.tsx` L17.)
-- In live mode, how does the step-3 recommendation agent receive the step-2 diagnosis? (The hook appends `&diagnosis=<encoded>` — `lib/hooks/useInvestigation.ts` L162–L164 — which the server parses in its recommend branch.)
-- Does the effect register a cleanup function? (No — by design; L32–L36.)
-
 ## See also
 
 → [audit.md](./audit.md) (state-ownership-and-source-of-truth lens — the four sessionStorage keys + the started-guard) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [01-request-flow.md](./01-request-flow.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`
@@ -445,3 +419,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

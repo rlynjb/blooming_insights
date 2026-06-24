@@ -495,46 +495,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the substrate: agents at the top, `filterToolSchemas` slicing the discovered list, `runAgentLoop` calling `mcp.callTool`, `McpClient` with its four labels (cache / spacing / retry / no-cache-on-error), `SdkTransport`, `BloomreachAuthProvider`, the Bloomreach MCP server at the bottom. Label each cross-cutting concern's file and roughly its line.
-
-Open the file. Compare.
-
-✓ Pass: you got the slicing boundary, the single `McpClient`, the four labels, and the OAuth provider, with files for each
-✗ Fail: re-read How it works moves 2–4, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-Explain "how does this agent call tools through MCP" to a colleague who just asked "wait, the model doesn't run the code?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the brain/hands split clearly (model emits, loop dispatches)?
-- Name `McpClient` and what cross-cutting concerns it owns?
-- Explain why each agent only sees its allowed tools (and where the slicing happens)?
-- Name the tradeoff vs direct tool defs in one sentence?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new tool, `predict_churn`, is exposed by the Bloomreach MCP server. The recommendation agent should be able to use it; the monitoring agent shouldn't. Without looking at the file: name the exact files and lines you'd touch to make that change, and explain why no agent code (no schema, no prompt change) is strictly required for the discovery to happen.
-
-Write your answer (3–5 sentences). Then open `lib/mcp/tools.ts` L27 and check whether the recommendation agent's allow-list is where the change lands.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today with the same Bloomreach host but only ONE agent (no multi-agent split), would you still adopt MCP, or would you skip the protocol layer and call the Bloomreach HTTP API directly? Why? If you'd skip MCP, which file would absorb the OAuth + rate-limit + cache logic that `McpClient` currently owns?"
-
-Reference the code: `lib/mcp/client.ts` L97–L172 for what MCP-via-the-client owns; `lib/mcp/connect.ts` L80–L97 for the OAuth wiring.
-
-### Quick check — code reference test
-Without opening any files:
-- What function does each agent call to get its per-agent slice of tools?
-- What file holds the four per-agent allow-lists?
-- What constant in `lib/mcp/connect.ts` sets the proactive call spacing, and to what value?
-- Roughly what TTL does `McpClient`'s response cache use?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `01-context-engineering.md` · → `05-guardrails-and-control.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/02-tool-calling.md` · → `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
@@ -546,3 +506,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added the `DataSource` seam above MCP (Phase 2): subtitle + Implementation block now name `lib/data-source/*`, both adapters (Bloomreach OAuth, Olist subprocess), and the authored `mcp-server-olist` sibling package with its three domain tools (`get_metric_timeseries` / `get_segments` / `get_anomaly_context`) replacing raw SQL.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

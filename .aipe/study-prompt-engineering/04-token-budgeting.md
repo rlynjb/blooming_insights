@@ -411,28 +411,6 @@ fixed: [static][{schema}][cache_control][VOLATILE]  ← long cacheable prefix
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the context window as a buffer filled from four sources (prefix, transcript, output reservation) and name the cap on each: `schemaSummary` for the prefix, `truncate` + `maxToolCalls` for the transcript, `max_tokens` for the output. State which source has no cap and is unbounded (the underlying tool result, before `truncate`).
-
-### Level 2 — Explain
-
-Out loud: why does the recommendation agent use `maxToolCalls: 4` (`recommendation.ts` L57) when the others use 6? Tie it to `recommendation.md` L10 ("You mostly reason from the diagnosis") — fewer observations are needed because it is not exploring, so a smaller transcript cap fits the job.
-
-### Level 3 — Apply
-
-Scenario: you are adding prefix caching. Open `lib/agents/prompts/diagnostic.md` and find where `{schema}` is (L83–L85) and where `{anomaly}` is (L14–L16). State why the current order defeats caching, and write the reordered layout (static → `{schema}` → `{anomaly}`) with the `cache_control` boundary, citing the line in `base.ts` (L98–L102) where you would set it.
-
-### Level 4 — Defend
-
-A reviewer says: "The schema is 112KB and re-sent every turn — that's wasteful, rewrite the agents to fetch schema on demand." State what is *already* done (`schemaSummary` caps it to a bounded summary, `monitoring.ts` L16–L49), what the reviewer's real target should be (no prefix caching, `{schema}` placed last), and the measured condition — rising investigation volume — under which caching pays for itself.
-
-### Quick check — code reference test
-
-What is `MAX_TOOL_RESULT_CHARS`, where is it defined, and what does `truncate` append when it clips? (Answer: `16_000`, defined at `lib/agents/base.ts` L29; `truncate` returns `s.slice(0, 16_000) + '\n…[truncated]'` — L31–L34.)
-
 ## See also
 
 → 01-anatomy.md · → 02-structured-outputs.md · → 03-prompts-as-code.md · → 08-few-shot.md
@@ -444,3 +422,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Updated `schemaSummary` range to L16–L57 (was L16–L49) and noted the new `Data horizon: <from> → <to>` line appended at L40–L49 under Olist — a single-line prefix anchor that drove a measured 5x loose-recall lift on the Phase 3 detection eval.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

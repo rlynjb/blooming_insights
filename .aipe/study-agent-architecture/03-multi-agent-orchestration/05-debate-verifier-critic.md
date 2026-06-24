@@ -470,52 +470,6 @@ What forced-synthesis is vs what a critic is
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw both shapes from memory: verifier-critic (producer + critic + loop back) and debate (two symmetric proposers + judge). Annotate where the "different model family" requirement applies in each, and what the catch-rate is for same-family vs different-family.
-
-Open the file. Compare.
-
-✓ Pass: you drew both shapes, named the orthogonality requirement, and named the ~5% vs ~10–30% catch-rate gap
-✗ Fail: re-read How it works Layers 1–3, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who asked "should we add a critic agent to double-check the diagnosis?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Name the LLM-as-judge bias (same-family critic = rubber stamp)?
-- Distinguish forced-synthesis turn from a real critic?
-- Name what would have to be true for a critic to earn its cost?
-- Reference the cross-ref `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`?
-
-If you skipped any: you defended the absence weakly.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants to add a "confidence check" on the diagnostic output: an agent that reads the `Diagnosis` and rates how confident the team should be in shipping a recommendation from it.
-
-Without looking at the file: is this a critic? What model family should the confidence-check agent use, and why? What's the minimum architecture that avoids the rubber-stamp failure mode? Reference `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`.
-
-Write your answer (3–5 sentences). Then open `lib/agents/base.ts` L90–L101 and verify whether the forced-synthesis mechanic could be repurposed (it can't — same model).
-
-### Level 4 — Defend the decision you'd change
-
-"If you were building this today and you had budget for ONE quality-improvement mechanism, would you (a) add a verifier-critic over the diagnostic output, or (b) invest the same budget into improving the diagnostic agent's prompt + tool subset? Why? What's the worst case if you pick wrong?"
-
-Reference the code: `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), L63 (`synthesisInstruction`), `lib/agents/base.ts` L90–L101 (forced-synthesis turn).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Does blooming insights have a critic agent? (Yes / No, and what's the closest mechanic?)
-- What's the failure mode of a same-family critic?
-- What two conditions must be true for a verifier-critic to earn its cost in this codebase?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → LLM-as-judge bias: `../../study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → forced-final-turn mechanic: `../01-reasoning-patterns/01-chains-vs-agents.md`
@@ -526,3 +480,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

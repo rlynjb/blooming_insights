@@ -430,16 +430,6 @@ A: Two reasons. First, TypeScript carries the unit-in-name as a type signal — 
        either way the schema's contract becomes honest.
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: name the three columns in the Olist schema that store cents but read as Reais in their name. For each, name a tool that aggregates over the column.
-
-2. **Explain.** Why does the prompt disclaimer ("divide by 100 when narrating") work in monitoring-agent runs but fail more often in recommendation-agent runs? What changes about the context window between the two phases?
-
-3. **Apply.** A new schema column `total_freight_brl INTEGER NOT NULL` (stored as cents) is proposed. Trace: which fix option (A/B/C from this file) you'd apply at the moment the column is added, and why option C (tool-side conversion) is the right default for any new monetary column.
-
-4. **Defend.** Someone argues "the prompt disclaimer is the right fix — the schema is fine, the model just needs to be more careful." Push back. (Hint: the prompt isn't the load-bearing part of the contract; the schema is. A contract that depends on the consumer being careful is a contract that fails sometimes.)
-
 ## See also
 
 - `04-transactions-and-integrity.md` — the schema's NOT NULL and FK constraints are real; the unit dishonesty is a different kind of integrity gap (in the *contract*, not in the data).
@@ -451,3 +441,4 @@ A: Two reasons. First, TypeScript carries the unit-in-name as a type signal — 
 
 ---
 Created: 2026-06-16 — new file covering the `price_brl` unit-in-name failure as a data-modeling-meets-AI-eval finding, with the committed eval evidence as the measured downstream cost.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

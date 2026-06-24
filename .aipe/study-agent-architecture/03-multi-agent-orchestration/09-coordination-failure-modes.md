@@ -586,53 +586,6 @@ The "absence" argument, made concrete
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the failure table from memory: 6 failure modes in rows, two columns ("structurally absent" and "mechanically controlled"). Place each failure in the right column and annotate the file/mechanism that prevents/controls it.
-
-Open the file. Compare.
-
-✓ Pass: you listed all 6 failures, split them 3/3 between structural and mechanical, and named the right mechanism (or architectural choice) for each
-✗ Fail: re-read How it works Layers 1–6 and the failure table at the top, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who asked "what could break in a multi-agent system?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Name at least 4 of the 6 failure modes?
-- Distinguish structural prevention from mechanical control?
-- Name `maxToolCalls` + forced-final-turn as the tool-call cascade bound?
-- Name "no `transfer_to_*` tools" as the infinite-handoff prevention?
-
-If you skipped any: you listed failures without naming what stops them.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager proposes adding a "second-opinion" agent that reviews the diagnostic agent's output before recommendation. The PM doesn't specify whether it's a separate LLM or the same model.
-
-Without looking at the file: which failure modes does this introduce? Which mechanisms would you need to add? Which structural property of the codebase would change? Reference `./05-debate-verifier-critic.md` and the LLM-as-judge bias issue.
-
-Write your answer (3–5 sentences). Then open `lib/agents/base.ts` L90–L101 (the forced-final-turn mechanic) and consider whether the same model running as a critic shares the producer's blind spots.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today and you had to defend the choice between (a) deterministic orchestration with 3 mechanisms (today) and (b) autonomous orchestration with 6 mechanisms, which would you pick and why? What's the specific product requirement that would flip you from (a) to (b)? What's the on-call cost difference?"
-
-Reference the code: `lib/agents/base.ts` L48–L176 (`runAgentLoop`), `app/api/agent/route.ts` L199–L249 (the orchestration), `lib/mcp/tools.ts` (the per-agent tool subsets that prevent handoff structurally), `app/page.tsx` L394–L427 (token-revocation handling).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Name 3 failure modes blooming insights structurally prevents.
-- Name 3 failure modes blooming insights mechanically controls.
-- Which file holds the forced-final-turn mechanic that bounds tool-call cascade?
-- Which file holds the `sessionStorage` flag that bounds the token-revocation reconnect loop?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
@@ -643,3 +596,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

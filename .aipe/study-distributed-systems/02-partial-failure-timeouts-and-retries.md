@@ -410,13 +410,6 @@ No per-call timeout on the actual `transport.callTool`. A hung connection (TCP R
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, write the five-part retry kernel: predicate, bound, wait, ceiling, rebind. Name what breaks if you remove each.
-- **Explain.** Why does `parseRetryAfterMs` in `lib/data-source/bloomreach-data-source.ts:64-77` return `null` when no hint is parseable, rather than a default value? Because `null` lets the caller distinguish "no hint, use backoff" from "hint of 0ms" — the explicit null lets the wait calculation pick the right path.
-- **Apply.** A new external service you're integrating returns 429 with a `Retry-After` HTTP *header* (not in the body). Sketch the changes. (Add a new `parseRetryAfter` that checks response headers; `isRateLimited` checks status === 429 instead of body regex; rest of the loop is unchanged.)
-- **Defend.** Why is `minIntervalMs = 1100` and not, say, `10_000` (matching the observed 10s window)? Because 10s × 6 tool calls = 60s of spacing per investigation, on top of the 300s budget for the actual work, which doesn't fit. 1.1s spacing keeps most first attempts under the window; the retry loop handles the ones that slip through. Trades occasional retry latency for normal-case throughput.
-
 ---
 
 ## See also
@@ -433,3 +426,4 @@ Updated: 2026-06-16 — Verdict + structure pass cover the two-adapter shape (Bl
 
 ---
 Updated: 2026-06-19 — Olist adapter deleted (PR #8); Part 5b removed; structure-pass diagram + zoom-out diagram revert to one distributed adapter; the per-call-timeout gap is no longer adapter-asymmetric, just open on Bloomreach (lone finding stands). Verdict rewritten; use-cases swap the Olist case for a SyntheticDataSource note.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -621,32 +621,7 @@ O(N log N) is the *information-theoretic lower bound* for comparison-based sorti
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write: (a) the kernel of comparator sort (subtract for asc/desc, stable order on ties), (b) the kernel of binary search (sorted precondition, halve search space, `low <= high`), (c) the three top-K strategies and their costs (sort-and-slice O(N log N), quickselect O(N) avg, heap O(N log K)). For each, name the bug that breaks the kernel if missing.
-
-### Level 2 — explain
-
-Open `lib/agents/monitoring.ts` L51 and L119. Explain (a) why `SEV_RANK` is a `Record<Severity, number>` and not an array, (b) why the comparator is `b - a` and not `a - b`, (c) why `[...parsed]` is in front of `.sort()`. State what would break for each if you removed it.
-
-### Level 3 — apply
-
-**Scenario:** The product wants to add a "top 3 most-affected scopes by revenue" widget. Each anomaly carries a `scope: string[]` (e.g. `["homepage", "checkout"]`) and a `revenueImpact.lostUsd` (derived). You need to aggregate revenue across scopes (each scope's total lost USD), then pick the top 3. Walk through: (a) the aggregation step (`Map<string, number>` accumulating per scope — O(total scope occurrences)), (b) the selection step (top 3 by value — sort-and-slice or heap-based?), (c) the cost for N=30 anomalies with average 2 scopes each. Cite `lib/agents/monitoring.ts` L119 for the sort pattern and `lib/insights/derive.ts` for where the revenueImpact comes from.
-
-### Level 4 — defend
-
-A teammate suggests: "Replace `.sort().slice(0, 10)` with a quickselect that finds the top 10 in O(N) — it's asymptotically better." Defend the sort-and-slice approach. Address: (a) N=30 in practice, (b) Timsort's stability vs quickselect's non-stability (does stable order matter for downstream code?), (c) the cost of writing/testing custom partition logic vs using the standard library, (d) when you *would* switch (real N threshold + a streaming requirement). Cite `lib/agents/monitoring.ts` L119.
-
-### Quick check
-
-- Cost of `Array.prototype.sort` in V8? (O(N log N), Timsort, stable.)
-- Cost of binary search? Precondition? (O(log N); array must be sorted.)
-- Cost of linear search worst-case, average, best? (O(N), O(N/2), O(1).)
-- Why `b - a` instead of `a - b` in `monitoring.ts` L119's comparator? (Descending — `b - a` is positive when `b > a`, so `b` sorts first.)
-- Does this codebase use binary search? (No — `not yet exercised`. Nothing is pre-sorted in a way that demands O(log N) lookup.)
-
 ## See also
 
 → `01-complexity-and-cost-models.md` (where the O(N log N) cost of sort and O(log N) of binary search live) · → `02-arrays-strings-and-hash-maps.md` (the primitives these operations work on) · → `03-stacks-queues-deques-and-heaps.md` (heaps as the streaming top-K data structure) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the SEV_RANK sort) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the substring scan)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

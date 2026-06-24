@@ -580,28 +580,9 @@ CSRF and the allowlist are layered defenses. CSRF asks "did the user intend this
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-Without looking, name the five enforcement points a hardened version of this route would have, and say which are present today. Then check against the **Primary diagram**.
-
-### Level 2 — Explain
-Why doesn't the audit consider the upstream MCP server's authz (which DOES validate "is this user authorized for this resource") as sufficient defense? What does the route-side allowlist add that the upstream doesn't? Reference `app/api/mcp/call/route.ts` L13 and `lib/mcp/tools.ts`.
-
-### Level 3 — Apply
-Bloomreach announces `create_segment` will land next quarter. Walk through what specifically you'd do in this codebase: would you add the tool to any agent's whitelist? What additional defenses (CSRF, human-in-loop confirmation, audit log) would you add to the agent flow before shipping support for it? Reference the patterns in `04-read-only-tool-whitelist.md`.
-
-### Level 4 — Defend
-A teammate proposes adding the allowlist as a *denylist* instead: `if (DANGEROUS.has(name)) return 403`. Defend or refute. (Hint: trace what happens when Bloomreach adds `delete_user` next quarter and you haven't updated the denylist.)
-
-### Quick check
-- What's the file and line range of the route? → `app/api/mcp/call/route.ts` L5–L22.
-- What's the only check present today? → Session authentication via `connectMcp`.
-- What's the one-line fix? → `if (!ALL_KNOWN.has(name)) return NextResponse.json({error: 'tool not permitted'}, {status: 403})` where `ALL_KNOWN` is the union of agent whitelists from `lib/mcp/tools.ts`.
-- Why is this high-severity if no exploit is possible today? → Bound is upstream (Bloomreach not having write tools), not in our code; one Bloomreach release could turn it critical.
-
 ---
 
 ## See also
 
 → [audit.md](./audit.md) · [04-read-only-tool-whitelist.md](./04-read-only-tool-whitelist.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

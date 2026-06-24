@@ -453,13 +453,6 @@ The lesson generalises: when result-dirs are date-stamped without a tag, *any* c
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, list the four observability surfaces in this codebase and name what scope each one debugs. Anchor: surfaces 1-3 live across `01-` through `05-`; surface 4 is this file.
-2. **Explain.** Why is `EVAL_RUN_TAG` set via env var rather than CLI flag? What does the env-var choice license the user to do that a CLI flag wouldn't? Anchor: `eval/scripts/run-detection.ts` and the four sibling dirs under `eval/results/`.
-3. **Apply to a scenario.** A new prompt change for the diagnostic agent is hypothesized to improve clarity. Walk the eval flywheel end to end (measure baseline → change prompt → re-measure → verdict) and name the specific commands and result-dir names you'd use.
-4. **Defend the decision.** Argue for adding a `compare-evals.ts` script that diffs two result dirs and emits structured deltas. Then argue why the manual diff workflow is good enough for a solo repo today. Name the leading indicator that flips the decision.
-
 ---
 
 ## See also
@@ -473,3 +466,4 @@ The lesson generalises: when result-dirs are date-stamped without a tag, *any* c
 
 ---
 Updated: 2026-06-16 — new file: fourth observability surface (eval result paper trail, EVAL_RUN_TAG, flywheel methodology, LLM-as-judge as debug signal, parallel-run process-level debugging incident).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

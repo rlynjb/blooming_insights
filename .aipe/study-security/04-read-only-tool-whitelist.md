@@ -568,27 +568,6 @@ Real defenses for this: per-tool result-shaping middleware that strips PII field
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-Without looking, name the four agents and how many tools each has in its whitelist. Then check against `lib/mcp/tools.ts` L5–L40.
-
-### Level 2 — Explain
-Why is `queryTools` defined as `[...new Set([...monitoringTools, ...diagnosticTools, ...recommendationTools])]` — what does the `new Set` accomplish, and why does deduplication matter for the Anthropic Tool schema array? Reference `lib/mcp/tools.ts` L38–L40.
-
-### Level 3 — Apply
-A new agent ships — `AlertAgent` — whose job is to subscribe a user to alert rules. It needs to call `list_users`, `get_user`, `create_alert_rule`, `update_alert_rule`. Walk through what changes in `lib/mcp/tools.ts` to add the whitelist, what the security review reaction should be to the `create_*` and `update_*` tools, and what additional defenses (human-in-loop confirmation, audit log) would have to land before shipping.
-
-### Level 4 — Defend
-A teammate proposes consolidating to a single `allReadTools` whitelist shared by every agent, "because the per-agent specificity is just bookkeeping." Defend or refute. (Hint: trace what changes if a single agent's task needs a specific tool that's PII-sensitive — does putting it in `allReadTools` give it to agents that don't need it?)
-
-### Quick check
-- Where are the per-agent whitelists declared? → `lib/mcp/tools.ts` L5–L40.
-- What's the enforcer that narrows tools per agent? → `filterToolSchemas` in `lib/agents/tool-schemas.ts` L9–L21.
-- What name patterns appear in every whitelist? → `list_*` / `get_*` / `execute_analytics*` — read-only by construction.
-- Which agent has the widest tool surface? → `QueryAgent` (uses `queryTools`, the union of the other three).
-- Which route bypasses the whitelist entirely? → `POST /api/mcp/call` (`app/api/mcp/call/route.ts` L7–L13).
-
 ---
 
 ## See also
@@ -596,3 +575,4 @@ A teammate proposes consolidating to a single `allReadTools` whitelist shared by
 → [audit.md](./audit.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md) · [05-open-tool-surface-gap.md](./05-open-tool-surface-gap.md)
 
 Cross-reference: `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the LLM-angle treatment of why tool-scope discipline is the structural defense for agents.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

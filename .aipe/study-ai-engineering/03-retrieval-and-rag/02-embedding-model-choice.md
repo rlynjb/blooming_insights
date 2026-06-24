@@ -287,31 +287,10 @@ fix: re-embed ALL items with B (full reprocess)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the three knobs an embedding-model choice trades and state the decision rule (smallest/cheapest model that holds retrieval quality on your own corpus). Note what each extra dimension costs.
-
-### Level 2 — Explain
-
-Out loud: why is "highest MTEB rank" the wrong final criterion? Why does choosing a model lock you in until a full re-index?
-
-### Level 3 — Apply
-
-Scenario: you are adding the schema-term embedding from `01-embeddings.md`. Open `lib/mcp/schema.ts` L91–L99 (the event names you would embed) and `lib/agents/intent.ts` L14 / `lib/agents/base.ts` L9 (the chat-model tiering to mirror). Name two candidate embedding models, the query→term pairs you would measure on, and the decision rule. Justify why a 384-dimension model might suffice for these short names.
-
-### Level 4 — Defend
-
-A colleague wants to default to a 3072-dimension model "to never be limited later." Argue the cost (8× storage and cosine compute for terms that may not need it) and propose the measured alternative (recall@k on your own pairs, pick the smallest that holds). Then state the one scenario where their instinct is right (long natural-language past-investigation documents).
-
-### Quick check — code reference test
-
-What model-selection discipline does blooming insights already demonstrate, and where? (Answer: cheap-small-vs-capable tiering — `claude-haiku-4-5` for the 16-token intent classification in `lib/agents/intent.ts` L14, `claude-sonnet-4-6` for the analyst agents in `lib/agents/base.ts` L9 — the same "smallest sufficient model" logic the embedding choice requires.)
-
 ## See also
 
 → 01-embeddings.md · → 04-vector-databases.md · → 09-stale-embeddings.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

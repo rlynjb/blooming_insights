@@ -382,28 +382,6 @@ fixed path → await chain (now)      branching/parallel → graph runner (later
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three-link briefing chain. For each link, name its one job, its tool subset, its validator, and its safe fallback. Mark which two links contain a gather→synthesize micro-chain and what the input and output type of each link is.
-
-### Level 2 — Explain
-
-Out loud: explain the difference between a chain (this codebase's briefing) and an agent (the loop inside each link). Who decides the order in each case? Then explain why the `diagnosis` is serialized and re-read by `propose` rather than living in one shared context.
-
-### Level 3 — Apply
-
-Scenario: the diagnostic link returns the `FALLBACK` diagnosis but the recommendation link still runs. Check `app/api/agent/route.ts` L244–L249 (and the diagnosis parsed at L227) — is there a gate on `diagnosis.confidence` between the two links? What does `propose` produce when handed a hollow `FALLBACK` diagnosis, and where would you add a confidence check so a weak upstream result stops wasting the downstream call?
-
-### Level 4 — Defend
-
-A reviewer says: "Collapse the three agents into one prompt that detects, diagnoses, and recommends — it'll be faster and simpler." Respond using this codebase: name what you lose in failure isolation (cite the three fallbacks), in intermediate streaming (the `diagnosis` event at route.ts L239), in per-step budgeting (each `step` is its own `maxDuration = 300` request), and in per-step model selection (`AGENT_MODEL` at base.ts L9). Then name the one thing the reviewer is right about.
-
-### Quick check — code reference test
-
-Which two `await` calls in `app/api/agent/route.ts` run the investigation chain's two links, and how does the `Diagnosis` get from the first to the second on the live path? (Answer: `await diagAgent.investigate(inv, …)` (L238) then `await recAgent.propose(inv, diagnosis!, …)` (L247); on the live path they run in *separate* `step`-gated requests, so the `Diagnosis` is handed over via the client's sessionStorage `bi:diag:<id>` → `?diagnosis=` param (re-parsed at L227), not a shared local variable.)
-
 ## See also
 
 → 01-context-window.md · → 02-lost-in-the-middle.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md · → ../01-llm-foundations/04-structured-outputs.md
@@ -415,3 +393,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

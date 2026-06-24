@@ -457,52 +457,6 @@ tax. The tax doesn't get cheaper because the syntax did.
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the escalation gate from memory: single-agent baseline → measure → diagnosis (propositional vs structural failure) → if structural, pick the specific topology. Label what blooming insights' specific answer is at the bottom (deterministic route + sequential pipeline + per-stage tool subsets).
-
-Open the file. Compare.
-
-✓ Pass: you drew the three boxes (baseline, measure, diagnosis), the propositional/structural split, and named "sequential pipeline + deterministic route" as the answer for this codebase
-✗ Fail: re-read How it works, wait 10 minutes, try again. Do not move on until you pass.
-
-### Level 2 — Explain it out loud
-
-Explain "why isn't this autonomously coordinated?" to a colleague who asked "but you have four agents — isn't that multi-agent orchestration?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name `app/api/agent/route.ts` as the supervisor (and clarify: it's *code*, not an agent)?
-- Say why the stage order is knowable (monitoring → diagnostic → recommendation is fixed)?
-- Name the tradeoff in one sentence (no LLM reasoning over ordering → no extra LLM calls + 2 suspects, not 3)?
-- Name the breakpoint (when a stage's output has to change which stage runs next)?
-
-If you skipped any: you described the architecture, you didn't defend it.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager proposes: "Add a second-opinion agent that double-checks the diagnostic agent's conclusion before recommendation runs. If it agrees, continue. If it disagrees, re-run diagnosis with a deeper budget."
-
-Without looking at the file: does this change require an LLM supervisor? Why or why not? What would land in `route.ts` and what would land in the agents themselves? Reference `../05-debate-verifier-critic.md` if needed.
-
-Write your answer (3–5 sentences). Then open `app/api/agent/route.ts` L224–L249 and check whether the change is expressible as more `if`s, or whether it forces the route to *reason*.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today, with the same problem (anomaly detect → diagnose → recommend) but with 10x the anomaly types (now 100 categories instead of ~10), would you still keep the route as a deterministic `if`-ladder, or would you reach for an LLM supervisor? Why? If you'd switch, what would the supervisor cost you per investigation, and which lines in `route.ts` would it replace?"
-
-Reference the code: `route.ts` L199–L200 (lead-agent select), L224–L249 (pipeline). Reference the budget caps in `lib/agents/diagnostic.ts` L62, `recommendation.ts` L57, `monitoring.ts` L101.
-
-### Quick check — code reference test
-
-Without opening any files:
-- What file holds the deterministic supervisor (the `if`-ladder that picks the next agent)?
-- What function holds the single shared agent loop, and in what file?
-- Which model does the intent classifier use, and which model do the agents use?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
@@ -512,3 +466,4 @@ Updated: 2026-05-29 — created
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

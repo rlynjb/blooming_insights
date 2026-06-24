@@ -457,13 +457,6 @@ NDJSON over fetch is one-way, which is exactly what we need — the server emits
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, write the consumer's buffer-and-split loop. Name the load-bearing line (`buf = lines.pop() ?? ''`).
-- **Explain.** Why does the consumer `if (!line.trim()) continue` before `JSON.parse(line)`? Empty lines happen when the buffer ends on a newline (`split('\n')` gives a trailing empty element). Without the skip, `JSON.parse('')` throws.
-- **Apply.** A bug report: "in production sometimes I see the stream stop mid-way and no error appears in the UI." Walk through likely causes. (Vercel `maxDuration` hitting 300s with no `finally controller.close()` — the route is killed mid-stream, the client sees a network-level end of stream, no clean `done` event. Mitigated by the existing `try/catch/finally` in both routes; would re-appear if a new route forgot the pattern.)
-- **Defend.** Why no work queue? Because no work needs to outlive the request. Every agent runs inline; if it fails, the user retries. Adding a queue (BullMQ, SQS) would require background workers, separate observability, dead-letter handling — all valuable at scale, all overhead at hackathon scale. Defer until a feature needs work to survive a process death.
-
 ---
 
 ## See also
@@ -477,3 +470,4 @@ NDJSON over fetch is one-way, which is exactly what we need — the server emits
 
 ---
 Updated: 2026-06-16 — Verdict line notes the second framed stream (JSON-RPC over stdio to mcp-server-olist) introduced in Phase 2; cross-link to file 10.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

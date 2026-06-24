@@ -523,26 +523,6 @@ What we don't have is true rotation — no token-rotation-on-use that invalidate
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-Without looking, draw the wire format of the `bi_auth` cookie value and label each byte range. Then check against `lib/mcp/auth.ts` L62–L79.
-
-### Level 2 — Explain
-Why does `decryptStore` catch all errors and return `{}` instead of throwing? What invariant does this enforce on the rest of the codebase? Reference `lib/mcp/auth.ts` L69–L79.
-
-### Level 3 — Apply
-A new feature lands: encrypted user preferences in a second cookie (`bi_prefs`). Walk through how you'd implement it: do you reuse `AUTH_SECRET`, derive a separate key, or generate a per-cookie key? What changes about `withAuthCookies`? Reference the patterns in `auth.ts`.
-
-### Level 4 — Defend
-A teammate proposes replacing `bi_auth` with a JWT signed with `AUTH_SECRET` "so we can debug claims in DevTools." Defend or refute. (Hint: trace what becomes visible to an attacker who steals the cookie under each design.)
-
-### Quick check
-- Where is `AUTH_SECRET` first read at runtime? → `lib/mcp/auth.ts` `aesKey` L51–L60.
-- What IV length does the code use, and why that length? → 12 bytes (`randomBytes(12)`); AES-GCM standard, 96 bits is sufficient collision resistance.
-- What happens when an attacker tampers with the cookie value? → `decryptStore` catches the auth-tag failure and returns `{}`; user appears unauthenticated.
-- Why is the cookie `SameSite=None`? → It has to survive the cross-site OAuth round-trip from Bloomreach back to `/api/mcp/callback`.
-
 ---
 
 ## See also
@@ -550,3 +530,4 @@ A teammate proposes replacing `bi_auth` with a JWT signed with `AUTH_SECRET` "so
 → [audit.md](./audit.md) · [02-als-scoped-request-store.md](./02-als-scoped-request-store.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
 
 Cross-reference: `.aipe/study-system-design/02-oauth-boundary.md` — the OAuth + PKCE + DCR flow that produces the state stored in this cookie.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

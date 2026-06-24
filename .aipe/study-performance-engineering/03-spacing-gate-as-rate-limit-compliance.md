@@ -479,16 +479,6 @@ The full picture — the gate kernel, what it has, what it deliberately lacks, w
 
 ---
 
-## Validate
-
-**Level 1 — Reconstruct.** Name the file:line of the spacing gate, its state, its threshold value, and where the threshold is configured. (Answer: `lib/mcp/client.ts:148-152`. State: `lastCallAt: number` on the `McpClient` instance. Threshold: `minIntervalMs = 1100` set in `lib/mcp/connect.ts:92`. The 1100 = 1000ms (Bloomreach's contract) + 100ms (headroom for clock skew).)
-
-**Level 2 — Explain.** Why is the spacing gate "rate-limit compliance" and not "backpressure"? Name at least three distinctions. (Answer: (1) the gate has no queue; backpressure has a bounded queue with depth. (2) the gate has no semaphore; backpressure typically has K-permit concurrency limiting. (3) the gate fires every call deterministically; backpressure fires conditionally when the consumer can't keep up. (4) the gate has no upward signal; backpressure signals the producer to stop spawning. Bonus distinction: the gate's failure mode (without it) is 429s from Bloomreach; backpressure's failure mode (without it) is OOM from unbounded queue growth. Different failure modes, different machinery.)
-
-**Level 3 — Apply.** A new feature wants to parallelize the bootstrap chain (4 sequential `callOrThrow` calls in `bootstrapSchema`). What breaks? (Answer: nothing breaks at the spacing gate (it still correctly serializes them via the await chain), but the parallelism *fails to deliver speedup*. The four calls would each wait at the gate; the second/third/fourth would each sleep ~1.1s before their HTTPS call — total: same ~4.4-6.6s of spacing, but now with extra concurrency overhead. Actual latency would be roughly equal to or slightly worse than the serial version. The bootstrap can't be parallelized because the rate limit doesn't let you. The lesson: the gate is correct compliance even under attempted parallelism — but it makes the parallelism pointless.)
-
-**Level 4 — Defend.** A reviewer says "the spacing gate is the wrong layer for this — Bloomreach already returns 429s when you exceed the rate limit. Just remove the gate and let the retry loop handle it." Defend the current design. (Answer: removing the gate makes things strictly worse. Without the gate: every back-to-back call hits 429 on the second one; the retry loop kicks in; it parses "retry after 10 seconds" from the error and sleeps 10s. So removing the 1.1s deterministic wait gives you a 10s reactive wait, EVERY single call. The retry loop is also bounded at `maxRetries = 3` — if 3 retries in a row all 429, the loop gives up and returns the error envelope, killing the agent run. The gate trades 1.1s of *guaranteed* wait for 10-30s of *conditional* wait. Net effect of removing it: ~10× slower, with a real failure mode where the agent dies due to retry exhaustion. The gate is the *cheap* compliance solution. The expensive alternative is what you'd be opting into by removing it.)
-
 ---
 
 ## See also
@@ -498,3 +488,4 @@ The full picture — the gate kernel, what it has, what it deliberately lacks, w
 - `02-ttl-cache-with-no-cache-on-error.md` — the cache that skips the gate entirely on a hit
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that the gate doesn't help with
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — the topology that would force backpressure to exist
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

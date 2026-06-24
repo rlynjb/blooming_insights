@@ -459,35 +459,6 @@ Both respect the average rate limit. The token bucket is better under load varia
 
 ---
 
-## Validate your understanding
-
-### Level 1 — reconstruct
-
-Without looking at the code, write out the four stages every `callTool` call passes through. Name the data structures involved (what is the cache type? what is the cache key format?). Name the fields that track spacing and retry state.
-
-### Level 2 — explain
-
-Open `lib/mcp/client.ts`. Explain what `skipCache: true` does on both the read path (L105–L110) and the write path (L143–L144). Why does a `skipCache` call still write to the cache? Which use-case does this serve?
-
-### Level 3 — apply
-
-Scenario: two briefings run in the same process at the same time. User A's briefing calls `callTool("search_content", { eql: "top keywords" })`. One millisecond later, User B's briefing calls `callTool("search_content", { eql: "top keywords" })`.
-
-- Does User B get a cache hit? Why or why not? (Cite `lib/mcp/client.ts` L80 — is the cache shared or per-instance?)
-- Does the 1100 ms spacing still protect Bloomreach? If User A and User B share the same `McpClient` instance, yes. If they have separate instances (one per `connectMcp` call), cite `lib/mcp/connect.ts` L91–L96 to show each call to `connectMcp` creates a new `McpClient`. What does that mean for the spacing guarantee?
-- Now extend the scenario: two serverless function instances each handle one of these briefings. Does the 1100 ms spacing protect Bloomreach? Cite `lib/mcp/client.ts` L81 (`private lastCallAt = 0`) and explain why.
-
-### Level 4 — defend
-
-A colleague argues: "We should remove the in-memory cache because it makes debugging harder — you never know if you're seeing fresh data." What is the concrete cost of removing the cache for a 10-call briefing run against Bloomreach's 1 req/sec limit? Calculate the minimum wall-clock time with and without the cache. Then explain the no-cache-on-error rule and why it addresses the "stale bad data" concern.
-
-### Quick check
-
-- What does `isRateLimited` test for? (Name the two conditions — `lib/mcp/client.ts` L19–L21.)
-- What is the default TTL? (Cite the line.)
-- How many total transport calls does `maxRetries: 2` allow? (Initial call + 2 retries = 3.)
-- Does `listTools` use the cache? (Cite `lib/mcp/client.ts` L169–L171 and explain why not.)
-
 ## See also
 
 → [audit.md](./audit.md) (caching-and-invalidation + failure-handling-and-reliability lenses — the load-bearing MCP choke-point) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (DSA mechanism depth) · `.aipe/study-dsa-foundations/01-complexity-and-cost-models.md`
@@ -500,3 +471,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

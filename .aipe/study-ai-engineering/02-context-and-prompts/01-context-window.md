@@ -346,28 +346,6 @@ No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* window, defendi
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list every budget that keeps a request inside the window and its purpose: tool-result truncation (defends the window), schema-summary caps (defends the prefix), route stream truncation (defends the UI wire), and the forced-final turn (reserves output room). State which two protect the *model's* window and which one does not.
-
-### Level 2 — Explain
-
-Out loud: why are input and output zero-sum in a single model call? Explain how withholding tools on the final turn (`lib/agents/base.ts` L101) reserves room for the answer even though it sets no token budget directly.
-
-### Level 3 — Apply
-
-Scenario: a diagnostic run makes all six tool calls and each EQL result is 50,000 chars raw. Check `lib/agents/base.ts` L29 and L150 — what is the cumulative tool-result contribution to the transcript after truncation, and which line stops a seventh result from ever being appended? Then name the single change (no tokenizer) that would tell you how close that transcript ran to the actual window.
-
-### Level 4 — Defend
-
-A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` so the diagnostic agent stops losing the tail of large EQL results. Using the six-call budget, estimate the cumulative character contribution and argue whether that stays safely inside a 200k-token window — then name the measurement (`res.usage`) that would replace your estimate with a fact, and explain what the forced-final turn still guarantees regardless of the cap.
-
-### Quick check — code reference test
-
-Which line withholds the tool schemas so the model cannot grow the transcript on its final turn, and what condition gates it? (Answer: `lib/agents/base.ts` L101 — `if (!forceFinal) params.tools = toolSchemas`, gated by `forceFinal` set at L91.)
-
 ## See also
 
 → 02-lost-in-the-middle.md · → 03-prompt-chaining.md · → ../01-llm-foundations/02-tokenization.md · → ../04-agents-and-tool-use/02-tool-calling.md
@@ -378,3 +356,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

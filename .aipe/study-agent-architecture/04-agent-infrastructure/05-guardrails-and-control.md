@@ -491,47 +491,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the five layers around the loop: input scoping, loop envelope, tool contract, output validation, auth recovery. For each, name one file/function it lives in and one failure mode it catches.
-
-Open the file. Compare.
-
-✓ Pass: five layers with one file + one failure mode per layer (`categories.ts` / `base.ts` / `tools.ts` / `validate.ts` / `page.tsx`)
-✗ Fail: re-read How it works moves 1–5, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-Explain "what controls does your agent loop have" to a colleague who just asked "can the LLM do anything it wants?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the iteration + budget caps and which file holds them?
-- Explain why all MCP tools are read-only (and what that bounds)?
-- Name `parseAgentJson` + the type guards + the safe-default behaviour?
-- Mention capability gating before the budget is spent?
-- Name the tradeoff (less agent flexibility, more bounded blast radius) in one sentence?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A PM proposes: "Let the recommendation agent automatically create a 'draft' email campaign in Bloomreach when it has high confidence in a recommendation, so the user just has to click 'send' instead of building it themselves." Without looking at the file: which of the five layers would this break, and what new layer(s) would you add to keep the envelope honest? What would you NOT change?
-
-Write your answer (3–5 sentences). Then open `lib/mcp/tools.ts` L27 to verify what `recommendationTools` currently contains, and the discussion in this file's "Where this breaks down" section to confirm your reasoning matches the codebase's stated stance.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today and had a small, trusted internal team using this agent (no adversarial users), would you still enforce read-only tools, or would you let the agent perform safe writes (like 'create a saved view') to reduce user friction? What new envelope layer(s) would you require before you flipped that switch?"
-
-Reference: `lib/mcp/tools.ts` for the current contract; this file's tradeoff section for the named breakpoint.
-
-### Quick check — code reference test
-Without opening any files:
-- What constant in `base.ts` is the iteration cap, and what's its default?
-- What value does the recommendation agent pass for `maxToolCalls`?
-- What function gates the monitoring agent's category list against the workspace schema?
-- What sessionStorage key bounds the auto-reconnect to one attempt?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → `04-agent-evaluation.md` · → mechanics: `../../study-ai-engineering/06-production-serving/03-prompt-injection.md` · → `../../study-ai-engineering/04-agents-and-tool-use/06-error-recovery.md`
@@ -542,3 +501,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

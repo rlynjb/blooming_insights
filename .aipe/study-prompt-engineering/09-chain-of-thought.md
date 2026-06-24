@@ -405,28 +405,6 @@ classifier: max_tokens 16 + "one word" + "think step by step" → budget gone, n
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the diagnostic flow's three reasoning layers: the prompt forcing hypotheses before action, ReAct externalizing process thought, and the output capturing CoT as `hypothesesConsidered[]`. State which artifact is transient (the Thought stream) and which is durable (the typed array).
-
-### Level 2 — Explain
-
-Out loud: why does CoT's value on sonnet-4-6 (`base.ts` L9) come from output structure rather than elicitation? Contrast the 2022 davinci result ("think step by step" unlocked reasoning) with 2026 (the model reasons regardless; the scaffolding produces the `hypothesesConsidered` array).
-
-### Level 3 — Apply
-
-Scenario: a teammate wants to add "think step by step" to the intent classifier to improve accuracy. Open `intent.ts` L20 (`max_tokens: 16`) and L21–L23 ("ONLY the one word"), and explain exactly what breaks. Then state where structured CoT *does* belong and why (`diagnostic.md` L69–L75).
-
-### Level 4 — Defend
-
-A reviewer says: "Add a reasoning field to every agent's output for transparency." Defend keeping CoT only on the diagnostic agent — name the token cost on monitoring, the upstream-duplication on recommendation, and the budget break on the classifier — and concede the one place a reviewer is right (diagnosis benefits from inspectable hypotheses).
-
-### Quick check — code reference test
-
-In which output field does the diagnostic agent capture its chain-of-thought, and what does each element contain? (Answer: `hypothesesConsidered`, an array of `{ hypothesis, supported, reasoning }` objects — `diagnostic.md` L69–L75, required by `isDiagnosis` in `validate.ts`.)
-
 ## See also
 
 → 08-few-shot.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 04-token-budgeting.md
@@ -438,3 +416,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added a fourth "Where this breaks down" item: the diagnostic agent's `confidence` field scores `calibration: 0` in 29/30 runs against the 5-criterion diagnosis judge (`eval/judges/diagnosis-judge.md`). The structural CoT works; the confidence-derivation prompt logic is the deficit. Real receipt for "calibrated confidence is a prompt-engineering problem, traceable to one line in one prompt."
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

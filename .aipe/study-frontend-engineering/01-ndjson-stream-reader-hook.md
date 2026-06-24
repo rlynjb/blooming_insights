@@ -545,24 +545,6 @@ Honest answer: React Query solves StrictMode dedupe and the per-step memo, but i
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without opening the file: draw the three layers of the hook (lifecycle / consumer / state-projection) and name what lives in each. Write the four load-bearing parts of the line-buffering kernel from memory (`TextDecoder({stream:true})`, `buf.split('\n'); buf = lines.pop()`, `try/catch JSON.parse`, flush-after-close). Write the two lines of the started-guard.
-
-### Level 2 — explain
-
-Open `lib/hooks/useInvestigation.ts`. Explain why the effect declares closure mirrors (`cItems`, `cDiag`, `cRecs`, L65-67) in addition to the React state. Why can the `done` handler (L130-144) not just stash `items` from state? What would go stale if it tried? What batching rule of React's `setState` makes this matter?
-
-### Level 3 — apply
-
-Open `app/page.tsx`. Find the inline reader-loop equivalent at L323-464. List three things the inline copy does that `useInvestigation` *also* does, and one thing the inline copy does *differently* (hint: the auto-reconnect logic at L400-435 lives inside the inline handler; `useInvestigation` doesn't reconnect). Decide: should the inline copy be extracted as `useBriefingStream`, and if so what's its return shape? (The shape is documented in `study-software-design/02-shallow-module-page-component.md:146`.)
-
-### Level 4 — defend
-
-A reviewer says: "Cancelling the fetch in the effect cleanup is the standard React pattern — add an `AbortController`." Walk through exactly what breaks under StrictMode if you do (cite `lib/hooks/useInvestigation.ts:32-36` and `47-48`), name the class of effect this hook belongs to (one-shot stream, not re-runnable query or subscription), and state without hedging why guard-and-let-it-complete is correct here and what the real cost of the no-cancel choice is.
-
 ---
 
 ## See also
@@ -577,3 +559,4 @@ A reviewer says: "Cancelling the fetch in the effect cleanup is the standard Rea
 
 Generated: 2026-06-03 — `/aipe:study-frontend-engineering` (per `specs/study-frontend-engineering.md`).
 Updated: 2026-06-16 — kernel was hoisted to shared `lib/streaming/ndjson.ts:18-64` consumed by all four streaming surfaces (closes audit red flag #2). The hook's value now is the React-specific shape around that shared kernel (StrictMode latch, closure mirror, typed switch, sessionStorage stash).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -341,28 +341,6 @@ No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* conversation, p
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list every budget in the system and its unit: tool-result truncation (chars), schema summary caps (list lengths), route stream truncation (chars), and the output caps (tokens). State which one uses the *real* unit.
-
-### Level 2 — Explain
-
-Out loud: why does the codebase bound input in characters but output in tokens? Why is a character budget *conservative* (safe) for JSON tool results specifically?
-
-### Level 3 — Apply
-
-Scenario: a new workspace has event names averaging 60 characters and 40 customer properties. Check `lib/agents/monitoring.ts` L21–L22 and L33 — how does `schemaSummary` behave, and does the fixed character/list budget over- or under-represent the token cost compared to the demo workspace? What single change (no tokenizer) would give you visibility into the real number?
-
-### Level 4 — Defend
-
-A colleague wants to raise `MAX_TOOL_RESULT_CHARS` to `64_000` to stop truncating EQL results. Using the 4:1 rule and the six-call budget, estimate the cumulative token cost and argue whether that stays safely inside a large context window — then name the measurement (`res.usage`) that would replace your estimate with a fact.
-
-### Quick check — code reference test
-
-What `max_tokens` value forces the intent classifier to answer in one word, and where is it set? (Answer: `16` — `lib/agents/intent.ts` L20.)
-
 ## See also
 
 → 01-what-an-llm-is.md · → 06-token-economics.md · → 04-structured-outputs.md
@@ -375,3 +353,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (Mental model now opens with the "no tokenizer, char-proxy + max_tokens" verdict before unpacking what tokenization is).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

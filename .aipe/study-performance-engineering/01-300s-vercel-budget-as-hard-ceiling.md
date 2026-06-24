@@ -438,16 +438,6 @@ The full picture — the platform ceiling, the configured budget, the agent run 
 
 ---
 
-## Validate
-
-**Level 1 — Reconstruct.** Name the two files where `maxDuration = 300` is set, the platform max it's pinned to, and the typical-case latency the comment names. (Answer: `app/api/agent/route.ts:20` and `app/api/briefing/route.ts:17`. Pinned at Vercel Pro's max of 300s. Comment at `app/api/agent/route.ts:18-19` names ~100-115s typical.)
-
-**Level 2 — Explain.** Why is "pinned at the ceiling" different from "pinned at a measured value"? (Answer: pinning at a measured value means you measured the worst case (e.g. p99 + 50% headroom) and set the budget there. Pinning at the ceiling means you took the platform's max and used that. The cost of the latter is that you have no engineering headroom — if the workload's worst case grows (e.g. a new agent, a slower Anthropic day), there's nowhere to put it. The former gives you slack; the latter gives you maximum room *today* at the cost of zero room *tomorrow*.)
-
-**Level 3 — Apply.** A new monitoring feature wants to add a fourth agent to the chain. What three things would you do before shipping it? (Answer: (1) Add R2's meter (`res.usage` + per-investigation duration logging) so you can *see* what the typical and worst case actually are. (2) Implement the watchdog (Move B) at ~270s so any over-budget run fails visibly instead of silently. (3) Run the new chain against a synthetic load to measure the new typical and worst case — if either crosses ~250s, tighten `maxToolCalls` on the new agent (Move A) before shipping. Don't ship into a blind ceiling; add the meter first.)
-
-**Level 4 — Defend.** A reviewer says "just raise `maxDuration` to 900 — Vercel Enterprise supports it." Defend or accept. (Answer: that's the *Enterprise tier upgrade* — not free, and not actually solving the problem. The problem isn't "we need more seconds"; the problem is "we have zero headroom and no graceful failure." Going from 300 to 900 buys 600s of additional room but doesn't add a watchdog, doesn't add measurement, doesn't change the architectural shape. The same bad-day failure mode (function killed silently, user sees half-stream) still happens, just at 900s instead of 300s. The right move is the watchdog (Move B) + the meter (R2) regardless of plan tier — and *then* decide whether to upgrade or to break the route's lifecycle (Move C). Buying more budget without buying more visibility is paying to defer the problem.)
-
 ---
 
 ## See also
@@ -458,3 +448,4 @@ The full picture — the platform ceiling, the configured budget, the agent run 
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that may amplify bad-day latency
 - `.aipe/study-system-design/audit.md#scale-bottlenecks-and-evolution` — Move C (queue + worker) at scale
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — what changes if the agent run fans out
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

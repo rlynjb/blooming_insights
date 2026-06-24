@@ -412,28 +412,6 @@ judge validation (TODO)    → hand-label 15, compute kappa per criterion
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the eval loop: edit prompt → dataset → runner (real path) → scorer → gate. State the two conditions the gate checks and name which one, alone, ships silent regressions.
-
-### Level 2 — Explain
-
-Out loud: why are the 269 Vitest tests (e.g. `test/agents/diagnostic.test.ts`) NOT evals, and what does `eval/scripts/run-detection.ts` do that they cannot? Name the seam (unit tests inject fake Anthropic + fake DataSource; the eval spawns a REAL `OlistDataSource` subprocess and runs the real Sonnet 4.6 with the real production prompt).
-
-### Level 3 — Apply
-
-Scenario: you're proposing the Path A iteration from `eval/results/2026-06-15-after-fix/summary.md` (the sliding-window scan plan to lift sp-revenue-w4 above 0/10 strict). Write the prompt delta (the new scan-plan paragraph for `monitoring.md`), name which `npm run eval:*` command verifies it, and predict which per-anomaly cell in the next `summary.md` should move.
-
-### Level 4 — Defend
-
-A reviewer says: "Detection precision dropped from 0% to 0% strict and false positives doubled — that's a regression, revert the prompt." State the actual finding (loose recall +26.6, voucher 1/10 → 10/10, the framing limit named honestly), and the principle: a measured partial win + a named limit is a senior outcome; reverting because one number didn't move loses the voucher receipt and the per-anomaly visibility.
-
-### Quick check — code reference test
-
-Which file in `eval/judges/` contains the 5-criterion diagnosis rubric, and what is the pass threshold? (Answer: `eval/judges/diagnosis-judge.md`; criteria = hypothesis 0-2 + evidence 0-2 + sizing 0-2 + calibration 0-1 + fabrication 0-2; pass ≥7/9. The judge runs as a second Sonnet 4.6 call with the rubric as its system prompt; the candidate diagnosis is the user message; it returns JSON scores per criterion.)
-
 ## See also
 
 → 02-structured-outputs.md · → 03-prompts-as-code.md · → 10-self-critique.md · → 13-forbidden-patterns.md
@@ -446,3 +424,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Phase 3 ships: flipped framing from "not yet implemented" to Case A. Rewrote Zoom-out, Part 2.5 (unit-tests-vs-evals), Part 3 (now references the real `eval/judges/*.md` files: 5-crit diagnosis + 3-crit recommendation + similarity), Implementation block (4-pillar runner + scorer + judges + fixtures + committed results), Project exercises (now: lift strict above 0%, fix calibration=29/30=0 deficit, validate judges vs human labels), and Interview defense. Added measured-receipt: Phase 2.5 monitoring fix drove loose recall 6.7% → 33.3% (voucher 1/10 → 10/10), with sp-revenue/electronics still 0/10 strict honestly named as a framing limit. Updated unit-test count 169 → 269.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

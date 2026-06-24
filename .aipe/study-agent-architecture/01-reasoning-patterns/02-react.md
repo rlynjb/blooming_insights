@@ -421,45 +421,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw `runAgentLoop`'s body from memory: the `for` loop, the `forceFinal` check, the model call (with/without tools), the natural stop (zero `tool_use`), the tool-result push as the next user turn. Label which lines in `base.ts` each box maps to.
-
-Open the file. Compare.
-
-✓ Pass: you have the loop, the `forceFinal` gate, the natural-stop branch, and the tool-result push, and you put `tools` only on non-forced turns
-✗ Fail: re-read Move 2.2 and Move 2.3, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-Explain "what reasoning pattern your agents use" to a colleague who just asked. No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the file and function? → `lib/agents/base.ts` `runAgentLoop`
-- Say what makes it ReAct and not something else (interleave of model-decided tool calls and observations)?
-- Name at least one of the four callers and its `maxToolCalls` budget?
-- Say what the forced-final turn does and why it exists?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Can we make the recommendation agent re-read its output and fix any structural mistakes before returning?" Without looking at the file: is that a ReAct change or an escalation? What would change in `runAgentLoop`, what would change in `recommendation.ts`, and which one is the right place to do it?
-
-Write your answer (3–5 sentences). Then open `lib/agents/recommendation.ts` L75–L77 and `lib/agents/base.ts` L48–L176 and check whether a post-loop critic naturally lives in the agent class (around its existing `synthesize()` fallback) or in the loop itself.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today with the same MCP and the same four agents, would you still share one `runAgentLoop` across all four, or give each its own control flow? Why? If you'd switch, what would you do instead and what would the loop bug surface look like?"
-
-Reference the code: point to `lib/agents/base.ts` L85–L172 for what exists, and describe what a per-agent loop would mean for the trace shape the route emits at `app/api/agent/route.ts` L181–L195.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the ReAct loop, and what is the function called?
-- What two budgets bound the loop, and which one usually fires first?
-- What does the loop do on the forced-final turn that's different from a normal turn?
-
-Open and verify. ✓ File + function + the two budgets matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-chains-vs-agents.md · → 03-plan-and-execute.md · → 04-reflexion-self-critique.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
@@ -472,3 +433,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Updated Implementation block to reflect Phase 2's DataSource seam (agents constructed with `DataSource`, not `McpClient`; loop dispatches via `dataSource.callTool`) and the authored Olist domain tools (`get_metric_timeseries`/`get_segments`/`get_anomaly_context`) replacing raw SQL — the agent never sees `execute_sql`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

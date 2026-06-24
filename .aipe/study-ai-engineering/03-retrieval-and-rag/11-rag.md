@@ -314,28 +314,6 @@ exact analytics question → live tool (current)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw RAG as retrieve-then-generate with the retriever as a swappable box, and fill in the two implementations (embedding index, live tool). State which one blooming insights uses and the three data properties that justify it.
-
-### Level 2 — Explain
-
-Out loud: why is "we don't use RAG" the wrong way to describe blooming insights? Why would an embedding index over the analytics data be a stale, lossy copy?
-
-### Level 3 — Apply
-
-Scenario: a PM asks for "find past investigations similar to this one." Open `lib/mcp/tools.ts` L11/L16 (the live retriever) and `lib/state/investigations.ts` (the free-text corpus). Explain why this single feature crosses the threshold to embedding-RAG while every analytics question stays on live tools, and which earlier files (`01`, `03`, `04`) you would build for it.
-
-### Level 4 — Defend
-
-A reviewer says "every serious AI product uses a vector database; add one." Defend live-tool retrieval using the data's properties (fresh, exact, queryable), the costs an index would add (staleness `09`, lossiness, incremental indexing `10`), and the precise threshold (fuzzy free-text recall) that would actually justify the index. Then concede what live retrieval gives up (semantic recall, microsecond latency) and why it does not bite the workload.
-
-### Quick check — code reference test
-
-Does blooming insights do RAG, and what is its retriever? (Answer: yes — it does retrieval-augmented generation with a *live tool* as the retriever: the agent loop runs `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11/L16) against Bloomreach and grounds the answer in the fresh result; it deliberately has no embedding-index retriever because the data is a fresh, exact, queryable API where an index would be stale and lossy.)
-
 ## See also
 
 → ../04-agents-and-tool-use/02-tool-calling.md · → 05-dense-vs-sparse.md · → 09-stale-embeddings.md · → 12-graphrag.md · → 01-embeddings.md
@@ -346,3 +324,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -375,28 +375,6 @@ golden set → {v1 out, v2 out} → judge pairwise → win-rate(v2)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the six-rung ladder from cheapest/strictest to most expensive/nuanced, and write the one-line rule for when to climb a rung.
-
-### Level 2 — Explain
-
-Out loud: why is exact-match correct for `classifyIntent` output but wrong for a `Diagnosis` conclusion? Tie it to output entropy (the size of the correct-answer space).
-
-### Level 3 — Apply
-
-Scenario: you must eval `MonitoringAgent.scan`. Open `lib/agents/monitoring.ts` L68–L103 and note it returns an array sorted by severity and sliced to 10. Explain why F1 (not exact-match, not a rubric) fits, and why you would weight recall on `critical` (`lib/mcp/types.ts` L3) above `info`.
-
-### Level 4 — Defend
-
-A colleague proposes one LLM-as-judge scorer for every surface "so the harness is simple." Argue the per-surface cost: name a surface where the judge wastes money and adds bias (intent/severity) and a surface where it is genuinely needed (recommendation prose), and state the simplest correct method for each.
-
-### Quick check — code reference test
-
-What does `classifyIntent` (`lib/agents/intent.ts` L17–L31) return, and which scoring method fits it and why? (Answer: one of three enum words — it caps `max_tokens` at 16 to force a single-word answer — so exact-match (`===`) is the correct method: the output space is a single label with zero correct variation, so no tolerance is needed and a judge would only add cost and bias.)
-
 ## See also
 
 → 01-eval-set-types.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../01-llm-foundations/07-heuristic-before-llm.md
@@ -408,3 +386,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Phase 3 flipped this file from Case B to Case A: opening verdict, Implementation in codebase, and the un-wired-rung enumeration now anchor to the four real runners under `eval/scripts/` and the three judge prompts under `eval/judges/`, with calibration receipts cited (diagnosis 8/8, recommendation 3/3 including BRL-bug catch). Replaced the "build the evals/runner.ts" exercise with two new ones: severity-weighted recall on the detection scorer; pairwise prompt-edit A/B (the actual un-built rung).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -433,44 +433,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three tiers stacked by durability. For each tier, write the file/line that holds it in this codebase (or "absent" for tier 3). Mark the access pattern next to each tier (full history / exact key / relevance retrieval).
-
-Open the file. Compare.
-
-✓ Pass: three tiers, files for tier 1 (`base.ts` L79) and tier 2 (server `investigations.ts` L11 + client `useInvestigation.ts` L19), "absent" for tier 3
-✗ Fail: re-read How it works moves 1–3, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-Explain "how does this agent remember things across the diagnosis-to-recommendation step" to a colleague who just asked "the route is stateless, right?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the server cache and the client stash, with file names?
-- Name the specific handoff key (`bi:diag:<id>`)?
-- Say why the cross-step handoff doesn't need a vector store?
-- Name what tier 3 *would* enable that the current shape can't?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A PM asks: "Can the agent learn that user A always dismisses cart-abandonment alerts for their Q4 sale period, and not re-surface them next year?" Without looking at the file: which tier does that fact belong in, what's the access pattern, and which file(s) would you build the new tier in (or which existing tier could you stretch)? Estimate roughly what's involved.
-
-Write your answer (3–5 sentences). Then open `lib/state/investigations.ts` and check whether the current shape could plausibly absorb this fact, or whether it forces the third tier.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today and you knew dismissals were coming in a quarter, would you still ship without a vector store? Or would you pre-build the third tier so the dismissal feature is a small addition instead of a foundation change? Reference `package.json` for the absence of vector deps and `lib/state/investigations.ts` for what exists."
-
-### Quick check — code reference test
-Without opening any files:
-- What variable holds working memory inside `runAgentLoop`, and what file is it in?
-- What's the function name for writing to the server-side episodic cache?
-- What sessionStorage key does the client use to hand the diagnosis from step 2 to step 3?
-- Is there a vector store in this codebase? (Yes/no — and one sentence why.)
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `01-context-engineering.md` · → `03-tool-calling-and-mcp.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/05-agent-memory.md`
@@ -481,3 +443,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

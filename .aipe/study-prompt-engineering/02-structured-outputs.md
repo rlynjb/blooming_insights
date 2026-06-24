@@ -419,28 +419,6 @@ fence-first: regex captures [...] → JSON.parse → precise ✓
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three-stage funnel (extract → validate → repair) and name the function at each stage. State the order of `parseAgentJson`'s three extraction strategies and which one matches what the prompt asked for.
-
-### Level 2 — Explain
-
-Out loud: why does `isRecommendationArray` validate a shape *without* `id` (`validate.ts` L42), where does the `id` come from (`recommendation.ts` L76), and why is the "Do NOT include an id" instruction repeated in the synthesis text (`recommendation.ts` L62)?
-
-### Level 3 — Apply
-
-Scenario: you add a new agent that must return `{ summary: string; tags: string[] }`. Using `validate.ts` L29–35 as the template, write the `isSummary` guard; decide which `parseAgentJson` strategy hits for fence-wrapped output; and decide whether this agent needs a `synthesize()` repair or can floor to a default like monitoring does — justify the choice with what a safe default would be.
-
-### Level 4 — Defend
-
-A reviewer says: "Switch the final diagnosis to Anthropic tool-use JSON mode and delete `parseAgentJson`." State what that buys (token-level validity), what it costs (provider coupling, harder fakes-in-tests, re-encoding `recommendation.md` L82 as a schema constraint), why the codebase already accepts native tool-use for *input* but not output, and the measured condition under which you'd flip the output side.
-
-### Quick check — code reference test
-
-In `parseAgentJson`, what are the three extraction strategies in order, and what happens if all three fail? (Answer: (1) fenced-code regex `/```(?:json)?\s*([\s\S]*?)```/i`, (2) bare `JSON.parse`, (3) first-bracket-to-last-bracket substring scan; if none yields valid JSON it throws `'no parseable json in agent output'` — `lib/mcp/validate.ts` L3–13.)
-
 ## See also
 
 → 01-anatomy.md · → 03-prompts-as-code.md · → 07-output-mode-mismatch.md · → 09-chain-of-thought.md
@@ -453,3 +431,4 @@ Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file 
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added a fifth "Where this breaks down" item: the BRL cents-vs-Reais unit-narration gap. Olist returns monetary values as integer cents but the schema only enforces type, not units. The prompt asks the model to divide by 100; nothing in the validator catches a miss. Surfaced as a prompt-engineering target by the Phase 3 eval suite.
 Updated: 2026-06-19 — Removed the BRL cents-vs-Reais item — Olist is gone (PR #8) and the legacy-prompts no longer narrate currency in cents. The structural point (shape ≠ unit-correctness) remains true; without an in-repo Olist adapter, it's no longer anchorable to a real file.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

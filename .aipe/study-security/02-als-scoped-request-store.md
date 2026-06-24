@@ -497,28 +497,9 @@ The honest perf concern would be: if we used ALS in a hot path that fires thousa
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-Without looking, write the pseudocode for `withAuthCookies`. Where does `requestStore.run` go relative to the decrypt and encrypt steps? Then check `lib/mcp/auth.ts` L86–L104.
-
-### Level 2 — Explain
-Why does `readAll()` check `requestStore.getStore()` first and only fall through to the in-memory Map / file backend if no ALS context exists? What invariant does this enforce? Reference `lib/mcp/auth.ts` L114–L123.
-
-### Level 3 — Apply
-A new feature lands: a request-scoped logger that prefixes every `console.log` with the request ID. Walk through how you'd implement it using a second `AsyncLocalStorage` instance. What goes in the storage, where does `.run` wrap the handler, where does `getStore()` get called?
-
-### Level 4 — Defend
-A teammate proposes "simplifying" by removing ALS and passing the `ctx` object as an extra argument to every provider method, "since explicit is better than implicit." Defend or refute. (Hint: where does the MCP SDK's `OAuthClientProvider` interface live, and what would have to change?)
-
-### Quick check
-- Where is the `AsyncLocalStorage` instance declared? → `lib/mcp/auth.ts` L47.
-- What's inside the `RequestStore` interface? → `{ store: Store; dirty: boolean }` (L46).
-- What's the single function that calls `requestStore.run`? → `withAuthCookies` at L91.
-- What happens in dev mode regarding the ALS context? → No `.run()` is called; `readAll` falls through to the file or in-memory backend (L87 short-circuit, L114–L122).
-
 ---
 
 ## See also
 
 → [audit.md](./audit.md) · [01-encrypted-cookie-oauth-state.md](./01-encrypted-cookie-oauth-state.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

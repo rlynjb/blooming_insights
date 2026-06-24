@@ -470,13 +470,6 @@ A: At current scale (a handful of investigations per warm instance lifetime, eac
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw the three lifetimes (per-call, per-request, per-warm-instance). Place each piece of state from the codebase into the right tier.
-2. **Explain.** Why does `runAgentLoop` keep `messages[]` as a function local instead of caching it module-scope across turns? (Each request needs its own conversation history; sharing would mean every concurrent request sees every other's turns. Function-local is the correct scope.)
-3. **Apply.** A new tool returns a 5MB CSV. Where does that get truncated to bound memory growth, and what's the consequence of removing the truncation? (Truncation happens at `lib/agents/base.ts:33` — caps the entry in `messages[]`. Without it, the CSV lives in every subsequent Anthropic call's message history, costing tokens and growing the heap.)
-4. **Defend.** Defend the choice to never evict entries from the `investigations` Map. When does this stop being defensible? (Defensible today: at hackathon scale, total memory is a few MB; Vercel evicts the process long before it becomes a problem. Stops being defensible when sustained traffic + warm-instance longevity push it past ~100MB — at which point switch to LRU or move to KV/Redis.)
-
 ---
 
 ## See also
@@ -488,3 +481,4 @@ A: At current scale (a handful of investigations per warm instance lifetime, eac
 
 ---
 Updated: 2026-06-16 — added child-heap section (5.5) covering better-sqlite3 handle, per-query rows, baseline ~30-50MB, orphan-on-no-dispose risk.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

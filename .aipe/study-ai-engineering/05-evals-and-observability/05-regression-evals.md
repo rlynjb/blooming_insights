@@ -380,31 +380,10 @@ sonnet judge biases toward "same substance"
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the capture/score split as a flow: live agent → capture mode writes to `eval/fixtures/regression-golden/`; later, score mode runs the same inputs and compares via structural diff + similarity judge. Name the two outputs of the similarity judge.
-
-### Level 2 — Explain
-
-Out loud: why does `eval/results/2026-06-15-score-baseline/regression-summary.md` show 100% structural / 30% semantic when capture and score ran back-to-back with no code changes? Tie the 30% to LLM non-determinism and the 100% to the agent contract.
-
-### Level 3 — Apply
-
-Scenario: you edit `lib/agents/prompts/diagnostic.md` and re-run `npm run eval:regression -- --mode=score`. The new summary shows 100% structural / 20% semantic. Open `eval/results/2026-06-15-score-baseline/regression-summary.md` for the baseline; decide merge vs no-merge and justify with the decision rule from "Move 2 — the baseline-relative decision rule."
-
-### Level 4 — Defend
-
-A colleague says "this regression eval is broken — it says 70% of our fixtures fail every time." Defend the design: explain why 30% semantic is the floor for *this* system, why structural at 100% means the shape contract isn't drifting, and why moving away from baseline-relative scoring (e.g., "we should hit 80% semantic") would replace a real signal with a wishful target.
-
-### Quick check — code reference test
-
-What two modes does `eval/scripts/run-regression.ts` run in, and which one is destructive? (Answer: `capture` mode writes today's outputs to `eval/fixtures/regression-golden/` — destructive; `score` mode reads the goldens and compares today's candidates without modifying them — non-destructive. Capture is operator-driven; score runs every time you want to check for regression.)
-
 ## See also
 
 → 01-eval-set-types.md · → 02-eval-methods.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../07-system-design-templates/03-multi-rubric-eval-pipeline.md
 
 ---
 Updated: 2026-06-16 — new file. Documents the regression-eval pillar shipped in Phase 3: capture/score modes, structural-diff + similarity-judge two-mode scoring, the 30% semantic baseline as the load-bearing finding, fixture inventory under `eval/fixtures/regression-golden/`, and the paper trail at `eval/results/2026-06-15-score-baseline/regression-summary.md`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

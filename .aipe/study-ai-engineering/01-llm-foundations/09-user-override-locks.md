@@ -331,28 +331,6 @@ field-level:  _overridden_fields[], partial refresh (granular)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the two-writer conflict (machine re-run vs. human edit on one field) and the marker that resolves it. State the field name (`_overridden_at`), where it lives (the record), and the re-run's check (skip if set).
-
-### Level 2 — Explain
-
-Out loud: why does "last write wins" structurally favor the machine over the human here? Why is a dismissal an override that the marker design must cover?
-
-### Level 3 — Apply
-
-Scenario: a PM asks for dismissible recommendations. Open `lib/mcp/types.ts` L85–L99 and `lib/state/insights.ts` L29–L57 — name exactly which type gains which fields, where the dismiss write sets the marker, and where the re-run's merge check goes. Explain why shipping the dismiss button *without* the marker is a bug.
-
-### Level 4 — Defend
-
-A colleague wants to ship editable recommendations now and "add the override protection later if users complain." Argue why the lock and the edit feature are the same change, what the user-visible failure looks like without it, and which reconciliation policy (user-wins vs. newest-wins) you would ship first.
-
-### Quick check — code reference test
-
-Does the `Recommendation` type carry any field that records a human edit, and what does its absence tell you about this concept's status in the codebase? (Answer: no — `lib/mcp/types.ts` L85–L99 has only machine-generated fields and no `_overridden_at`/`_dismissed`; its absence confirms blooming insights is a read-only analyst, so user-override locks are a buildable target, not a present feature.)
-
 ## See also
 
 → 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
@@ -363,3 +341,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -313,16 +313,6 @@ Optimistic. Save-insights is low contention — two users editing the same row a
 
 Diagram: the version-column UPDATE pattern.
 
-## Validate
-
-**Level 1 — reconstruct.** Explain MVCC in two sentences. Why don't readers block writers under MVCC?
-
-**Level 2 — explain.** Why is `putInsights()` "safe" today and what's the smallest change that would break that safety? (Answer: safe because no await in the body, one instance. Adding any `await` inside the body OR adding any feature that triggers two concurrent briefings on different instances breaks it.)
-
-**Level 3 — apply.** Sketch the shared token-bucket fix for the rate-limit gap. What's the Redis-side primitive? (Answer: `INCR rl:user:{id}:window` then `EXPIRE rl:user:{id}:window 1` on the first increment; reject when the counter exceeds the budget. Pseudocode in `lib/mcp/client.ts` would replace `lastCallAt` with a check against this counter before the call.)
-
-**Level 4 — defend.** Argue against introducing pessimistic row locks for saved-insights "to be safe." (Answer: locks block other writers; under typical save-insights traffic (low contention, mostly different rows), locks are pure overhead. Optimistic concurrency pays only when a conflict actually happens — which is the right cost shape for the workload.)
-
 ## See also
 
 - `05-transactions-isolation-and-anomalies` — the contract concurrency control enforces
@@ -333,3 +323,4 @@ Diagram: the version-column UPDATE pattern.
 
 ---
 Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app concurrency gap unchanged; the rate-limit-budget-per-instance finding is still the load-bearing concurrency story here.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

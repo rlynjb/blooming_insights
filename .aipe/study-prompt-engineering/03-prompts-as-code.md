@@ -356,28 +356,6 @@ no pairing/co-log → regression untraceable to the model change
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the two halves of prompts-as-code (authoring: file → load → version → review; observability: pair → log → bisect) and mark which half blooming insights implements. Name the file+line where each prompt is loaded and where the model ID lives.
-
-### Level 2 — Explain
-
-Out loud: why does loading the prompt with `readFileSync` *at import* (`monitoring.ts` L13) guarantee the deployed prompt equals the committed one, and what does that immutability cost during an incident?
-
-### Level 3 — Apply
-
-Scenario: you change `AGENT_MODEL` at `base.ts` L9 to a newer model and the diagnostic agent's parse-failure rate climbs. Walk through why the persisted records (`route.ts` L254) don't let you confirm the model bump as the cause, and name the one field you'd add to make it traceable.
-
-### Level 4 — Defend
-
-A reviewer says: "We don't need prompt observability — git history is enough." State what git history *does* give (the diff, the author, the timeline) and what it *doesn't* (which prompt version ran for a given output, paired with which model), and the event that makes the gap bite (the first model bump that silently regresses output tuned to the prior model).
-
-### Quick check — code reference test
-
-Where does the model ID that runs the three agents live, and is it stored anywhere alongside the prompt or the output? (Answer: `AGENT_MODEL = 'claude-sonnet-4-6'` at `lib/agents/base.ts` L9; it is *not* paired with the prompt files and *not* persisted by `saveInvestigation` at `app/api/agent/route.ts` L254 — the observability gap.)
-
 ## See also
 
 → 01-anatomy.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md
@@ -390,3 +368,4 @@ Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file 
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Noted that Phase 3 ships per-day committed `eval/results/<YYYY-MM-DD>/summary.md` directories alongside the prompt deltas they scored, so the eval-bench side now has the bisectable prompt-vs-result history the production-output side still lacks.
 Updated: 2026-06-19 — Removed the `eval/results/<YYYY-MM-DD>/summary.md` observability link (the `eval/` suite is no longer in the repo). Added the package-version dimension to the gap: now that active prompts ship via `@aptkit/prompts`, a transitive `npm install` bump can change the prompts the agents read without touching `lib/agents/`, so the missing prompt-version + model-id co-log is even more load-bearing. See file 14 for the broader treatment of prompts-as-an-external-package.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

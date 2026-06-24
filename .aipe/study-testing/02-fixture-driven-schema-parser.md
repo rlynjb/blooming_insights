@@ -361,16 +361,10 @@ Synthetic vs fixture — what each guarantees
 
 **Q: Why specific values like 204917 instead of "greater than zero"?** Because `eventCount > 0` passes for almost any input — a synthetic, a stale fixture, a malformed payload that happens to have one event. `eventCount === 204917` passes only when the parser correctly read the real captured payload's most-frequent event count and got the sort order right. The specific value pins both the parsing AND the post-processing (sort by frequency, take the top).
 
-## Validate
-
-1. **Reconstruct:** Without looking, list the three load-bearing parts of fixture-driven testing as practiced in `test/mcp/schema.test.ts`.
-2. **Explain:** Why does `expect(schema.events[0].name).toBe('campaign')` provide stronger regression coverage than `expect(schema.events.length).toBeGreaterThan(0)`?
-3. **Apply:** Sketch the CI job that would close the staleness gap. What does it run, what does it compare, when does it fail?
-4. **Defend:** A reviewer says "the four robustness tests are redundant — TypeScript already says `events: Event[]`." Push back with the "the type doesn't validate runtime input from MCP" argument.
-
 ## See also
 
 - `audit.md#what-is-tested-and-what-isnt` — the coverage map this pattern anchors
 - `audit.md#testing-red-flags-audit` — flag 7 (no contract test on external) is the staleness gap this pattern carries
 - `01-scripted-anthropic-harness.md` — the agent layer's complementary pattern; together they cover the lib boundary
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard discipline applied to the parser's output, after parsing
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

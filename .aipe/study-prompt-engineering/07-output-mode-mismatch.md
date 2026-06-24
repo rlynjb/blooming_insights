@@ -365,28 +365,6 @@ answer for a human reader     → prose (.trim())
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the four agents and each one's output mode, draw the two consumer paths (JSON: parseAgentJson+guard; prose: trim), and state what each mismatch direction does (prose→JSON consumer; JSON→prose consumer).
-
-### Level 2 — Explain
-
-Out loud: why does the query agent deliberately *not* use `parseAgentJson` (`query.ts` L47), and why would forcing it onto the JSON path be the wrong contract for its consumer?
-
-### Level 3 — Apply
-
-Scenario: a teammate's PR changes `query.md` L49 to "Return ONLY a JSON object with an `answer` field" but leaves `query.ts` L47 as `finalText.trim()`. Walk through what the user sees, why no test that checks "didn't throw" catches it, and which two other sites (`## Output`, the synthesis nudge at `query.ts` L42–44, the consumer) you'd read together to flag it in review.
-
-### Level 4 — Defend
-
-A reviewer says: "Make all four agents return JSON so there's one consumer and no mismatch class." State what that removes (the prose path and its mismatch surface) and what it costs (wrapping a human answer in `{ "answer": "..." }` the UI just unwraps; a schema constraining inherently unstructured output), and the condition under which uniform JSON would be right (every agent's output becomes machine-consumed — which query's human-facing answer prevents here).
-
-### Quick check — code reference test
-
-Which agent consumes its `finalText` without calling `parseAgentJson`, and what is the exact consuming expression? (Answer: the query agent — `finalText.trim() || 'I was unable to find enough data to answer that question.'` at `lib/agents/query.ts` L47; it declares prose mode at `query.md` L49 and never touches the JSON parse path.)
-
 ## See also
 
 → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
@@ -398,3 +376,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

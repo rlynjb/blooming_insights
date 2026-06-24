@@ -384,16 +384,6 @@ Interview-defense diagram — the extraction logic
   page after: just layout + composition → ~120 LOC
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the eight concerns held at one altitude in `app/page.tsx`. Which three hooks would extract them, and what's the return shape of each?
-
-2. **Explain.** Why is the depth ratio the right measure here, rather than line count? A 200-LOC file with 14 useState slots is shallower than an 800-LOC file with 2 useState slots — explain the mechanism.
-
-3. **Apply.** Open `app/investigate/[id]/page.tsx` (225 LOC). Why is this page calm despite being non-trivial? Name the hooks it delegates to and trace what each one hides. (Hint: `useInvestigation` already extracts NDJSON parsing into a hook — that's the proof-of-concept for `useBriefingStream`.)
-
-4. **Defend.** A reviewer says "extracting hooks for a single component is over-engineering — keep it simple." Counter using the cognitive-load argument. (Hint: the page already isn't simple — it has 8 concerns. The hooks aren't *adding* abstraction; they're *exposing* the abstraction that already exists informally. The cost is paid once; the benefit is paid every edit.)
-
 ## See also
 
 - `audit.md` — the deep-vs-shallow-modules lens, updated to record the resolution.
@@ -402,3 +392,4 @@ Interview-defense diagram — the extraction logic
 
 ---
 Updated: 2026-06-16 — verdict RESOLVED; refactor landed (page 817→462 LOC, three hooks extracted); kept as worked example of the shallow→deep move in practice with post-fix calibration on LOC vs visibility-surface deltas.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

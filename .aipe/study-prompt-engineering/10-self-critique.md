@@ -341,28 +341,6 @@ independent critique → can disagree → catches confident-wrong
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw both shapes: self-critique (generate→critique→revise, sequential) and self-consistency (run N→vote, parallel). Label the token cost of each (~2–3× vs N×) and write the one caveat that limits same-model critique (the shared blind spot).
-
-### Level 2 — Explain
-
-Out loud: why is `synthesize()` (`lib/agents/diagnostic.ts` L82–121) NOT self-critique? Name its trigger (`tryParseDiagnosis(finalText)` is null, L73–77), what it takes as input (evidence, not the first output), and how a real verify pass would differ on all three points.
-
-### Level 3 — Apply
-
-Scenario: add a verify pass that catches a diagnosis whose `conclusion` says "mobile checkout regressed" while its `evidence` rows show desktop moved. Decide where it goes (`app/api/agent/route.ts` L153–154, before the `diagnosis` event), what it receives (anomaly + tool results + the v1 diagnosis), which model you'd use for the critic and why (Haiku, to blunt the shared-blind-spot problem), and what it returns (unchanged or corrected).
-
-### Level 4 — Defend
-
-A reviewer says: "Just add a self-critique pass to every agent — the model can check its own work." State which agent it actually helps (the prose diagnosis) versus where a vote is the right tool instead (the discrete classifier, `intent.ts`), name the shared-blind-spot ceiling that limits same-model critique, and give the cost (2–5× tokens) and the breakpoint event that justifies paying it.
-
-### Quick check — code reference test
-
-What is the exact trigger condition under which `synthesize()` runs in the diagnostic agent, and why does that make it recovery rather than verification? (Answer: it runs only when `tryParseDiagnosis(finalText)` returns `null` — `lib/agents/diagnostic.ts` L73–77 — i.e. the loop produced no parseable JSON. On the successful path it never runs and never inspects the valid diagnosis, so it recovers a missing artifact rather than verifying an existing one.)
-
 ## See also
 
 → 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
@@ -370,3 +348,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

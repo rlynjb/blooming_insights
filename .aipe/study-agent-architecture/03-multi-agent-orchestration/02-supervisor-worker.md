@@ -467,52 +467,6 @@ The supervisor role — present in both flavors
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the supervisor-worker shape from memory: supervisor at the top, three workers below, arrows down for delegation and arrows up for results. Then draw the same shape with the supervisor labelled "code (if-ladder)" — that's the blooming insights version.
-
-Open the file. Compare.
-
-✓ Pass: the shape is the same in both diagrams; only the supervisor label changes
-✗ Fail: re-read How it works Layer 1, wait 10 minutes, try again. Do not move on until you pass.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who asked "wait, do you have a supervisor or not?" — answer in under 90 seconds without notes.
-
-Checkpoints — did you:
-- Name `app/api/agent/route.ts` as the supervisor (and clarify: it's code, not an LLM)?
-- Name the supervisor's three jobs (decompose, delegate, synthesize) and walk through how the route does each?
-- Name the tradeoff (no runtime adaptation, but no LLM cost and one less suspect to debug)?
-- Name the breakpoint (when the route becomes a switchboard)?
-
-If you skipped any: you described the architecture, you didn't defend the choice.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants to add an "explain in plain English" agent that runs *after* recommendation and rewrites the recommendations for a non-technical reader. The PM also wants the system to *skip* the explain step if the recommendation confidence is high (the assumption: high-confidence recs are already clear).
-
-Without looking at the file: does this change require an LLM supervisor, or can the route's `if`-ladder still express it? What would land in `route.ts` and what would land in a new agent class?
-
-Write your answer (3–5 sentences). Then open `app/api/agent/route.ts` L244–L249 and check whether the recommendation block could be extended with another `if (lowConfidence) { await explainAgent.run(...) }`.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today and you knew the user journey would grow to 20+ anomaly types each needing a specialist worker, would you still use a code supervisor, or start with an LLM supervisor on day one? Why? If you'd switch, what's the minimum supervisor agent you'd ship — what tool schemas, what synthesis instruction — and which lines in `route.ts` would it replace?"
-
-Reference the code: `route.ts` L199–L200 (lead-agent select), L224–L249 (pipeline), `lib/agents/base.ts` L48–L176 (`runAgentLoop`).
-
-### Quick check — code reference test
-
-Without opening any files:
-- What file plays the supervisor role in blooming insights?
-- What's the function that runs each worker's loop, and what file is it in?
-- How is the diagnosis handed from the diagnostic worker to the recommendation worker — function call, LLM merge, message bus?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./01-when-not-to-go-multi-agent.md` · → `./03-sequential-pipeline.md` · → `./06-swarm-handoff.md` · → `../06-orchestration-system-design-templates/` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → routing primitive: `../01-reasoning-patterns/01-chains-vs-agents.md`
@@ -524,3 +478,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 1 (lead with "every multi-agent system has a supervisor; only variant is who plays it" before the cost/debug breakdown).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

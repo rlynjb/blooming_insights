@@ -341,28 +341,6 @@ Build the meter. Read `res.usage` per call and persist a per-run total (`ai_call
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the three cost-bounding levers and the one missing meter. State the output-vs-input price asymmetry and which call in an investigation is the conditional spike.
-
-### Level 2 — Explain
-
-Out loud: why does input-token cost grow across turns of a single agent even though each *new* increment is small? How does `truncate` (`lib/agents/base.ts` L31–L34) bound that growth, and why does it bound *cost* only coarsely?
-
-### Level 3 — Apply
-
-Scenario: the LLM bill is 30% over target. Open `lib/agents/base.ts` L102 and explain why you cannot currently say which call is the offender, what single field on the `create` response would tell you, and where you'd accumulate it (`AgentRunResult`, L24–L27).
-
-### Level 4 — Defend
-
-A colleague says: "We have `maxToolCalls`, so cost is handled — skip the usage logging." Argue the difference between *bounded* and *measured*, name what stays invisible without the meter (the synthesis fire rate), and state the event that makes the meter non-optional.
-
-### Quick check — code reference test
-
-Which model classifies intent, and why is it the cheap choice rather than the agent model? (Answer: `claude-haiku-4-5-20251001` — `lib/agents/intent.ts` L14; classification is a trivial three-way label, so it runs on the cheap haiku model while sonnet (`AGENT_MODEL`, `base.ts` L9) does the reasoning.)
-
 ## See also
 
 → 02-tokenization.md · → 03-sampling-parameters.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
@@ -373,3 +351,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

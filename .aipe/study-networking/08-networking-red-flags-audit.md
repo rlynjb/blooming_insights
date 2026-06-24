@@ -314,13 +314,6 @@ CORS. Every browser → API call is same-origin; we don't expose any cross-origi
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Without looking, name the top 3 risks and the file you'd open first for each.
-  2. **Explain.** For risk #1 (no per-call timeout), trace the user-visible failure: what does the user see, at what timestamps, and why does it happen?
-  3. **Apply.** A teammate proposes adding 5 more retries to the rate-limit logic. Argue against it citing risk #2's math, and propose what they should ship instead.
-  4. **Defend.** Why is risk #3 (cookie SPOF for OAuth) ranked above risk #4 (text-match brittleness)? Compare the consequence × likelihood for each.
-
 ---
 
 ## See also
@@ -329,3 +322,4 @@ CORS. Every browser → API call is same-origin; we don't expose any cross-origi
   → `07-timeouts-retries-pooling-and-backpressure.md` — the mechanism behind risks 1, 2, 4, 6, 7.
   → `04-tls-and-trust-establishment.md` — the mechanism behind risks 3, 8.
   → `06-websockets-sse-streaming-and-realtime.md` — the design behind risks 5, 10.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

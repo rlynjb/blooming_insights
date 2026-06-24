@@ -428,13 +428,6 @@ Anchor: "the only timeout in play is the platform's hard kill — that's a gap."
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Sketch the network map from memory. Label every hop with method, URL, content type, auth header. Compare against the recap diagram above.
-  2. **Explain.** For each of the four seams, name what *flips* across it and one consequence of the flip.
-  3. **Apply.** A reader asks "where would I add a third upstream — say, Stripe — if I wanted invoice-anomaly detection?" Point at exactly which file would gain the new transport, which agent would call it, and how the rate-limit logic would need to generalise (or not). Anchor to `lib/mcp/client.ts:79-172` and `lib/agents/`.
-  4. **Defend.** Argue why this small map is the right size for the current product (not "scalable" or "good for the future" — *right for now*) and name the trigger that would force the next layer (e.g. "a second concurrent user" — what breaks?).
-
 ---
 
 ## See also
@@ -444,3 +437,4 @@ Anchor: "the only timeout in play is the platform's hard kill — that's a gap."
   → `05-http-semantics-caching-and-cors.md` — the cookies and headers that hold this together.
   → `07-timeouts-retries-pooling-and-backpressure.md` — the rate-limit playbook at hop 2a.
   → `../study-system-design/05-streaming-ndjson.md` — the line-buffering contract on the wire.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

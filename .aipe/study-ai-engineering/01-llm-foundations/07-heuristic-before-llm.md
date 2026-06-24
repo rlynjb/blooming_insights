@@ -330,28 +330,6 @@ fix: log parseIntent vs classifyIntent disagreement → drift visible
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three-layer routing cascade: parameter-presence (route), keyword substring (`parseIntent`), haiku classification (`classifyIntent`). State which are free, which is paid, and where `parseIntent` is reused.
-
-### Level 2 — Explain
-
-Out loud: why does `classifyIntent` feed its model output back through `parseIntent` (`lib/agents/intent.ts` L30)? What single guarantee does reusing the heuristic as the parser provide?
-
-### Level 3 — Apply
-
-Scenario: a user types "stop monitoring my spend." Trace it through `parseIntent` (`lib/agents/intent.ts` L6–L12). What does it return, is that correct, and what signal would have told you the heuristic made a low-quality call? Tie the answer to the disagreement-logging idea.
-
-### Level 4 — Defend
-
-A colleague wants to delete `parseIntent` and "just always call the classifier — it's smarter." Argue the cost and latency case for keeping the free tier, and name the one situation where the colleague is actually right (the heuristic's coverage collapsing as inputs evolve).
-
-### Quick check — code reference test
-
-What does `parseIntent` return for an input with no intent keyword, and where is that default set? (Answer: `'diagnostic'` — `lib/agents/intent.ts` L11, the final `return 'diagnostic'`.)
-
 ## See also
 
 → 06-token-economics.md · → 03-sampling-parameters.md · → 08-provider-abstraction.md · → 01-what-an-llm-is.md
@@ -362,3 +340,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

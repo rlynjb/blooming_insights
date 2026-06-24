@@ -529,52 +529,6 @@ The two state machines, not to be confused
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the graph orchestration shape from memory: nodes, conditional edges, checkpoint store, human node, engine. Then annotate what blooming insights has instead (imperative route + UI ProcessStepper + manual sessionStorage handoff).
-
-Open the file. Compare.
-
-✓ Pass: you drew nodes-edges-state-engine-checkpoint, named human nodes, and contrasted with the imperative route + UI state machine pair this codebase has
-✗ Fail: re-read How it works Layers 1–4, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who said "we have a ProcessStepper — that's our graph runtime, right?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Distinguish UI state machine from agent-orchestration runtime?
-- Name what a graph runtime owns (server-side state, checkpoints, thread_ids)?
-- Name what the ProcessStepper does (UI step rendering, derived client-side state)?
-- Name the manual sessionStorage handoff as what stands in for human-in-the-loop today?
-
-If you skipped any: you let the conflation slide; the colleague will keep believing it.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants a "save and resume investigation later" feature: the user starts an investigation, closes the browser, comes back 2 days later, and resumes from where they left off.
-
-Without looking at the file: does this work today with `sessionStorage`? Why or why not? What would need to change — graph runtime adoption, server-side state store, both? What's the minimum architecture that earns the feature?
-
-Write your answer (3–5 sentences). Then open `lib/hooks/useInvestigation.ts` L138 (the sessionStorage write) and consider its scope (per-tab, cleared on tab close).
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today and you knew the product team would ship a 'save and resume' feature within 6 months, would you start with imperative route code (this codebase's choice) or with LangGraph from day one? Why? What's the cost of getting it wrong in either direction — premature graph adoption for a 50-line orchestration, or imperative-then-rewrite when the feature lands?"
-
-Reference the code: `app/api/agent/route.ts` L199–L249 (current imperative orchestration), `lib/hooks/useInvestigation.ts` L138 (current manual sessionStorage handoff), `lib/mcp/types.ts` L95–L104 (the typed `Diagnosis` that would be part of any graph state schema).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Does blooming insights use a graph runtime? (Yes / No)
-- Is the UI ProcessStepper a graph runtime? Why or why not?
-- What manually-implemented mechanism stands in for human-in-the-loop pause/resume today?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./03-sequential-pipeline.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
@@ -586,3 +540,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase position + the ProcessStepper-vs-graph-runtime category-error trap directly, alongside the strategy line, instead of waiting until the dodged-question block).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

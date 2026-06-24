@@ -448,13 +448,6 @@ Skeleton — what breaks if removed
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Sketch the producer side (5 lines of pseudocode) and the consumer side (5 lines). Name the load-bearing line in each.
-  2. **Explain.** Why is `buf = lines.pop()` correct and `lines.slice(0,-1)` wrong (or differently correct)? Trace what happens to a TCP chunk that splits a line.
-  3. **Apply.** A product manager asks "can we push notifications when a new anomaly fires, without the user opening the page?" Argue which transport (NDJSON, SSE, WebSocket) is right and why; trace through the implementation surface for each.
-  4. **Defend.** Why is `controller.close()` in the `finally` block, not at the end of the happy path? Construct the failure if we move it.
-
 ---
 
 ## See also
@@ -463,3 +456,4 @@ Skeleton — what breaks if removed
   → `03-tcp-udp-connections-and-sockets.md` — why the inbound TCP must stay open for the full agent run.
   → `05-http-semantics-caching-and-cors.md` — the `Cache-Control: no-transform` directive that keeps the stream live.
   → `../study-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire detail.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

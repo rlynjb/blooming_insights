@@ -532,32 +532,7 @@ Shape vs algorithm again. A pipeline has the *shape* of a path graph (a chain of
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the shared BFS/DFS kernel: visited set, frontier (queue or stack), expand-and-mark loop, empty-frontier termination. State the two pieces people most often forget (visited set, empty-frontier termination) and what breaks when they're missing. Write the adjacency list representation as `Map<NodeId, NodeId[]>` and the cost of finding neighbors (O(degree)).
-
-### Level 2 — explain
-
-Open `lib/mcp/schema.ts` L151–L192. Walk through why the bootstrap chain is a *pipeline* and not a *graph traversal*. Identify what would be different in the code if this were genuinely a graph traversal (visited set, frontier choice, branching decision). What would the bootstrap chain look like if a new tool was added that *might or might not* need to be called based on the previous call's result?
-
-### Level 3 — apply
-
-**Scenario:** Bloomreach's MCP API adds 20 more tools, with explicit dependencies declared between them ("`analyze_cohort` requires `list_cohorts` first; `forecast_revenue` requires `list_sales`"). You need to compute a valid call order for any subset of tools. Walk through: (a) the graph representation (nodes = tools, directed edges = "depends on"), (b) the algorithm (topological sort via DFS post-order, reversed), (c) the cost (O(V+E)). Where in the codebase would this live, and which existing piece would it replace (cite `lib/mcp/schema.ts` L151–L192).
-
-### Level 4 — defend
-
-A teammate suggests: "Model the agent pipeline (monitoring → diagnostic → recommendation) as a DAG and use BFS to drive it, in case we want to add parallel agents later." Defend the current fixed-sequence approach. Address: (a) the cost of a graph abstraction at N=3 nodes (gratuitous), (b) what would change if a fourth agent was added (one line in the route handler), (c) when the graph abstraction *would* be worth it (multiple optional agents, conditional branching, parallel dispatch). Cite the pipeline structure in `app/api/briefing/route.ts`.
-
-### Quick check
-
-- Adjacency list vs adjacency matrix: when does each win? (List: sparse graphs, O(V+E) space. Matrix: dense graphs or when O(1) edge-exists is required, O(V²) space.)
-- BFS uses what frontier data structure? DFS? Dijkstra? (Queue, stack, min-heap.)
-- What is the load-bearing piece of BFS people forget? (Visited set — without it, cyclic graphs loop forever.)
-- Cost of BFS or DFS on a graph with V nodes and E edges? (O(V+E).)
-- Does this codebase have a real graph algorithm? (No — the closest things are fixed pipelines, not traversals.)
-
 ## See also
 
 → `03-stacks-queues-deques-and-heaps.md` (BFS needs a queue, DFS needs a stack — both `not yet exercised` here) · → `04-trees-tries-and-balanced-indexes.md` (trees are acyclic graphs with a root; this chapter teaches the more general case) · → `08-dsa-foundations-practice-map.md` (where graph algorithms rank in the practice plan — high, because they're frequent interview topics)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

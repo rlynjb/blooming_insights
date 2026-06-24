@@ -474,13 +474,6 @@ Two pillars, one product, complementary signals.
 
 **Q: What does this pillar NOT catch?** The *production* MCP path. The eval suite runs against `OlistDataSource` because it's faster, hermetic, and deterministic enough for seeded ground truth. Production runs against `BloomreachDataSource`. The agents are the same; the data underneath isn't. If the Bloomreach schema has quirks the Olist seed doesn't, a green eval would not prove production quality. That's the load-bearing gap of the current revision — named in audit's Top-3, not yet closed.
 
-## Validate
-
-1. **Reconstruct:** Without looking, list the five load-bearing parts of LLM-eval-as-testing. Which one is most often skipped in practice (and what failure mode does that produce)?
-2. **Explain:** Why does the eval suite reuse the `DataSource` seam from Pillar 1 instead of building its own agent-runner? Walk through what would break if the eval suite ran a "for-testing-only" copy of `DiagnosticAgent`.
-3. **Apply:** Sketch the lockfile-based fix for red-flag 12 (parallel-run hazard). What does it check at entry? When does it fail-loud? How does `EVAL_RUN_TAG` interact with it?
-4. **Defend:** A reviewer says "you can't trust an LLM to judge another LLM — this whole pillar is theatre." Push back with the calibration-receipts argument and the K=10 variance argument; concede the judge-drift risk and name the mitigation.
-
 ## See also
 
 - `audit.md#testing-ai-features` — the seam where Pillar 1 hands off to Pillar 2
@@ -492,3 +485,4 @@ Two pillars, one product, complementary signals.
 
 ---
 Updated: 2026-06-16 — New concept file. Names LLM-eval-as-testing as the second pillar of this folder; covers the 4-eval suite, anchored rubrics, calibration receipts (8/8 diagnosis + 3/3 recommendation incl. BRL bug catch), K=10 variance, EVAL_RUN_TAG result-dir versioning, pre-flight gates as testing discipline, and the eval-vs-npm-test boundary. Anchored to `eval/scripts/run-detection.ts` (lines 92–135) and `eval/scripts/run-regression.ts` (lines 387–399) with file-line grounding.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

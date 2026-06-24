@@ -396,28 +396,6 @@ clean call:   [evidence + "output JSON"]               → emits JSON
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three-stage funnel (extract → validate → repair) and name the function at each stage. State what `parseAgentJson` returns (`unknown`), what the type guard returns (`v is T`), and what the chain returns when all stages fail (`FALLBACK` / `[]`).
-
-### Level 2 — Explain
-
-Out loud: why does `isRecommendationArray` validate a shape *without* an `id` (`lib/mcp/validate.ts` L42–L57), and where does the `id` come from (`lib/agents/recommendation.ts` L76)? What bug does this split prevent? Then: why does the same guard accept `estimatedImpact` as *either* a `string` or a `{ range, … }` object (the `impactOk` check, L46–L48)?
-
-### Level 3 — Apply
-
-Scenario: a new agent must return `{ summary: string; tags: string[] }`. Using `lib/mcp/validate.ts` L29–L35 as the template, write the `isSummary` guard, decide which of `parseAgentJson`'s three strategies will hit for fence-wrapped output, and describe the `synthesize()`-equivalent clean-context retry you'd add.
-
-### Level 4 — Defend
-
-A reviewer says: "Use Anthropic's tool-use JSON mode for the final diagnosis and delete `parseAgentJson`." State what that buys (token-level validity), what it costs (provider coupling, harder fakes-in-tests), why the codebase already accepts native tool-use for *input* but not output, and the measured condition under which you'd flip the output side too.
-
-### Quick check — code reference test
-
-In `parseAgentJson`, what are the three extraction strategies in order, and what happens if all three fail? (Answer: (1) fenced-code regex, (2) bare `JSON.parse`, (3) first-bracket-to-last-bracket substring scan; if none yields valid JSON it throws `'no parseable json in agent output'` — `lib/mcp/validate.ts` L3–L13.)
-
 ## See also
 
 → 01-what-an-llm-is.md · → 05-streaming.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
@@ -429,3 +407,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

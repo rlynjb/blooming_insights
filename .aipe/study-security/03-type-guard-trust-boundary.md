@@ -562,26 +562,6 @@ The migration cost is low (three predicates) and the benefit is real if we add a
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-Without looking, draw the three steps of `parseAgentJson` in order and name what each step handles. Then check against `lib/mcp/validate.ts` L3–L13.
-
-### Level 2 — Explain
-Why does `isAnomalyArray` check every element's `severity` against the `SEVERITIES` constant (`['critical', 'warning', 'info', 'positive']`) instead of just checking `typeof a.severity === 'string'`? Reference `lib/mcp/validate.ts` L15–L27.
-
-### Level 3 — Apply
-A new agent ships — `ForecastAgent` — that returns a `Forecast` shape `{ horizon: '7d' | '30d' | '90d', confidenceBand: { low: number, high: number } }`. Walk through implementing the validator chain: the type guard, the FALLBACK constant, the wrapper. Reference the patterns in `lib/mcp/validate.ts` and `lib/agents/diagnostic.ts`.
-
-### Level 4 — Defend
-A teammate proposes that the QueryAgent emit JSON like the others, "so we can run it through `parseAgentJson + isQueryAnswer`." Defend or refute. (Hint: what does the QueryAgent's UI use the answer for? Would a typed envelope around the text help or just bloat?)
-
-### Quick check
-- What's the FALLBACK for the Diagnostic agent? → `{conclusion: 'Insufficient data...', evidence: [], hypothesesConsidered: []}` (`lib/agents/diagnostic.ts` L16–L20).
-- What's the FALLBACK for the Monitoring agent? → `[]` (no anomalies).
-- Which agent skips the validator entirely? → `QueryAgent.answer` returns `finalText.trim()` (`lib/agents/query.ts` L46).
-- What does `parseAgentJson` do when the model emits prose around the JSON? → Substring-rescue: find first `[` or `{`, find last `]` or `}`, parse the slice (`lib/mcp/validate.ts` L8–L11).
-
 ---
 
 ## See also
@@ -589,3 +569,4 @@ A teammate proposes that the QueryAgent emit JSON like the others, "so we can ru
 → [audit.md](./audit.md) · [01-encrypted-cookie-oauth-state.md](./01-encrypted-cookie-oauth-state.md) · [04-read-only-tool-whitelist.md](./04-read-only-tool-whitelist.md)
 
 Cross-reference: `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the LLM-angle treatment of why output handling beats input filtering.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

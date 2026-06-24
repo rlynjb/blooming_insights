@@ -482,52 +482,6 @@ What fan-out optimizes vs what the user cares about
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the fan-out shape from memory: a split at the top, N concurrent workers, a merge at the bottom. Then annotate where a semaphore cap goes and what its value would be in blooming insights given the MCP rate limit.
-
-Open the file. Compare.
-
-✓ Pass: you drew the split-workers-merge shape, named the semaphore between split and workers, and put N=1–2 given the ~1 req/s MCP limit
-✗ Fail: re-read How it works Layers 1–2 and the diagram, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who asked "why don't you parallelize the pipeline?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Name the data dependency (recommendation needs diagnosis as a function arg)?
-- Name the rate-limit constraint (~1 req/s MCP spacing) and why it collapses fan-out's win?
-- Say where fan-out *would* fit (multi-domain QueryAgent path)?
-- Name the breakpoint (multi-domain queries + relaxed rate limit)?
-
-If you skipped any: you described why it's not implemented, you didn't defend the absence.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants the QueryAgent to handle multi-domain queries like "give me the funnel drop-off, the conversion rate, the retention curve, AND the segment breakdown for the last 30 days" — and wants the answer in under 6 seconds.
-
-Without looking at the file: how would you decompose the query? Where would you put the semaphore, and what value of N? How would you merge — function call or LLM? What changes do you need to the MCP rate limit for the latency target to be achievable?
-
-Write your answer (3–5 sentences). Then open `lib/mcp/connect.ts` L92 and `lib/agents/query.ts` L41–L42 and verify which constraints would have to relax.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today and you knew the dominant user behavior would be multi-domain queries (not anomaly investigation), would you still build the pipeline as sequential? Or would you architect the QueryAgent as a fan-out from day one? What's the cost of the wrong call in either direction — over-built fan-out for single-domain queries, or sequential when multi-domain dominates?"
-
-Reference the code: `lib/agents/query.ts` L41–L42 (current single-agent shape), `lib/mcp/connect.ts` L92 (the rate-limit constraint), `app/api/agent/route.ts` L210–L218 (the query branch in the route).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Why doesn't blooming insights fan out the pipeline stages? (One sentence — the signature.)
-- What's the MCP rate limit, and where is it set?
-- Which agent would be the first to benefit from fan-out if the rate limit were relaxed?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
@@ -539,3 +493,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the two specific gates blooming insights fails — typed Diagnosis dependency + ~1 req/s MCP spacer — alongside the generic strategy line, instead of waiting until Phase A vs B).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

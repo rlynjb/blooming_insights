@@ -432,28 +432,6 @@ have: verbatim replay             need: counterfactual replay (eval bridge)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the agent trace as a span timeline: a root (the investigation), child spans (tool calls) each with a `durationMs`, and annotations (reasoning steps) between them. Name the two event types that bracket a span and the field that carries its duration.
-
-### Level 2 — Explain
-
-Out loud: how does one captured `AgentEvent[]` serve three jobs — live UI, replay, and per-call narration? Walk through what `send` (`app/api/agent/route.ts` L172–L175) does on every event.
-
-### Level 3 — Apply
-
-Scenario: an investigation feels slow and you need to find which tool call is the bottleneck. Open `lib/agents/base.ts` L144–L149 and `lib/mcp/events.ts` L7 — explain where the per-call duration is captured and which event carries it to where you would read it. Then explain why you *cannot* currently answer "is this tool usually this slow" (cite `lib/state/investigations.ts` L7–L9).
-
-### Level 4 — Defend
-
-A colleague says "drop the custom NDJSON trace and just add Langfuse." Argue what Langfuse gives you (aggregation, queryable storage, cost tracking) and what it does *not* replace (the trace-as-UI product surface streamed to the user). State the condition under which you would add Langfuse *alongside* — not instead of — the NDJSON stream.
-
-### Quick check — code reference test
-
-Where is a tool call's `durationMs` captured, and why does capturing it there guarantee every span in the trace is timed? (Answer: at `lib/agents/base.ts` L144–L149, inside `runAgentLoop`'s per-tool block, from `mcp.callTool`'s `{ result, durationMs }` return — and because every agent's tool calls flow through this single loop, every span is timed by construction, with no per-call instrumentation to forget.)
-
 ## See also
 
 → 01-eval-set-types.md · → 02-eval-methods.md · → ../04-agents-and-tool-use/03-react-pattern.md · → ../01-llm-foundations/05-streaming.md · → ../06-production-serving/01-caching.md
@@ -464,3 +442,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

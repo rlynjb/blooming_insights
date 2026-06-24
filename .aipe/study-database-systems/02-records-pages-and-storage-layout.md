@@ -135,16 +135,6 @@ Diagram: a generic page diagram with rows packed; an arrow off to "our Maps live
 
 Anchor: `package.json` has no DB dependencies.
 
-## Validate
-
-**Level 1 — reconstruct.** Draw an 8KB page with five row slots. Explain why a 200-byte row is 40-per-page and a 2KB row is 4-per-page.
-
-**Level 2 — explain.** Name one access pattern row-store is faster for and one column-store is faster for.
-
-**Level 3 — apply.** If we added a "saved insights" table and the dominant query is "give me this user's last 20 saved insights, newest first," what's the right index and clustering choice? (Answer: B-tree index on `(user_id, created_at DESC)`, clustering optional but helpful at scale.)
-
-**Level 4 — defend.** Argue against premature columnar storage for the saved-insights table. (Answer: row-store wins for OLTP point lookups; you only switch to columnar when analytical scans across all users dominate — that's a usage shift, not a feature ship.)
-
 ## See also
 
 - `01-database-systems-map` — what storage actually exists here (none)
@@ -154,3 +144,4 @@ Anchor: `package.json` has no DB dependencies.
 
 ---
 Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." Section now teaches the concept generically and names the trigger that would activate it.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -527,40 +527,7 @@ No, and here's why. Ordering disciplines are a response to *constraints*: undo (
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the kernel for each of the four disciplines (one diagram each):
-- Stack: push, pop, peek
-- Queue: enqueue, dequeue, peek
-- Deque: pushFront, pushBack, popFront, popBack
-- Heap: insert (heapifyUp), extractMin (heapifyDown), peek
-
-For each, name one real-world or interview problem where it's the right answer.
-
-### Level 2 — explain
-
-Open `lib/hooks/useInvestigation.ts` L184–L208. Walk through why the reader's `buf` is correctly described as an *implicit* FIFO queue. Then describe what would change if it were LIFO instead — trace a multi-chunk `tool_call_start` event through both disciplines and identify which records reach `handleEvent` and in what order. Reference L86–L95 for the downstream assumption about ordering.
-
-### Level 3 — apply
-
-**Scenario A — the trigger for a heap shows up.** Imagine the monitoring stream is upgraded to live mode: anomalies arrive one at a time over a long-running connection, and the UI must always display the 10 most-severe seen so far. Today's batch sort (`lib/agents/monitoring.ts` L119) doesn't fit. Walk through the heap-based solution: which heap (min or max)? What size? What's the per-arrival cost? Where in the codebase would you put it?
-
-**Scenario B — the trigger for a stack shows up.** Imagine a "undo last investigation" feature in the UI. Walk through: what gets pushed onto the stack (the previous state of the insight list? a diff?), what gets popped on Ctrl-Z, what bounds the stack size (memory), what happens if the user makes a new investigation after undo (the redo stack clears).
-
-### Level 4 — defend
-
-A teammate says: "Replace the NDJSON `buf` string with a `Queue<string>` of chunks, then `concat` them at dequeue. It's more 'data-structure-y'." Defend the current string-buf design. Address: where framing happens (inline vs deferred), latency cost of deferred framing, extra memory of a second buffer, and the fact that the queue discipline is *already* present — just enforced by the loop, not by a class. Cite `lib/hooks/useInvestigation.ts` L184–L208.
-
-### Quick check
-
-- What is `Array.prototype.shift`'s time complexity? (O(N) — it shifts every other element down by one.)
-- Min-heap of N elements: cost of insert? Cost of extractMin? (Both O(log N).)
-- What ordering does a stack enforce? A queue? (Stack: LIFO. Queue: FIFO.)
-- Which one of the four disciplines does this codebase exercise? (Queue, implicitly, in the NDJSON reader.)
-- Name the trigger that would make you reach for a heap here. (Streaming top-K — anomalies arriving live with the UI always showing the K most severe.)
-
 ## See also
 
 → `02-arrays-strings-and-hash-maps.md` (the primitives these are built from) · → `04-trees-tries-and-balanced-indexes.md` (heap is technically a tree-shaped structure; this chapter teaches the array-backed variant) · → `05-graphs-and-traversals.md` (BFS uses a queue, DFS uses a stack — both `not yet exercised` here) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the full case study of the implicit queue)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -314,13 +314,6 @@ The alpha endpoint 307s when you POST to `/mcp/` and the SDK doesn't carry the `
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Without looking, name the three hostnames in production traffic and which side configures resolution for each.
-  2. **Explain.** Why does `redirectUri()` read `x-forwarded-host` instead of using `APP_ORIGIN`? What breaks if it doesn't?
-  3. **Apply.** A teammate reports OAuth works in production but not on the preview deployment. Without running the code, write the four most likely causes ordered by probability, citing the file you'd open first for each.
-  4. **Defend.** Why is "no app-layer DNS cache" the right call today? What's the trigger (in concrete terms — load, latency, region) that would change the answer?
-
 ---
 
 ## See also
@@ -328,3 +321,4 @@ The alpha endpoint 307s when you POST to `/mcp/` and the SDK doesn't carry the `
   → `01-network-map.md` — the four-band picture this file sits inside.
   → `04-tls-and-trust-establishment.md` — what happens once DNS hands us a socket.
   → `05-http-semantics-caching-and-cors.md` — the cookies that ride the same connection.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

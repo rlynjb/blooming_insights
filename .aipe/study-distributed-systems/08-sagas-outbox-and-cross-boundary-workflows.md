@@ -475,13 +475,6 @@ Everything in this file. Each execute is a write — needs an idempotency key (a
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, draw the two-step saga: client states, server states, the carrier (sessionStorage key), and what happens during the interregnum.
-- **Explain.** Why does `app/api/agent/route.ts:254` only call `saveInvestigation` when `step == null` (combined run)? Because the split-step runs (`diagnose` and `recommend` separately) are the live two-step user flow; persisting their events would require keying by step *and* merging, and would be redundant with the client's sessionStorage handoff. The combined run is only used by the demo-capture path, which IS meant to be replayed.
-- **Apply.** A new product spec: "user can save an investigation to come back to tomorrow." Walk through the changes. (Need cross-instance persistence — Vercel KV keyed by `insightId` storing the diagnosis + recommendations. The client-side sessionStorage handoff stops being the source of truth; the server-side store does. The persistence layer changes, but the workflow shape doesn't.)
-- **Defend.** Why no compensating actions? Because no step has side effects. Compensation is for undoing writes; this saga has no writes to undo. The day a write step lands, compensations become required — and that's the day you reach for a real workflow library.
-
 ---
 
 ## See also
@@ -495,3 +488,4 @@ Everything in this file. Each execute is a write — needs an idempotency key (a
 
 ---
 Updated: 2026-06-16 — No mechanism drift in the two-step workflow; the workflow shape is unchanged by Phase 2 (both adapters speak the same DataSource interface, so the saga reads identically against either backend). Changelog stamp only.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

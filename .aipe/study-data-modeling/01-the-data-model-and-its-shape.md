@@ -462,16 +462,6 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
   api/agent/route.ts insightToAnomaly(i) → copies 4, DROPS 4 ★ leak
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: name the 8 interfaces in `lib/mcp/types.ts` and what each one represents (entity / aggregate / projection). Which one is the upstream model the repo doesn't own?
-
-2. **Explain.** Why does `Insight` have ~9 optional Tier-1 fields, all marked optional? What is the design intent the comment at `lib/mcp/types.ts` L54 names, and how does it affect schema evolution?
-
-3. **Apply.** Add a new field `confidenceTier: 'A'|'B'|'C'` to `Anomaly`. Trace the schema change: which file does the interface live in, which file has to be updated to copy it forward, which file has to be updated to copy it back, and which file does the LLM-seam validator need a new check in? (Hint: the answer is 4 files, and 2 of them TypeScript will not force you to update.)
-
-4. **Defend.** Someone proposes adding Zod to derive the type guards from the interfaces. Defend the *current* hand-rolled approach with the cost-vs-benefit case for THIS repo's size (3 guards, ~50 lines). At what point would Zod earn its place?
-
 ## See also
 
 - `02-normalization-and-duplication.md` — the Insight↔Anomaly story, now partly fixed; the wire-format leak that still lives.
@@ -485,3 +475,4 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
 ---
 Updated: 2026-06-16 — added `WorkspaceSchema` dual-derivation section; flagged the leak as code-fixed (colocated + tested) with the wire-format follow-on still live.
 Updated: 2026-06-19 — swapped Olist for the in-process synthetic fixture as the second derivation of `WorkspaceSchema`; anchored event/property lists to `lib/data-source/synthetic-data-source.ts`; added file-11 cross-link.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

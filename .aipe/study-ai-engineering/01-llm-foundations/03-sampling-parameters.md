@@ -328,28 +328,6 @@ agent turns  → default  (exploration, parsed downstream)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory: name the three sampling parameters, what each does to the distribution, and which of them this codebase sets (none). List the `max_tokens` value for the classifier, the agent turn, and a synthesis call.
-
-### Level 2 — Explain
-
-Out loud: why is default temperature harmless for the diagnostic agent's exploration turns but a (small) liability for the intent classifier? Tie the answer to the parse/validate boundary in → 01-what-an-llm-is.md.
-
-### Level 3 — Apply
-
-Scenario: QA reports the same free-form query is occasionally routed to a different agent. Open `lib/agents/intent.ts` L18–L25. Explain how default temperature on the classifier produces this, why `max_tokens: 16` does *not* fix it, and the exact one-line change that does.
-
-### Level 4 — Defend
-
-A colleague proposes `temperature: 0` on *every* call including the agent loop in `lib/agents/base.ts`. Argue which calls should get it and which should not, and name the concrete risk of forcing greedy decoding on the multi-step exploration turns.
-
-### Quick check — code reference test
-
-How many sampling-randomness parameters does any `anthropic.messages.create` call in this codebase set? (Answer: zero — only `max_tokens` is set; `temperature`/`top_p`/`top_k` are all left at Claude defaults.)
-
 ## See also
 
 → 01-what-an-llm-is.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
@@ -361,3 +339,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (Mental model now opens with "sets none of them — only `max_tokens`" verdict before unpacking the distribution).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

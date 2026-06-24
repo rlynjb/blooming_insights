@@ -365,13 +365,6 @@ The OAuth callback is a cross-site return: Bloomreach's IdP 302s the browser to 
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** List every route, its method, and its possible response status codes from memory. Compare to the recap diagram.
-  2. **Explain.** Why does the agent route return `200 + {type:"error"}` in the stream for a Bloomreach tool failure, instead of a 5xx? Trace the consequence on the client side.
-  3. **Apply.** A teammate proposes adding a `DELETE /api/insights/:id` endpoint. Argue for or against — what would the client need to do, and what would change about our cookies / status semantics?
-  4. **Defend.** Why is `no-transform` load-bearing? Construct the failure: without it, what does the user see, and at what timestamp?
-
 ---
 
 ## See also
@@ -380,3 +373,4 @@ The OAuth callback is a cross-site return: Bloomreach's IdP 302s the browser to 
   → `04-tls-and-trust-establishment.md` — the cookie crypto these attributes wrap.
   → `06-websockets-sse-streaming-and-realtime.md` — why NDJSON over GET and not SSE.
   → `../study-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire framing.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

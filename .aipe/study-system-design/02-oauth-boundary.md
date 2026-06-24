@@ -642,43 +642,6 @@ Honest answer: I could. OAuth 2.0 + PKCE + DCR are well-documented protocols. Wr
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking at the code, write the sequence of method calls the MCP SDK makes on `OAuthClientProvider` during a full connect → callback cycle. Start from "provider is constructed" and end at "tokens are available." Then check against `lib/mcp/auth.ts` L160–L218.
-
-Expected sequence: `clientMetadata` (DCR POST) → `saveClientInformation` → `state` → `saveCodeVerifier` → `redirectToAuthorization` → [throw] → [callback] → `codeVerifier` → `clientInformation` → `saveTokens`.
-
-### Level 2 — Explain
-
-What is the purpose of `patchState` vs directly writing to `writeAll`? Why does it do a read-modify-write instead of a direct set?
-
-Checkpoint: `lib/mcp/auth.ts` L148–L152. Answer: multiple fields are written in separate SDK callbacks during the same flow. A direct write would erase previously saved fields (e.g., overwriting `clientInformation` when saving `codeVerifier`). `patchState` merges the new fields with the existing session state.
-
-### Level 3 — Apply
-
-The callback is returning `{ error: 'no PKCE code_verifier stored for this session' }`. The browser's DevTools show the `bi_session` cookie is present and has the same value it had when the connect request was made. What do you check next, and which lines of code do you look at?
-
-- Check `auth.ts` L113–L123 (`readAll`): is `PERSIST` true? Is `.auth-cache.json` present at `process.cwd()`? Does it contain the `sessionId` key with a `codeVerifier` field? (In prod, is the `bi_auth` cookie present and decrypting — or did `AUTH_SECRET` change?)
-- Check `auth.ts` L125–L142 (`writeAll`): is the `catch` at L139 silently swallowing a write error? Add a `console.error` temporarily to verify the file write succeeds.
-- Check `connect.ts` L114–L122 (`completeAuth`): is the `redirectUri()` the same value used in both the connect and the callback? If it differs (e.g., a per-deploy host vs the alias), the SDK may build a different provider state key.
-- If `.auth-cache.json` exists but does not contain the session id, the `connectMcp` call wrote to a different `sessionId` than the callback is reading — the `bi_session` cookie was not sent on the connect request.
-
-### Level 4 — Defend
-
-A teammate proposes storing the `codeVerifier` in a `localStorage` item on the browser side (like some SPAs do) and sending it in the callback request body. What are the security implications, and why does the current server-side approach avoid them?
-
-Answer points: `localStorage` is accessible to any JavaScript on the page — an XSS vulnerability exposes the verifier. The server-side store is never accessible to the browser. The `httpOnly` `bi_session` cookie cannot be read by JavaScript, so it cannot be exfiltrated by XSS. Sending the verifier in the request body requires the callback to be a POST, but OAuth IdPs always issue GET redirects. The server-side store + cookie session is the correct pattern for server-rendered OAuth clients.
-
-### Quick check
-
-- What is the cookie name used for session tracking? → `bi_session` (`lib/mcp/session.ts` L3); the prod auth store is the `bi_auth` cookie (`auth.ts` L48)
-- What does `connectMcp` return when no token exists? → `{ ok: false, authUrl: string }` (`connect.ts` L21–L23, `ConnectResult`)
-- What line throws if the PKCE verifier is missing? → `auth.ts` L215
-- What `NODE_ENV` value activates file-backed storage? → `'development'` (`PERSIST`, `auth.ts` L34); `'production'` uses the encrypted cookie
-- What HTTP method does the callback route implement? → `GET` (`app/api/mcp/callback/route.ts` L5)
-
 ## See also
 
 → [audit.md](./audit.md) (system-map-and-boundaries · state-ownership · storage-choice lenses — B1 + Tier 5 cookie) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md)
@@ -690,3 +653,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

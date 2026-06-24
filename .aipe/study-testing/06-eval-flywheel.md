@@ -399,13 +399,6 @@ Cross-reference: `study-debugging-observability`'s "the trace IS the test" — t
 
 **Q: What pre-condition makes this possible?** The `DataSource` seam from Phase 2. Without an injectable production seam, the eval suite couldn't run the *real* agent against a controlled data source; it would have to run a parallel for-testing copy, and a green eval against the parallel copy would not prove the production agent works. The flywheel only works because Pillar 1 and Pillar 2 share the seam.
 
-## Validate
-
-1. **Reconstruct:** Without looking, list the four load-bearing parts of the eval flywheel. Which one is the discipline that distinguishes "real methodology" from "vibes-based dev"?
-2. **Explain:** Walk through what would have happened in the PR E parallel-run incident if `EVAL_RUN_TAG` didn't exist. What proof would have been lost?
-3. **Apply:** Sketch the loop for a hypothetical PR H — the team bumps Sonnet 4.6 to a newer model. What measures, what fixes, what receipts? Include the calibration step.
-4. **Defend:** A reviewer says "you're just iterating on prompts until the number looks good — this is Goodhart's-law-bait." Push back with the rubric-criteria-not-just-totals argument and the calibration receipts that prevent the judge from being optimized for.
-
 ## See also
 
 - `audit.md#testing-ai-features` — the seam where Pillar 1 hands off to Pillar 2
@@ -417,3 +410,4 @@ Cross-reference: `study-debugging-observability`'s "the trace IS the test" — t
 
 ---
 Updated: 2026-06-16 — New concept file. Names the eval flywheel as a testing-driven development methodology at the model-behavior layer. Walks the Phase 3 PR D→E→F→G cadence with committed receipts at each step. Surfaces the K=10 parallel-run incident as the canonical post-mortem (cf. file 03's AUTH_SECRET flake — same family). Cross-links to red-flag 12 (lockfile gate as the unbuilt next discipline).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

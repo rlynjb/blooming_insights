@@ -346,28 +346,6 @@ with evals → automated optimization (score candidates) — APE/DSPy/OPRO
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the meta-prompting pipeline: goal + context → meta-prompt → draft → human review → committed `.md`. Mark which step is authoring-time vs runtime, and circle the step that is non-optional (human review).
-
-### Level 2 — Explain
-
-Out loud: why does the runtime path in `lib/agents/diagnostic.ts` (L13, `readFileSync`) stay completely unchanged when a prompt is meta-prompted? What is the only difference between a generated prompt file and a hand-written one once both are committed?
-
-### Level 3 — Apply
-
-Scenario: you meta-prompt a new "page-performance" agent prompt and the draft says "try to keep your tool usage reasonable." Compare it to `monitoring.md` L11 ("Make at most 6 tool calls total, then stop"). State why the draft's phrasing is a failure (the model reads "reasonable" as optional), and rewrite it into spec voice.
-
-### Level 4 — Defend
-
-A reviewer says: "Just have the model generate all our prompts going forward." State where generation saves time (complex first drafts) versus where it's overhead (tweaks, hourly eval-driven prompts), name the hedging-drift failure mode and the EQL-invention risk (`diagnostic.md` L35), and explain why human review stays in the critical path until an eval harness (→ 05) can score candidates instead.
-
-### Quick check — code reference test
-
-If a meta-prompting helper produced a new agent prompt, what would have to be true about its placeholders for the existing loader to use it unchanged? (Answer: it must contain the `{schema}` and `{project_id}` placeholders the loader replaces — e.g. `lib/agents/diagnostic.ts` L45–48 does `PROMPT.replace('{schema}', …).replace(/\{project_id\}/g, …)` — plus any agent-specific placeholder like `{anomaly}`; without them the replace calls leave literal placeholder text in the system prompt.)
-
 ## See also
 
 → 01-anatomy.md · → 03-prompts-as-code.md · → 05-eval-driven-iteration.md · → 10-self-critique.md
@@ -379,3 +357,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

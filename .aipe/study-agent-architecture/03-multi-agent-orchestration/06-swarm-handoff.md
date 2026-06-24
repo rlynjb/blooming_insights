@@ -485,52 +485,6 @@ Pipeline vs handoff — same direction, different controller
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the swarm shape from memory: peer agents with bi-directional handoff arrows, a handoff counter as a guardrail, and the infinite-handoff failure mode as a labeled cycle. Then annotate why blooming insights doesn't have this shape today (control is centralized in the route).
-
-Open the file. Compare.
-
-✓ Pass: you drew peer agents with bi-directional arrows, named the `MAX_HOPS` counter, and labelled where the codebase sits (centralized, not swarm)
-✗ Fail: re-read How it works Layers 1–2 and the diagram, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain to a colleague who said "we have multiple agents, so it's a swarm, right?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Distinguish multiple-agents (true) from swarm-handoff (false in this codebase)?
-- Say where control lives (the route, not the agents)?
-- Name the failure mode handoff would introduce (infinite handoff)?
-- Reference `./09-coordination-failure-modes.md` for the mitigation?
-
-If you skipped any: you described what's there, you didn't name what's not there.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager wants the QueryAgent to "automatically escalate to a full investigation if the question is actually about an anomaly" — without requiring the user to know which is which.
-
-Without looking at the file: is this a handoff? Where does it slot into `route.ts`? What `transfer_to_*` tool would `QueryAgent` need? What context does it pass? How do you bound the failure mode?
-
-Write your answer (3–5 sentences). Then open `lib/agents/query.ts` L41–L42 and `app/api/agent/route.ts` L210–L218 (the query branch) and check whether the handoff would be at the agent layer or the route layer.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were starting this project today and you knew the QueryAgent would frequently encounter questions that should really be investigations, would you build the QueryAgent → DiagnosticAgent path as a handoff, or as a route-level re-dispatch (the route detects 'this is actually an investigation' and starts the DiagnosticAgent)? Why? What's the failure mode you'd accept in either case?"
-
-Reference the code: `app/api/agent/route.ts` L199–L218 (route-level routing today), `lib/agents/intent.ts` L14 (`CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`), `lib/agents/query.ts` L41–L42 (current single-agent shape).
-
-### Quick check — code reference test
-
-Without opening any files:
-- Does blooming insights have peer handoff between agents? (Yes / No)
-- Where is control centralized today?
-- What's the failure mode every handoff system has to bound, and what's the standard mitigation?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./02-supervisor-worker.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` (infinite handoff) · → `./01-when-not-to-go-multi-agent.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
@@ -542,3 +496,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (added the codebase-position contrast — centralized in the route, no transfer_to_* tool, sequential pipeline's function-call transition as closest cousin — alongside the strategy line, instead of waiting until Phase A vs B).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

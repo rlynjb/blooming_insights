@@ -395,31 +395,10 @@ not "the agent might want a tool" — "the eval proves the agent needs one"
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, name the three authored tools and the access pattern each covers. Then name the table in `mcp-server-olist/data/olist.db` that makes the detection eval possible at all, and one sentence about why.
-
-### Level 2 — Explain
-
-Out loud: why does authoring three domain tools shrink the failure surface compared to one `execute_sql` tool? Tie the answer to specific failure modes (out-of-horizon dates, wrong joins, schema guesses) and where each is caught.
-
-### Level 3 — Apply
-
-Scenario: you're seeing the detection eval report 0% strict recall on `sp-revenue-drop-w4` and `electronics-spike-w2` — both mid-horizon week-specific. Open `eval/results/2026-06-15-after-fix/summary.md` and identify which path (prompt fix vs tool fix) the author recommended, why, and which tool would close the gap. Then walk what its Zod schema would look like.
-
-### Level 4 — Defend
-
-A colleague says "this authored MCP server is over-engineering — just use Bloomreach for evals too." Argue against using the live vendor MCP as the eval backend by naming three concrete blockers (rate limit, no ground truth, expiring tokens) and the eval-pillar capability each blocker would kill.
-
-### Quick check — code reference test
-
-Where do the seeded-anomaly rows live, what writes them, and what reads them? (Answer: rows in the `seeded_anomalies` table of `mcp-server-olist/data/olist.db`; written by `mcp-server-olist/scripts/seed-olist.ts` during `npm run seed`; read by `eval/scripts/run-detection.ts` (and the diagnosis + recommendation runners) as the ground truth the agent's output is scored against.)
-
 ## See also
 
 → 02-tool-calling.md · → 04-tool-routing.md · → 06-error-recovery.md · → 07-capability-gating.md · → ../05-evals-and-observability/01-eval-set-types.md · → ../05-evals-and-observability/05-regression-evals.md · → ../07-system-design-templates/03-multi-rubric-eval-pipeline.md
 
 ---
 Updated: 2026-06-16 — new file. Documents the authored `mcp-server-olist/` package: the three domain tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`) vs the raw `execute_sql` alternative, the `seeded_anomalies` ground-truth contract, the per-run subprocess crash isolation, and the eval-flywheel rule for adding a fourth tool.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

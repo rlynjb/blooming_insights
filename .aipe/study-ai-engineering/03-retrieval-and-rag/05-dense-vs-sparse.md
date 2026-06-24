@@ -305,28 +305,6 @@ both in one query → hybrid + RRF
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the two retrieval columns (sparse: exact terms; dense: meaning) and fill in three query types where each wins and each loses.
-
-### Level 2 — Explain
-
-Out loud: why are dense and sparse failure modes mirror images? Why would adding dense retrieval to an exact analytics query *hurt* rather than help?
-
-### Level 3 — Apply
-
-Scenario: a PM wants "find past investigations similar to this one." Open `lib/mcp/tools.ts` L15–L25 (the diagnostic agent's sparse EQL tools) and `lib/state/investigations.ts` (the free-text corpus). Explain why this new feature needs the dense axis (paraphrase/synonym) while the existing analytics agents must stay sparse, and where the dense retriever would live.
-
-### Level 4 — Defend
-
-A colleague says "embeddings are strictly more powerful than keyword search, replace EQL with a vector search." Argue why this breaks exact analytics (a "close" event is the wrong event, IDs blur), and why EQL's exactness is the correct tool for aggregates. Then concede the one place dense belongs (free-text past-investigation search).
-
-### Quick check — code reference test
-
-What kind of retrieval does blooming insights do, and which tool is the evidence? (Answer: pure sparse/structured retrieval — exact-term querying via `execute_analytics_eql` (`lib/mcp/tools.ts` L11 monitoring, L16 diagnostic) and `execute_analytics`; there is no dense/embedding retrieval, and sparse is the correct tool for exact analytics aggregates.)
-
 ## See also
 
 → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
@@ -334,3 +312,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

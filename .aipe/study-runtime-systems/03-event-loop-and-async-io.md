@@ -453,13 +453,6 @@ A: `await setTimeout(...)` schedules a macrotask and yields the loop — other t
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw one `await mcp.callTool(...)` call. Show what queues where (microtask, macrotask, I/O completion) and at what time.
-2. **Explain.** In `app/api/agent/route.ts:131-141`, why is the `await new Promise(setTimeout)` between events *required* for the demo replay to look "alive"? What happens if you remove it?
-3. **Apply.** A new feature wants to add an MD5 hash to every NDJSON event. Where do you do the hashing, and why doesn't it need to be in a Worker? (Hashing a sub-KB event is ~microseconds — well under a frame. Workers are for >50ms CPU.)
-4. **Defend.** Defend the `AsyncLocalStorage` choice in `lib/mcp/auth.ts:47` against "you could just pass the store as a function argument." (The store is read/written deep inside the MCP SDK's `OAuthClientProvider` methods that we don't control — we can't thread the arg through. ALS gives us implicit context across the call chain without API surgery on the SDK.)
-
 ---
 
 ## See also
@@ -470,3 +463,4 @@ A: `await setTimeout(...)` schedules a macrotask and yields the loop — other t
 
 ---
 Updated: 2026-06-16 — added child-loop sections (4.5 stdio JSON-RPC framing, 4.6 better-sqlite3 sync), explained why the subprocess boundary makes sync SQLite safe.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

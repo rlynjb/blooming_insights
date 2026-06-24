@@ -372,28 +372,6 @@ recurring prose digest: prose × same generation × same user × over time
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the two halves of the concept: negative constraints (one generation) and rotating formulas (a sequence). State the condition under which rotation is needed (prose × same user × over time) and whether it holds anywhere in this codebase (it does not).
-
-### Level 2 — Explain
-
-Out loud: why is rotation correctly *absent* for the monitoring/diagnostic/recommendation chains even though they run repeatedly? Tie it to their JSON output (`monitoring.md` L69–L97) — structured output has no phrasing to converge, so sameness is the contract.
-
-### Level 3 — Apply
-
-Scenario: you are adding a daily prose digest for one merchant. Open `query.md` L49 (the one-shot prose precedent) and explain why the digest, unlike the query agent, *does* need rotation. Then list the two pieces you would add (forbidden openings + a rotating formula pool) and where they would live (a new `digest.md`).
-
-### Level 4 — Defend
-
-A reviewer says: "The agents generate text all day — add anti-repetition to all of them." Defend leaving the structured chains alone (JSON has no phrasing to converge) and the query agent alone (one-shot per question), and name the single feature — a recurring prose digest — that would actually require rotation.
-
-### Quick check — code reference test
-
-Name two forbidden ("do NOT" / "Never") instructions in the prompts and the bug each prevents. (Answer: `monitoring.md` L37 "Never report a change derived from an empty or zero window" — prevents bogus ±100% swings off an empty data tail; `recommendation.md` L82 "Do NOT include an `id` field" — prevents the model inventing identity the system assigns via `crypto.randomUUID()` after validation.)
-
 ## See also
 
 → 02-structured-outputs.md · → 01-anatomy.md · → 09-chain-of-thought.md · → 06-single-purpose-chains.md
@@ -405,3 +383,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

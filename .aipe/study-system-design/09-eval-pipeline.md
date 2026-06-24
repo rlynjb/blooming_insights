@@ -485,39 +485,10 @@ That's the position before the eval pipeline exists. The whole point of building
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking, draw the five-layer pipeline (CLI → fixture → agent driver → judge → paper trail) for any one pillar, and place the judge type (deterministic vs LLM) in the right slot for each of the four pillars. Check your diagram against the primary diagram in this file.
-
-### Level 2 — Explain
-
-Open `eval/scripts/run-detection.ts` and read L132–L144. Explain in one sentence why the agent driver is called per K (not once for all K). Then explain what would break if the subprocess were reused across K iterations instead of fresh per call. Cite `eval/scripts/lib/run-agent.ts` L56 (the per-K `new OlistDataSource()` call).
-
-### Level 3 — Apply
-
-**Scenario:** You change `lib/agents/prompts/diagnostic.md` to add a new hypothesis section. Before merging, you want to know whether the change improved or regressed diagnosis quality. Walk through which pillars to run, in which order, with which `K` and which `EVAL_RUN_TAG` value.
-
-Expected reasoning: (1) Capture a baseline first (`EVAL_RUN_TAG=before-prompt-change`) — diagnosis pillar at K=10. (2) Apply the prompt change. (3) Re-run diagnosis at K=10 with `EVAL_RUN_TAG=after-prompt-change`. (4) Diff `eval/results/<date>-before-prompt-change/diagnosis-K10-judge.json` against `…-after-prompt-change/…` — compare aggregate pass-rate, per-criterion score distribution, and judge errors. (5) Optional: re-run the regression eval (`eval:regression`) in score mode to confirm no breakage on the 10 golden fixtures.
-
-Check: `eval/scripts/run-detection.ts` L89–L100 (`makeResultsDir()` reading `EVAL_RUN_TAG`) — this is the mechanism that makes step 1 vs step 3 non-overwriting.
-
-### Level 4 — Defend
-
-A reviewer says: "The judge model is the same as the working model. That's circular — Sonnet judging Sonnet. Switch to GPT-4 for judging." Construct a two-paragraph rebuttal that names the real risk (systematic same-model bias) AND the real cost of the proposed fix (two API providers, two SDK auth flows, ~2× judge cost). Then state under what condition you'd flip — i.e., what concrete bias signal would justify paying the cost.
-
-### Quick check
-
-- How many pillars and what's each one's scoring shape? (Answer: 4 — detection deterministic, diagnosis/recommendation LLM-judge with rubric, regression structural+LLM-similarity)
-- What's the load-bearing reason for spawning a fresh `OlistDataSource` per K? (Answer: subprocess isolation — one crash doesn't cascade)
-- What does `EVAL_RUN_TAG` do? (Answer: same-day re-runs land in a sibling dir instead of overwriting — `2026-06-15-after-fix/` vs `2026-06-15/`)
-- Why does pillar 3 use `reference-diagnoses-as-input.json` rather than the candidate diagnosis from pillar 2? (Answer: per-pillar isolation — coupling them would make "recommendation given a bad diagnosis" indistinguishable from "recommendation regressed")
-- What happens when the LLM judge returns malformed JSON? (Answer: retried once, then marked `judge_error`, counted separately in the aggregate)
-
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow lens — the eval pipeline is a parallel-universe request flow over the same agent code) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` seam that makes eval-vs-prod parity possible) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) (what the evals are measuring) · [10-authored-mcp-server.md](./10-authored-mcp-server.md) (the seeded anomalies live in the `mcp-server-olist` SQLite database — that's the ground truth)
 
 ---
 Updated: 2026-06-16 — initial generation. Documents the 4-pillar eval suite (detection / diagnosis / recommendation / regression) introduced in Phase 3 (~75 files in `eval/`). Frames each pillar as its own 5-layer request-flow over the same agent code as production, with a date-keyed paper trail (`eval/results/<date>[/<tag>]/`) and the `EVAL_RUN_TAG` non-destructive same-day re-run pattern. The LLM-as-judge harness (`eval/scripts/lib/judge.ts`) is treated as a system component with its own retry, truncation, and failure semantics.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

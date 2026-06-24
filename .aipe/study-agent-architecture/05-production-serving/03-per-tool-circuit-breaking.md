@@ -539,45 +539,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three breaker states (closed, open, half-open) with the transition triggers (N consecutive failures → OPEN; cooldown T elapses → HALF-OPEN; success → CLOSED; failure → OPEN). Then draw the agent-observation extension: open-state intercepts the `tool_use` and returns a synthetic `tool_result` the model reads on its next turn.
-
-Open the file. Compare.
-
-✓ Pass: you drew the three states with named triggers, drew the per-tool scope (one state machine per tool name), and drew the synthetic observation feeding back to the agent
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague asks "why isn't your retry loop enough? You have exponential backoff, you have Retry-After honoring, what's missing?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Distinguish transient blip (retry handles) from sustained outage (breaker handles) from agent-loop-on-dead-tool (observation feedback handles)?
-- Name the worst-case budget burn during a sustained outage (3 retries × up to 20s × N calls)?
-- Explain why a service-style breaker isn't enough (agent has no signal to route around)?
-- Name the synthetic `tool_result` observation as the specific agent-architecture extension?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: a vector store over past investigations is added beside the MCP-EQL tool. The agent can now retrieve from either source. Without opening the code: how would the per-tool breaker pattern apply, and what does "route around" look like if the vector store goes down but Bloomreach is fine?
-
-Write your answer (4–6 sentences). Then open `lib/mcp/client.ts` L79–L95 to see where per-tool state would slot in, and `runAgentLoop` (`base.ts` L143–L171) for the result-handling block where the synthetic observation would be constructed.
-
-### Level 4 — Defend the decision you'd change
-"You said the breaker is worth building when sustained outages become a real failure mode. If Bloomreach had a known 30-minute outage scheduled for tomorrow and you had two hours to ship a fix, would you (a) add the breaker, (b) increase `maxRetries`, or (c) put up a banner and disable investigations during the window? Walk the cost of each — what does it buy, what's left exposed?"
-
-Reference the code: point to `McpClient`'s retry loop (`client.ts` L122–L132) and configuration (`connect.ts` L92–L95) for what's tunable today.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the retry loop and what line range?
-- What three retry parameters are configured in `connect.ts` and what are their values?
-- What's the agent-architecture extension that makes the breaker different from a service-style breaker?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-cross-turn-caching.md · → 02-fan-out-backpressure.md · → single-call retry/breaker: `../../study-ai-engineering/06-production-serving/05-retry-circuit-breaker.md` · → coordination failure modes: `../03-multi-agent-orchestration/09-coordination-failure-modes.md`
@@ -588,3 +549,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

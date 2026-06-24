@@ -418,13 +418,6 @@ The fake / real boundary in one diagram
 
 **Q: What does this pattern *not* catch?** Anything that's a function of the real model's output. If Anthropic ships a model that emits worse JSON tomorrow — fewer markdown fences, more rambling prose — every test in this file still passes (the script returns what the test author wrote). That's the AI-eval gap. The harness catches *wiring* bugs; it cannot catch *quality* bugs. You need both disciplines; this pattern is one half.
 
-## Validate
-
-1. **Reconstruct:** Without looking, sketch the three load-bearing parts of the scripted-Anthropic harness. Which one enables assertions on *outbound* traffic?
-2. **Explain:** Walk through what would break in `test/agents/base.test.ts` if `buildFakeAnthropic` returned the same response on every call instead of advancing through a queue.
-3. **Apply:** Write the pseudocode for a `buildFakeAnthropic` that supports throwing on demand (e.g., the test passes `responses: [{ throw: '401 Unauthorized' }, …]`). Use it to design the missing test for `anthropic.messages.create` throwing.
-4. **Defend:** A teammate proposes replacing `buildFakeAnthropic` with `vi.mock('@anthropic-ai/sdk', …)` so every test file gets the same fake automatically. Argue for or against; consider test isolation, the `create.mock.calls` introspection, and the per-test response queue.
-
 ## See also
 
 - `audit.md#testing-ai-features` — the deterministic-vs-eval seam this pattern straddles
@@ -436,3 +429,4 @@ The fake / real boundary in one diagram
 ---
 Updated: 2026-06-16 — Test count 31→40 (synthesis-instruction + tool-schemas added). `McpCaller` renamed to `DataSource` in Phase 2 swap — mechanics unchanged, paragraph added explaining the rename. Backwards-compat shim at `lib/mcp/client.ts` not surfaced here (lives in audit's design-pressure lens). Added See-also link to 05.
 Updated: 2026-06-19 — Olist removal (PR #8): reverted test count to 31 (synthesis-instruction + tool-schemas don't use buildFakeAnthropic; the 40 claim was inaccurate). Removed Olist references — second DataSource implementation today is `SyntheticDataSource`, not `OlistDataSource`. Reframed the "AI-eval gap" callout from "see file 06" to "see study-ai-engineering/05" since 06 is RETIRED. See-also link to 05 marked RETIRED.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

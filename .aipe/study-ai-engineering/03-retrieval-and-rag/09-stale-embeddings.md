@@ -290,28 +290,6 @@ fix: re-embed ALL (no mixing models)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the embedding index as a cache parallel to `McpClient.cache` and label the three corresponding pieces: `embedding_stale_at` ↔ `expiresAt`, freshness check ↔ TTL read check, no-poison-on-error ↔ no-cache-on-error. State the three events that make an embedding stale.
-
-### Level 2 — Explain
-
-Out loud: why is a stale embedding more dangerous than a rate-limit error? Why does a model swap invalidate the entire index rather than just the changed documents?
-
-### Level 3 — Apply
-
-Scenario: past investigations are re-run with fresh data and their embeddings drift. Open `lib/mcp/client.ts` L40, L58–L60, L65 (the TTL + no-cache-on-error policy) and explain how you would port each piece to an embedding index: where `embedding_stale_at` goes, how change-detection avoids re-embedding the unchanged, and how a failed re-embed avoids poisoning the index.
-
-### Level 4 — Defend
-
-A colleague says "embeddings don't go stale, they're just math." Argue why an embedding is a cached snapshot that drifts from its source, why the failure is silent (no error), and why live tool retrieval avoids the problem entirely (always fresh) — making the staleness burden a real cost in the no-RAG decision.
-
-### Quick check — code reference test
-
-What freshness/staleness mechanism does blooming insights already implement, and what is the embedding analog of `expiresAt`? (Answer: the 60-second TTL cache in `McpClient` — `expiresAt = Date.now() + 60_000` written at `lib/mcp/client.ts` L65, checked at L40, with error results never cached at L58–L60; the embedding analog of `expiresAt` is `embedding_stale_at`, and no-cache-on-error is the analog of keeping the last-good vector on a failed re-embed.)
-
 ## See also
 
 → 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
@@ -319,3 +297,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

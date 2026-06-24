@@ -400,45 +400,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three positions from memory: pure ReAct (the diagnostic/recommendation/query shape), plan-in-prompt (the monitoring shape), and full plan-and-execute (the shape this repo does NOT use). Label which agents sit on which position and what each row adds in model calls per run.
-
-Open the file. Compare.
-
-✓ Pass: you have three positions, you put monitoring on plan-in-prompt and the other three on ReAct, and you correctly say plan-and-execute adds an expensive planner call up front
-✗ Fail: re-read Move 2.4 and the primary diagram, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-Explain "do you use plan-and-execute" to a colleague who just asked. No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Answer honestly that no agent has a separate planner call?
-- Name the closest analog (monitoring's `## Suggested query plan` section at `lib/agents/prompts/monitoring.md` L39–L47)?
-- Say why diagnostic and recommendation are NOT good candidates (each step depends on prior data)?
-- Name the breakpoint where a runtime planner would start to earn its keep (per-workspace divergence)?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Can we let users pick which metrics matter to them and have the monitoring agent only check those?" Without looking at the file: would that change push monitoring toward runtime plan-and-execute, or is there a cheaper answer? What exactly would you touch in `monitoring.md` or in `monitoring.ts`?
-
-Write your answer (3–5 sentences). Then open `lib/agents/prompts/monitoring.md` L39–L47 and `lib/agents/monitoring.ts` L83–L86 and check whether the user-picked metric list can be injected as a prompt variable (like `{categories}` is now, L11–L12 of the prompt), or whether the divergence is big enough that a runtime planner is cheaper.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today and expected user-customizable monitoring (per-workspace KPI lists, custom anomaly categories), would you still put the plan in the prompt, or would you start with a runtime planner? Why? If you'd switch, what new file would exist in `lib/agents/` and what would it return?"
-
-Reference the code: point to `lib/agents/prompts/monitoring.md` L39–L47 for what exists today, and describe what a `lib/agents/planner.ts` would output as JSON the executor consumes.
-
-### Quick check — code reference test
-Without opening any files:
-- Where in the codebase is the closest analog to a "plan" — what file and roughly what section?
-- How many model calls does the monitoring agent's `scan()` make per turn? (One per turn — the plan is in the prompt, not a separate call.)
-- Which of the four agents would be the worst candidate for plan-and-execute, and why?
-
-Open and verify. ✓ File + section name + the "one model call per turn" answer matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-react.md · → 04-reflexion-self-critique.md · → 06-routing.md · → agents-vs-chains: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → tool routing: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md`
@@ -450,3 +411,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase position — no runtime plan phase; closest cousin is the static "Suggested query plan" section in monitoring's prompt — alongside the strategy line, instead of waiting until Move 2.4).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -379,28 +379,6 @@ Honestly: `parseIntent` gets it *wrong* on the heuristic path. The string contai
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw both routers: (a) the static path from `allTools` through `filterToolSchemas` to a per-agent subset, naming the three subsets; (b) the dynamic path from `q` through `parseIntent` to `classifyIntent` and back through `parseIntent`. Label which is "by construction" and which is "per request."
-
-### Level 2 — Explain
-
-Out loud: explain why subset-scoping prevents the wrong-tool failure more reliably than a prompt instruction, and why `parseIntent` runs before `classifyIntent` on cost grounds.
-
-### Level 3 — Apply
-
-Scenario: a diagnostic investigation needs to inspect a voucher pool, but the agent never calls `list_voucher_pools`. Why? Check `lib/mcp/tools.ts` L15–L25 (`diagnosticTools`) — is `list_voucher_pools` in the subset? (It is in `recommendationTools`, L32, not `diagnosticTools`.) Explain that the tool is structurally absent from the diagnostic agent's menu, and name the two fixes: add it to `diagnosticTools`, or route the question to the recommendation surface.
-
-### Level 4 — Defend
-
-A reviewer says: "Hand-maintaining three tool arrays is a maintenance burden — give every agent all the tools and let a good prompt handle scoping." Defend the subsets using tool-selection accuracy degradation at large menus and the structural-vs-probabilistic prevention argument. Then concede the catalog size at which the reviewer becomes right (and name semantic tool retrieval as the migration).
-
-### Quick check — code reference test
-
-What does `classifyIntent` do with the haiku model's text output before returning it, and why? (Answer: it passes it through `parseIntent` — `intent.ts` L30 — to coerce a possibly-noisy one-word answer into a valid `Intent`, defaulting to `'diagnostic'`.)
-
 ## See also
 
 → 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design/06-multi-agent-orchestration.md
@@ -411,3 +389,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

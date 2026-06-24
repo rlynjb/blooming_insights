@@ -535,13 +535,6 @@ No per-call `AbortController`. If a Bloomreach socket hangs at minute 2, we eat 
 
 ---
 
-## Validate
-
-  1. **Reconstruct.** Sketch the three concentric defenses from memory; name the load-bearing piece of each.
-  2. **Explain.** Why is `+ 500 ms` added to the parsed hint? Construct the failure mode without it (timing-wise).
-  3. **Apply.** A teammate proposes raising `maxRetries` to 5 to "handle more transient errors." Argue against it citing the math against the route budget; propose what they should change instead.
-  4. **Defend.** Why is the cache per-instance instead of shared (Vercel KV)? Name the tradeoff explicitly — what does the simpler design buy, and at what cost in concurrent-user behaviour?
-
 ---
 
 ## See also
@@ -555,3 +548,4 @@ Updated: 2026-06-16 — per-call timeout finding flipped from "not yet exercised
 
 ---
 Updated: 2026-06-19 — The asymmetric per-call timeout finding (Olist 30s vs Bloomreach none) collapses: Olist side deleted in PR #8. Bloomreach still has no per-call timeout — that finding stands. SyntheticDataSource is in-process so timeout discipline doesn't apply.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -366,32 +366,6 @@ On a live run, largely yes — the gate is instant, so the items flush back-to-b
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking, draw the briefing pipeline from `bootstrapSchema` to `done`, placing the coverage gate as its own stage and showing both its outputs (the streamed `coverage_item`s to the UI, the `runnable` subset to `scan`). Then compare to the primary diagram above and to `app/api/briefing/route.ts` L189–L223. The gate must sit *before* `scan`, and `coverageReport` must feed both consumers.
-
-### Level 2 — Explain
-
-Walk a workspace that supports 7 of 10 categories through the live path. State, in order: what `bootstrapSchema` returns, what the gate computes, what gets streamed (how many `coverage_item`s, how many checklist steps), what `scan` receives, and what the grid shows for the 3 unsupported categories. Cite `app/api/briefing/route.ts` L202–L211 and `components/feed/CoverageGrid.tsx` L156 (ghost tile).
-
-### Level 3 — Apply
-
-**Scenario:** Product wants the demo feed to *visibly* fill tile-by-tile, but a live run resolves the grid instantly. Explain precisely why, where the difference lives in the code, and why we deliberately do NOT add the same delay to the live path. Then propose one honest way to give a live run a sense of progress without faking the gate's timing. Check your reasoning against `app/api/briefing/route.ts` L23 (`REPLAY_DELAY_MS`), L113–L117 (demo emit with delay), L208–L211 (live emit, no delay), and the demo hop in `01-request-flow.md`.
-
-### Level 4 — Defend
-
-Your PM says: "The ghost tiles look broken — just hide categories the workspace can't support so the grid only shows green." Counter-argue or agree. Consider: what a judge/user learns from seeing the full 10-category checklist with honest gaps, the product's stance on cosmetic vs. real, and whether hiding gaps changes the gate logic or only the render. Reference the `[arch]` answer and the coverage note.
-
-### Quick check
-
-- Which two outputs does the gate produce from one `coverageReport`, and who consumes each? `app/api/briefing/route.ts` L202–L223.
-- Why is the gate run *before* `agent.scan` rather than after? Name the budget it protects.
-- What event type carries one category's verdict, and why isn't it added to the shared `AgentEvent` union? (See `05-streaming-ndjson.md`.)
-- What are the four tile states the grid can render, and which one is *not* a gate verdict?
-- On a live run, is the tile-by-tile reveal real? What *is* the genuinely incremental work that follows the gate?
-
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow + scale-bottlenecks lenses — the gate is what bounds the agent's `maxToolCalls: 6` budget to runnable categories) · [01-request-flow.md](./01-request-flow.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the schema-vocabulary asymmetry between adapters) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · [10-authored-mcp-server.md](./10-authored-mcp-server.md) (why the Olist server intentionally has no schema-discovery tools) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`
@@ -403,3 +377,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

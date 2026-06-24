@@ -591,42 +591,6 @@ no extra infra               cron + durable store + TTL
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the full pipeline from `useEffect` to card render as a vertical sequence of boxes. Label every box with a function name. Draw the demo short-circuit as a branch. Draw the 401 as a branch. Check your diagram against the primary diagram in `## Request flow — diagram`.
-
-### Level 2 — Explain it out loud
-
-Work through these checkpoints without looking at the file:
-
-- [ ] What state value does `HomePage` start with, and what triggers the `fetch`? (`app/page.tsx` L88, L248)
-- [ ] What are the three possible outcomes of `connectMcp`, and what does the route do for each? (`app/api/briefing/route.ts` L161–174, `lib/mcp/connect.ts` L89–106)
-- [ ] What does `bootstrapSchema` return on a warm function, and what does it call on a cold start? (`lib/mcp/schema.ts` L170–192)
-- [ ] What is the maximum number of MCP tool calls the agent will make, and where is that limit set? (`lib/agents/monitoring.ts` L101)
-- [ ] What does the route return when the agent produces no parseable anomaly array? (`lib/agents/monitoring.ts` L112–119, `lib/state/insights.ts` L51–53)
-
-### Level 3 — Apply it to a new scenario
-
-Scenario: You add a second agent that runs after `MonitoringAgent.scan` and calls three more MCP tools. Estimate whether it fits within the existing `maxDuration = 300` budget.
-
-Check your reasoning against `app/api/briefing/route.ts` L17 for the budget and `lib/mcp/connect.ts` L81–95 for the rate-limit spacing. Three additional MCP calls at 1100 ms each = 3.3 seconds minimum added to the pipeline. If the monitoring agent already uses 6 calls (6 × 1.1 s = 6.6 s) plus schema (4 × 1.1 s = 4.4 s) plus Claude latency (estimate 5–15 s per turn × up to 8 turns), the budget is already tight. The second agent's 3 calls add 3.3 s plus its own Claude turns. You need to reduce `maxToolCalls` or `maxTurns` on one of the agents, or run them concurrently (requires careful MCP rate-limit coordination), or move one to a separate route.
-
-### Level 4 — Defend the decision you'd change
-
-The in-process `Map`s in `lib/state/insights.ts` (L4–6) are not shared across Vercel function instances. Two concurrent requests each get their own `insights` map and `listInsights()` returns only the current invocation's insights — not a merged view. `putInsights` followed by `listInsights` in the same request is fine, but any design that expects insights to persist between requests (e.g., a follow-up query that references a previous briefing's insights by id) will silently return nothing on a different instance. The fix: replace the in-process maps with a durable KV store keyed by session id. Defend why the current design was acceptable at launch and where it breaks.
-
-### Quick check — code reference test
-
-Without reading the file, answer:
-
-1. What is the exact cookie name used by `getOrCreateSessionId`? (Check: `lib/mcp/session.ts` L3)
-2. What HTTP status does the route return when `conn.ok` is false? (Check: `app/api/briefing/route.ts` L172–174)
-3. What is the hard limit on MCP tool calls inside `MonitoringAgent.scan`? (Check: `lib/agents/monitoring.ts` L101)
-4. What does the route export to tell Vercel the function timeout? (Check: `app/api/briefing/route.ts` L17)
-5. What file does the demo path read from, and where is the path constructed? (Check: `app/api/briefing/route.ts` L19 (`DEMO_FILE`), L84–87)
-
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow lens) · [02-oauth-boundary.md](./02-oauth-boundary.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` upper seam the route now branches over — three implementations) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · [12-synthetic-data-source.md](./12-synthetic-data-source.md) (the in-process adapter on the far side of `live-synthetic`)
@@ -644,3 +608,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

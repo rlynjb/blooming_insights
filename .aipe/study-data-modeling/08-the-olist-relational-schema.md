@@ -362,16 +362,6 @@ A: One real bug, one drift risk. The real bug is **`price_brl` (and `value_brl`,
   ★ price_brl stores cents but the name says BRL → file 10
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the 7 tables and the 9 indexes. For each index, name one query that uses it.
-
-2. **Explain.** Why is `weight_g` on `products` and the whole `reviews` table considered acceptable speculative content when the discipline elsewhere is "no speculative columns"?
-
-3. **Apply.** A new tool `get_top_categories_by_review_score(time_range)` is requested. Trace: which existing index does it use, which new index (if any) does it need, and what's the SQL it would execute?
-
-4. **Defend.** Someone argues `seeded_anomalies` should be in a separate JSON file outside the DB. Defend keeping it in the DB. (Hint: the metric/dimension/segment columns ARE the eval matcher's join keys; pulling it out separates the data from the ground truth that judges it.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the agent-contract layer that sits above this schema; the `WorkspaceSchema` interface that bridges Olist and Bloomreach.
@@ -383,3 +373,4 @@ A: One real bug, one drift risk. The real bug is **`price_brl` (and `value_brl`,
 
 ---
 Created: 2026-06-16 — new file covering the Phase 2 Olist DB schema as a worked relational-modeling example.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

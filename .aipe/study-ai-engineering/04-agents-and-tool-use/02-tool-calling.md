@@ -372,28 +372,6 @@ No — and candidates dodge by saying "the model calls the tool" as if the model
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw one tool round-trip: model emits `tool_use { name, input }` → loop runs `mcp.callTool` → loop builds `tool_result { tool_use_id }` → pushed back as `role: 'user'`. Label which side is the brain and which is the hands.
-
-### Level 2 — Explain
-
-Out loud: explain why a language model cannot run a tool, and why "the model called the API" is a simplification. Name the exact line where the real call happens.
-
-### Level 3 — Apply
-
-Scenario: a teammate reports the model "called `execute_analytics_eql` but nothing happened — no Bloomreach traffic." Where do you look? Check `lib/agents/base.ts` L116–L144: is the response producing `tool_use` blocks (L116)? Is `mcp.callTool` being reached (L144)? Is `params.tools` set this turn (L101 — on a `forceFinal` turn tools are omitted, so the model *cannot* emit `tool_use`)? Walk the path and name which check fails.
-
-### Level 4 — Defend
-
-A reviewer says: "Drop the `McpCaller` interface and call the Bloomreach client directly in the loop — fewer types." Defend the seam using unit-test isolation (no network, no API key) and the ability to swap cache/retry behavior by changing a constructor argument rather than the loop.
-
-### Quick check — code reference test
-
-What does `runAgentLoop` set as the `content` of a `tool_result`, and what caps its size? (Answer: `truncate(JSON.stringify(result))` — capped at `MAX_TOOL_RESULT_CHARS = 16_000`, `lib/agents/base.ts` L29 / L150.)
-
 ## See also
 
 → 01-agents-vs-chains.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design/06-multi-agent-orchestration.md
@@ -404,3 +382,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

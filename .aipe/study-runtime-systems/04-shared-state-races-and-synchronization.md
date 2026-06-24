@@ -468,13 +468,6 @@ A: The OAuth flow in `lib/mcp/auth.ts`. The MCP SDK's `OAuthClientProvider` is s
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw two simultaneous OAuth `connect` calls on the warm instance. Show the SDK calling `saveCodeVerifier` and then `codeVerifier` across an `await`. With ALS, what do they see? Without ALS, what could go wrong?
-2. **Explain.** Why is the `cached` schema race in `lib/mcp/schema.ts:131` *benign* but the auth-store race (without ALS) would be a *bug*? (Schema is deterministic — same inputs, same output; auth state is per-session and writes are not idempotent.)
-3. **Apply.** A new module wants to cache embeddings keyed by `(text, model)`. Where do you put the cache? Do you need ALS? (Module scope + plain Map is fine. The race is benign because embeddings are deterministic. No ALS needed; just a Promise<Embedding> if you want to dedupe in-flight requests.)
-4. **Defend.** Defend the choice to NOT use a Promise cache in `bootstrapSchema`. Why is the duplicated-bootstrap cost acceptable? (One-time, ~4-5s, only on the very first concurrent requests after cold start. The complexity of memoizing an in-flight promise — handling errors, retries — isn't worth it at this scale.)
-
 ---
 
 ## See also
@@ -487,3 +480,4 @@ A: The OAuth flow in `lib/mcp/auth.ts`. The MCP SDK's `OAuthClientProvider` is s
 
 ---
 Updated: 2026-06-16 — added composeSignals (sec 5) and single-flight subprocess (sec 6); noted 10-LOC duplication of composeSignals as a cleanup candidate.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

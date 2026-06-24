@@ -298,28 +298,6 @@ same meaning     → embedding (the only tool that works)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw a string going into an embedding model and out as a fixed-length float array, then two such arrays compared by the angle between them. State what cosine similarity returns for identical, unrelated, and opposite meanings (1, ~0, -1).
-
-### Level 2 — Explain
-
-Out loud: why is an embedding the *opposite* of a hash function you would use for a `Map` key? Why does that opposition make it useful for similarity and useless for exact lookup?
-
-### Level 3 — Apply
-
-Scenario: a user query "checkout abandonment" must select relevant events from the real schema. Open `lib/mcp/schema.ts` L91–L99 (where `events[].name` is built) and `lib/agents/monitoring.ts` L15–L48 (`schemaSummary`). Name exactly where you would embed the event names, where you would cache the vectors, and how `nearestSchemaTerms` would feed `schemaSummary`. Explain why `checkout_started` would rank high even though "abandonment" appears in no event name.
-
-### Level 4 — Defend
-
-A colleague says "just embed everything, embeddings are always better than string matching." Argue back using two cases from this codebase where they are wrong: matching an exact event ID, and the current `parseIntent` exact keyword check that should stay a substring match for speed.
-
-### Quick check — code reference test
-
-Does blooming insights compute any vector similarity, and what does the only term-matching code in the repo use instead? (Answer: no vector similarity exists; `parseIntent` in `lib/agents/intent.ts` L6–L12 uses exact `String.includes` substring checks — the surface-level matching embeddings exist to replace.)
-
 ## See also
 
 → 02-embedding-model-choice.md · → 05-dense-vs-sparse.md · → 11-rag.md · → ../04-agents-and-tool-use/04-tool-routing.md
@@ -327,3 +305,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (Mental model now names the blooming insights contrast — uses none of this; truncated schemaSummary + model's own fuzzy matching — before unpacking the hash analogy).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -403,13 +403,6 @@ A: The boundary we needed was *protocol* (MCP) and *isolation* (separate event l
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw two requests landing on the same warm instance. Mark the `await` points. Show which one runs when.
-2. **Explain.** Why is `await new Promise((r) => setTimeout(r, ...))` in `lib/mcp/client.ts:151` *better* than a `while (Date.now() < target) {}` busy-wait? (Spinning blocks the loop and freezes every other request; awaiting `setTimeout` yields the loop so other tasks can run.)
-3. **Apply.** A new feature needs to compute a 200ms CRC32 over every insight before storing it. Where does that work go, and why? (A `worker_threads.Worker` — putting it in the main thread freezes every concurrent request for 200ms.)
-4. **Defend.** The `readFileSync` calls at `app/api/agent/route.ts:53` and `app/api/briefing/route.ts:87` block the main thread. Why is that acceptable here, and what would change that? (Files are ≤50KB and are demo-snapshot paths, not the live hot path. Acceptable today; would become a real problem if the snapshot grew or moved into the live path, where the fix would be `await readFile(...)` from `fs/promises`.)
-
 ---
 
 ## See also
@@ -422,3 +415,4 @@ A: The boundary we needed was *protocol* (MCP) and *isolation* (separate event l
 
 ---
 Updated: 2026-06-16 — corrected the "no child_process" claim, added subprocess lifecycle section (3.5), worker_threads-vs-subprocess defense, K=10 anecdote cross-link.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

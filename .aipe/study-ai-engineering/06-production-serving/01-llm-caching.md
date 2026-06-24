@@ -396,28 +396,6 @@ Because blooming insights *does* (L0 replay) — and that only helps when the ex
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the four-layer cache stack (L0 response, L1 tool, L2 prompt, L2.5 semantic). For each, name what is cached, what it is keyed by, and which cost it removes. Mark which two are built in blooming insights.
-
-### Level 2 — Explain
-
-Out loud: explain why caching the tool results (L1) does nothing to reduce the input-token bill, and why caching the prompt prefix (L2) does nothing to reduce network round-trips. Why are they orthogonal?
-
-### Level 3 — Apply
-
-Scenario: a live diagnostic run is slow and expensive. Open `lib/agents/base.ts` L92–L100. The `system` field is re-sent every turn. Identify exactly where you would insert the `cache_control` boundary, and state what per-run text must move *out* of the cached prefix to keep it byte-stable. Then check `lib/agents/diagnostic.ts` to confirm what variable text gets interpolated into the diagnostic system prompt.
-
-### Level 4 — Defend
-
-A teammate says "remove the L0 investigation replay cache — it makes the demo show stale data." State the concrete cost of removing it: how many Claude calls a single re-viewed investigation would then make (three agents, each up to 6 tool calls + a synthesis call). Then defend why the no-cache-on-error rule in L1 already addresses the "stale bad data" worry that L0 raises.
-
-### Quick check — code reference test
-
-What is the default TTL of the L1 tool cache, and on which line is it set? (Answer: `60_000` ms, `lib/mcp/client.ts` L103.)
-
 ## See also
 
 → 02-llm-cost-optimization.md · → 04-rate-limiting-backpressure.md · → 05-retry-circuit-breaker.md · → ../04-agents-and-tool-use/README.md
@@ -428,3 +406,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

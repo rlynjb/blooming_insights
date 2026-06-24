@@ -452,16 +452,6 @@ Diagram: the seam-3 picture (db.ts truth on the left, hand-coded schema on the r
 
 Anchor: `lib/mcp/schema.ts` L232-273; `mcp-server-olist/scripts/seed-olist.ts` L184-244 (the actual schema).
 
-## Validate
-
-**Level 1 — reconstruct.** Name the four layers of the fixture pattern (seed script + PRNG, committed binary, readonly open, tool queries) and one property each enforces.
-
-**Level 2 — explain.** Why is `Math.random` banned inside the seed script? What specifically would break if it were used? (Answer: every seed run would produce a different DB; the committed binary would diverge from regenerated ones; the three SEEDED_ANOMALIES would land at slightly different anomaly characteristics; eval baselines calibrated against one run would no-op against another. The mulberry32 + fixed-seed combo removes all of this.)
-
-**Level 3 — apply.** Suppose we add a fourth domain tool, `get_top_customers`. Walk the seed→binary→runtime→agent chain — what must change, what stays the same. (Answer: db.ts is unchanged. seed-olist.ts unchanged unless we need a new index. New file `src/tools/get_top_customers.ts` with input schema, SQL builder, prepared-statement call. `lib/mcp/schema.ts` `olistWorkspaceSchema()` may or may not need to expose new dimensions; check if the agent needs to know. New tests in `test/tools/`.)
-
-**Level 4 — defend.** Argue against switching the seed PRNG from mulberry32 to `Math.random` "for simplicity." (Answer: the committed DB stops being reproducible. Future maintainers cloning the repo and running `npm run seed` would get a DIFFERENT DB than the committed one, so they'd either re-commit it (churn) or accept the divergence (drift). The eval result paper trail at `eval/results/<date>/` would no longer be reproducible. The mulberry32 line cost is 6 lines of code; the determinism it buys is foundational to the whole eval story.)
-
 ## See also
 
 - `01-database-systems-map` — where this fits in the overall storage picture
@@ -476,3 +466,4 @@ Anchor: `lib/mcp/schema.ts` L232-273; `mcp-server-olist/scripts/seed-olist.ts` L
 
 ---
 Updated: 2026-06-16 — created. Phase 2 introduced the SQLite-backed mcp-server-olist; this file teaches the "data as fixture" pattern across all four layers (seed determinism, committed binary, readonly open, prepared-statement tool queries).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

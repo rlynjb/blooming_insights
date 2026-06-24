@@ -223,16 +223,6 @@ Diagram: the isolation-level dial with read-committed circled.
 
 Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
 
-## Validate
-
-**Level 1 — reconstruct.** From memory, name the four ANSI isolation levels and one anomaly each one fixes.
-
-**Level 2 — explain.** Why does `putInsights()` work "atomically enough" today even without a transaction? (Answer: Node's single-threaded event loop, no awaits in the body, single instance most of the time. Each of these falsehoods is a real failure mode — see section 06.)
-
-**Level 3 — apply.** Suppose we add an audit log: every insight save also writes an `audit_events` row. What can go wrong if we don't wrap both in a transaction? (Answer: insight save succeeds, audit write fails, no row in audit referring to a save that happened — silent data loss for compliance use cases.)
-
-**Level 4 — defend.** Argue against using `SERIALIZABLE` everywhere "just to be safe." (Answer: SSI aborts retry-heavy workloads under contention, and most queries don't have multi-row invariants. The right move is read-committed by default, escalate per-query where invariants exist. Premature `SERIALIZABLE` makes the system slower and adds retry handling everywhere for benefit you don't need.)
-
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — how isolation actually gets enforced
@@ -241,3 +231,4 @@ Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
 
 ---
 Updated: 2026-06-19 — Olist seed transaction removed (file gone); verdict reverts to "not yet exercised" at the engine level. `withAuthCookies` remains the transaction-shaped cousin; the `putInsights` event-loop-atomicity walk stands.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

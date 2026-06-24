@@ -400,13 +400,6 @@ The fix in one diagram
 
 **Q: Has this lesson been generalized at all?** Not in the current codebase. The fix landed in one file (`auth.test.ts`); no ESLint rule yet bans direct `process.env.X = …` in test files. A previous revision of this guide pointed at the Phase 3 eval suite's `EVAL_RUN_TAG` mitigation as a parallel-shared-state generalization at a new layer, but PR #8 deleted the eval pipeline that gave that story its hook. Today the honest answer is: the lesson is correctly applied where it matters (the one flake of record); the next move (a lint rule banning direct env mutation in tests) hasn't been made.
 
-## Validate
-
-1. **Reconstruct:** Without looking, draw the timeline of the AUTH_SECRET flake: which worker mutated which global at which point, and why parallel workers made it visible.
-2. **Explain:** Why does `vi.stubEnv` work where direct `process.env.X = …` fails? What does vitest track that direct mutation doesn't?
-3. **Apply:** A new test for `lib/mcp/session.ts` needs `BI_SESSION_SECRET` set. Write the `beforeEach` / `afterEach` pair correctly on the first try.
-4. **Defend:** A reviewer says "just rerun the test in CI if it flakes once." Push back with the "flakes are state leaks in disguise" argument and name what gets eroded by accepting retry-on-flake.
-
 ## See also
 
 - `audit.md#determinism-isolation-and-flakiness` — the full isolation map for the suite
@@ -417,3 +410,4 @@ The fix in one diagram
 ---
 Updated: 2026-06-16 — Test count 169→269 (suite grew via Phase 2+3). Added Q on "has this been generalized" pointing at the Phase 3 parallel-run incident and `EVAL_RUN_TAG` as the same family of fix. Added cross-link to 06-eval-flywheel.md.
 Updated: 2026-06-19 — Olist removal (PR #8). Test count 269→221 (24 files). Removed `EVAL_RUN_TAG` generalization Q — the eval pipeline that surfaced the parallel-run hazard is gone. Removed See-also link to 06 (RETIRED). Updated body counts.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

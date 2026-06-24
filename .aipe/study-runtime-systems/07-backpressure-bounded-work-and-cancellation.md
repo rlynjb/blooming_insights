@@ -537,13 +537,6 @@ A: As of Phase 2, that's no longer fully true. The DataSource layer accepts an `
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw the nested budgets: `maxDuration` outside, `maxTurns × turn-cost` inside, `maxToolCalls × call-cost` inside that, `MAX_TOOL_RESULT_CHARS` innermost. Mark the order they would fire under a runaway agent.
-2. **Explain.** Why does the diagnostic agent have TWO stages of synthesis fallback (forced-synthesis turn AND a separate `synthesize()` call)? What can make the first one fail? (The model can ignore the instruction and emit prose instead of JSON, or it can wrap the JSON in markdown the parser doesn't handle. Stage 2 is a fresh call with NO tools and a tighter prompt — just "here's the evidence, output JSON." Stage 3 is the hard-coded FALLBACK string.)
-3. **Apply.** A new agent needs a 12-tool budget for its category. Where do you change the bound, and what's the consequence for `maxDuration`? (Change `maxToolCalls` at the agent's call site. Consequence: 12 calls × ~2.1s = ~25s of MCP work plus 12 Anthropic round-trips ~~~ ~60s; still under 300s but eating significantly more of the budget. Verify against worst-case Anthropic latency.)
-4. **Defend.** Defend the choice to NOT thread an `AbortController` through the agent loop. What would change your mind? (Today: StrictMode survivability matters more than disconnect-cancellation, and at current usage the wasted compute is rounding-error money. Would change my mind: a billing line that shows Anthropic spend significantly higher than UI-completed runs would suggest, indicating real abandonment cost. Then wire it through, both directions, and accept the StrictMode complexity.)
-
 ---
 
 ## See also
@@ -557,3 +550,4 @@ A: As of Phase 2, that's no longer fully true. The DataSource layer accepts an `
 
 ---
 Updated: 2026-06-16 — corrected "no AbortController anywhere" to "half-wired"; added DataSource signal support, AbortSignal.timeout(30_000), composeSignals as the adapter-level wall.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

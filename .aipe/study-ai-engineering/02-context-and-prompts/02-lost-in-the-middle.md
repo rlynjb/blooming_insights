@@ -347,28 +347,6 @@ long, low-signal context     → need retrieval + rerank (absent)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, sketch the U-shaped attention curve over context position and mark where the codebase places: (a) the `synthesisInstruction`, (b) the latest tool results, (c) the accumulated middle turns. State which two are at strong positions by construction and which one sits in the sag.
-
-### Level 2 — Explain
-
-Out loud: explain the difference between placement (what this codebase does) and curation (retrieval + reranking, what it does not). Why does `synthesize()`'s short flat context sidestep the middle problem that the loop's long context cannot?
-
-### Level 3 — Apply
-
-Scenario: a query agent calls eight tools and six of them return data irrelevant to the user's question. Check `lib/agents/base.ts` L171 — what position do the irrelevant results occupy in the transcript, and why does appending each batch fail to keep the *relevant* two at the edges? Then name the file that would not exist yet but would house the reorder step (cross-reference → ../03-retrieval-and-rag/07-reranking.md).
-
-### Level 4 — Defend
-
-A reviewer says: "Recency placement is enough — we don't need a reranker." Defend or refute using this codebase: for the bounded ~96,000-char diagnostic context with six uniformly-relevant results, is the reviewer right? For a hypothetical twelve-tool query context with low signal-to-noise, is the reviewer right? Name the event that flips the answer and the file (`lib/mcp/rerank.ts`, not yet present) where the fix would live.
-
-### Quick check — code reference test
-
-On the forced-final turn, where in the system prompt does the must-obey directive sit, and which line places it there? (Answer: at the *end* — `lib/agents/base.ts` L98 concatenates `synthesisInstruction` after the base `system` prompt.)
-
 ## See also
 
 → 01-context-window.md · → 03-prompt-chaining.md · → ../03-retrieval-and-rag/07-reranking.md · → ../04-agents-and-tool-use/02-tool-calling.md
@@ -379,3 +357,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

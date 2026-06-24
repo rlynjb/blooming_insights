@@ -275,16 +275,6 @@ Diagram: primary + replica with a routed-to-primary arrow for fresh writes.
 
 Anchor: hypothetical; flag in interview.
 
-## Validate
-
-**Level 1 — reconstruct.** Walk the WAL streaming path from primary to replica and name the three lag components.
-
-**Level 2 — explain.** Why is `?insight=...` in the URL the codebase's "consistency fix"? (Answer: it makes every request self-contained; the server can answer without having seen any prior request. The browser carries the state across requests in place of a shared server store.)
-
-**Level 3 — apply.** Suppose we add Vercel KV for the insights Map. Sketch the rewrite of `lib/state/insights.ts`. (Answer: `putInsights()` becomes `await kv.set('briefing:current', items)`; `listInsights()` becomes `await kv.get('briefing:current')`. The `clear()` is no longer needed — overwrite IS the clear. All instances now see the same truth.)
-
-**Level 4 — defend.** Argue against rushing to add Vercel KV today. (Answer: KV introduces a new failure mode (KV unavailable), a new latency (~5-20ms per access), and a vendor lock. The current divergence problem doesn't surface at demo traffic. Wait until two users see different briefings and complain, OR until a feature requires it (multi-tab, history, cross-device).)
-
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — the same problem at a finer altitude
@@ -295,3 +285,4 @@ Anchor: hypothetical; flag in interview.
 
 ---
 Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app cross-instance divergence story unchanged; it's the load-bearing teaching here.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

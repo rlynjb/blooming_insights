@@ -291,31 +291,10 @@ not → prompt middle (lost-in-the-middle dead zone)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the two-stage pipeline (retrieve top-20 → rerank → keep top-3 → place). State which stage uses a bi-encoder and which uses a cross-encoder, and which optimizes recall vs. precision.
-
-### Level 2 — Explain
-
-Out loud: why is a cross-encoder more accurate but too slow to run over a whole corpus? Why does reranked order need to feed prompt placement, not just truncation?
-
-### Level 3 — Apply
-
-Scenario: retrieval over past investigations returns 20 candidates; you can fit 3 in the prompt. Open `../02-context-and-prompts/02-lost-in-the-middle.md` (placement) and imagine the retriever from `05`/`06`. Explain where the reranker sits, why you keep top-3 not top-20, and where in the prompt the top-reranked document goes. Contrast with `lib/agents/monitoring.ts` L92's field-sort.
-
-### Level 4 — Defend
-
-A colleague says "reranking is overkill, just trust the cosine order." Argue the case where it matters (best match at position 5, tight prompt budget, decision-relevant difference) and the case where they are right (tiny candidate set, order barely matters). Then explain why reranking cannot rescue a retriever with bad recall.
-
-### Quick check — code reference test
-
-Does blooming insights rerank retrieved candidates by query relevance, and what is the closest existing "rank then top-k" code? (Answer: no — there is no retrieval reranker; the closest shape is `MonitoringAgent.scan` sorting *output* anomalies by `SEV_RANK` then `.slice(0, 10)` (`lib/agents/monitoring.ts` L50, L92), which ranks results by a fixed field, not candidates by joint query relevance.)
-
 ## See also
 
 → 06-hybrid-retrieval-rrf.md · → 01-embeddings.md · → ../02-context-and-prompts/02-lost-in-the-middle.md · → 11-rag.md
 Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

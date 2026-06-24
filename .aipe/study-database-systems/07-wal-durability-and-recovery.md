@@ -214,16 +214,6 @@ Diagram: the WAL + checkpoint + backup picture.
 
 Anchor: today, no DB; this is hypothetical and I'd flag it.
 
-## Validate
-
-**Level 1 — reconstruct.** Walk the write path through a WAL: when does the data hit disk, when does COMMIT return, what does recovery do after a crash.
-
-**Level 2 — explain.** Why does the dev write path (`writeFileSync` in `lib/state/investigations.ts`) work in practice despite having no fsync and no atomic rename? (Answer: single writer; if it tears, the JSON.parse catches and falls through to demo data; the user observes "investigation not cached, re-running it" — acceptable in dev. Would be unacceptable in any real persistence story.)
-
-**Level 3 — apply.** Suppose we add saved insights to Postgres. What's the smallest set of durability decisions we need to make? (Answer: synchronous_commit=on (the default, don't disable it), daily backup + WAL archive, document RPO/RTO, test restore.)
-
-**Level 4 — defend.** Argue against using `synchronous_commit=off` for "faster writes" on a saved-insights table. (Answer: faster commits, yes — but a crash between commit and WAL flush loses committed data. Saved-insights is exactly the workload where "I clicked save and it said success" must mean "it's safe." Don't trade durability for throughput on user content.)
-
 ## See also
 
 - `08-replication-and-read-consistency` — replication is WAL shipping
@@ -233,3 +223,4 @@ Anchor: today, no DB; this is hypothetical and I'd flag it.
 
 ---
 Updated: 2026-06-19 — Olist SQLite WAL exercise removed (sibling tier gone); verdict reverts to "not yet exercised." Auth cookie + dev JSON files + committed fixtures remain the closest cousins.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

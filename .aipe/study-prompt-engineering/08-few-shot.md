@@ -411,28 +411,6 @@ example     → imitated → gaps filled by analogy   ← stronger structural co
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the zero-shot → format-exemplar → few-shot spectrum and place each of these on it: `classifyIntent`, the EQL reminders, the JSON output block. State which one is the actual classification decision and what shot-count it uses (zero).
-
-### Level 2 — Explain
-
-Out loud: why is the JSON output block (`monitoring.md` L73–L85) both a few-shot example *and* the request side of the structured-output contract? Tie it to `parseAgentJson` + `isAnomalyArray` (the guarantee side, → 02-structured-outputs.md) — the example makes the model emit the shape, the validator enforces it.
-
-### Level 3 — Apply
-
-Scenario: you must add few-shot examples to `classifyIntent` (`intent.ts` L21–L23). Write three diverse `query → label` pairs that cover the boundary between monitoring and diagnostic, state where in the system string they go, and name the eval you would run before keeping them (a labeled held-out set, → 05-eval-driven-iteration.md).
-
-### Level 4 — Defend
-
-A reviewer says: "Add examples to the classifier — few-shot always beats zero-shot." Defend the current zero-shot choice (three distinct categories, `max_tokens: 16`, per-call token cost) while conceding the reviewer is right *if* a measured boundary-case accuracy gap shows up. Name the measured condition that flips the decision.
-
-### Quick check — code reference test
-
-Is `classifyIntent` few-shot or zero-shot, and what does its system prompt contain? (Answer: zero-shot — its system prompt at `intent.ts` L21–L23 contains label *definitions* for monitoring/diagnostic/recommendation and "Reply with ONLY the one word," with no labeled query→label examples.)
-
 ## See also
 
 → 01-anatomy.md · → 02-structured-outputs.md · → 09-chain-of-thought.md · → 04-token-budgeting.md
@@ -445,3 +423,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added items 4 (dual-adapter format exemplars: prompt now carries parallel Bloomreach-EQL + Olist-SQL exemplar blocks since Phase 2) and 5 (enumerated 3-dim scan plan as exemplars-as-checklist few-shot — measured 5x loose-recall lift on the Phase 3 eval suite).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

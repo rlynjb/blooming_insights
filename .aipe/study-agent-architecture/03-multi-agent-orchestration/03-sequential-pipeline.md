@@ -464,52 +464,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-
-Close this file. Draw the sequential pipeline from memory: three boxes (monitoring → diagnostic → recommendation), arrows between them labelled with the message type (Anomaly → Diagnosis → Recommendations). Then add a second layer below the diagnostic box showing the ReAct loop inside one stage.
-
-Open the file. Compare.
-
-✓ Pass: you drew three stages, labelled the inter-stage messages (especially Diagnosis), and showed the ReAct loop inside one stage
-✗ Fail: re-read How it works Layer 1 and the diagram section, wait 10 minutes, try again.
-
-### Level 2 — Explain it out loud
-
-Explain the pipeline to a colleague who asked "why isn't this all one agent?" — under 90 seconds, no notes.
-
-Checkpoints — did you:
-- Name `app/api/agent/route.ts` L224–L249 (the code that owns the order)?
-- Name the inter-stage message (`Diagnosis` in `lib/mcp/types.ts`)?
-- Say why the order is sequential (data dependency: recommendation needs diagnosis)?
-- Name the per-stage budgets (6/6/4) and why they matter (tool budget contention)?
-
-If you skipped any: you described the pipeline, you didn't defend it.
-
-### Level 3 — Apply it to a new scenario
-
-A product manager proposes: "Add a fourth stage — `summary` — that runs after recommendation and produces a one-paragraph summary the user can copy-paste into Slack." The summary needs the diagnosis AND the recommendations as input.
-
-Without looking at the file: where would `summary` slot into the pipeline? What new type would you add to `lib/mcp/types.ts`? Which line range of `route.ts` would change, and how does the in-process / cross-request handoff change?
-
-Write your answer (3–5 sentences). Then open `app/api/agent/route.ts` L244–L249 and check whether the change is a straightforward extension or whether the cross-request handoff (now with two messages — diagnosis AND recommendations) is the load-bearing complication.
-
-### Level 4 — Defend the decision you'd change
-
-"If you were building this today with the same problem (anomaly → diagnose → recommend) but with a hard 5-second total latency budget, would you still use a sequential pipeline? Why or why not? If you'd switch to a different topology, which one (parallel fan-out? mega-agent?), and how would you handle the recommendation agent's data dependency on the diagnosis?"
-
-Reference the code: `route.ts` L237–L248 (the in-process pipeline), `recommendation.ts:propose(anomaly, diagnosis, hooks)` signature, `connect.ts` L92 (the ~1.1s MCP spacing that bounds per-stage latency).
-
-### Quick check — code reference test
-
-Without opening any files:
-- What file defines the inter-stage message type?
-- What's the key the client uses to persist the diagnosis between step 2 and step 3?
-- What function validates the handed-over diagnosis when step 3 starts?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
@@ -522,3 +476,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Updated Implementation block pseudocode (`conn.mcp` → `dataSource`) to reflect Phase 2's DataSource seam; agent constructors now receive the adapter, not the McpClient.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

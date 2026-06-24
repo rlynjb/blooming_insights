@@ -385,28 +385,6 @@ The honest answer: because today there is no branch, and `propose` against a `FA
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three layers: (a) the route as a fixed chain naming both `await` steps; (b) one node as an agent loop naming the line where the model ends it; (c) the micro-chain `tryParse ?? synthesize ?? FALLBACK`. Label which layer is code-owned and which is model-owned.
-
-### Level 2 — Explain
-
-Out loud: explain why "is this an agent or a chain?" has no single answer for this codebase, and why the determinism boundary is drawn at the agent's public method (above it code, below it model).
-
-### Level 3 — Apply
-
-Scenario: a PM wants the system to run the diagnostic and recommendation steps *in parallel* to cut latency. Why does the current architecture forbid this, and what specifically would break? Check against `app/api/agent/route.ts` L247 — note that `propose` takes `diagnosis` as an argument, and on the two-step path `step=recommend` cannot even start until the client has stashed the diagnosis from `step=diagnose` and passed it back via `parseDiagnosis(diagnosisParam)` (L227). Explain that the dependency is a data dependency, not a code-style choice, and that true parallelism would require a different decomposition.
-
-### Level 4 — Defend
-
-A reviewer says: "Collapse the route into a single agent with all tools — fewer moving parts." Defend the chain using prompt size, per-node `maxToolCalls` (diagnostic 6 vs recommendation 4), and isolated testability. Then concede the one case where the reviewer is right (a task with no fixed sub-step order).
-
-### Quick check — code reference test
-
-Which line in `lib/agents/base.ts` is the single point where the *model*, not your code, decides the agent loop is finished? (Answer: L121 — `if (toolUses.length === 0) return { finalText, toolCalls }`.)
-
 ## See also
 
 → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design/06-multi-agent-orchestration.md
@@ -420,3 +398,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

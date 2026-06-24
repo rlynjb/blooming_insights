@@ -379,28 +379,6 @@ No — and saying otherwise is the tell of someone who has not thought about it.
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the path of a `?q=` value from the URL to the model, marking the single sanitization step. Then draw the two structural mitigations (where read-only is enforced; where output is validated) and state what blast radius each removes.
-
-### Level 2 — Explain
-
-Out loud: explain why prompt injection has no equivalent to the parameterized-query fix for SQL injection. What is it about the token stream that prevents a clean instruction-data separation?
-
-### Level 3 — Apply
-
-Scenario: a product manager wants to add a `create_audience_segment` write tool to the agents. Open `lib/mcp/tools.ts` and `app/api/agent/route.ts` L115. Explain precisely why the unguarded `?q=` becomes a critical issue the moment this tool joins the set, and what must ship *before* the tool to keep the system safe.
-
-### Level 4 — Defend
-
-A teammate says "the input is unsanitized, this is a P0 security bug, block the launch." Defend the nuanced position: name the two structural mitigations that bound the current blast radius to exfiltration (cite `lib/mcp/tools.ts` and `lib/mcp/validate.ts`), state the residual risk honestly, and identify the single future change that would make their P0 framing correct.
-
-### Quick check — code reference test
-
-What is the only transformation applied to `?q=` before it reaches the model, and on which line? (Answer: `.trim()`, `app/api/agent/route.ts` L115.)
-
 ## See also
 
 → 05-retry-circuit-breaker.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
@@ -411,3 +389,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

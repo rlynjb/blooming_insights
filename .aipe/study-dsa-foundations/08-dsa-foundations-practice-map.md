@@ -515,32 +515,7 @@ Partly, yes — interview frequency *is* one of the three lenses, and LeetCode i
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the three lenses in the ranking formula (interview frequency, portfolio gap, leverage) and explain in one sentence what each measures. Then write the top 3 items of the ranked list and why they're at the top.
-
-### Level 2 — explain
-
-Open chapters 03, 05, and 07. For each "not yet exercised" sub-item (heaps, BFS/DFS, DP), identify (a) its position in the ranked list above, (b) the rationale in one sentence, (c) the time estimate, and (d) the trigger that would make it suddenly *more* urgent (a job posting? an interview scheduled? a side project starting?).
-
-### Level 3 — apply
-
-**Scenario:** You get a senior interview at a company in 2 weeks. The recruiter says "expect a lot of dynamic programming and at least one graph problem." Re-rank your 2 weeks of study time. Do you skip binary search to spend more time on DP? Do you defer topological sort entirely? Justify the re-ranking against the original 6-week plan.
-
-### Level 4 — defend
-
-A teammate says: "You should drill tries before DP — they're easier and you'll feel productive faster." Defend the DP-first ranking. Address: (a) interview frequency, (b) portfolio gap (you've never built DP from scratch; tries are also new but lower-frequency), (c) leverage in real codebases (DP shows up in optimization problems; tries show up mainly in autocomplete and IP routing). State without hedging which one wins on each axis and why the product favors DP.
-
-### Quick check
-
-- Which item is rank 1 in the practice plan? (Dynamic programming.)
-- Which item is rank 2? (Binary search.)
-- What does "portfolio gap" measure? (How much *new building* vs *rehearsal* the topic needs, given what you've already built in `reincodes/`.)
-- What's the total time estimate for the 6-week plan? (~38-58 hours.)
-- Which item from chapters 03–07 is *not* on the ranked plan, and why? (Deques and segment trees — both scored too low on frequency × leverage to make the top 7.)
-
 ## See also
 
 → chapters 01 through 07 (the audits this plan ranks) · → `me.md` (the portfolio status that calibrates "build vs rehearse") · → IK curriculum (the structured drilling path many of the ranked items follow)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

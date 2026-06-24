@@ -436,45 +436,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the canonical self-corrective RAG diagram: retrieve → grader → (pass) generate / (fail) fallback ladder. Mark the spot where this codebase does *not* have the grader. Mark the two adjacent checks it *does* have, with arrows showing which side of `retrieve` they sit on.
-
-Open the file. Compare.
-
-✓ Pass: you put the grader between retrieve and generate, drew the fallback ladder (rewrite / widen / escalate), and placed the volume-check before retrieval and the hypothesis-test after generation
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague asks: "wait, if you don't grade relevance, how do you know the agent isn't hallucinating from off-topic numbers?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Distinguish "retrieval ran" from "retrieval was relevant" in one sentence?
-- Name the volume-check (premise side) and hypothesis-test (answer side) honestly as *adjacent*, not as substitutes?
-- Name the structural reason (EQL is typed) that today's retrieval is mostly on-topic by construction?
-- Name the breakpoint (fuzzier retriever + answers to end users without review) at which the gap becomes a real problem?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: a chat surface where end-users (not the operator) ask questions about their workspace and get model-generated answers with no human review step. Without opening the code: which of the two adjacent checks still covers the relevance gap, and which doesn't? Where would you add the grader and what would the fallback ladder look like in this specific codebase?
-
-Write your answer (4–6 sentences). Then open `lib/agents/base.ts` L143–L171 and check where the grader call would slot.
-
-### Level 4 — Defend the decision you'd change
-"You said the codebase doesn't need a grader today because EQL is typed and the operator reviews answers. If both of those changed tomorrow (a vector store over narratives goes in, AND answers ship to end users), what's the cheapest credible grader you'd add? Walk the cost: per-turn extra calls, per-investigation extra latency, how the fallback interacts with `maxToolCalls`."
-
-Reference the code: point to `runAgentLoop` (`base.ts` L48–L176) for where the gate slots in and `monitoring.md` ~L31 for the existing premise pattern you'd extend.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the monitoring volume-check, and roughly which section of it?
-- What file holds the diagnostic hypothesis-test pattern, and what does it ask the model to do?
-- In `runAgentLoop`, between which two line regions would a relevance grader call slot?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-agentic-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/04-reflexion-self-critique.md` · → `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
@@ -486,3 +447,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase position — no relevance grader, only adjacent premise + groundedness-on-reasoning checks at different layers — alongside the strategy line, instead of waiting until Move 2.4).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

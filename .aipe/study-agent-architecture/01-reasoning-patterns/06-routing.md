@@ -434,45 +434,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the two-stage router from memory: heuristic (deterministic) first, LLM fallback second, both normalizing through the same parser. Then sketch where this router fires in `app/api/agent/route.ts` (the `?q=` branch) and where it does NOT fire (the `?insightId=` branch).
-
-Open the file. Compare.
-
-✓ Pass: you have the two stages, you label the heuristic as deterministic and the LLM as Haiku, you correctly mark the `?q=` path as the one with the router and the investigation path as the one without
-✗ Fail: re-read Move 2.3 and Move 2.4, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-Explain "how do you route user input to the right agent" to a colleague who just asked. No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the two files? → `lib/agents/intent.ts` (the classifier), `app/api/agent/route.ts` (where it fires)
-- Say why the heuristic exists alongside the LLM call (free routing for the easy cases + normalizing the LLM's output)?
-- Name the model used for classification and why? → Haiku, because classification doesn't need Sonnet's depth
-- Say why the investigation flow doesn't use this router (`?step=` already encodes the agent choice)?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Can we add a fourth intent — 'comparative analysis', like 'compare this quarter vs last year' — and route those queries to a new agent we're building?" Without looking at the file: which files would you touch, in what order, and what would break if you only touched one of them?
-
-Write your answer (3–5 sentences). Then open `lib/agents/intent.ts` (the `Intent` type at L3, the `parseIntent` at L6–L12, and the classifier prompt at L21–L23) and `app/api/agent/route.ts` L210–L218 to confirm what dispatch would need to change.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today expecting 100x the free-form query volume, would you still use the heuristic + Haiku two-stage router, or replace it with an embedding-based classifier? Why? If you'd switch, what new file would exist in `lib/agents/` and what would the heuristic still cover?"
-
-Reference the code: point to `lib/agents/intent.ts` L17–L31 for the current Haiku call and describe what the embedding classifier would do differently (one embedding compute + nearest-neighbor, no LLM call per input).
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the heuristic + LLM router, and what are the two functions called?
-- What model does the LLM classifier use, and why that one?
-- On which URL pattern does the router fire, and on which does it NOT?
-
-Open and verify. ✓ Files + function names + the path-firing rule matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-chains-vs-agents.md · → 02-react.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/04-tool-routing.md` · → capability gating: `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` · → multi-agent: `../../study-system-design/06-multi-agent-orchestration.md`
@@ -483,3 +444,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

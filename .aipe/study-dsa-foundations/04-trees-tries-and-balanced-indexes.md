@@ -529,32 +529,7 @@ Shape vs algorithm. The WorkspaceSchema in `lib/mcp/schema.ts` is *shaped* like 
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the BST kernel: the invariant ("left < node < right"), the three core operations (find, insert, delete), and what balance buys you (O(log N) instead of O(N)). Then write the trie kernel: edges labeled by characters, paths from the root spell stored strings, lookup is O(M) where M is the key length.
-
-### Level 2 — explain
-
-Open `lib/mcp/schema.ts` L8–L18 and `lib/agents/categories.ts` L116–L127. Walk through why the schema is *shaped* like a tree but is not *used* as one. What would the same code look like if the schema were 5 levels deep and a recursive walker became necessary? Where would you put the recursion termination condition?
-
-### Level 3 — apply
-
-**Scenario:** The product wants an autocomplete in the query box at `components/chat/QueryBox.tsx` that suggests every Bloomreach event the user has access to. The lexicon is ~200 event names; the user types one character at a time. Walk through three implementations: (a) linear scan over a sorted array, (b) hash map with prefix iteration, (c) trie. State the cost of each for the prefix "ses" returning K matches. Which would you pick at N=200 events? At N=20,000? Cite no file paths (this is hypothetical).
-
-### Level 4 — defend
-
-A teammate suggests: "Replace the `Map<string, {result, expiresAt}>` in `lib/mcp/client.ts` L80 with a balanced BST keyed by `expiresAt` so we can efficiently expire stale entries." Defend the current `Map` choice or accept the suggestion. Address: what range query would the BST answer (find all entries with `expiresAt < now`), what's the alternative (lazy expiry on read, which is what the codebase does), and what's the cost trade (O(log N) per write to maintain the BST vs O(1) for Map plus O(N) for a sweep). Cite `lib/mcp/client.ts` L80, L102–L108, L137–L144.
-
-### Quick check
-
-- What's the find/insert/delete cost of a balanced BST? (O(log N) all three.)
-- What's the find/insert cost of a trie storing words of length M? (O(M) both.)
-- Why does sorted-order insertion into a plain BST degrade to O(N) per op? (The tree becomes a linked list — every node has only one child.)
-- Name two database systems that use B-trees for indexes. (PostgreSQL, MySQL — InnoDB. SQLite uses them too.)
-- Does this codebase have a tree algorithm? (No — the schema is *shaped* like a tree but iterated with flat loops.)
-
 ## See also
 
 → `03-stacks-queues-deques-and-heaps.md` (heap is a tree-shaped structure, but stored as a flat array — the bridge between this chapter and the previous one) · → `05-graphs-and-traversals.md` (trees are a special case of graphs — acyclic, rooted, one parent per node) · → `08-dsa-foundations-practice-map.md` (where trees rank in the practice plan)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

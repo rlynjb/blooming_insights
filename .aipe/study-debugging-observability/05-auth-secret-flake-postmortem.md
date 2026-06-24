@@ -426,13 +426,6 @@ The first move is the smallest and highest-leverage. The second is preventive (c
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, name the four phases of an incident lifecycle and what the `e83a8e0` flake-fix did at each phase. Anchor: `test/mcp/auth.test.ts:117-122` for the fix.
-2. **Explain.** Why is "passes in isolation, flakes in parallel" a diagnostic *fingerprint*, and what does it always point to? Why does recognizing the fingerprint matter for diagnostic latency?
-3. **Apply to a scenario.** A user reports the recommendation panel was empty for one investigation. Walk the four phases (detect, diagnose, fix, prevent) and name what tooling exists at each phase vs what's missing.
-4. **Defend the decision.** Argue for adding a `tests/setup.ts` with global `vi.unstubAllEnvs()` today. Argue against. Name the leading indicator that flips the decision.
-
 ---
 
 ## See also
@@ -447,3 +440,4 @@ The first move is the smallest and highest-leverage. The second is preventive (c
 
 ---
 Updated: 2026-06-19 — reverted framing to "the only documented incident in the repo" after PR #8 removed the Olist pipeline; the BRL bug and parallel-run race noted in the previous refresh are RESOLVED-BY-DELETION; cross-link to `06-` retained with RETIRED treatment.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

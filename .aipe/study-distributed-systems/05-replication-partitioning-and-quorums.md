@@ -394,13 +394,6 @@ A shared workspace where two users see the same briefing. That breaks the per-bi
 
 ---
 
-## Validate
-
-- **Reconstruct.** Name the three replication patterns (primary-replica, multi-primary, quorum) and one place each is used in industry.
-- **Explain.** Why does `lib/mcp/auth.ts:22-36`'s comment cite production-multi-instance as the reason for the encrypted cookie backend? Because connect and callback are two HTTP requests, possibly on different instances; the cookie is the only store both can read. It's the same "push state to the client" pattern as bi:diag:<id>.
-- **Apply.** A new feature: scheduled briefings (8am daily for each org). What's the leader-election concern? Two Vercel instances both firing the cron means two briefings, double MCP cost, possibly conflicting writes. What's the fix? Vercel Cron Jobs — the platform IS the leader-election protocol; you lean on it rather than building consensus.
-- **Defend.** Why doesn't this codebase implement any of this file's mechanisms? Because there's no state worth replicating today. Implementing replication-shaped infrastructure before you have replication-needing state is overengineering; honest distributed-systems thinking names it as deferred, not absent.
-
 ---
 
 ## See also
@@ -414,3 +407,4 @@ A shared workspace where two users see the same briefing. That breaks the per-bi
 
 ---
 Updated: 2026-06-16 — Added Part 6: the K=10 parallel-eval race + EVAL_RUN_TAG fix as a real single-host multi-process distributed-systems anecdote; added the eval code side-by-side; cross-link to study-testing.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

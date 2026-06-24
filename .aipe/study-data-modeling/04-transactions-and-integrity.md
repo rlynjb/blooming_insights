@@ -545,16 +545,6 @@ A: The `isAnomalyArray` guard in `lib/mcp/validate.ts` (L17–L27). The monitori
   Anomaly[]   return []  ← fail-closed; briefing renders "no anomalies"
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the three runtime guards in `lib/mcp/validate.ts`. For each, name the boundary it protects and the fail-closed return.
-
-2. **Explain.** Why does `parseAgentJson` have three fallbacks (fenced block, bare JSON, substring scan)? What real LLM output shapes does each handle, and what fails if you drop the substring scan?
-
-3. **Apply.** A new agent emits `{ surprise: 'X' }[]` as its output. Trace: which guard catches it (or fails to catch it)? What's the fail-closed return, and what does the user see in the UI?
-
-4. **Defend.** Someone says "Node is single-threaded, so `putInsights` is already atomic — you don't need a transaction." Counter the argument. (Hint: the JS *event loop* is single-threaded but the *write path* can grow I/O — a future caller awaiting between clear and set would re-introduce the race; also, "single-process" stops being true the moment you scale to multiple serverless instances.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — the 8 interfaces the guards narrow to.
@@ -567,3 +557,4 @@ A: The `isAnomalyArray` guard in `lib/mcp/validate.ts` (L17–L27). The monitori
 
 ---
 Updated: 2026-06-16 — rewrote in-memory atomicity story for session-scoped state; added the Olist FK + WAL + transaction layer (was "not yet exercised").
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

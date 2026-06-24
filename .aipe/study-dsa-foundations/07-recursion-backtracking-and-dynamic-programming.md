@@ -590,34 +590,7 @@ No. The `recursive: true` is a parameter passed to Node's `fs.promises.mkdir`. T
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write: (a) the recursion kernel (base case + recursive case + reduction toward base), (b) the backtracking kernel (state + candidate + try + recurse + undo), (c) the DP kernel (state + recurrence + memo + base case). For each, name one example problem where the technique is the right answer, and one problem where you'd reach for a flat loop instead.
-
-### Level 2 — explain
-
-Open `lib/mcp/validate.ts` L3–L13. Walk through why the three-attempt fallback ladder is *not* backtracking, even though it superficially looks like "try a thing, fall back, try another." Identify what's missing: shared state that gets modified-and-restored, recursive descent, undo semantics. State what the same algorithm would look like written *as* recursion (each fallback as a recursive case with the previous attempt's failure as a parameter).
-
-### Level 3 — apply
-
-**Scenario A — recursion trigger.** Imagine Bloomreach's schema gets a 5-level nested structure: events → property groups → properties → property attributes → metadata fields. Walk through how you'd rewrite `schemaCapabilities` (`lib/agents/categories.ts` L116–L127) from flat nested loops to a recursive walker. Where's the base case? What's the recursive case? What's the combination step?
-
-**Scenario B — DP trigger.** Imagine the recommendation agent needs to pick the best 3 recommendations from a list of 10, where each has an estimated impact in USD and some pairs conflict (can't both be picked). Maximize total impact, subject to picking at most 3 and respecting conflicts. Walk through: (a) why this is a DP problem (overlapping subproblems on "best subset of recommendations 1..k under constraint"), (b) the state (current index, count chosen, set of picked), (c) the recurrence, (d) the cost. Compare to the brute-force backtracking version (try all 2^10 subsets).
-
-### Level 4 — defend
-
-A teammate says: "Rewrite `parseAgentJson` as a backtracking algorithm — try each extraction strategy with proper undo/state tracking." Defend the current flat-fallback design. Address: (a) is there state being modified across attempts? (no — each attempt operates on the same input), (b) is there any benefit to recursive descent over a sequential ladder? (no — sequential is clearer), (c) what would backtracking buy if there were? Cite `lib/mcp/validate.ts` L3–L13.
-
-### Quick check
-
-- What's the base case in a recursive function, and what breaks without it? (The terminating condition; missing it → infinite recursion → stack overflow.)
-- What turns naive recursion into DP? (Memoization — caching subproblem results.)
-- Why is backtracking "recursion plus undo"? (You modify shared state to try a choice, then restore it on backtrack so siblings start clean.)
-- Does this codebase have any recursive function definitions? (No — only `mkdir({recursive: true})` as a stdlib parameter.)
-- Name the two preconditions for DP. (Overlapping subproblems + optimal substructure.)
-
 ## See also
 
 → `04-trees-tries-and-balanced-indexes.md` (trees are the natural data structure for recursion; tree walks are the canonical recursive algorithm) · → `05-graphs-and-traversals.md` (DFS is recursion with a visited set; backtracking is DFS plus undo) · → `06-sorting-searching-and-selection.md` (merge sort, quicksort, quickselect are all recursive/divide-and-conquer — `not yet exercised` directly here, but V8's Timsort uses recursion internally) · → `08-dsa-foundations-practice-map.md` (where these three rank in the practice plan)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

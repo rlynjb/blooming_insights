@@ -522,39 +522,10 @@ The cost paid for that decision: ~1800 LOC of server code that wouldn't exist if
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking, draw the five-layer subprocess pipeline (transport → MCP server → dispatch → validate+execute → SQLite) and place the trust seam at the validator level. Add the parent-side caller (`OlistDataSource`) as the upstream box, with `StdioClientTransport` as the seam. Check your diagram against the primary diagram in this file.
-
-### Level 2 — Explain
-
-Open `mcp-server-olist/src/server.ts` and read L79–L108 (`callTool`). Explain in one sentence why the handler is wrapped in `try/catch` and what would go wrong if it weren't. Then explain why `validateInput` returns `string | TypedInput` rather than throwing or returning a `Result<T, E>` shape.
-
-### Level 3 — Apply
-
-**Scenario:** Product wants a new tool: "given a customer ID, return the customer's last 5 orders and lifetime value." Walk through the files you'd touch and the order you'd write them in.
-
-Expected reasoning: (1) Add a new `GetCustomerHistoryInput` type and JSON Schema in `mcp-server-olist/src/schemas.ts`. (2) Create `mcp-server-olist/src/tools/get_customer_history.ts` with `validateInput` + `execute(db, input)`. (3) Register it in `TOOL_DEFINITIONS` in `server.ts` (L32–L51) with a task-shaped description ("Use this when investigating a churn diagnosis to size impact per customer"). (4) Add a switch case to `callTool` (L79–L108). (5) Write the test — call the dispatched `callTool(db, 'get_customer_history', args)` directly without spinning up stdio. (6) Update the agent prompts to mention when to use it. (7) On the parent side, NOTHING changes — `OlistDataSource` will see the new tool via `listTools()` automatically.
-
-Check: `mcp-server-olist/src/server.ts` L113–L133 (`buildServer` registers the SAME handlers regardless of how many tools exist; adding one is a switch-case + a definition).
-
-### Level 4 — Defend
-
-A teammate proposes: "Let's add an `execute_sql` tool to the server so the agent has an escape hatch for queries we don't have a domain tool for." Construct a three-sentence rebuttal anchored in: (a) prompt complexity, (b) fabrication risk, (c) parity with the Bloomreach backend. Then acknowledge the one case where the teammate would be right (exploratory data analysis at scale).
-
-### Quick check
-
-- How many tools does the server expose, and what's each one's role? (Answer: 3 — `get_metric_timeseries` (what changed?), `get_segments` (what exists?), `get_anomaly_context` (evidence))
-- Why are tool errors returned as `isError: true` envelopes instead of thrown? (Answer: thrown exceptions could corrupt the JSON-RPC frame; the envelope is the SDK-safe surface)
-- Where does the seeded ground truth for the eval pipeline live? (Answer: `mcp-server-olist/data/olist.db` `seeded_anomalies` table — committed, 3 rows)
-- What MCP transport does the parent process use? (Answer: `StdioClientTransport` — stdio JSON-RPC frames; the subprocess uses `StdioServerTransport` on the other end)
-- Why is `console.log` effectively banned in this codebase? (Answer: stdout is reserved for MCP protocol frames; any non-protocol stdout write corrupts the JSON-RPC stream)
-
 ## See also
 
 → [audit.md](./audit.md) (system-map-and-boundaries lens — the new authored sibling package) · [03-provider-abstraction.md](./03-provider-abstraction.md) (this server is the far side of `OlistDataSource`) · [01-request-flow.md](./01-request-flow.md) (the `live-sql` mode that spawns this server) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) (why this server has no schema-discovery tools — the parent synthesizes the schema instead) · [09-eval-pipeline.md](./09-eval-pipeline.md) (the seeded anomalies in this DB are the eval ground truth)
 
 ---
 Updated: 2026-06-16 — initial generation. Documents `mcp-server-olist/` (~1800 LOC sibling package) introduced in Phase 2 of the DataSource seam work as the second adapter's far side. Framed as a 5-layer authored-MCP-server architecture: stdio transport → MCP server → dispatch → validator+execute → SQLite. Three domain tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`) — explicitly NOT `execute_sql` — with the design rationale around prompt complexity, fabrication risk, and Bloomreach-vocabulary parity. The `seeded_anomalies` SQLite table is named as the eval pipeline's load-bearing ground truth.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

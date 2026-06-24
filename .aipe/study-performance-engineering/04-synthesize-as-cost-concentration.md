@@ -599,16 +599,6 @@ The full picture — the synthesize call's role, the four unread `res.usage` sit
 
 ---
 
-## Validate
-
-**Level 1 — Reconstruct.** Name the file:line of the synthesize call in both DiagnosticAgent and RecommendationAgent, what the call lacks (in terms of measurement), and where the fix would go. (Answer: `lib/agents/diagnostic.ts:87-126` (Anthropic call at `:97`); `lib/agents/recommendation.ts:82-132` (Anthropic call at `:96`). Both lack `res.usage` logging. The fix is `console.log` of `res.usage` at each call site — plus the same fix at `lib/agents/base.ts:102` (main loop turn) and `lib/agents/intent.ts:18` (haiku classifier). Total: 4 call sites, ~5 lines.)
-
-**Level 2 — Explain.** Why does the synthesize call cost approximately 2× a loop turn even though both are single `anthropic.messages.create` calls? (Answer: per-token Anthropic pricing is asymmetric — output tokens cost roughly 5× input tokens. A loop turn is input-heavy: ~6K input + ~800 output, so output is a small fraction of the bill. Synthesize is output-heavy: ~4K input + ~3K output, so output is *half* the bill. The 5× output multiplier amplifies that half, making synthesize's per-call cost roughly 2× the loop turn even with comparable total tokens. Output-heavy calls always dominate in pricing; that's the structural reason synthesize is the suspected concentration.)
-
-**Level 3 — Apply.** A new agent is being added that runs after recommendation. It will likely have its own synthesize fallback. What three things would you measure before shipping it, and how? (Answer: (1) The new agent's synthesize fire rate — add a counter at the fallback path. (2) The new agent's per-call cost — add `res.usage` logging at both the loop call site and the synthesize call site. (3) The total per-investigation cost increase — wrap the route's `done` event with a summary log line: `console.log('[perf]', { investigation_id, total_input, total_output, total_synthesize_calls, total_cost_estimate })`. All three are `console.log` additions; the new agent ships measured rather than estimated.)
-
-**Level 4 — Defend.** A reviewer says "you've identified the cost concentration but haven't actually fixed anything — this audit is just hand-waving." Defend. (Answer: the audit's value is the *sequencing*. The right next step isn't to "fix synthesize" — that's a decision that requires data. The right next step is to *land the meter*, which is the five-line fix. With the meter, three things become possible: (a) confirm or refute the synthesize concentration suspicion; (b) measure how often the fallback fires; (c) measure the actual per-investigation cost. Without the meter, any "fix" is shipping blind. The audit isn't hand-waving — it's the prerequisite ordering. Five lines of `console.log` is the actionable thing. Ripping out synthesize without measurement would be the hand-wave.)
-
 ---
 
 ## See also
@@ -626,3 +616,4 @@ Updated: 2026-06-16 — 3 of 5 Anthropic call sites now log `res.usage` (`base.t
 
 ---
 Updated: 2026-06-19 — Phase 3 evals (the source of the ~$10-15 measured cost data) are GONE; per-call attribution remains uncomputed. The 2 unmeasured synthesize() sites are still the only remaining unmeasured Anthropic call sites. ~2 lines of console.log still closes the gap.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

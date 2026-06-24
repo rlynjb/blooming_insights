@@ -482,28 +482,6 @@ Yes — and this is the one candidates avoid because graceful sounds good. The `
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the recovery cascade for a diagnosis: the budget bound at the top (forceFinal withholds tools), then the three output tiers (tryParse → synthesize → FALLBACK), then the transport recovery below (retry + no-cache-on-error). Mark which tier never throws.
-
-### Level 2 — Explain
-
-Out loud: explain why the budget is both the latency bound and the loop protection, and why a *separate* `synthesize()` call recovers output that the loop's own final turn could not produce.
-
-### Level 3 — Apply
-
-Scenario: an investigation returns `FALLBACK` ("Insufficient data") even though the trace shows six successful tool calls with real data. Where do you look? Start at `lib/agents/diagnostic.ts` L74–L75: both `tryParseDiagnosis(finalText)` and `synthesize()` returned `null`. Check whether the forced-final turn emitted prose (was `synthesisInstruction` appended at `base.ts` L98?) and whether `synthesize`'s `try/catch` (L123) swallowed an error. Name the fix path.
-
-### Level 4 — Defend
-
-A reviewer says: "Drop the `synthesize()` call and the `FALLBACK` — if the loop returns JSON it is fine, and the extra call is wasted cost." Defend the tiers using the failure mode they prevent (a stream-breaking `null` diagnosis) and the fact that `synthesize` costs nothing when the loop succeeds. Then concede the one alternative that would make them redundant (constrained decoding).
-
-### Quick check — code reference test
-
-When `McpClient.callTool` gets an error result, does it write it to the cache, and why? (Answer: no — `lib/mcp/client.ts` L137–L139 returns the error result without caching, so a transient failure cannot poison the next 60s of calls.)
-
 ## See also
 
 → 01-agents-vs-chains.md · → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → ../../study-system-design/04-caching-and-rate-limiting.md · → ../../study-system-design/06-multi-agent-orchestration.md
@@ -514,3 +492,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

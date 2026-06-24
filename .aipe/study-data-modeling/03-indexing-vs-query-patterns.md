@@ -465,16 +465,6 @@ A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add
                                           └─────────────────────────┘
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: which file contains the static EQL recipes, and what's the pattern for fitting multiple metrics into one call? What's the budget cap on monitoring agent tool calls, and why is it set there?
-
-2. **Explain.** Why does the McpClient cache use `${toolName}:${JSON.stringify(args)}` as its key? What query optimization does this play the role of in a SQL world, and what does it NOT do (hint: partial overlap)?
-
-3. **Apply.** A 1000-row briefing-list page is requested. Trace what would happen against the current in-memory `listInsights()` (today). Now design the query and index for a Postgres-backed version. Which fields would you index, and which would you not?
-
-4. **Defend.** Someone argues the monitoring agent's `maxToolCalls: 6` is too restrictive — "let it ask for more if it needs to." Defend the cap. (Hint: at 1 req/s, 6 calls is 6 seconds plus the time the model spends thinking; raising it raises wall-clock latency for a marginal data win that often doesn't change the headline.)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — `WorkspaceSchema` and the capability set are the upstream schema view the EQL is constructed against.
@@ -486,3 +476,4 @@ A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add
 
 ---
 Updated: 2026-06-16 — added Olist 9-index walk; reframed "not yet exercised" as "still no EXPLAIN gates in CI"; the topic is now genuinely live for the Olist tools.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

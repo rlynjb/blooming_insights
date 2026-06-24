@@ -458,16 +458,6 @@ Diagram: the lifetime-hierarchy nested-boxes diagram.
 
 Anchor: `package.json` has zero database dependencies.
 
-## Validate
-
-**Level 1 — reconstruct.** From memory, list every place a byte is stored in blooming insights and what its lifetime is. Check against the storage map in Move 1 / the primary diagram.
-
-**Level 2 — explain.** Why does `lib/mcp/auth.ts` need THREE backends? Walk dev / test / prod and the constraint that drove each choice.
-
-**Level 3 — apply.** If we added a "favorite insights" feature where a user can star an insight and see their stars next session, which existing layer would fail you and what's the minimum change? (Answer: every existing layer fails — `Map` doesn't persist, cookies could hold a star list but not arbitrary insight data. Minimum change: external KV keyed by user, OR push the star list into the `bi_auth`-style cookie if the data is small enough.)
-
-**Level 4 — defend.** Argue for or against migrating `lib/state/insights.ts` to Vercel KV TODAY. Name the cost (a deploy, a vendor lock, a new failure mode), name the benefit (cross-instance coherence, survives cold starts, enables history), name the trigger (you'd do it when feature X arrives, not before).
-
 ## See also
 
 - `06-locks-mvcc-and-concurrency-control` — the concurrent-write seams named above
@@ -478,3 +468,4 @@ Anchor: `package.json` has zero database dependencies.
 
 ---
 Updated: 2026-06-19 — Olist SQLite tier (Move 2e and supporting diagrams) removed; Olist altitude collapsed back to the single "no DB" altitude. Move 2e now describes the synthetic data source as the in-process, no-storage demo backstop.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

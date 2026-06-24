@@ -376,28 +376,6 @@ adversarial.json ─▶ ?q= path ─▶ assert: no destructive tool / no leak
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the one-line difference between a unit test case and an eval case (what changes is the assertion and whether the model is real). Then list the three eval set types and what each measures.
-
-### Level 2 — Explain
-
-Out loud: why does a green run of all 221 Vitest tests tell you nothing about whether `DiagnosticAgent` produces a *correct* diagnosis — given that the repo today has no eval suite scoring that? Use `isDiagnosis` (which only validates *shape*) to make the point concrete: the Vitest suite is plumbing; the parallel quality layer that would close this gap does not exist in this repo right now.
-
-### Level 3 — Apply
-
-Scenario: a teammate edits `lib/agents/prompts/diagnostic.md` to "make diagnoses more concise" and the demo still looks fine. Open `lib/mcp/validate.ts` L29–L35 and `test/agents/diagnostic.test.ts` — explain which tests would catch a *quality* regression from this edit (answer: none), and describe the golden case you would add to catch it.
-
-### Level 4 — Defend
-
-A colleague says "we already have 169 tests, we don't need evals." Argue the distinction: name what the tests guard, name what they cannot, and give the concrete change (a model swap or a `?q=` injection) that the test suite would pass through silently while an eval set would catch.
-
-### Quick check — code reference test
-
-What does `isDiagnosis` (`lib/mcp/validate.ts` L29–L35) actually assert about a diagnosis, and why does that prove the codebase has no eval coverage of diagnosis quality? (Answer: it asserts `conclusion` is a string and `evidence`/`hypothesesConsidered` are arrays — pure shape validation — so a factually wrong diagnosis passes; quality is never scored anywhere, confirming Case B.)
-
 ## See also
 
 → 02-eval-methods.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../06-production-serving/03-prompt-injection.md · → ../04-agents-and-tool-use/06-error-recovery.md
@@ -411,3 +389,4 @@ Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file 
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Phase 3 flipped this file from Case B to Case A: opening verdict, Current state vs future state table, and Implementation in codebase now anchor to the real `eval/fixtures/`, `eval/scripts/`, and `mcp-server-olist/data/olist.db` `seeded_anomalies` table; 269 Vitest tests (was 169); replaced the now-obsolete "build the evals/ directory" exercises with two new ones (adversarial set for `?q=` to close the remaining Case-B gap; promote captured failures into `eval/fixtures/regression-golden/`).
 Updated: 2026-06-19 — Olist removal (PR #8 / 62c24d7) collapsed this file back from Case A to Case B: opening verdict reverts, Current state vs future state table relabeled "TODAY (Case B)" vs "WHAT A FUTURE CASE A WOULD ADD", Implementation in codebase rewritten to say "not present" for each set type (with what was there before, now gone), interview-defense + one-line anchors + Level 2 reverted from "the eval/ suite scores quality" to "no eval suite in the repo today"; test count 269→221; exercise list replaces "promote a captured failure into regression-golden" with "build a minimal golden set + runner over `SyntheticDataSource`" (the cheapest re-entry to Case A).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

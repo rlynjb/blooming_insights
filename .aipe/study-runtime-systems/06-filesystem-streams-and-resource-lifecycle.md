@@ -494,13 +494,6 @@ A: It's a textbook anti-pattern in the general case — sync I/O blocks the even
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Draw the route's stream lifecycle from `start(controller)` through `try`/`catch`/`finally` to `controller.close()`. Add an arrow showing what the client sees at each step.
-2. **Explain.** Why doesn't `useInvestigation` call `reader.cancel()` on effect cleanup? What would that break? (React StrictMode double-mounts in dev — the started-ref guard blocks the second mount's fetch, but a cleanup-time cancel on the first mount's stream would abort it before any bytes arrived. See `lib/hooks/useInvestigation.ts:32-36`.)
-3. **Apply.** A new route streams a multi-megabyte CSV from a tool result. Should it use the same `ReadableStream` pattern? What changes? (Yes for the controller pattern. What changes: be careful about `controller.desiredSize` / backpressure if the producer outpaces the client — not exercised today, but the lever exists.)
-4. **Defend.** Defend the absence of a `cancel(reason)` callback on the route's `ReadableStream`. Why doesn't the route react to a client closing the tab? (Documented at `useInvestigation.ts` — we deliberately let the stream complete; the server keeps running. The cost is named in `07`: a client disconnect doesn't stop billing on Anthropic/MCP. The right fix when this matters is to add `cancel` + propagate to an `AbortController` threaded through the agent loop.)
-
 ---
 
 ## See also
@@ -513,3 +506,4 @@ A: It's a textbook anti-pattern in the general case — sync I/O blocks the even
 
 ---
 Updated: 2026-06-16 — added subprocess-as-resource section (6.5) with OlistDataSource lifecycle, factory dispose contract, and the no-op vs kill-child asymmetry.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

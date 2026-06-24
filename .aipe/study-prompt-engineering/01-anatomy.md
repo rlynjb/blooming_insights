@@ -384,28 +384,6 @@ synthesis append (L98)  = "emit it NOW, no tools" (last thing read → wins)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three time-layers (constant `.md` → per-call injection → synthesis append) and list the six shared sections of the `.md` in order. Name which placeholder is unique to each of the diagnostic, recommendation, and query agents.
-
-### Level 2 — Explain
-
-Out loud: why is `{project_id}` replaced with the global regex `/\{project_id\}/g` (`diagnostic.ts` L47) while `{anomaly}` uses a plain string replace (L48)? What bug does the `/g` prevent, and when would it matter for `{anomaly}`?
-
-### Level 3 — Apply
-
-Scenario: you're adding a fifth agent — a "forecasting" agent that needs a `{horizon}` value injected. Using `diagnostic.ts` L45–48 as the template, write the `.replace` chain, decide which of the six sections the forecasting-specific method goes in, and write the one-line Role disclaimer that keeps it from stepping on the monitoring agent's job.
-
-### Level 4 — Defend
-
-A reviewer says: "Just inline the synthesis instruction into each prompt's `## Output` section — one less moving part." State what that costs (the model reads it mid-loop as "later," not "now"; you lose the tools-removed + recency-last effect of `base.ts` L96–101), and the condition under which inlining would actually be fine (a single-shot, non-agentic prompt with no tool loop).
-
-### Quick check — code reference test
-
-In `lib/agents/base.ts`, what exactly is the `system` value on the forced-final turn, and what else changes on that turn? (Answer: `` `${system}\n\n${synthesisInstruction}` `` at L98 when `forceFinal && synthesisInstruction`; additionally `params.tools` is *not* set at L101, removing the tools so the model must produce a final answer.)
-
 ## See also
 
 → 02-structured-outputs.md · → 03-prompts-as-code.md · → 06-single-purpose-chains.md · → 07-output-mode-mismatch.md
@@ -418,3 +396,4 @@ Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file 
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added the Phase 2.5 anatomy receipt: monitoring.md gained a `## DATA HORIZON` section (constant Layer A) whose date values arrive via `schemaSummary()` inside the `{schema}` placeholder (per-call Layer B). The section earned its place through a measured 5x loose-recall lift on the eval suite — anatomy choices now carry receipts.
 Updated: 2026-06-19 — Removed the Phase 2.5 DATA HORIZON receipt section (the Olist anchor + the 5x loose-recall lift are no longer reproducible — commit 03fba57 rewrote `legacy-prompts/` to Bloomreach-only, and the `eval/` suite is gone). Rewrote Implementation block to name both the active path (`@aptkit/prompts` via `@aptkit/core@0.3.0`) and the legacy path (`lib/agents/legacy-prompts/`); the anatomy itself is unchanged on both sides.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

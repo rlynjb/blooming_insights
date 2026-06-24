@@ -332,28 +332,6 @@ No — and conflating the two is the dodge. `full` means *runnable*: the schema 
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the gate stage: schema → `schemaCapabilities` (Set) → `coverageReport` (10 classified) → the split into `runnableCategories` (to the agent) and the full report (to the grid). Label the gate as "free, in-memory, before the agent" and `agent.scan` as "expensive, rate-limited, after."
-
-### Level 2 — Explain
-
-Out loud: explain why a prompt instruction ("skip categories with no data") cannot prevent the wasted query, and why the gate can — anchor it to the fact that the agent can't see the schema's contents until it spends a call.
-
-### Level 3 — Apply
-
-Scenario: a workspace emits `view_item`, `cart_update`, `checkout`, `purchase`, `session_start` but no `search`, `return`, or `payment_failure` events, and has no inventory catalog. Walk the ten categories through `coverageFor` (`lib/agents/categories.ts` L131–L136 + the `CATEGORIES` deps L19–L112): how many are `full`, `limited`, `unavailable`? Which does `runnableCategories` (L158) hand to the agent, and what does the grid show for the rest? (Check: 5 full, 2 limited — `inventory` and `campaign_perf` miss a soft dep — 3 unavailable.)
-
-### Level 4 — Defend
-
-A reviewer says: "Delete the gate — just run all ten categories and ignore the empty results. Less code." Defend the gate using the agent's scarce resource (the ~1 req/s budget under a 300s ceiling, `maxToolCalls`-capped) and the silent-waste failure mode, then concede the condition under which the reviewer is right (a tiny, unmetered, latency-insensitive data source where the wasted calls cost nothing).
-
-### Quick check — code reference test
-
-What two outputs does the gate produce from a single `coverageReport`, and who consumes each? (Answer: `runnableCategories` → the monitoring agent's checklist via `agent.scan` at `briefing/route.ts` L223; the full `coverageReport` → the `CoverageGrid` via per-category `coverage_item` events at L209–L212. One computation, two consumers.)
-
 ## See also
 
 → 04-tool-routing.md · → 01-agents-vs-chains.md · → ../06-production-serving/02-llm-cost-optimization.md · → ../06-production-serving/04-rate-limiting-backpressure.md · → ../../study-system-design/08-schema-gated-coverage.md · → ../../study-dsa-foundations/02-arrays-strings-and-hash-maps.md
@@ -364,3 +342,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

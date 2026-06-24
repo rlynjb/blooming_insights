@@ -413,13 +413,6 @@ The lease — a lock with a TTL. A naive distributed lock without an expiration 
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, list the three classical responses to cross-machine clocks (Lamport / vector / HLC) and name the failure mode each fixes.
-- **Explain.** Why is the `lastCallAt` update in `lib/data-source/bloomreach-data-source.ts:200` in the `catch` block as well as the `try` block? So the next call's spacing applies even after a failure — without this, a thrown error would leave `lastCallAt` stale, and the next call might fire too quickly.
-- **Apply.** A new feature wants "exactly one briefing per organization per day at 8am." Walk through the leader-election question. (Vercel Cron Jobs — the platform IS the leader-election protocol for this. Define the cron entry, point it at a route handler; Vercel guarantees one invocation per schedule entry. No custom consensus needed.)
-- **Defend.** Why does `Insight.timestamp = new Date().toISOString()` not need a clock-skew correction? Because the only consumer is the browser, displaying "X minutes ago" — a cosmetic computation with no data-path dependency. Cosmetic skew is acceptable; correctness skew (which doesn't exist here) wouldn't be.
-
 ---
 
 ## See also
@@ -432,3 +425,4 @@ The lease — a lock with a TTL. A naive distributed lock without an expiration 
 
 ---
 Updated: 2026-06-16 — Added Callsite 2b (Olist durationMs); migrated line refs to `lib/data-source/bloomreach-data-source.ts`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

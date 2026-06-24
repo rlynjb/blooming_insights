@@ -406,28 +406,6 @@ Because a diagnosis is a reasoning task — haiku may fail the `isDiagnosis` val
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, list the three lever families (route, shrink, see) and place each blooming insights mechanism under one: haiku classifier, `maxToolCalls`, 16k truncation, tool cache, prompt caching (absent), in-agent cascade (absent), cost meter (absent).
-
-### Level 2 — Explain
-
-Out loud: explain why "switch everything to a cheaper model" can *increase* cost for a reasoning task. Tie it to the `isDiagnosis` validator and the double-pay failure mode of a cascade.
-
-### Level 3 — Apply
-
-Scenario: the monthly LLM bill spiked. Open `lib/agents/diagnostic.ts` L87–L126. Explain why this `synthesize()` call is the first place to suspect, citing its `max_tokens: 2048` (L99) and that it emits JSON (output tokens). Then state exactly where you would read `res.usage` to confirm it (after the create at L97).
-
-### Level 4 — Defend
-
-A teammate wants to add a haiku-first cascade to every agent immediately. Defend the position that the cost meter must ship first: state what you cannot know without it (whether the cheap pass succeeds often enough to beat the double-pay), and name the file where the meter would live (`lib/agents/base.ts`, reading `res.usage` after L102).
-
-### Quick check — code reference test
-
-Which model does the intent classifier use, on which line, and what is its `max_tokens`? (Answer: `claude-haiku-4-5-20251001` at `lib/agents/intent.ts` L14, `max_tokens: 16` at L20.)
-
 ## See also
 
 → 01-llm-caching.md · → 04-rate-limiting-backpressure.md · → ../01-llm-foundations/README.md · → ../04-agents-and-tool-use/README.md
@@ -441,3 +419,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

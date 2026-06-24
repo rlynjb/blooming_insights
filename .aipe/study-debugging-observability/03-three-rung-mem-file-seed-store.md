@@ -424,13 +424,6 @@ The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the even
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, draw the 3 rungs and label the read priority. Test: name the file:line range for `getCachedInvestigation`. Anchor: `lib/state/investigations.ts:22-28`.
-2. **Explain.** Why does `saveInvestigation` use `try/catch` around `writeFileSync`? What scenario does that defend against, and why is the `PERSIST` gate the *primary* defense? Anchor: `lib/state/investigations.ts:34-37`.
-3. **Apply to a scenario.** A captured investigation produces a different result on replay than on the original live run. List three categories of cause, ranked by likelihood: (a) staleness in the seed vs current code, (b) the live run drifted (LLM non-determinism), (c) a bug in the replay path.
-4. **Defend the decision.** Argue for replacing rung 2 (the dev file) with Vercel KV / Redis so prod also persists captured runs. Then argue why the current 3-rung shape is right for an early-stage demo-first app.
-
 ---
 
 ## See also
@@ -444,3 +437,4 @@ The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the even
 
 ---
 Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this 3-rung store is now the only persistence layer for trace evidence in the repo.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

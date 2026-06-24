@@ -425,13 +425,6 @@ Two reasons. First, NDJSON is symmetric: the same `JSON.stringify(e) + '\n'` sha
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, list the 8 variants of `AgentEvent` and group them as annotation / span / output / terminal. Anchor: `lib/mcp/events.ts:4-12`.
-2. **Explain.** Why is the `\n` in `encodeEvent` load-bearing rather than cosmetic? What does the consumer do without it?
-3. **Apply to a scenario.** A new agent emits a "plan" output — the agent produced an intermediate plan before tool dispatch. Argue for (a) adding a 9th variant `plan: { steps: string[] }`, vs (b) overloading `reasoning_step` with `kind: 'plan'`. Which preserves the trichotomy?
-4. **Defend the decision.** Why is the `error` variant's `message: string` field a deliberate exception to the typed-evidence rule? What's the cost, and when would you fix it?
-
 ---
 
 ## See also
@@ -446,3 +439,4 @@ Two reasons. First, NDJSON is symmetric: the same `JSON.stringify(e) + '\n'` sha
 
 ---
 Updated: 2026-06-19 — kept cross-link to `06-` with RETIRED treatment after PR #8 removed the Olist eval pipeline; added an introductory note in How it works that AptKit's traces also produce events on this same surface via `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) — same NDJSON contract, additional producer.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

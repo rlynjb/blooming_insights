@@ -430,13 +430,6 @@ The order of the writes also matters: push first, enqueue second. If `enqueue` t
 
 ---
 
-## Validate
-
-1. **Reconstruct.** Without looking, write the two lines of the `send` closure and explain which destination each one serves. Anchor: `app/api/agent/route.ts:172-175`.
-2. **Explain.** Why does `saveInvestigation` only fire when `step == null`? What would change if you removed the gate? Anchor: `app/api/agent/route.ts:254`.
-3. **Apply to a scenario.** The route catches an exception partway through an investigation. Walk what's in `collected[]` at that moment, what's on the wire, and what's in the snapshot. What would it take to capture half-runs for diagnosis?
-4. **Defend the decision.** Argue for splitting the dual-write into two separate functions (`emit(e)` and `capture(e)`) called explicitly by the agent loop. Then argue why the single closure is the right shape for this codebase.
-
 ---
 
 ## See also
@@ -450,3 +443,4 @@ The order of the writes also matters: push first, enqueue second. If `enqueue` t
 
 ---
 Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this dual-write is now the only place the trace gets captured-while-emitted in the repo.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

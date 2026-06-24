@@ -387,45 +387,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the two shapes side by side: static RAG (one-shot pipeline) on the left, agentic RAG (the loop) on the right. Under "agentic RAG," draw the retriever as a slot and label what fills it in this codebase.
-
-Open the file. Compare.
-
-✓ Pass: you drew the loop with `reason → tool_use → observe → repeat`, labelled the retriever slot as `execute_analytics_eql` / live API / no vector index, and put the stop rule (no `tool_use` block or `maxToolCalls`) somewhere
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague who knows static RAG asks: "wait, is this even RAG if there's no vector store?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Define RAG as "retrieve, then ground the answer," not as "embed and stuff"?
-- Name what fills the retriever slot here (`execute_analytics_eql` against Bloomreach via MCP)?
-- Name the loop's stop rule (model emits no `tool_use`, or `maxToolCalls` budget)?
-- Say at least one reason embeddings would be the wrong retriever for this data (freshness, exactness, or "source is an API")?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: "let users ask 'have we seen this pattern before?' against past investigations stored as free-text narratives." Without opening the codebase: is this still the live-tool retriever, or does this push the retriever back toward an embedding index? What would you change in `runAgentLoop`, and what would you add alongside?
-
-Write your answer (4–6 sentences). Then open `lib/agents/base.ts` L48–L176 and check whether the loop body itself would change — or only what `mcp.callTool` resolves to.
-
-### Level 4 — Defend the decision you'd change
-"If you were building this today and you had to give up either the live tool retriever OR the agentic loop (keep one, kill the other), which goes? What does the system look like in the version you kept, and what does it stop being able to answer?"
-
-Reference the code: point to `lib/agents/base.ts` L85 (the loop) and `lib/mcp/tools.ts` (the retriever-as-tool), and describe what each shape covers alone.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the agentic-RAG loop and what function?
-- What's the tool name the model calls to retrieve from Bloomreach?
-- What two caps stop the loop from running forever, and where do they live in `base.ts`?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-self-corrective-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/02-react.md` · → why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
@@ -436,3 +397,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

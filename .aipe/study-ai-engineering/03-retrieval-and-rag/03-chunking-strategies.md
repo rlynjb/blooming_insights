@@ -307,28 +307,6 @@ each chunk: one topic + insightId metadata
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw a document split three ways: fixed-size with overlap, rank-truncation (keep the top slice), and semantic (split at section boundaries). State the failure mode of each.
-
-### Level 2 — Explain
-
-Out loud: why is the chunk boundary the "resolution" of a search? Why does a too-large chunk produce a blurry embedding?
-
-### Level 3 — Apply
-
-Scenario: build a chunker for past investigations. Open `lib/state/investigations.ts` (stored events per investigation) and `lib/mcp/types.ts` L68–L77 (the `Investigation` shape). Name the natural chunk boundaries (diagnosis, hypotheses, recommendations), the metadata each chunk must carry to trace back, and where overlap helps. Contrast with `schemaSummary`'s rank-truncation in `lib/agents/monitoring.ts` L15–L48.
-
-### Level 4 — Defend
-
-A colleague says "just make each whole investigation one chunk — simpler." Argue the cost (its embedding averages a dozen topics into a vague point that matches everything weakly) and propose per-finding chunking with traceability metadata. Then name when the one-chunk approach is actually fine (very short investigations).
-
-### Quick check — code reference test
-
-What chunking strategy does blooming insights use today, where, and what does it silently drop? (Answer: rank-truncation — `schemaSummary` in `lib/agents/monitoring.ts` L15–L48 sorts events by `eventCount` and keeps the top 20 (`MAX_EVENTS`), 10 properties each, 30 customer properties — silently dropping every relevant event below the volume cut.)
-
 ## See also
 
 → 01-embeddings.md · → 04-vector-databases.md · → 10-incremental-indexing.md · → 11-rag.md
@@ -336,3 +314,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

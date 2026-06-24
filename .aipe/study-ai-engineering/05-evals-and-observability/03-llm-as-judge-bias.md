@@ -359,28 +359,6 @@ rubric:   each required point present? → length is irrelevant
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, name the three judge biases and the one-line mechanical fix for each. Then state which bias is the live trap in blooming insights and why.
-
-### Level 2 — Explain
-
-Out loud: why is a clean numeric score from a biased judge *more* dangerous than having no score at all? Tie it to the fact that you act on numbers.
-
-### Level 3 — Apply
-
-Scenario: a teammate builds the first eval and reaches for the Anthropic SDK already in the repo, judging diagnosis output with `claude-sonnet-4-6`. Open `lib/agents/base.ts` L9 — name the exact bias this introduces, why it is by construction, and the minimal change that fixes it.
-
-### Level 4 — Defend
-
-A colleague argues "cross-family judging is overkill — we'll just tell the judge to be objective in the prompt." Argue why an instruction does not remove a systematic bias, what swap-and-average and cross-family selection do that a prompt cannot, and when a single cross-family judge is still insufficient (panel of judges).
-
-### Quick check — code reference test
-
-What model do the diagnostic and recommendation agents run on, and why does that make the choice of judge model a bias decision? (Answer: `claude-sonnet-4-6` — `AGENT_MODEL` at `lib/agents/base.ts` L9 — so judging their output with another `claude-sonnet-4-6` call is self-preference bias by construction; the judge must be a different family for the score to reflect quality rather than the judge recognizing its own style.)
-
 ## See also
 
 → 02-eval-methods.md · → 01-eval-set-types.md · → 04-llm-observability.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md
@@ -392,3 +370,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Phase 3 flipped this file to "Case A — partial; trap acknowledged-and-receipted, not avoided": opening verdict + Implementation in codebase now name the three live LLM-as-judge surfaces (`eval/judges/diagnosis-judge.md`, `recommendation-judge.md`, `similarity-judge.md`, all on `claude-sonnet-4-6` → self-preference live). Calibration receipts cited (diagnosis 8/8, recommendation 3/3 incl BRL-bug catch); cross-family judging + pairwise + panel-of-judges named as the remaining Case-B gaps. Replaced the "build a debiased judge" exercise with two new ones: cross-family judge (close self-preference) and standardized calibration receipts.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

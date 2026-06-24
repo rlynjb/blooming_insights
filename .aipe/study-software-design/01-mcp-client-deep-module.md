@@ -396,16 +396,6 @@ Interview-defense diagram — the spacing gate, why it's load-bearing
        BAD: penalty window drives the run     GOOD: spacing keeps under the limit
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the file: name the three methods `McpClient` exposes and the eight mechanics absorbed behind `callTool`. What's the cache key format?
-
-2. **Explain.** Why is the cache write-on-success-only — what would go wrong if the wrapper cached rate-limit error envelopes? (Hint: subsequent retries would hit the cache and return the same error envelope for the cache TTL, locking the agent out of the tool for 60 seconds.)
-
-3. **Apply.** Bloomreach changes their error prose to `"please retry in 12 seconds"`. Which file (and which lines) change in this codebase? How many other files change? (Answer: `lib/mcp/client.ts:31-38` only — the regex updates. The grep test confirms zero other matches.)
-
-4. **Defend.** A reviewer says "let's split this into `McpCache`, `McpRateLimiter`, `McpTransportAdapter` for testability." Argue against. (Hint: invoke the depth ratio — three split classes would widen the interface (each with its own constructor, methods, types to import) and shrink each hidden body. The test seam already exists at `McpTransport` injection. Classitis is the failure mode you'd be creating.)
-
 ## See also
 
 - `audit.md` — the deep-vs-shallow-modules lens now names the **DataSource seam** as the new top deep-module case study; `BloomreachDataSource` is the deepest single class. The deep walk on the seam lives in the audit lens itself.
@@ -415,3 +405,4 @@ Interview-defense diagram — the spacing gate, why it's load-bearing
 
 ---
 Updated: 2026-06-16 — class renamed to `BloomreachDataSource` and moved to `lib/data-source/bloomreach-data-source.ts` in Phase 2 PR A; internals unchanged; `lib/mcp/client.ts` kept as 17-line shim; depth analysis still holds; cross-refs updated to flag resolved sibling files.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

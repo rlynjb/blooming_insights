@@ -537,16 +537,6 @@ A: When the system under test is the *transport* itself — OAuth, rate limiting
   it's the boundary of what the pattern covers.
 ```
 
-## Validate
-
-1. **Reconstruct.** Without opening the files: name the two methods on the `DataSource` interface and the three-field result envelope of `callTool`. Why does `fromCache` always return `false` from the synthetic adapter, and what would be misleading about returning `true`?
-
-2. **Explain.** The factory `makeDataSource(mode, sessionId)` returns *different* `bootstrap` functions for live vs synthetic (one fans out across ~4 MCP round-trips; the other returns the const directly). Why is this asymmetry **correct**, not a smell? (Hint: trace what each one does and what the agent above the factory sees.)
-
-3. **Apply.** Suppose you want to add a new tool, `get_funnel_breakdown`, that breaks down a funnel by customer segment. Trace the changes needed: which MCP module gets it added to (so it shows up in `toolNames`), which dispatcher case has to be written in `SyntheticDataSource`, and what shape the const literal must have. What's the simplest test you'd write to catch the day someone advertises the tool without implementing the case?
-
-4. **Defend.** Someone proposes replacing the const-literal approach with a seeded PRNG (mulberry32-style) so the synthetic data can vary across calls without losing determinism. Defend the *current* pure-const approach for THIS repo today. At what point would the seeded PRNG earn its place? (Hint: file 09's RETIRED banner names the predecessor that used mulberry32; what use case justified it then that doesn't apply now?)
-
 ## See also
 
 - `01-the-data-model-and-its-shape.md` — `WorkspaceSchema` is the typed shape both adapters derive into; the synthetic derivation is the top-level const this file walks.
@@ -558,3 +548,4 @@ A: When the system under test is the *transport* itself — OAuth, rate limiting
 
 ---
 Created: 2026-06-19 — new pattern file covering the in-process synthetic fixture (`lib/data-source/synthetic-data-source.ts`). Replaces the data-modeling-for-test slot previously held by the deterministic-synthetic-data file (09), which is now RETIRED.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -301,28 +301,6 @@ millions of chunks  → vector DB (Tier 3)
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the four storage tiers (in-memory `Map`, JSON/SQLite, ANN index, vector DB) and state the nearest-neighbor method and scale threshold for each.
-
-### Level 2 — Explain
-
-Out loud: why is brute-force nearest-neighbor exact but eventually too slow? Why does an ANN index give up exactness, and how do you measure what you gave up?
-
-### Level 3 — Apply
-
-Scenario: you are storing embedded past-investigation chunks. Open `lib/mcp/client.ts` L18 (`McpClient.cache` `Map`) and `lib/state/investigations.ts` (the JSON-file persistence pattern). Name which tier you would start in, why a vector DB is unwarranted at ~100 investigations, and the concrete signal (scale or latency) that would justify climbing a tier.
-
-### Level 4 — Defend
-
-A colleague wants to provision a managed vector DB for the "search past investigations" feature on day one. Argue the cost (provisioning, a network hop per query slower than an in-memory scan, a monthly bill) against the data size, and propose the `Map`/JSON tier the codebase already uses for its cache. Then name the threshold at which they would be right.
-
-### Quick check — code reference test
-
-What storage tier does blooming insights already run that a small vector index would reuse, and where? (Answer: the in-memory `Map` tier — `McpClient.cache` at `lib/mcp/client.ts` L18 and the module-level schema cache at `lib/mcp/schema.ts` L130, plus JSON-file persistence in `lib/state/investigations.ts` — the "<1k items, brute-force scan" tier where no vector DB is needed.)
-
 ## See also
 
 → 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
@@ -330,3 +308,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

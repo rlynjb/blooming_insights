@@ -386,28 +386,6 @@ The dodge is to say "yes" because there is a cache. The honest answer is "it has
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw both layers: (a) the short-term `messages` array's lifecycle (born, grows, discarded) with the line that appends tool results; (b) the long-term three-tier lookup (`mem` → dev file → demo seed). Mark which survives a run and which does not, and write "NO semantic layer" where the vector store would go.
-
-### Level 2 — Explain
-
-Out loud: explain why the model needs the *full* `messages` array on every call, not just the latest tool result, and why long-term memory storing exact snapshots cannot answer "similar past investigations."
-
-### Level 3 — Apply
-
-Scenario: a PM asks for a "you investigated something like this last month" banner. What does the codebase support today, and what is missing? Check `lib/state/investigations.ts` L22–L28 — the lookup is `mem.get(insightId)`, an exact-key hash lookup with no similarity. Explain that the banner requires a new semantic layer (embed + top-k), name where it would live (`lib/state/investigation-memory.ts`), and reference ../03-retrieval-and-rag/ for the retrieval mechanics.
-
-### Level 4 — Defend
-
-A colleague says: "Just add a vector DB now so the agent can learn from history." Defend the current exact-key store for the repeat-visit use case, name the access pattern the vector DB would actually serve, and state the breakpoint (a real "similar investigations" feature) at which adding it becomes correct rather than speculative.
-
-### Quick check — code reference test
-
-In `getCachedInvestigation`, what are the three sources checked in order, and what is returned on a complete miss? (Answer: in-process `mem` Map → dev `CACHE_FILE` (only when `PERSIST`) → committed `DEMO_FILE`; returns `null` on a miss — `lib/state/investigations.ts` L22–L28.)
-
 ## See also
 
 → 01-agents-vs-chains.md · → 03-react-pattern.md · → 06-error-recovery.md · → ../03-retrieval-and-rag/ · → ../../study-system-design/06-multi-agent-orchestration.md · → ../../study-system-design/04-caching-and-rate-limiting.md
@@ -421,3 +399,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

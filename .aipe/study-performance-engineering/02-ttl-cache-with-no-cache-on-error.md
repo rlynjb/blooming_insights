@@ -480,16 +480,6 @@ The full picture — key derivation, read path, miss path, write path with the e
 
 ---
 
-## Validate
-
-**Level 1 — Reconstruct.** Name the cache's data structure, key shape, default TTL, and the file:line where the error-bypass guard lives. (Answer: `Map<string, { result, expiresAt }>` at `lib/mcp/client.ts:80`. Key: `${name}:${JSON.stringify(args)}`. Default TTL: 60_000 ms. Error-bypass guard at `lib/mcp/client.ts:137-145` — `if ((result as any)?.isError === true) return { ..., fromCache: false }` without storing.)
-
-**Level 2 — Explain.** Why does the cache use exact-match keying (`JSON.stringify(args)`) instead of semantic similarity? (Answer: semantic similarity would let you return one EQL's result for a "similar" EQL — but for analytics queries, a different filter or a different period means a different number. The user expects the correct answer, not a similar one. Exact-match accepts more misses in exchange for *bounded staleness* (same args → same answer for 60s, which is safe); semantic similarity would silently return wrong answers. Cache misses are recoverable; wrong answers aren't.)
-
-**Level 3 — Apply.** A new feature wants to cache the LLM's *responses* (not tool results) by their prompt hash. What three guards from this cache should you reuse, and what's an LLM-specific guard you should add? (Answer: (1) exact-match keying (different prompts mean different responses; semantic similarity would be wrong); (2) error-bypass (if Anthropic returns a 5xx or content policy reject, don't cache it); (3) TTL bounded by the use case (how long is the response semantically valid?). LLM-specific guard: don't cache responses that include `tool_use` blocks — those are mid-conversation steps, not final answers; caching them would mean the cached "answer" is "I'd like to call this tool now," which is not the answer the next caller wants. Only cache *terminal text-only* responses.)
-
-**Level 4 — Defend.** A reviewer says "the cache adds complexity — what's it actually saving on a typical investigation, and is it worth it?" Defend. (Answer: a typical diagnostic agent makes 6 tool calls; if 2 of them hit the cache (Claude re-derives a query while exploring), that's ~3-6s saved (1.5-3s per skipped call) AND 2 rate-limit slots returned (reducing retry-storm probability). At ~100s typical investigation, that's a 3-6% latency reduction. More importantly: the savings *compound* with how often Claude revisits a query — on a complex investigation with 3-4 re-derives, the savings climb to ~5-12s. The complexity is ~20 lines of code (the Map + the read/write paths + the guard); the value is real, repeatable, and compounding. The current design is correct; the only meaningful refactor would be adding observability — emit a `cache_hit_rate` metric per investigation so we know if the leverage is actually being captured.)
-
 ---
 
 ## See also
@@ -500,3 +490,4 @@ The full picture — key derivation, read path, miss path, write path with the e
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that no cache helps with
 - `.aipe/study-agent-architecture/05-production-serving/01-cross-turn-caching.md` — the three cache scopes and why semantic similarity is off the table
 - `.aipe/study-ai-engineering/06-production-serving/01-llm-caching.md` — Anthropic's prompt-prefix caching (a related-but-different cache at a different layer)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -368,28 +368,6 @@ today:   read-only tools  → injection can only ANSWER
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the three defense layers (prompt-side, output-side, action-side) and mark each PRESENT or MISSING in blooming insights. Trace the `?q=` path from `route.ts` L54 to the model and name what is absent at each step.
-
-### Level 2 — Explain
-
-Out loud: why does the read-only-tools / no-side-effects property bound the blast radius even though the prompt-side defense is missing? Walk through what an injected "delete the campaign" actually does (nothing — no write tool) versus what an injected "print your system prompt" might do (possible leak via the unguarded prose path).
-
-### Level 3 — Apply
-
-Scenario: you are adding the prompt-side layer. Specify the exact change to `lib/agents/query.ts` L35 (inject the question into a delimited slot instead of a bare `userPrompt`), the addition to `query.md` (a `<user_question>` boundary + an instruction hierarchy saying system rules outrank question text), and the input guard at `app/api/agent/route.ts` L54 — then name the false-positive risk you must tune for.
-
-### Level 4 — Defend
-
-A reviewer says: "Add a regex on `?q=` that blocks the word 'ignore' and we're protected from prompt injection." State why a keyword blocklist is not a fix (injection has unbounded phrasings; the boundary is statistical, not lexical), why injection is unsolved (Willison), and what actually bounds the risk here (the read-only/no-side-effect and validator layers) — then describe the defense-in-depth additions that genuinely help.
-
-### Quick check — code reference test
-
-On the `?q=` query path, which line passes the user's input to the model and what processing has been applied to it by that point? (Answer: `lib/agents/query.ts` L35 — `userPrompt: query` — passes it verbatim; the only processing is the `.trim()` at `app/api/agent/route.ts` L54. No delimiters, no instruction hierarchy, and no data-vs-instruction framing are applied.)
-
 ## See also
 
 → 01-anatomy.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 07-output-mode-mismatch.md
@@ -397,3 +375,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -502,45 +502,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw fan-out backpressure: supervisor → bounded queue (upward signal) → semaphore (K slots) → upstream. Beside it, draw what this codebase has: serial agent chain → `runAgentLoop` (serial tool calls) → `liveCall` (1100 ms spacing) → Bloomreach. Mark the three pieces (semaphore, queue, signal) the canonical pattern has and this codebase doesn't.
-
-Open the file. Compare.
-
-✓ Pass: you drew the three canonical pieces and the upstream they protect, drew the serial spacer with `lastCallAt` and the sleep, and labelled the topology difference (sequential vs parallel)
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague asks "isn't the 1.1s spacing already backpressure?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the two layers of canonical backpressure (semaphore + upward signal) and which one the serial spacer lacks?
-- Distinguish "throttle one caller" (spacing) from "coordinate producer-consumer across concurrent callers" (backpressure)?
-- Cite the K = rate_limit × per_call_time math and note that Bloomreach's limit gives K≈1?
-- Name the topology breakpoint (parallel fan-out OR concurrent investigations from one user) where serial spacing stops being sufficient?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: a supervisor agent decomposes a question into 5 parallel sub-investigations, each running its own `runAgentLoop`. Without opening the code: which of the three backpressure pieces (semaphore, queue, signal) does the codebase need first? What value of K would you pick against Bloomreach's ~1 req/s limit, and what happens to the parallel-latency win if K=1?
-
-Write your answer (4–6 sentences). Then open `lib/mcp/client.ts` L80–L95 (where `lastCallAt` and `minIntervalMs` live) to see what would have to change.
-
-### Level 4 — Defend the decision you'd change
-"You said today's 1.1s spacing handles one user's serial chain. If a user opens two browser tabs and runs two investigations simultaneously, what exactly breaks in `McpClient`? Would you fix it with a shared `lastCallAt` (one spacer per user across instances) or with a semaphore? Walk the cost of each."
-
-Reference the code: point to `McpClient`'s constructor (`client.ts` L79–L95) and `liveCall` (`client.ts` L148–L163), and describe how `lastCallAt`'s per-instance scope causes the failure.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds `McpClient.liveCall` and what line range?
-- What's the `minIntervalMs` value used in `connectMcp`, and where is it set?
-- What's the K-sizing rule for concurrency (the math)?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-cross-turn-caching.md · → 03-per-tool-circuit-breaking.md · → `../03-multi-agent-orchestration/04-parallel-fan-out.md` · → single-call rate limiting: `../../study-ai-engineering/06-production-serving/04-rate-limiting-backpressure.md`
@@ -551,3 +512,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

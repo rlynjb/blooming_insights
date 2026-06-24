@@ -341,44 +341,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the two-layer picture from memory: the chain layer (what picks the next stage) on top, one stage zoomed into the agent layer (the reason→act→observe loop) below. Label which layer is code and which is model.
-
-Open the file. Compare.
-
-✓ Pass: you put the `if`-ladder/order on the chain layer and the reason→tool→observe loop on the agent layer, and labelled code vs model
-✗ Fail: re-read How it works, wait 10 minutes, try again. Do not move on until you pass.
-
-### Level 2 — Explain it out loud
-Explain "is this a chain or an agent" to a colleague who just asked "wait, which is it?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Name the specific files? → `app/api/agent/route.ts` (chain) and `lib/agents/base.ts` `runAgentLoop` (agent)
-- Say why the order is in code, not in a model?
-- Name the tradeoff (fixed order vs supervisor overhead) in one sentence?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Can we make the system skip the recommendation stage when the diagnosis confidence is low, and instead re-run diagnosis with a deeper budget?" Without looking at the file: is that a change to the chain layer or the agent layer? What exactly would you touch, and which shape (code `if` vs model decision) does it become?
-
-Write your answer (3–5 sentences). Then open `app/api/agent/route.ts` L224–L249 and check whether that `if`-ladder is where the change lands — and whether it stays an `if` or needs to read the diagnosis's confidence field.
-
-### Level 4 — Defend the decision you'd change
-"If you were building this today with the same ~1 req/s MCP limit and the same three-stage analyst flow, would you still hardcode the stage order in the route, or start with an LLM supervisor? Why? If you'd switch, what would the supervisor cost you per investigation, and which lines in `route.ts` would it replace?"
-
-Reference the code: point to `route.ts` L224–L249 for what exists, and describe what a supervisor's own `runAgentLoop` would add.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the chain (the stage-order `if`-ladder)?
-- What function holds the agent loop, and in what file?
-- Roughly what line range is the diagnostic→recommendation handoff in the route?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-react.md · → 06-routing.md · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` · → `../../study-system-design/06-multi-agent-orchestration.md`
@@ -389,3 +351,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

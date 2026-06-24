@@ -170,16 +170,6 @@ Diagram: a vertical timeline showing 10 calls spaced 1.1s apart.
 
 Anchor: `lib/agents/monitoring.ts` (scan loop); `lib/mcp/client.ts` L150-156 (`minIntervalMs` enforcement).
 
-## Validate
-
-**Level 1 — reconstruct.** Explain what `EXPLAIN` does and why a plan can change without the query changing.
-
-**Level 2 — explain.** Why is the monitoring scan sequential instead of parallel? (Answer: Bloomreach's per-user rate limit; parallel calls would just trigger more 429s and trigger retries that cost more wall time.)
-
-**Level 3 — apply.** Suppose we added a Postgres for saved insights and the dominant query is `SELECT * FROM insights WHERE user_id=? AND severity='critical' ORDER BY created_at DESC LIMIT 20`. What index makes this an index-only scan? (Answer: `(user_id, severity, created_at DESC) INCLUDE (id, headline, summary, ...)` — covers the WHERE, the ORDER BY, and the projected columns.)
-
-**Level 4 — defend.** A teammate proposes parallelizing the monitoring scan. Argue against it for this codebase as it stands. (Answer: the rate limit is global per user, not per call. Ten parallel calls all hit the same window and trigger ten 429 retries; the retry math eats more wall time than the sequential version. We'd need Bloomreach to lift the limit OR a queue with per-request budget tracking before parallel pays off.)
-
 ## See also
 
 - `01-database-systems-map` — where the planner half of the boundary actually sits
@@ -188,3 +178,4 @@ Anchor: `lib/agents/monitoring.ts` (scan loop); `lib/mcp/client.ts` L150-156 (`m
 
 ---
 Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." Move 2e (dynamic SQL construction) and the SQLite primary diagram dropped. The N+1 at the agent layer remains the load-bearing cousin.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

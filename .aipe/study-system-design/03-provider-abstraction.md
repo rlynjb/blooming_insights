@@ -698,40 +698,6 @@ Without the seam         With the seam
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking at the code, draw the two-seam vertical stack: agent layer → `DataSource` (upper seam) → adapter slot → `McpTransport` (lower seam, Bloomreach-only) → vendor edge. Place `BloomreachDataSource`, `OlistDataSource`, `SdkTransport`, `fakeTransport`, and `mcp-server-olist` into the correct positions. Add the factory (`makeDataSource`) as a sidebar. Check your diagram against the primary diagram in this file.
-
-### Level 2 — Explain
-
-Open `lib/data-source/types.ts`. Read L64–L72 (`DataSource`) and `lib/data-source/index.ts` L73–L109 (`makeDataSource`). Explain in one sentence why every agent imports `DataSource` but never `BloomreachDataSource` or `OlistDataSource`. Then explain what `lib/mcp/client.ts` is (a 17-line shim) and why deleting it today would break the codebase but in a fixable way.
-
-### Level 3 — Apply
-
-Scenario: you need to add request logging to every MCP tool call — log the tool name, arguments, and duration to the console before and after each live call.
-
-Where does the logging code go? The options are `SdkTransport.callTool` (provider layer), `McpClient.liveCall` (service layer), or a new `LoggingTransport` that wraps `SdkTransport`.
-
-Cite:
-- `lib/mcp/client.ts` L148–L163 (`liveCall`) — this is where the spacing gate runs and the transport is called.
-- `lib/mcp/transport.ts` L47–L59 — this is where the raw SDK call happens.
-
-Answer: logging belongs in `McpClient.liveCall` (L148–L163) if you want it co-located with rate-limit enforcement. It belongs in a wrapping `LoggingTransport` if you want the transport layer to be independently observable without touching `McpClient`. Both work. What stays untouched in either case: `SdkTransport`, all test fakes (they satisfy `McpTransport` and do not need to log), and `runAgentLoop`.
-
-### Level 4 — Defend
-
-A teammate proposes: "The `McpCaller` interface is pointless — `McpClient` is the only thing that satisfies it, so we should just type `mcp` as `McpClient` in `runAgentLoop`." Formulate a two-sentence rebuttal grounded in `test/agents/base.test.ts` L76–L83. Then acknowledge the one case where the teammate would be right.
-
-### Quick check
-
-- What are the two methods on `McpTransport`?
-- Which file is the only one that imports `Client` from `@modelcontextprotocol/sdk`?
-- Why does `buildFakeAnthropic` use `as unknown as Anthropic` rather than constructing a real `Anthropic` instance?
-- Name one thing `fakeTransport` tracks that lets tests verify caching behaviour.
-- In `runAgentLoop`, what is the parameter type of `mcp` and why is it not `McpClient`?
-
 ## See also
 
 → [audit.md](./audit.md) (system-map-and-boundaries lens — `DataSource` upper seam + `McpTransport` lower seam) · [01-request-flow.md](./01-request-flow.md) (now branches on `bi:mode` → `live-sql` vs `live-bloomreach`) · [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) (cache + retry live INSIDE `BloomreachDataSource`, not at the interface) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) (agents consume `DataSource`, never a concrete adapter) · [10-authored-mcp-server.md](./10-authored-mcp-server.md) (the far side of `OlistDataSource` — three domain tools over SQLite)
@@ -745,3 +711,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edits to Move 2.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

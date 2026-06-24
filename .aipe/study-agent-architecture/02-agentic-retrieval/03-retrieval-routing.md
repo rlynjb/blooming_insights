@@ -459,45 +459,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the canonical retrieval routing diagram: question → router (heuristic + LLM fallback) → one of {vector, SQL, web, live API} → agentic loop. Now mark where this codebase actually has logic and where the absence is — the capability gate goes upstream of the loop, the source router is absent.
-
-Open the file. Compare.
-
-✓ Pass: you drew the two-layer router, put the capability gate in the right place (upstream, capability-not-source layer), and labelled the source router as absent because there's one source
-✗ Fail: re-read How it works, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-A colleague asks: "wait, you said no routing, but the briefing page shows ghost tiles for categories that can't run — isn't *that* routing?" No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Distinguish source routing (pick which retriever) from capability routing (pick which questions are askable of the one retriever)?
-- Name the coverage gate (`categories.ts` `schemaCapabilities` → `coverageFor` → `runnableCategories`) as the capability route?
-- Say why source routing doesn't apply here (one source, EQL covers the surface)?
-- Name the breakpoint where source routing would earn its place (a second retriever for a question shape EQL can't express)?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A new feature ships: users can ask "find investigations similar to the one I'm looking at right now." Without opening the code: which retriever shape does this need, where does the source router slot in, and what happens to the coverage gate?
-
-Write your answer (4–6 sentences). Then open `app/api/briefing/route.ts` L200–L204 and `lib/agents/base.ts` L48 to see where the router would intercept versus where the coverage gate stays put.
-
-### Level 4 — Defend the decision you'd change
-"You said source routing doesn't apply because there's one source. If you had to ship a second source tomorrow with the same 60s investigation budget and the same 1.1s MCP spacing, what's the cheapest router you'd add and what would it cost per query? Where do the rules go, where does the LLM fallback go, and how do you keep both within budget?"
-
-Reference the code: point to `categories.ts` L158–L160 for what the capability gate already does, and `runAgentLoop` (`base.ts` L48) for where the source decision would intercept the loop's retriever binding.
-
-### Quick check — code reference test
-Without opening any files:
-- What file holds the coverage gate's `runnableCategories` filter?
-- What route calls it, and where does the result go?
-- What's the one source the agents retrieve from today?
-
-Open and verify. ✓ File + function names matter; line numbers drifting is fine.
-
 ## See also
 
 → 01-agentic-rag.md · → 02-self-corrective-rag.md · → `../01-reasoning-patterns/06-routing.md` · → `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md`
@@ -508,3 +469,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

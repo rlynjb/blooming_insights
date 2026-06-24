@@ -404,28 +404,6 @@ routing requires the jobs be separated first
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw the four links with their one verb each, mark where the diagnose→recommend handoff happens, and name the two payoffs of decomposition (attribution, routing) and the two costs (round-trips, lossy handoff).
-
-### Level 2 — Explain
-
-Out loud: why is the chain wired in `route.ts` L145–162 as code rather than having one agent decide to call the others? What does code-wiring buy for testing and debugging?
-
-### Level 3 — Apply
-
-Scenario: a final recommendation is clearly wrong. Walk the agent-tagged trace (`route.ts` L116–131): which event do you read first to decide whether the *diagnosis* or the *recommendation* link failed, and what does the typed `Diagnosis` handoff at L158 let you check?
-
-### Level 4 — Defend
-
-A reviewer says: "Merge diagnose and recommend into one prompt — it'd be one call instead of two." State what merging would save (a round-trip, full shared context) and what it would cost (unattributable failures, no per-link routing, no crisp single-shape output for the validator), and the condition under which merging would actually be right (two links always run together and never debugged independently — which none of the current four meet).
-
-### Quick check — code reference test
-
-In the investigation flow, what is the typed value passed from the diagnostic link to the recommendation link, and on which line? (Answer: the `Diagnosis` returned by `diagAgent.investigate` (L153) is passed into `recAgent.propose(inv, diagnosis, …)` at `app/api/agent/route.ts` L158 — the typed handoff between the two single-purpose links.)
-
 ## See also
 
 → 01-anatomy.md · → 07-output-mode-mismatch.md · → 02-structured-outputs.md · → 09-chain-of-thought.md
@@ -434,3 +412,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-06-16 — Added a fourth "Where this breaks down" item: Phase 2 dual-adapter framing (Bloomreach EQL + Olist SQL-tools) doubles the method section per prompt without breaking decomposition's single-job scope.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

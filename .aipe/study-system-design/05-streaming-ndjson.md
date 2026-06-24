@@ -793,36 +793,6 @@ Honest answer: SSE/`EventSource` is the standard for server push when you want r
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking at the code, write the producer side: a Next.js route handler that creates a `ReadableStream`, encodes events as NDJSON lines, and returns them with `Content-Type: application/x-ndjson`. Then write the consumer side: a `useEffect` that reads the stream, buffers chunks, splits on newline, and calls a handler per line. Compare to `route.ts` L168–L267 and `lib/hooks/useInvestigation.ts` L153–L212.
-
-### Level 2 — Explain
-
-Open `lib/hooks/useInvestigation.ts`. At L190, `dec.decode(value, { stream: true })` is called. What does the `{ stream: true }` option do? What would go wrong if you omitted it and the server sent a string containing a multi-byte UTF-8 character (e.g., "—") that was split across two TCP chunks? Then explain why L192 (`buf = lines.pop() ?? ''`) is the critical line in the consumer loop. What invariant does it maintain?
-
-### Level 3 — Apply
-
-**Scenario:** A user reports that the trace shows 3 tool calls but the diagnosis panel never renders. The stream eventually closes. Where in the consumer loop do you look?
-
-Start at `handle` in `useInvestigation.ts` L97–L151. Check the `case 'diagnosis':` branch (L122–L125) — it sets `diagnosis` state. If `diagnosis` is never set, either: (a) the `diagnosis` event was never emitted by the producer (check `route.ts` L239 — note the diagnose step is the only one that emits it), (b) the line containing the `diagnosis` event was malformed and fell into the per-line `catch` block at L195–L199 (silently ignored), or (c) the line containing the `diagnosis` event was split across two chunks and the partial was lost.
-
-For case (c) — a line split across two chunks: the `buf.split('\n')` + `lines.pop()` pattern handles this correctly. `buf` accumulates the partial line until the next chunk completes it. If `{ stream: true }` was missing from `TextDecoder` (L190), a multi-byte character in the diagnosis JSON could produce the replacement character `�`, making `JSON.parse` throw and landing in the silent catch at L195–L199. Check `lib/mcp/events.ts` L4–L12 for the `diagnosis` event shape — the `diagnosis` field must be present or the switch falls through to `default` (L148–L149) silently.
-
-### Level 4 — Defend
-
-An interviewer asks: "you're manually line-buffering in the browser — isn't that fragile? `EventSource` handles all that for you." Defend the choice. Name one specific failure mode EventSource would cause in this app and one specific failure mode the manual buffer approach could have if implemented incorrectly.
-
-### Quick check
-
-- What is the exact return value of `encodeEvent({ type: 'done' })`?
-- What does `lines.pop()` return when `buf` ends with `\n` (i.e., the last event is complete)?
-- What is `REPLAY_DELAY_MS` and where is it defined?
-- Why does the `startedRef` guard exist in development but matter less in production?
-- What HTTP header signals to CDN proxies that this response should not be buffered?
-
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow lens — the three live flows + replay shortcut) · [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) · [01-request-flow.md](./01-request-flow.md) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (line-buffering kernel)
@@ -837,3 +807,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

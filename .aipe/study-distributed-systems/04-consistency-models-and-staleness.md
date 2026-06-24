@@ -400,13 +400,6 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 
 ---
 
-## Validate
-
-- **Reconstruct.** Without looking, draw the read-your-writes flow from step 2 to step 3. Name every component, the write key, the read key, and the carrier (URL param vs body vs cookie).
-- **Explain.** Why is the TTL on `BloomreachDataSource.cache` fixed at 60s for every tool, when `list_funnels` changes much less frequently than `execute_analytics_eql`? Because no callsite passes `cacheTtlMs` to override the default — the option exists but isn't wired up. At hackathon scale 60s for both is fine; at production scale you'd vary it per tool. (And the Olist side bypasses the question entirely — no TTL because no cache.)
-- **Apply.** A product manager asks: "Can the user re-open an old investigation tomorrow and see the same diagnosis?" Walk through the consistency layers. (Yes for cached/replayed investigations in `lib/state/investigations.ts` — those are persisted in `.investigation-cache.json` in dev or `demo-investigations.json` for the demo. No for a live investigation in production after Vercel recycles the instance — the in-memory cache is gone and the route's `getCachedInvestigation` returns null. Demo replay is the only durable path.)
-- **Defend.** Why no per-tool TTL? Because the workload doesn't demand it yet. The 60s default is comfortably below the perceived-freshness threshold for an analytics tool and comfortably above the rate-limit window. The day a real-time feature ships, the wired-but-unused `cacheTtlMs` option becomes the lever.
-
 ---
 
 ## See also
@@ -420,3 +413,4 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 
 ---
 Updated: 2026-06-16 — Verdict + Part 2 cover the asymmetric staleness contract (Bloomreach: 60s TTL; Olist: always fresh); line refs migrated to `lib/data-source/bloomreach-data-source.ts`.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

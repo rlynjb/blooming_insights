@@ -650,49 +650,6 @@ Second line: synthesize(anomaly, toolCalls)
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct
-
-Without looking at the code, write down: (a) the condition that sets `forceFinal` to `true`; (b) what changes in the API call parameters when `forceFinal` is `true`; (c) what the loop returns when it exits the `for` loop having exhausted all `maxTurns` without a clean break.
-
-Check against `lib/agents/base.ts` L90–L101 and L175.
-
-### Level 2 — Explain
-
-`runAgentLoop` accumulates `messages` across turns. Explain why the model needs to see all previous turns on every API call, not just the most recent tool results. Cite `lib/agents/base.ts` L79–L105 in your answer.
-
-The follow-up question: what would break if you sent only the latest tool results instead of the full message history?
-
-### Level 3 — Apply
-
-Scenario: an investigation returns the `FALLBACK` `{ conclusion: 'Insufficient data…', evidence: [] }` even though the tool calls all succeeded and returned data. Where do you look and what is the fix?
-
-Start at `lib/agents/diagnostic.ts` L74–L75: `tryParseDiagnosis(finalText)` returned `null` AND `synthesize()` returned `null` (so `?? FALLBACK` won). Work backwards:
-
-1. Was `finalText` non-empty prose? If yes, `synthesisInstruction` did not produce JSON on the forced-final turn. Look at `lib/agents/base.ts` L98: did `synthesisInstruction` get appended? Check that `synthesisInstruction` is set in the `runAgentLoop` call at `lib/agents/diagnostic.ts` L63–L67.
-
-2. Was `finalText` empty (`''`)? If yes, the loop exhausted `maxTurns` without a clean break (`lib/agents/base.ts` L175). Either `maxTurns` is too low for the number of tool calls, or `forceFinal` was hit but the model still emitted `tool_use` blocks (impossible after L101 — if tools are not sent, `tool_use` blocks cannot appear). Check that `maxToolCalls` is set correctly.
-
-3. Did `synthesize()` receive populated `toolCalls`? If `toolCalls` is empty or all entries have `tc.error` set, the evidence string sent to `synthesize()` is `'(no successful queries were completed)'`. The model has nothing to synthesize from. Look at `lib/agents/base.ts` L140–L156: did `mcp.callTool` throw for every tool call? Check the MCP connection and tool names.
-
-Fix path: verify `synthesisInstruction` is non-empty → verify `maxToolCalls` is high enough to allow meaningful exploration → verify at least one tool call succeeded by checking the `toolCalls` array in the `onToolResult` hook.
-
-### Level 4 — Defend
-
-A reviewer says: "You should use a single large agent with all tools instead of three specialist agents. It reduces code and the model has full context." Respond with the concrete tradeoffs in terms of this codebase: prompt size, tool count, budget, and the fallback chain.
-
-### Quick check
-
-- What is the value of `AGENT_MODEL`? (Answer: `'claude-sonnet-4-6'`, `lib/agents/base.ts` L9)
-- What does `runAgentLoop` return when `maxTurns` is exhausted? (Answer: `{ finalText: '', toolCalls }`, L175)
-- What is the `maxToolCalls` budget for `DiagnosticAgent`? (Answer: `6`, `lib/agents/diagnostic.ts` L62)
-- What is the `maxToolCalls` budget for `RecommendationAgent`? (Answer: `4`, `lib/agents/recommendation.ts` L57)
-- In the fallback chain at `diagnostic.ts` L74–L75, what does `synthesize()` receive as its second argument? (Answer: `toolCalls` — the full array of every tool call the loop made)
-- How does step 3 (`/investigate/[id]/recommend`) get the diagnosis from step 2? (Answer: via `sessionStorage` key `bi:diag:<id>`, written on step 2's `done` event and read by `useInvestigation`; passed as `&diagnosis=` in live mode)
-- How is a diagnosis's `confidence` set? (Answer: `diagnosisConfidence(diag)` from supported/tested hypotheses, `derive.ts` L54–L63, downgraded high→medium if any tool call errored, `diagnostic.ts` L80–L82)
-- Which line in `base.ts` feeds tool results back to the model as the next user turn? (Answer: L171 — `messages.push({ role: 'user', content: toolResults })`)
-
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` upper seam the agents now ride over) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · [09-eval-pipeline.md](./09-eval-pipeline.md) (how this orchestration is measured by the 4-pillar eval suite) · `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (parse-helper mechanism)
@@ -708,3 +665,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

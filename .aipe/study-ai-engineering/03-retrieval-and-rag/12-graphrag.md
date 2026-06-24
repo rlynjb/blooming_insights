@@ -319,28 +319,6 @@ edges are exact fields → no embeddings, no extraction
 
 ---
 
-## Validate
-
-### Level 1 — Reconstruct
-
-From memory, draw a flat vector index next to a knowledge graph, and state what each can answer ("similar to" vs. "connected to"). Draw three insights connected by shared `metric` and `scope` edges.
-
-### Level 2 — Explain
-
-Out loud: why is vector similarity blind to relationships? Why does the vector-entry + graph-expansion hybrid cover both relation types?
-
-### Level 3 — Apply
-
-Scenario: build "related insights." Open `lib/mcp/types.ts` L7–L17 (`Insight.metric`, `Insight.scope`) and `lib/mcp/schema.ts` L170–L192 (`bootstrapSchema`'s traversal-to-build-a-graph pattern). Name the nodes and edges, why no embeddings are needed, and how `relatedInsights(id)` would traverse the shared-metric and shared-scope edges.
-
-### Level 4 — Defend
-
-A colleague wants to build "related insights" with an embedding index ("just embed the headlines and find nearest"). Argue why a structured-edge graph over `metric`/`scope` is both cheaper (no embeddings) and *more correct* (catches a differently-worded same-metric insight that cosine would miss), and when the embedding approach would actually be needed (free-text similarity, not exact-field connection).
-
-### Quick check — code reference test
-
-What graph-shaped data does blooming insights already build and walk, and what edges would a "related insights" graph use? (Answer: `bootstrapSchema` (`lib/mcp/schema.ts` L170–L192) walks the graph-shaped Bloomreach schema and `parseWorkspaceSchema` assembles event→property edges (L91–L99); a "related insights" graph would use the exact structured `metric` and `scope` fields on the `Insight` type (`lib/mcp/types.ts` L7–L17) as edges — no embeddings required.)
-
 ## See also
 
 → 11-rag.md · → 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 10-incremental-indexing.md
@@ -351,3 +329,4 @@ Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanica
 Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

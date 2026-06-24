@@ -393,45 +393,6 @@ Diagram:
 
 ---
 
-## Validate your understanding
-
-### Level 1 — Reconstruct the diagram
-Close this file. Draw the three positions from memory: no recovery (pure ReAct), forced synthesis recovery (this repo's diagnostic + recommendation), and reflexion / critic loop (NOT in this repo). For each, label what runs always vs what runs only on the failure path, and how many model calls per "successful run."
-
-Open the file. Compare.
-
-✓ Pass: you have three positions, you correctly put diagnostic and recommendation on forced synthesis recovery, you correctly mark critic loop as not in this repo, and you label the critic as a *judgment* step distinct from a *recovery* step
-✗ Fail: re-read Move 2.3 and the dodged question's answer, wait 10 minutes, try again
-
-### Level 2 — Explain it out loud
-Explain "does your agent critique its own answers" to a colleague who just asked. No notes. Under 90 seconds.
-
-Checkpoints — did you:
-- Answer honestly that no critic call exists?
-- Name the recovery shape that DOES exist (`synthesize()` in diagnostic.ts and recommendation.ts)?
-- Explain the difference between a recovery (commit now) and a critic (judge correctness)?
-- Name the shared-blind-spot limit of same-family critics?
-
-If you skipped any: you described it, you didn't understand it.
-
-### Level 3 — Apply it to a new scenario
-A product manager asks: "Sometimes the diagnostic agent confidently states a wrong cause. Can we add a step that catches that before the user sees it?" Without looking at the file: would a same-model critic loop catch this? What WOULD reliably catch it, and which files would change?
-
-Write your answer (3–5 sentences). Then open `lib/agents/diagnostic.ts` L87–L126 and check what the current recovery does — and consider whether a *different-family* judge (e.g. Haiku at `lib/agents/intent.ts` L14) or a programmatic check against the evidence would be a cheaper, more reliable fix.
-
-### Level 4 — Defend the decision you'd change
-"If you were starting today and expected this to ship as an automated decision system — where the diagnosis directly triggers a Bloomreach action with no human read — would you still ship without a critic? Why or why not? If you'd change it, what new file would exist in `lib/agents/` and what model would you reach for?"
-
-Reference the code: point to `lib/agents/diagnostic.ts` L75 (where synthesize is invoked) for where a critic would slot in, and to `lib/agents/intent.ts` L14 for the precedent of using a different (cheaper) model for a judgment-like task.
-
-### Quick check — code reference test
-Without opening any files:
-- Does this repo have a self-critique loop? (No.)
-- What file and function hold the closest analog (the forced synthesis recovery), and is it judging or committing?
-- Why doesn't a same-model critic reliably catch wrong-but-plausible diagnoses?
-
-Open and verify. ✓ File + function + the recovery-vs-critic distinction matter; line numbers drifting is fine.
-
 ## See also
 
 → 02-react.md · → 03-plan-and-execute.md · → 06-routing.md · → prompt mechanics: `../../study-prompt-engineering/10-self-critique.md` · → react: `../../study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`
@@ -443,3 +404,4 @@ Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care"
 Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
 Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
 Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the codebase-position contrast — forced synthesis is the closest cousin, same shape but no second perspective — alongside the strategy line, instead of waiting until Move 2.3).
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

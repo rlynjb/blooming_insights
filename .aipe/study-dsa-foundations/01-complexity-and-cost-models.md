@@ -479,32 +479,7 @@ For some of it, yes — and that's fine. The codebase doesn't pre-tune for huge 
 
 ---
 
-## Validate
-
-### Level 1 — reconstruct
-
-Without looking, write the seven big-O classes from O(1) to O(N!), with one example of each from this codebase (or "not yet exercised"). Then write the kernel formula for amortized cost: `amortized = total_cost / M` and one sentence explaining when you reach for it instead of single-call cost.
-
-### Level 2 — explain
-
-Open `lib/mcp/client.ts` L80 and L149. Explain the asymptotic complexity of the `cache` field at L80 (lookup, write, space) and the spacing gate at L149 (worst-case wait, amortized throughput). State why each cost model is the right one for that line.
-
-### Level 3 — apply
-
-Scenario: a new feature wants to take the 10 categories and rank them by "most-missing-deps first" so the UI shows the closest-to-runnable ghost tiles at the top. You need to (a) compute `missingFor(cat)` for each category and (b) sort the results by `missing.length`. Cite `lib/agents/categories.ts` L139–L141 for the `missingFor` cost and `lib/agents/monitoring.ts` L119 for the sort pattern. What is the total complexity for one briefing? What is N for each step? Does this require any structural change to the existing data structures?
-
-### Level 4 — defend
-
-A teammate says: "Move the TTL cache to Redis so it's shared across processes." Defend the current in-process `Map` choice on cost grounds. Address: per-call latency cost (Map.get vs Redis network roundtrip), space cost (process heap vs Redis memory), and the amortized vs worst-case question (when does cross-process consistency become worth the per-call cost?). Reference `lib/mcp/client.ts` L80 and L102–L110.
-
-### Quick check
-
-- What does V8's `Array.prototype.sort` use under the hood, and what is its space complexity? (Timsort, O(N) auxiliary.)
-- For N=15 distinct tool names, how many operations does `new Set([...a, ...b, ...c]).size` cost? (O(15) ≈ 15 insertions + 15 spread = ~30 ops.)
-- Per-call cost of the spacing gate is up to 1100 ms; what is the amortized cost per call over a long sequence? (≤ 1100 ms — and that's the budget, not a failure.)
-- What is the space complexity of `schemaCapabilities` for a schema with E events and P properties per event? (O(E + E·P + C) = O(E·P) dominated.)
-- Why is `Map.get(key)` "O(1) average" and not "O(1) worst case"? (Hash collisions can degrade to O(N); worst case is rare in V8's hash implementation but exists.)
-
 ## See also
 
 → `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/audit.md#complexity-in-this-codebase` (the design-complexity lens, different sense of the word)
+Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).
