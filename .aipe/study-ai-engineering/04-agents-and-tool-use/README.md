@@ -20,6 +20,3 @@ Read in order: **02 (the round-trip) → 03 (streamed as ReAct) → 04 (which to
 This guide is the AI-engineering lens on the same loop the system-design guide covers in `../../study-system-design/06-multi-agent-orchestration.md` — read that file for the orchestration/streaming systems view; read this directory for the agent-design view. They are consistent, not duplicative.
 
 ---
-Updated: 2026-05-28 — Refreshed the run-flow one-liners for the two-step `?step=diagnose`/`?step=recommend` split, the `useInvestigation` trace consumer, exponential-backoff retry, and the new route/client recovery guards.
-Updated: 2026-05-29 — Added `07-capability-gating.md` (the anomaly-coverage schema gate: scope the monitoring agent's checklist against the live schema before spending budget) to the file list and the reading order.
-Updated: 2026-06-16 — Added `08-authoring-mcp-server.md` (the authored Olist MCP server: three domain tools instead of raw EQL, seeded-anomalies ground truth, per-run subprocess crash isolation) to the file list and the reading order; opening blurb now reflects the DataSource seam (Bloomreach + Olist) being the new default agent backbone.

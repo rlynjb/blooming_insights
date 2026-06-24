@@ -408,6 +408,3 @@ The fix in one diagram
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard tests this file's `_authCookieCrypto` calls feed
 
 ---
-Updated: 2026-06-16 — Test count 169→269 (suite grew via Phase 2+3). Added Q on "has this been generalized" pointing at the Phase 3 parallel-run incident and `EVAL_RUN_TAG` as the same family of fix. Added cross-link to 06-eval-flywheel.md.
-Updated: 2026-06-19 — Olist removal (PR #8). Test count 269→221 (24 files). Removed `EVAL_RUN_TAG` generalization Q — the eval pipeline that surfaced the parallel-run hazard is gone. Removed See-also link to 06 (RETIRED). Updated body counts.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

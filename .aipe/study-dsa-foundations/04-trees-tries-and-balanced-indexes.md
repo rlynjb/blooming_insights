@@ -532,4 +532,3 @@ Shape vs algorithm. The WorkspaceSchema in `lib/mcp/schema.ts` is *shaped* like 
 ## See also
 
 → `03-stacks-queues-deques-and-heaps.md` (heap is a tree-shaped structure, but stored as a flat array — the bridge between this chapter and the previous one) · → `05-graphs-and-traversals.md` (trees are a special case of graphs — acyclic, rooted, one parent per node) · → `08-dsa-foundations-practice-map.md` (where trees rank in the practice plan)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

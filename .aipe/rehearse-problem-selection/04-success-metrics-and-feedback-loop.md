@@ -385,4 +385,3 @@ questions and the answers that hold under each one.
 Read chapter 05 next.
 
 ---
-Updated: 2026-06-03 — refreshed test-suite count (144 → 169) and pointed D3 at the now-spec'd queue-head eval drill (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md`).

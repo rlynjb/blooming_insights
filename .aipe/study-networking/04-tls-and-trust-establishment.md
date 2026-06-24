@@ -375,4 +375,3 @@ The blob carries OAuth tokens with a 10-day lifetime. Risks ranked: (1) `AUTH_SE
   → `02-dns-routing-and-addressing.md` — how the cert's hostname matches resolution.
   → `05-http-semantics-caching-and-cors.md` — the cookies' other flags and what they bind to.
   → `../study-security/` — for the application-level trust audit; this file covers the mechanism, that one covers whether it's enough.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

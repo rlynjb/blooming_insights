@@ -235,4 +235,3 @@ If you're building features today and want to keep the audit clean: **assume not
 - `study-distributed-systems` — token-bucket algorithm details
 
 ---
-Updated: 2026-06-19 — Olist tier removed; findings #10 (committed binary repo cost), #11 (seed determinism), #12 (schema-to-tool drift) RESOLVED-BY-DELETION and dropped. Findings re-numbered (was #13 Bloomreach SPOF → now #10). Absent-list returns to pure "no DB" framing.

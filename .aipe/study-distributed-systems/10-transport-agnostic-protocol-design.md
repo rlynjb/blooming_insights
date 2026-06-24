@@ -608,5 +608,3 @@ The idempotent `connect()`. Concurrent callers under the first call share one in
 - `.aipe/study-software-design/` — the same seam from a deep-modules / information-hiding perspective
 
 ---
-Updated: 2026-06-16 — Initial generation as the Phase 2 concept file. Covers the DataSource interface, the makeDataSource factory, the two-adapter shape with asymmetric failure ontologies, subprocess lifecycle as a distributed primitive, and JSON-RPC 2.0 over arbitrary transports.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -222,5 +222,3 @@ Anchor: today, no DB; this is hypothetical and I'd flag it.
 - `study-distributed-systems` — log-as-truth pattern at a higher altitude
 
 ---
-Updated: 2026-06-19 — Olist SQLite WAL exercise removed (sibling tier gone); verdict reverts to "not yet exercised." Auth cookie + dev JSON files + committed fixtures remain the closest cousins.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

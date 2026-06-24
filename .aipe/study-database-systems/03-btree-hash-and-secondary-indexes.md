@@ -191,5 +191,3 @@ Anchor: there is no such table today; this is hypothetical, and I'd say so in th
 - `study-dsa-foundations` — hash tables and trees as data structures
 
 ---
-Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." The 9-index Olist landscape is gone; section returns to teaching the concept generically with V8 Map hash-lookup as the only present cousin.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

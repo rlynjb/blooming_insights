@@ -438,7 +438,3 @@ A: Two reasons. First, TypeScript carries the unit-in-name as a type signal — 
 - `09-deterministic-synthetic-data.md` — the seeder generates the cents values; the eval that measures the cost.
 - `lib/agents/prompts/monitoring.md` — the disclaimer that tries to recover from the schema's dishonesty.
 - `eval/judges/recommendation-judge.md` — the `impact_sized` criterion that surfaces the cost.
-
----
-Created: 2026-06-16 — new file covering the `price_brl` unit-in-name failure as a data-modeling-meets-AI-eval finding, with the committed eval evidence as the measured downstream cost.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -129,9 +129,3 @@ These are the runtime mechanisms the topic spec lists that the repo simply does 
 - `.aipe/study-distributed-systems/00-overview.md` — *not yet generated* — the place where multi-instance behavior, network failure between Node and providers, and serverless coordination would live.
 - `.aipe/study-performance-engineering/00-overview.md` — *not yet generated* — the place to go for budgets, baselines, and where latency actually goes.
 - `.aipe/study-testing/06-eval-flywheel.md` — the K=10 parallel-run anecdote (PIDs 30039/30040, `ps aux` + `kill`) and the `EVAL_RUN_TAG` mitigation. Cross-linked from section 8.
-
----
-Updated: 2026-06-16 — Phase 2 subprocess runtime added (Olist stdio child), DataSource.callTool now accepts signal, tsx/eval scripts named; orphan-subprocess risk promoted to #1.
-
----
-Updated: 2026-06-19 — Phase 2 subprocess runtime (`mcp-server-olist/`) deleted in PR #8; verdict reverts from "two Node runtimes" to one; band map collapses from four to three; `SyntheticDataSource` named as the in-process Blooming-owned replacement (no subprocess, no SQLite). AbortSignal.timeout(30_000) reference removed (it lived in the deleted Olist adapter); per-call signal? option on DataSource.callTool survives.

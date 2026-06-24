@@ -480,5 +480,3 @@ A: At current scale (a handful of investigations per warm instance lifetime, eac
 - `07-backpressure-bounded-work-and-cancellation.md` — the bounds that keep `messages[]` from growing unbounded.
 
 ---
-Updated: 2026-06-16 — added child-heap section (5.5) covering better-sqlite3 handle, per-query rows, baseline ~30-50MB, orphan-on-no-dispose risk.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

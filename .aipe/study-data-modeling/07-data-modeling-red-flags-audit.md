@@ -478,6 +478,3 @@ A: Two scores: severity (impact if left in place) and concreteness (clarity of t
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the schema-side leak.
 
 ---
-Updated: 2026-06-19 — re-ranked after Olist removal; #1 (price_brl) resolved-by-deletion; #4 (seeded_anomalies drift) and #9 (EXPLAIN gate) removed (no Olist queries); wire-format leak promoted to #1; new #7 (SyntheticDataSource determinism contract).
-Updated: 2026-06-16 — re-ranked the audit post-Phase-2; added #1 (price_brl) and #4 (description drift); promoted "not yet exercised" items #8/#10/#11 to "activated"; named the new honest gaps.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

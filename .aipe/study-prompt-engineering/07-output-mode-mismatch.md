@@ -370,10 +370,3 @@ answer for a human reader     → prose (.trim())
 → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
 
 ---
-Updated: 2026-05-29 — Corrected the monitoring.md JSON-output fence reference L52→L71 (the `## Output` "Return ONLY a JSON array" line moved down after the `{categories}` section) across all 7 citations.
-Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift from an earlier prompt-file revision): diagnostic.md output fence L46→L61, recommendation.md output fence L46→L49, query.md prose-output L36→L49, across all prose + diagram citations.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

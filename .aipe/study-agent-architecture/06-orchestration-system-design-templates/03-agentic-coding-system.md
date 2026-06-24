@@ -109,5 +109,3 @@ If the reader wants the blooming-insights-shaped agentic system reframed, the re
 This file stays as the "what an agentic coding system looks like, for cross-pattern fluency" reference, not a refactor target.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-16 — Updated stale "169 vitest tests under `__tests__/`" reference to the current 269 across `test/` + `mcp-server-olist/test/`, and named both data adapters (Bloomreach + the authored Olist server) in the "no coding affordance" framing.

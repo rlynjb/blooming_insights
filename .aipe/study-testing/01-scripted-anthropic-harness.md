@@ -427,6 +427,3 @@ The fake / real boundary in one diagram
 - (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the model-architecture / rubric-design deep walk; the only place this repo still teaches model-quality measurement
 
 ---
-Updated: 2026-06-16 — Test count 31→40 (synthesis-instruction + tool-schemas added). `McpCaller` renamed to `DataSource` in Phase 2 swap — mechanics unchanged, paragraph added explaining the rename. Backwards-compat shim at `lib/mcp/client.ts` not surfaced here (lives in audit's design-pressure lens). Added See-also link to 05.
-Updated: 2026-06-19 — Olist removal (PR #8): reverted test count to 31 (synthesis-instruction + tool-schemas don't use buildFakeAnthropic; the 40 claim was inaccurate). Removed Olist references — second DataSource implementation today is `SyntheticDataSource`, not `OlistDataSource`. Reframed the "AI-eval gap" callout from "see file 06" to "see study-ai-engineering/05" since 06 is RETIRED. See-also link to 05 marked RETIRED.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

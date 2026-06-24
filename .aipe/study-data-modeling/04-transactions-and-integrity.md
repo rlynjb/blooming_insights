@@ -556,5 +556,3 @@ A: The `isAnomalyArray` guard in `lib/mcp/validate.ts` (L17–L27). The monitori
 - `study-software-design/audit.md#information-hiding-and-leakage` — the LLM-seam parsing logic is a strong hide.
 
 ---
-Updated: 2026-06-16 — rewrote in-memory atomicity story for session-scoped state; added the Olist FK + WAL + transaction layer (was "not yet exercised").
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

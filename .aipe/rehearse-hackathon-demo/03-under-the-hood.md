@@ -273,5 +273,3 @@ infrastructure, not a wrapper."
 ```
 
 Read chapter 4 next.
-
-Updated: 2026-06-02 — v1.59.2 drift refresh: softened "about two hundred lines of code" claim (actual streaming pipeline is ~660 lines across the three files) into "three files end-to-end"; keeps the three load-bearing file paths intact.

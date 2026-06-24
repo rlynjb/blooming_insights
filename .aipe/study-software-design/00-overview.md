@@ -45,4 +45,3 @@ This guide applies Ousterhout's *A Philosophy of Software Design* to **this repo
 - `study-dsa-foundations/` — algorithm and data-structure curriculum. Not exercised in this guide.
 
 ---
-Updated: 2026-06-16 — verdict paragraph rewritten for post-Phase-2 state (DataSource seam, domain-tool server, 3 top fires resolved); reading order updated to flag the resolved pattern files as worked examples with kept lessons; through-line expanded to name Phase-2 additions.

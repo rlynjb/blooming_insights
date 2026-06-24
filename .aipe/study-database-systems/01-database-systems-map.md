@@ -467,5 +467,3 @@ Anchor: `package.json` has zero database dependencies.
 - `study-runtime-systems` — why module globals are per-process
 
 ---
-Updated: 2026-06-19 — Olist SQLite tier (Move 2e and supporting diagrams) removed; Olist altitude collapsed back to the single "no DB" altitude. Move 2e now describes the synthetic data source as the in-process, no-storage demo backstop.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

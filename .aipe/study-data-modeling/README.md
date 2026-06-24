@@ -175,5 +175,3 @@ This repo's **runtime UI state still has no relational store** — the per-sessi
 The synthetic adapter also doesn't exercise **schema evolution** — every change to `syntheticWorkspaceSchema` is a code edit + a process restart. That's fine for fixture data, but it means "how do you evolve a schema while the live data is also evolving" is still not a question this codebase has answered. When that becomes a real requirement (e.g. if the UI starts persisting briefings to a real DB), the answer would be Drizzle + `drizzle/` migration files, exactly the pattern AdvntrCue uses.
 
 ---
-Updated: 2026-06-19 — Olist removal landed in PR #8; the SQLite second domain is gone; second derivation of `WorkspaceSchema` swapped to the in-process synthetic fixture; `price_brl` resolved-by-deletion; top-3 reranked; file count 10 → 11 (added file 11 for the new pattern).
-Updated: 2026-06-16 — added the Olist relational layer + units-in-name finding + leak fix; 7 → 10 files.

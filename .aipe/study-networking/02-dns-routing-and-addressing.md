@@ -321,4 +321,3 @@ The alpha endpoint 307s when you POST to `/mcp/` and the SDK doesn't carry the `
   → `01-network-map.md` — the four-band picture this file sits inside.
   → `04-tls-and-trust-establishment.md` — what happens once DNS hands us a socket.
   → `05-http-semantics-caching-and-cors.md` — the cookies that ride the same connection.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

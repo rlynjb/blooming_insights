@@ -505,5 +505,3 @@ A: It's a textbook anti-pattern in the general case — sync I/O blocks the even
 - `08-runtime-systems-red-flags-audit.md` — orphan-subprocess risk, parent-crash cleanup gap.
 
 ---
-Updated: 2026-06-16 — added subprocess-as-resource section (6.5) with OlistDataSource lifecycle, factory dispose contract, and the no-op vs kill-child asymmetry.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

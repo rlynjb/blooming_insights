@@ -409,5 +409,3 @@ Cross-reference: `study-debugging-observability`'s "the trace IS the test" — t
 - (external) `.aipe/study-debugging-observability/` — the NDJSON trace pillar that makes eval input possible
 
 ---
-Updated: 2026-06-16 — New concept file. Names the eval flywheel as a testing-driven development methodology at the model-behavior layer. Walks the Phase 3 PR D→E→F→G cadence with committed receipts at each step. Surfaces the K=10 parallel-run incident as the canonical post-mortem (cf. file 03's AUTH_SECRET flake — same family). Cross-links to red-flag 12 (lockfile gate as the unbuilt next discipline).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

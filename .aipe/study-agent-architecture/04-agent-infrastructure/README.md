@@ -31,6 +31,3 @@ A frontend engineer reading this directory should walk away with six takeaways: 
 This sub-section's anchor is **single-agent + multi-agent (both)** — every concept here applies to a single ReAct loop and to a multi-agent topology. The four single-agent concepts in this codebase exercise all six disciplines today; if blooming insights ever grows a supervisor-worker shape (covered in sub-section 03), these same files describe what the supervisor and each worker would each need.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-16 — Reflected Phase 3 eval suite landing (04-agent-evaluation): replaced "no harness" framing with the four pillars + portfolio numbers; updated test count 169 → 269; added Phase 2 DataSource seam reference under tool-calling intro.
-Updated: 2026-06-19 — Reflected AptKit v0.3.0 migration: added 06-aptkit-runtime-layer.md as the senior-pattern concept file; reverted 04-agent-evaluation Case A claim — automated harness gone with `eval/` removal in PR #8; updated test count 269 → 221; replaced `OlistDataSource` references with `SyntheticDataSource`; tool-calling-and-mcp now names `BloomreachDataSource` (relocated from `lib/mcp/client.ts`) instead of `McpClient`.

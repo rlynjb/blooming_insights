@@ -462,5 +462,3 @@ A: `await setTimeout(...)` schedules a macrotask and yields the loop — other t
 - `07-backpressure-bounded-work-and-cancellation.md` — `maxDuration = 300` is the parent's hard wall; `AbortSignal.timeout(30_000)` is the subprocess per-call wall.
 
 ---
-Updated: 2026-06-16 — added child-loop sections (4.5 stdio JSON-RPC framing, 4.6 better-sqlite3 sync), explained why the subprocess boundary makes sync SQLite safe.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

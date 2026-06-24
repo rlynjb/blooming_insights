@@ -451,5 +451,3 @@ Interview-defense diagram — helper vs lift
 - `03-insight-anomaly-silent-leak.md` — RESOLVED with the same fix shape (one owner, not two), different scale (data vs logic).
 
 ---
-Updated: 2026-06-16 — verdict RESOLVED; lift landed as predicted (parseResult + recoveryPrompt parameters on runAgentLoop; ~90 LOC deleted); kept as the canonical worked example of "define it out of existence" at the agent-loop seam, with a post-fix lesson on why this beat a shared helper.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

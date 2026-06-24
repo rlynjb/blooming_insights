@@ -424,5 +424,3 @@ The lease — a lock with a TTL. A naive distributed lock without an expiration 
 - `.aipe/study-runtime-systems/` — event loop within one Vercel instance (when generated)
 
 ---
-Updated: 2026-06-16 — Added Callsite 2b (Olist durationMs); migrated line refs to `lib/data-source/bloomreach-data-source.ts`.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

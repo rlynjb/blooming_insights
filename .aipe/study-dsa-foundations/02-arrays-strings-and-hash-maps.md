@@ -525,4 +525,3 @@ Yes, when N is small and stable. `CATEGORIES` in `lib/agents/categories.ts` is a
 ## See also
 
 → `01-complexity-and-cost-models.md` (the cost framework these primitives are evaluated under) · → `06-sorting-searching-and-selection.md` (where Array.prototype.sort and substring scan live) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Map case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the Set case study) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the string-buffer case study)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

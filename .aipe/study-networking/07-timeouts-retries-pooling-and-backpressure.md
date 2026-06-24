@@ -542,10 +542,3 @@ No per-call `AbortController`. If a Bloomreach socket hangs at minute 2, we eat 
   → `01-network-map.md` — where this client sits in the system.
   → `03-tcp-udp-connections-and-sockets.md` — the (absent) connection pool layer below this.
   → `08-networking-red-flags-audit.md` — the audit ranks the missing per-call timeout as risk #1.
-
----
-Updated: 2026-06-16 — per-call timeout finding flipped from "not yet exercised" to "asymmetric coverage" — Olist side closed (30s AbortSignal.timeout at olist-data-source.ts:151), Bloomreach side still open. ~10-line mirror is the cheapest production-grade fix.
-
----
-Updated: 2026-06-19 — The asymmetric per-call timeout finding (Olist 30s vs Bloomreach none) collapses: Olist side deleted in PR #8. Bloomreach still has no per-call timeout — that finding stands. SyntheticDataSource is in-process so timeout discipline doesn't apply.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

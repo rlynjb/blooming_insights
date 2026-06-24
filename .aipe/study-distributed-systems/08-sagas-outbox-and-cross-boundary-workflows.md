@@ -487,5 +487,3 @@ Everything in this file. Each execute is a write — needs an idempotency key (a
 - `.aipe/study-agent-architecture/` — the agents inside each step
 
 ---
-Updated: 2026-06-16 — No mechanism drift in the two-step workflow; the workflow shape is unchanged by Phase 2 (both adapters speak the same DataSource interface, so the saga reads identically against either backend). Changelog stamp only.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

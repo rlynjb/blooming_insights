@@ -537,5 +537,3 @@ A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a 
 - `study-software-design/audit.md#pull-complexity-downward` — the prompts owning their own output-shape schema is "pull complexity downward" applied to schema evolution.
 
 ---
-Updated: 2026-06-16 — added the Olist "drop-and-reseed" pattern; named the determinism-and-read-only invariants that make it work; contrasted with the additive-evolution policy on the agent contract.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

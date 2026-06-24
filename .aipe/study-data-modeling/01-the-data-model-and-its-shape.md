@@ -473,6 +473,3 @@ A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — s
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.
 
 ---
-Updated: 2026-06-16 — added `WorkspaceSchema` dual-derivation section; flagged the leak as code-fixed (colocated + tested) with the wire-format follow-on still live.
-Updated: 2026-06-19 — swapped Olist for the in-process synthetic fixture as the second derivation of `WorkspaceSchema`; anchored event/property lists to `lib/data-source/synthetic-data-source.ts`; added file-11 cross-link.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

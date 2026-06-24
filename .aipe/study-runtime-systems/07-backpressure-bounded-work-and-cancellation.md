@@ -549,5 +549,3 @@ A: As of Phase 2, that's no longer fully true. The DataSource layer accepts an `
 - `08-runtime-systems-red-flags-audit.md` — where the half-wired cancellation ranks against the other risks.
 
 ---
-Updated: 2026-06-16 — corrected "no AbortController anywhere" to "half-wired"; added DataSource signal support, AbortSignal.timeout(30_000), composeSignals as the adapter-level wall.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

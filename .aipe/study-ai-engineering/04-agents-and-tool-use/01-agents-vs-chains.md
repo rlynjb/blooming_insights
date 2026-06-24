@@ -388,14 +388,3 @@ The honest answer: because today there is no branch, and `propose` against a `FA
 ## See also
 
 → 02-tool-calling.md · → 03-react-pattern.md · → 04-tool-routing.md · → 06-error-recovery.md · → ../../study-system-design/06-multi-agent-orchestration.md
-
----
-Updated: 2026-05-28 — Re-anchored the chain to the two-step `?step=diagnose`/`?step=recommend` split (separate calls, sessionStorage diagnosis handoff via `parseDiagnosis`), added the derived `confidence` step, and refreshed all route/diagnostic line refs.
-
----
-Updated: 2026-05-29 — Noted the monitoring node's `scan(hooks?, categories = [])` signature (monitoring.ts L69) and per-category checklist; the briefing route gates the list to `runnableCategories(schemaCapabilities(schema))` (briefing route L202–204/223) before the agent runs, so the monitoring node is schema-gated. Cross-ref 07-capability-gating.md.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

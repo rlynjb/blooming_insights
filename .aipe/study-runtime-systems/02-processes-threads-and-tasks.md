@@ -414,5 +414,3 @@ A: The boundary we needed was *protocol* (MCP) and *isolation* (separate event l
 - `07-backpressure-bounded-work-and-cancellation.md` — `maxToolCalls` is task-budget; `AbortSignal.timeout(30_000)` is now the per-call subprocess cap.
 
 ---
-Updated: 2026-06-16 — corrected the "no child_process" claim, added subprocess lifecycle section (3.5), worker_threads-vs-subprocess defense, K=10 anecdote cross-link.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

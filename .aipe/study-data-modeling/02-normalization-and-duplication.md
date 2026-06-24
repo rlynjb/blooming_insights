@@ -530,6 +530,3 @@ A: Correct when (a) there's a named single owner, (b) the denormalization is for
 - `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem.
 
 ---
-Updated: 2026-06-16 — schema-side leak status moved from "WORST" to "partly fixed in code"; added Move 2.5 on the wire format as the remaining leak source.
-Updated: 2026-06-19 — dropped the Olist 3NF contrast-case framing (the schema is removed); the file's core story (Insight↔Anomaly + wire-format leak) is unchanged.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

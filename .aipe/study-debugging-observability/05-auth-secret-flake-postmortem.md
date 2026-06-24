@@ -439,5 +439,3 @@ The first move is the smallest and highest-leverage. The second is preventive (c
 - `.aipe/study-security/` — the auth/crypto layer the test was exercising (`_authCookieCrypto`).
 
 ---
-Updated: 2026-06-19 — reverted framing to "the only documented incident in the repo" after PR #8 removed the Olist pipeline; the BRL bug and parallel-run race noted in the previous refresh are RESOLVED-BY-DELETION; cross-link to `06-` retained with RETIRED treatment.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

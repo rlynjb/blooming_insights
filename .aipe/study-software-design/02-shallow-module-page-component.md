@@ -391,5 +391,3 @@ Interview-defense diagram — the extraction logic
 - `04-synthesize-recovery-duplication.md` — also resolved; the `synthesize()` methods deleted as predicted.
 
 ---
-Updated: 2026-06-16 — verdict RESOLVED; refactor landed (page 817→462 LOC, three hooks extracted); kept as worked example of the shallow→deep move in practice with post-fix calibration on LOC vs visibility-surface deltas.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

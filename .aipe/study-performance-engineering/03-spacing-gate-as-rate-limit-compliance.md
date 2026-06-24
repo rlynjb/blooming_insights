@@ -488,4 +488,3 @@ The full picture — the gate kernel, what it has, what it deliberately lacks, w
 - `02-ttl-cache-with-no-cache-on-error.md` — the cache that skips the gate entirely on a hit
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that the gate doesn't help with
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — the topology that would force backpressure to exist
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

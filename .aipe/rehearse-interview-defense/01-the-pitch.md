@@ -231,5 +231,3 @@ If you rebuilt the pitch itself, you'd cut the word "agents" from the thirty-sec
 **What you'd change:** Cut "agents" from the 30-second version; let "multi-agent" arrive as the answer to "how's it built," not part of the headline.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-20 — 90s pitch updated: "four agents on one shared tool-use loop" → "four agents on a shared agent runtime; started with a hand-rolled loop and migrated the active path to a generic agent library, keeping three small adapter classes." Adds the Synthetic adapter as the parenthetical "live path that works without the upstream." 10s and 30s versions unchanged (compression discipline). Project-at-a-glance diagram updated: 3-way mode toggle (demo / live-bloomreach / live-synthetic) replaces the demo/live binary.

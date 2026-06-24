@@ -585,4 +585,3 @@ CSRF and the allowlist are layered defenses. CSRF asks "did the user intend this
 ## See also
 
 → [audit.md](./audit.md) · [04-read-only-tool-whitelist.md](./04-read-only-tool-whitelist.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

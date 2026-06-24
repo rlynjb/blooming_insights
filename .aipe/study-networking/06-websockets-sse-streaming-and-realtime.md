@@ -456,4 +456,3 @@ Skeleton — what breaks if removed
   → `03-tcp-udp-connections-and-sockets.md` — why the inbound TCP must stay open for the full agent run.
   → `05-http-semantics-caching-and-cors.md` — the `Cache-Control: no-transform` directive that keeps the stream live.
   → `../study-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire detail.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

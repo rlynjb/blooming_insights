@@ -352,7 +352,3 @@ The most reconsiderable choice in this chapter is the fixed roughly-one-second s
 **What you'd change:** Move the fixed ~1.1s Bloomreach spacing to an adaptive/token-bucket limiter if the rate limit were stable and documented.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-02 — Test-count precision: "around 170 tests" → "169 tests across 18 files" to match the current vitest suite per study-testing audit.
-Updated: 2026-06-03 — Added a "framework runtime, not its data primitives" paragraph to Choice 1 (Next.js) absorbing the study-frontend-engineering audit's "framework underused" finding — preempts "why no Suspense / Server Components?" with the fit-for-purpose defense (this product is a 30-90s NDJSON stream, not a request-response shape).
-Updated: 2026-06-20 — Choice 2 (own agent loop) reframed as a two-step decision: deliberate hand-roll first, then evaluated-and-accepted migration to @aptkit/core's runtime + 3 Blooming-owned adapter classes (lib/agents/aptkit-adapters.ts); runAgentLoop preserved at base-legacy.ts. New Choice 2.5 added: DataSource seam + 3 adapters, defended with the receipt that the seam survived two adapter swaps (Olist added/removed; Synthetic added) without changing the caller surface. Choice 5 (no DB) updated: insights.ts race condition is RESOLVED via session-keying (Map<sessionId, SessionFeed>); per-instance cache loss remains the named cost. One-page summary updated to 6 choices.

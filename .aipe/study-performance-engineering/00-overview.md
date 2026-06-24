@@ -139,8 +139,6 @@ Three findings dominate; everything else is small by comparison.
   → Backpressure (single-flight serial calls; no queue, no semaphore)
 ```
 
----
-Updated: 2026-06-16 — `res.usage` partially landed (3/5 sites); Phase 3 evals produced first measured per-investigation cost (~$10-15 across K=10 × 4 pillars on Olist adapter); asymmetric per-call timeout finding added (Olist 30s, Bloomreach none).
 
 The pattern: blooming insights makes **bound-by-judgment** decisions (the 300s budget, the 16k truncation, the 60s TTL) — it has not yet entered the **bound-by-measurement** phase. The audit's `measurement-baselines-and-profiling` lens names which measurements would change which decisions.
 
@@ -175,6 +173,3 @@ A finding belongs here when the question is *"how big? how fast? how often? how 
 - `.aipe/study-system-design/audit.md#scale-bottlenecks-and-evolution` — the three scale ceilings
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — why spacing isn't backpressure
 - `.aipe/study-ai-engineering/06-production-serving/02-llm-cost-optimization.md` — the token-economics layer
-
----
-Updated: 2026-06-19 — Phase 3 eval cost data point (~$10-15 across K=10 × 4 pillars) RESOLVED-BY-DELETION (eval/ gone in PR #8). Asymmetric per-call timeout finding (Olist 30s, Bloomreach none) collapses: Olist side deleted. Bloomreach side still has no per-call timeout — that finding stands. Synthetic data source is in-process; zero network/spawn cost. res.usage logging at 3 of 5 sites unchanged.

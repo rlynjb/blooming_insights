@@ -412,5 +412,3 @@ Attack: for *debugging* a captured run, the original pause IS the diagnostic sig
 - `.aipe/study-system-design/05-streaming-ndjson.md` — the NDJSON carrier (system-design angle).
 
 ---
-Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; replay-from-snapshot is now the only reproduction primitive in this repo.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

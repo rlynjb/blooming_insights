@@ -287,5 +287,3 @@ The failure-handling I would reconsider is the auth state, because it is the one
 **What you'd change:** Wire the written-but-disconnected CSRF `state` validation into the callback (needs a shared store), and key auto-reconnect off a structured `needsAuth` signal instead of regex-matching error prose.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-20 — File references updated post-Phase-2 PR A rename + page-decomposition refactor: McpClient → BloomreachDataSource (cache at lib/data-source/bloomreach-data-source.ts:122,144-148); reconnect logic extracted to lib/hooks/useReconnectPolicy.ts. Each failure surface now notes whether it applies to the Bloomreach side or the new in-process Synthetic adapter (Synthetic has no rate-limit, no auth, no network failure surface — that's part of why the seam matters).

@@ -143,5 +143,3 @@ Anchor: `package.json` has no DB dependencies.
 - `study-data-modeling` — how to shape what you'd store
 
 ---
-Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." Section now teaches the concept generically and names the trigger that would activate it.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

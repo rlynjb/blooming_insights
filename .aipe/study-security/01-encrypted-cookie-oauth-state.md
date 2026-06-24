@@ -530,4 +530,3 @@ What we don't have is true rotation — no token-rotation-on-use that invalidate
 → [audit.md](./audit.md) · [02-als-scoped-request-store.md](./02-als-scoped-request-store.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
 
 Cross-reference: `.aipe/study-system-design/02-oauth-boundary.md` — the OAuth + PKCE + DCR flow that produces the state stored in this cookie.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

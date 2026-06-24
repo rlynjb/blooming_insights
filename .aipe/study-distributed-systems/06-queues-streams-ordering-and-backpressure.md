@@ -469,5 +469,3 @@ NDJSON over fetch is one-way, which is exactly what we need — the server emits
 - `.aipe/study-prompt-engineering/` — the agent loop driving the events is the actual content producer
 
 ---
-Updated: 2026-06-16 — Verdict line notes the second framed stream (JSON-RPC over stdio to mcp-server-olist) introduced in Phase 2; cross-link to file 10.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

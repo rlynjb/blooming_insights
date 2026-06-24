@@ -482,4 +482,3 @@ For some of it, yes — and that's fine. The codebase doesn't pre-tune for huge 
 ## See also
 
 → `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/audit.md#complexity-in-this-codebase` (the design-complexity lens, different sense of the word)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

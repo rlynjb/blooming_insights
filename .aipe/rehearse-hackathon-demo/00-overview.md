@@ -161,5 +161,3 @@ expected.
 ```
 
 Read chapter 1 next.
-Updated: 2026-05-31 — Migrated to /aipe:rehearse orchestrator (v1.50): directory renamed from .aipe/study-hackathon-demo/ to .aipe/rehearse-hackathon-demo/ per spec rename study-hackathon-demo.md → rehearse-hackathon-demo.md; cross-references updated. Slot length (10 min) preserved. Content unchanged.
-Updated: 2026-06-02 — v1.59.2 drift audit: verified click-path against current code (app/page.tsx, app/investigate/[id]/page.tsx, lib/agents/diagnostic.ts, lib/mcp/events.ts); cross-refs to .aipe/study-system-design/ and siblings still valid after the v1.59.2 two-pass restructure; no structural change required. The "what's next" framing in chapter 5 (scheduled briefings, Slack delivery, multi-workspace) remains accurately not-yet-built. Money shot still lands at ~3:00 against current replay timings (briefing 140ms/event, investigation 180ms/event — both unchanged).

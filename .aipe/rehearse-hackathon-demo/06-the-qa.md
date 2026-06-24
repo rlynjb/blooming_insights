@@ -361,5 +361,3 @@ Two sentences. Then stop. The discipline IS the answer.
 
 End of book. Run the demo end-to-end with a timer before reading
 anything else.
-
-Updated: 2026-06-03 — Probe 8 "if they push on hallucination" follow-up extended with the eval-harness drill (named in `.aipe/drills/`) as the named next engineering move; turns the unmeasured-quality gap into a forward-looking answer.

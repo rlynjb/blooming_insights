@@ -122,9 +122,3 @@ The consolidated triage, by severity and section. Each row was named with file:l
 2. **Four routes leak `e.stack` in error responses** — `app/api/mcp/call/route.ts` L17–L20, `app/api/mcp/tools/route.ts` L18–L22, `app/api/mcp/tools/check/route.ts` L21–L25, `app/api/mcp/capture/route.ts` L54–L57 — fix: remove `'\n' + (e.stack ?? '')` from the JSON response, keep the full error in `console.error` for the operator. The streaming routes already use this safer pattern. The inconsistency is the finding; the fix is one line per route.
 
 3. **`AUTH_SECRET` has no strength enforcement** — `lib/mcp/auth.ts` `aesKey` L51–L60 — fix: `if (secret.length < 32) throw new Error('AUTH_SECRET must be at least 32 characters')`. Today `AUTH_SECRET=password` is silently SHA-256'd to a 32-byte AES key with ~10 bits of underlying entropy; an attacker who steals a `bi_auth` cookie plus guesses or knows the secret can decrypt OAuth tokens offline. The `.env.example` documents the `openssl rand -base64 32` requirement; the code doesn't enforce it.
-
----
-Updated: 2026-06-16 — Phase 2 subprocess (mcp-server-olist/) named as a 4th trust boundary with negligible attack surface (hardcoded path, no user input, no shell, read-only SQLite, PII-free synthetic data). No new findings; the 10 existing medium-severity findings stand.
-
----
-Updated: 2026-06-19 — The "4th trust boundary" (subprocess Olist server) added last refresh is GONE (PR #8 deleted mcp-server-olist/). Revert to 3 trust boundaries (browser → route, route → Bloomreach, model output → typed value). New SyntheticDataSource is in-process Blooming-owned synthetic data — no new attack surface vs the legacy single-process design. No new findings; the 10 existing medium-severity findings stand.

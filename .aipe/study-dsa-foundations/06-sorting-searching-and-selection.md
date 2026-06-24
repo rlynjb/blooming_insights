@@ -624,4 +624,3 @@ O(N log N) is the *information-theoretic lower bound* for comparison-based sorti
 ## See also
 
 → `01-complexity-and-cost-models.md` (where the O(N log N) cost of sort and O(log N) of binary search live) · → `02-arrays-strings-and-hash-maps.md` (the primitives these operations work on) · → `03-stacks-queues-deques-and-heaps.md` (heaps as the streaming top-K data structure) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the SEV_RANK sort) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the substring scan)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

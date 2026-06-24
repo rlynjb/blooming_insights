@@ -530,4 +530,3 @@ No, and here's why. Ordering disciplines are a response to *constraints*: undo (
 ## See also
 
 → `02-arrays-strings-and-hash-maps.md` (the primitives these are built from) · → `04-trees-tries-and-balanced-indexes.md` (heap is technically a tree-shaped structure; this chapter teaches the array-backed variant) · → `05-graphs-and-traversals.md` (BFS uses a queue, DFS uses a stack — both `not yet exercised` here) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the full case study of the implicit queue)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

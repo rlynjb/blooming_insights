@@ -475,5 +475,3 @@ A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add
 - `study-software-design/audit.md#information-hiding-and-leakage` — the McpClient cache is named as a strong-hide example.
 
 ---
-Updated: 2026-06-16 — added Olist 9-index walk; reframed "not yet exercised" as "still no EXPLAIN gates in CI"; the topic is now genuinely live for the Olist tools.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

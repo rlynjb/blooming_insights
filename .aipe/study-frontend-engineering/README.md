@@ -34,4 +34,3 @@ The frontend layer is small, deliberately framework-light, and shaped by one con
 ---
 
 Generated: 2026-06-03 — initial generation as v1.62.0 audit-style frontend-engineering guide.
-Updated: 2026-06-16 — page-decomposition refactor landed: `app/page.tsx` 817 → 462 LOC, three hooks extracted to `lib/hooks/`, NDJSON kernel hoisted to shared `lib/streaming/ndjson.ts` consumed by all four streaming surfaces. Top frontend findings #1 and #2 in the audit are RESOLVED.

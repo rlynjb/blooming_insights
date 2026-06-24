@@ -177,5 +177,3 @@ Anchor: `lib/agents/monitoring.ts` (scan loop); `lib/mcp/client.ts` L150-156 (`m
 - `study-agent-architecture` — the agent loop, which is the outer "planner" here
 
 ---
-Updated: 2026-06-19 — Olist SQLite tier removed; verdict reverts to "not yet exercised." Move 2e (dynamic SQL construction) and the SQLite primary diagram dropped. The N+1 at the agent layer remains the load-bearing cousin.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

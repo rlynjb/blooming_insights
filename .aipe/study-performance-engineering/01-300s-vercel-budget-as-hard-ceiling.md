@@ -448,4 +448,3 @@ The full picture — the platform ceiling, the configured budget, the agent run 
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that may amplify bad-day latency
 - `.aipe/study-system-design/audit.md#scale-bottlenecks-and-evolution` — Move C (queue + worker) at scale
 - `.aipe/study-agent-architecture/05-production-serving/02-fan-out-backpressure.md` — what changes if the agent run fans out
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

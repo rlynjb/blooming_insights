@@ -535,4 +535,3 @@ Shape vs algorithm again. A pipeline has the *shape* of a path graph (a chain of
 ## See also
 
 → `03-stacks-queues-deques-and-heaps.md` (BFS needs a queue, DFS needs a stack — both `not yet exercised` here) · → `04-trees-tries-and-balanced-indexes.md` (trees are acyclic graphs with a root; this chapter teaches the more general case) · → `08-dsa-foundations-practice-map.md` (where graph algorithms rank in the practice plan — high, because they're frequent interview topics)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

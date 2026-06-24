@@ -416,7 +416,3 @@ A: Because the eval and the agent read the same substrate. The Olist DB has 7 ta
 - `07-data-modeling-red-flags-audit.md` — finding #4 (description ↔ multiplier drift).
 - `08-the-olist-relational-schema.md` — the 7 tables this data lands in.
 - `10-units-in-column-names.md` — the `price_brl` bug; the eval evidence for measured downstream cost.
-
----
-Created: 2026-06-16 — new file covering deterministic synthetic data, seeded_anomalies as ground truth, and eval result schemas as data contracts.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

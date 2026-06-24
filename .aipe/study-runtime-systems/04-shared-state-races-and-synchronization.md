@@ -479,5 +479,3 @@ A: The OAuth flow in `lib/mcp/auth.ts`. The MCP SDK's `OAuthClientProvider` is s
 - `.aipe/study-security/00-overview.md` — *not yet generated* — for the auth-cookie crypto + the encrypted-cookie store as a security mechanism.
 
 ---
-Updated: 2026-06-16 — added composeSignals (sec 5) and single-flight subprocess (sec 6); noted 10-LOC duplication of composeSignals as a cleanup candidate.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

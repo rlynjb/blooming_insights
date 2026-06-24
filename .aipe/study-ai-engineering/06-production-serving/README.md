@@ -65,4 +65,3 @@ Each file is self-contained, but they pair naturally:
 All five anchor to the same two files — `lib/mcp/client.ts` and `lib/mcp/connect.ts` — which together form the single choke-point where caching, spacing, and retry meet.
 
 ---
-Updated: 2026-05-28 — Fixed the 05 summary: retry is exponential backoff (10s base, 20s ceiling) with a parsed Retry-After window, not a fixed 1200ms delay; the remaining gaps are jitter + breaker.

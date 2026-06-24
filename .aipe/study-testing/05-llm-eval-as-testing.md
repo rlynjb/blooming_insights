@@ -484,5 +484,3 @@ Two pillars, one product, complementary signals.
 - (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — model-architecture / rubric-design theory deep walk
 
 ---
-Updated: 2026-06-16 — New concept file. Names LLM-eval-as-testing as the second pillar of this folder; covers the 4-eval suite, anchored rubrics, calibration receipts (8/8 diagnosis + 3/3 recommendation incl. BRL bug catch), K=10 variance, EVAL_RUN_TAG result-dir versioning, pre-flight gates as testing discipline, and the eval-vs-npm-test boundary. Anchored to `eval/scripts/run-detection.ts` (lines 92–135) and `eval/scripts/run-regression.ts` (lines 387–399) with file-line grounding.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

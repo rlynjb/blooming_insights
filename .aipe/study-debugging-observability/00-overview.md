@@ -127,4 +127,3 @@ The ranking spotlights what's load-bearing in this repo, not a generic checklist
 Each is called out in the relevant `audit.md` lens, not buried.
 
 ---
-Updated: 2026-06-19 — Olist pipeline removed in PR #8 / 62c24d7; reverted four-surface map to three (NDJSON trace + Vitest + dev cache); dropped finding #6 (eval paper trail) and replaced with the AptKit-traces-into-existing-surface note; reverted test count 269 → 221; reading order keeps `06-` with RETIRED treatment; cross-link to `06-` stays so the pattern is still teachable.

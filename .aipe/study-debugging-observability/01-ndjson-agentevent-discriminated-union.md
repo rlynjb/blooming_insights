@@ -438,5 +438,3 @@ Two reasons. First, NDJSON is symmetric: the same `JSON.stringify(e) + '\n'` sha
 - `.aipe/study-system-design/05-streaming-ndjson.md` — NDJSON as the transport (system-design angle).
 
 ---
-Updated: 2026-06-19 — kept cross-link to `06-` with RETIRED treatment after PR #8 removed the Olist eval pipeline; added an introductory note in How it works that AptKit's traces also produce events on this same surface via `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) — same NDJSON contract, additional producer.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

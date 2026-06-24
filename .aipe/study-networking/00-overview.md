@@ -89,9 +89,3 @@ Honest about absence — if you reach for it from training data, it's not here.
   1. **No per-upstream timeout.** A hung Bloomreach or Anthropic socket consumes the route's full 300 s window. The only safety net is `maxDuration`, which kills the entire investigation — the user sees nothing.
   2. **Rate-limit ceiling can starve the route.** `maxRetries: 3` × `retryCeilingMs: 20_000` = ~60 s of retry budget per single tool call. A single contested call can eat 20% of the route budget; a sequence of two can take 40%.
   3. **DCR + PKCE state in an httpOnly cookie is single-point-of-failure for OAuth.** If the cookie is dropped (browser policy, third-party-cookie restrictions, `SameSite=None` quirks), the OAuth callback cannot find its PKCE verifier and the flow fails with no recovery path other than re-initiating.
-
----
-Updated: 2026-06-16 — added cross-link to stdio IPC transport (Phase 2 mcp-server-olist subprocess via StdioClientTransport); deep walk lives in study-distributed-systems/10-transport-agnostic-protocol-design.md. The MCP protocol is same on both wires; stdio is IPC not networking, hence out-of-scope here.
-
----
-Updated: 2026-06-19 — Phase 2 stdio IPC transport deleted in PR #8 (mcp-server-olist subprocess gone). Wire surface reverts to three (browser↔routes, routes↔Bloomreach MCP, routes↔Anthropic). Synthetic data source is in-process; no new wire crossings. Cross-link to study-distributed-systems/10-transport-agnostic-protocol-design.md still valid but that file is RETIRED.

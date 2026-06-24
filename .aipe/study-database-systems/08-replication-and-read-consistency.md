@@ -284,5 +284,3 @@ Anchor: hypothetical; flag in interview.
 - `study-system-design` — when to reach for KV vs Postgres vs nothing
 
 ---
-Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app cross-instance divergence story unchanged; it's the load-bearing teaching here.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

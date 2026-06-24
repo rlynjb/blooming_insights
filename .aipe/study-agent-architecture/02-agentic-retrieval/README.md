@@ -31,4 +31,3 @@ What *does* matter, and what this sub-section covers, is the agent-architecture 
 - `../01-reasoning-patterns/04-reflexion-self-critique.md` — self-critique as a loop on the answer, not on retrieval
 
 ---
-Updated: 2026-05-29 — created

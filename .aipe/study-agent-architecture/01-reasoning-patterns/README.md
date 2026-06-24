@@ -37,4 +37,3 @@ How one model thinks through a task. This is the substrate every topology in SEC
 Read 01 first to name the chain/agent boundary in this codebase. Read 02 to see the one ReAct loop four agents share. Read 06 next because it bridges from single-agent (routing a tool) to multi-agent (routing an agent) — it's the conceptual hop to SECTION C. Then read 03 / 04 / 05 in any order as the family of escalations from ReAct, each one naming a different failure mode and the structural cost it pays to fix it.
 
 ---
-Updated: 2026-05-29 — created

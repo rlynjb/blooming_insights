@@ -625,4 +625,3 @@ The full picture — the streaming kernel, the four UX moves, the buffering risk
 - `03-spacing-gate-as-rate-limit-compliance.md` — the floor that makes actual latency unavoidable
 - `04-synthesize-as-cost-concentration.md` — the same "design without measurement" gap on the server side
 - `.aipe/study-system-design/audit.md#request-response-and-data-flow` — the NDJSON flow from the request-shape lens
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

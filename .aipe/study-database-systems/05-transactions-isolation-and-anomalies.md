@@ -230,5 +230,3 @@ Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
 - `01-database-systems-map` — the Map state that today has neither A, C, I, nor D
 
 ---
-Updated: 2026-06-19 — Olist seed transaction removed (file gone); verdict reverts to "not yet exercised" at the engine level. `withAuthCookies` remains the transaction-shaped cousin; the `putInsights` event-loop-atomicity walk stands.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

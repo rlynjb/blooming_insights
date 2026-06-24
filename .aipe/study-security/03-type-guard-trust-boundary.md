@@ -569,4 +569,3 @@ The migration cost is low (three predicates) and the benefit is real if we add a
 → [audit.md](./audit.md) · [01-encrypted-cookie-oauth-state.md](./01-encrypted-cookie-oauth-state.md) · [04-read-only-tool-whitelist.md](./04-read-only-tool-whitelist.md)
 
 Cross-reference: `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the LLM-angle treatment of why output handling beats input filtering.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

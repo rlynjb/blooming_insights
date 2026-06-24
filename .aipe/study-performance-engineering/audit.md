@@ -136,9 +136,3 @@ Ranked by consequence × likelihood. The discipline is *forcing the rank* — if
 1. **`res.usage` logging — partially landed 2026-06-15** — 3 of 5 sites now log (`base.ts:135`, `base.ts:257`, `intent.ts:36`). Close the remaining 2 (`diagnostic.ts:87-126`, `recommendation.ts:82-132` synthesize() retries) to finish unblocking #2.
 2. **Cost concentration on `synthesize()`** — `lib/agents/diagnostic.ts:87-126`, `lib/agents/recommendation.ts:82-132` — suspected dominant per-investigation cost (long structured JSON output, fires when loop fails to parse). Cannot be confirmed or fixed until #1 lands. Once measured, lever is tightening `maxToolCalls` (fewer forced syntheses) or reshaping the JSON output (smaller schema).
 3. **300s route budget at ceiling, zero headroom** — `app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17` — pinned at Vercel Pro's max. Typical ~100-115s, worst-case retry storm (~280-300s+) crosses the ceiling and the route dies mid-stream. Cheap fix: tighten `maxToolCalls`. Architectural fix: queue + worker (requires DB).
-
----
-Updated: 2026-06-16 — `res.usage` logging partially landed (3 of 5 sites). Cache code moved to `lib/data-source/bloomreach-data-source.ts` post Phase 2 PR A. Phase 3 produced first measured per-investigation cost data (~$10-15 across K=10 × 4 eval pillars). K=10 parallel-run race condition + `EVAL_RUN_TAG` mitigation added as real concurrent-execution anecdote. Asymmetric per-call timeout: Olist has 30s, Bloomreach still has none.
-
----
-Updated: 2026-06-19 — Eval/ pipeline deleted in PR #8. The Phase 3 measured spend (~$10-15) and the K=10 parallel-run race condition incident are no longer reproducible. Cache code moved to lib/data-source/bloomreach-data-source.ts (Phase 2 PR A). Three ceilings (300s / 1100ms spacing / maxToolCalls) still hold; res.usage logging at 3 of 5 sites still partial (the 2 remaining sites are still diagnostic + recommendation synthesize() retries).

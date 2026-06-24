@@ -607,6 +607,3 @@ A: When the user clicks an insight on the briefing, the browser puts the entire 
 - `study-system-design/*` — the system-design side of this question (which datastore, scaling, replication).
 
 ---
-Updated: 2026-06-16 — added the session-scoped state refactor and the Olist SQLite analytics layer; primary store layer count moved from 3 (in-memory / dev-file / demo-seed) to 5 (per-session in-memory / Olist SQLite / dev-file cache / committed demo seed / committed eval results).
-Updated: 2026-06-19 — Olist SQLite layer removed (PR #8); re-ranked to three layers (session-scoped in-memory / committed demo seed / in-process synthetic fixture); interview answer and storage table updated; cross-links pointed at retired files and the new file 11.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

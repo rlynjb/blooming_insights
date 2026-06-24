@@ -487,10 +487,3 @@ What fan-out optimizes vs what the user cares about
 → `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-05-31 — Applied study.md v1.52 voice trait (verdict first, then rank what matters) — clarity edit to Move 1 (named the two specific gates blooming insights fails — typed Diagnosis dependency + ~1 req/s MCP spacer — alongside the generic strategy line, instead of waiting until Phase A vs B).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

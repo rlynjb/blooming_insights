@@ -400,5 +400,3 @@ not "the agent might want a tool" — "the eval proves the agent needs one"
 → 02-tool-calling.md · → 04-tool-routing.md · → 06-error-recovery.md · → 07-capability-gating.md · → ../05-evals-and-observability/01-eval-set-types.md · → ../05-evals-and-observability/05-regression-evals.md · → ../07-system-design-templates/03-multi-rubric-eval-pipeline.md
 
 ---
-Updated: 2026-06-16 — new file. Documents the authored `mcp-server-olist/` package: the three domain tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`) vs the raw `execute_sql` alternative, the `seeded_anomalies` ground-truth contract, the per-run subprocess crash isolation, and the eval-flywheel rule for adding a fourth tool.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -447,5 +447,3 @@ Interview-defense diagram — why the queue is load-bearing
 - `audit.md → information-hiding-and-leakage` — names the adapter boundary as the third strong hide added since 2026-06-02 (alongside the `parseRetryAfterMs` grammar and the `makeDataSource` factory).
 
 ---
-Updated: 2026-06-19 — new file; documents `lib/agents/aptkit-adapters.ts` (206 LOC, 3 adapter classes) as the second instance of the APOSD "small interface, fat hidden body" pattern in this codebase, parallel to the `DataSource` seam in `01-mcp-client-deep-module.md`.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

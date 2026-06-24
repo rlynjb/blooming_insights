@@ -502,4 +502,3 @@ The honest perf concern would be: if we used ALS in a hot path that fires thousa
 ## See also
 
 → [audit.md](./audit.md) · [01-encrypted-cookie-oauth-state.md](./01-encrypted-cookie-oauth-state.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

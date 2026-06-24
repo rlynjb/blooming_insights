@@ -658,4 +658,3 @@ Honest answer: the primitives are too small to be worth a dependency. Skeleton i
 ---
 
 Generated: 2026-06-03 — `/aipe:study-frontend-engineering` (per `specs/study-frontend-engineering.md`).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

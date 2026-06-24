@@ -44,4 +44,3 @@ Named honestly in `audit.md` (metrics-slis-slos-and-alerts, incident-analysis-an
 - offline eval surface (RESOLVED-BY-DELETION — Olist pipeline removed PR #8 / 62c24d7)
 
 ---
-Updated: 2026-06-19 — Olist pipeline removed in PR #8 / 62c24d7; reverted reading order to mark `06-` as RETIRED; removed bug-class split (no live model-level surface); dropped eval-related `not yet exercised` rows; added AptKit-into-NDJSON note on `01-`.

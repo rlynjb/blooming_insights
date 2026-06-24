@@ -558,5 +558,3 @@ Honest answer: React Query solves StrictMode dedupe and the per-step memo, but i
 ---
 
 Generated: 2026-06-03 — `/aipe:study-frontend-engineering` (per `specs/study-frontend-engineering.md`).
-Updated: 2026-06-16 — kernel was hoisted to shared `lib/streaming/ndjson.ts:18-64` consumed by all four streaming surfaces (closes audit red flag #2). The hook's value now is the React-specific shape around that shared kernel (StrictMode latch, closure mirror, typed switch, sessionStorage stash).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -322,4 +322,3 @@ CORS. Every browser → API call is same-origin; we don't expose any cross-origi
   → `07-timeouts-retries-pooling-and-backpressure.md` — the mechanism behind risks 1, 2, 4, 6, 7.
   → `04-tls-and-trust-establishment.md` — the mechanism behind risks 3, 8.
   → `06-websockets-sse-streaming-and-realtime.md` — the design behind risks 5, 10.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

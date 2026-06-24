@@ -410,10 +410,3 @@ classifier: max_tokens 16 + "one word" + "think step by step" → budget gone, n
 → 08-few-shot.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md · → 04-token-budgeting.md
 
 ---
-Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md `hypothesesConsidered` shape L54–60→L69–75, field-rules ref L71→L90, monitoring output L50–73→L69–97, recommendation output L46–65→L49–74. (`diagnostic.md` L20 "generate 2–3 hypotheses" verified still correct — left unchanged.)
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-16 — Added a fourth "Where this breaks down" item: the diagnostic agent's `confidence` field scores `calibration: 0` in 29/30 runs against the 5-criterion diagnosis judge (`eval/judges/diagnosis-judge.md`). The structural CoT works; the confidence-derivation prompt logic is the deficit. Real receipt for "calibrated confidence is a prompt-engineering problem, traceable to one line in one prompt."
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

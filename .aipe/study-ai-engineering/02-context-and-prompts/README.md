@@ -29,5 +29,3 @@ A worked example of an eval-driven prompt iteration the codebase actually ran (c
 The case study is exactly the kind of eval-flywheel evidence senior reviews look for: an honest "this prompt edit lifted X but couldn't close Y, and here's the tool-layer fix that would." See `../05-evals-and-observability/02-eval-methods.md` for the scoring side and `../07-system-design-templates/03-multi-rubric-eval-pipeline.md` for the full flywheel walkthrough.
 
 ---
-Updated: 2026-05-28 — Refreshed the 03-prompt-chaining entry for the two-step `?step=diagnose`/`?step=recommend` split with the `bi:diag:<id>` sessionStorage handoff (was a single `await` chain at route.ts L145–L161); the 01/02 entries and `base.ts` refs verified unchanged.
-Updated: 2026-06-16 — added the Phase 2.5 DATA HORIZON prompt-anchoring case study (eval-driven prompt edit: 5× loose-recall lift, partial strict-recall fix, honest tool-layer follow-up) as a new section.

@@ -653,16 +653,3 @@ Second line: synthesize(anomaly, toolCalls)
 ## See also
 
 → [audit.md](./audit.md) (request-response-and-data-flow + failure-handling lenses — the CODE → MODEL control flip and the parse → synthesize → FALLBACK chain) · [05-streaming-ndjson.md](./05-streaming-ndjson.md) · [03-provider-abstraction.md](./03-provider-abstraction.md) (the `DataSource` upper seam the agents now ride over) · [07-client-stream-handoff.md](./07-client-stream-handoff.md) · [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) · [09-eval-pipeline.md](./09-eval-pipeline.md) (how this orchestration is measured by the 4-pillar eval suite) · `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (parse-helper mechanism)
-
----
-Updated: 2026-06-16 — added one paragraph noting that since the 2026-06 `DataSource` seam landed, `runAgentLoop.mcp` is structurally adapter-agnostic — `live-bloomreach` injects `BloomreachDataSource`, `live-sql` injects `OlistDataSource` (mcp-server-olist subprocess); topology and budget mechanics unchanged. Cross-linked `03-provider-abstraction.md` and the new `09-eval-pipeline.md` (which measures this orchestration's outputs across K iterations).
-Updated: 2026-06-02 — promoted from legacy archive `.aipe/study-system-design/` into v1.59.2 audit-style layout; See also cross-links re-pointed to sibling pattern files + audit.md lens (legacy DSA archive refs retained — that folder is preserved).
-Updated: 2026-05-28 — maxDuration 300; rewrote Move 2 as a two-request step-split (diagnose / recommend) with client-side diagnosis handoff via sessionStorage; added derived diagnosis confidence + richer recommendation fields; refreshed diagram and refs.
-
----
-Updated: 2026-05-29 — updated `MonitoringAgent.scan` to its gated signature `scan(hooks?, categories: AnomalyCategory[] = [])` and described the per-category checklist injection; added a "schema gate" sub-section with an ASCII diagram showing schema → capabilities → runnable categories → scan(hooks, runnable), noting the gate is upstream of the unchanged `runAgentLoop`; corrected the `scan` line range (L68–L103 → L69–L120) and the `DiagnosticAgent` `maxToolCalls` ref (L61 → L62); verified `runAgentLoop` (L48–L176) and `DiagnosticAgent.investigate` (L45–L83) against current code.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

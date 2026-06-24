@@ -367,4 +367,3 @@ Synthetic vs fixture — what each guarantees
 - `audit.md#testing-red-flags-audit` — flag 7 (no contract test on external) is the staleness gap this pattern carries
 - `01-scripted-anthropic-harness.md` — the agent layer's complementary pattern; together they cover the lib boundary
 - `04-acceptance-plus-per-gate-rejection.md` — the type-guard discipline applied to the parser's output, after parsing
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

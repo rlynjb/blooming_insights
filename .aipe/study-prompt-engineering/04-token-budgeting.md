@@ -416,10 +416,3 @@ fixed: [static][{schema}][cache_control][VOLATILE]  ← long cacheable prefix
 → 01-anatomy.md · → 02-structured-outputs.md · → 03-prompts-as-code.md · → 08-few-shot.md
 
 ---
-Updated: 2026-05-29 — Resynced monitoring refs after the `{categories}` shift: `schemaSummary` L15–48→L16–49, monitoring `maxToolCalls` L74→L101, `{schema}` placement L75–77→L99–101, plus the ~112KB comment L14→L15 and the `.replace('{schema}',…)` call L62→L84.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-16 — Updated `schemaSummary` range to L16–L57 (was L16–L49) and noted the new `Data horizon: <from> → <to>` line appended at L40–L49 under Olist — a single-line prefix anchor that drove a measured 5x loose-recall lift on the Phase 3 detection eval.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

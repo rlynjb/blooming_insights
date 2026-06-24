@@ -21,4 +21,3 @@ Read the prompt and the standard architecture as if you were at the whiteboard �
 The per-concept template (Subtitle / Why care / How it works / In this codebase / Elaborate / Tradeoffs / Tech reference / Summary / Interview defense / Validate / See also) is the right shape for explaining a *single pattern*. These files are not explaining a pattern — they are explaining an *interview prompt*. The nine-bullet shape lets the prompt, the standard answer, and the honest codebase mapping live side by side at the same level of structure, which is what the interview conversation actually needs.
 
 ---
-Updated: 2026-05-29 — created

@@ -57,4 +57,3 @@ Each of these is the right floor for the current topology. The breakpoint where 
 - `../03-multi-agent-orchestration/09-coordination-failure-modes.md` — the broader failure-mode catalog the per-tool breaker bounds
 
 ---
-Updated: 2026-05-29 — created

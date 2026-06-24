@@ -424,11 +424,3 @@ fence-first: regex captures [...] → JSON.parse → precise ✓
 → 01-anatomy.md · → 03-prompts-as-code.md · → 07-output-mode-mismatch.md · → 09-chain-of-thought.md
 
 ---
-Updated: 2026-05-29 — Corrected the `## Output` section ranges (monitoring L69–97, diagnostic L59–103, recommendation L47–91) and the dependent in-section refs (fence asks → monitoring L71 / diagnostic L61 / recommendation L49; "Do NOT include an id" → recommendation L82; diagnostic empty-case shape L94–101). No placeholder injection table exists in this file (it lives in 01-anatomy.md), so `{categories}` was added there instead.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-16 — Added a fifth "Where this breaks down" item: the BRL cents-vs-Reais unit-narration gap. Olist returns monetary values as integer cents but the schema only enforces type, not units. The prompt asks the model to divide by 100; nothing in the validator catches a miss. Surfaced as a prompt-engineering target by the Phase 3 eval suite.
-Updated: 2026-06-19 — Removed the BRL cents-vs-Reais item — Olist is gone (PR #8) and the legacy-prompts no longer narrate currency in cents. The structural point (shape ≠ unit-correctness) remains true; without an in-repo Olist adapter, it's no longer anchorable to a real file.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

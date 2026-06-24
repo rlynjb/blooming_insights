@@ -465,5 +465,3 @@ The lesson generalises: when result-dirs are date-stamped without a tag, *any* c
 - `.aipe/study-testing/` — owns the test-level correctness surface; the eval surface is the model-behavior complement.
 
 ---
-Updated: 2026-06-16 — new file: fourth observability surface (eval result paper trail, EVAL_RUN_TAG, flywheel methodology, LLM-as-judge as debug signal, parallel-run process-level debugging incident).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

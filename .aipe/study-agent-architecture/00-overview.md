@@ -112,6 +112,3 @@ F · system-design templates ── three generic 9-bullet templates the codebas
 The full per-feature breakdown is in [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md). The companion guides this one cross-references rather than duplicates: [`../study-ai-engineering/`](../study-ai-engineering/) (single-agent + retrieval mechanics) and [`../study-system-design/`](../study-system-design/) (the systems-level view of the same orchestration).
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-16 — Reflected Phase 2 DataSource seam (`lib/data-source/`), the authored sibling `mcp-server-olist` package and its three domain tools, the new `bi:mode = 'demo' | 'live-sql' | 'live-bloomreach'` triple, and the Phase 3 four-pillar eval suite with portfolio numbers.
-Updated: 2026-06-19 — Reflected AptKit v0.3.0 migration: active spine is AptKit's agent classes (`@aptkit/core`); Blooming-owned bridge is `aptkit-adapters.ts` (3 adapters, 206 LOC); legacy spine preserved at `base-legacy.ts`. Removed Olist + mcp-server-olist + eval/ references (all deleted in PR #8 commit 62c24d7). Added `SyntheticDataSource` as the second adapter behind the surviving DataSource seam. Mode triple is now `'demo' | 'live-bloomreach' | 'live-synthetic'`. Added pointer to new `04-agent-infrastructure/06-aptkit-runtime-layer.md` concept file.

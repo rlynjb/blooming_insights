@@ -359,4 +359,3 @@ Read chapter 03 next — the options analysis, including "do
 nothing" as a real option.
 
 ---
-Updated: 2026-06-03 — refreshed test-suite count (144 → 169) to match the 2026-06-02 status snapshot.

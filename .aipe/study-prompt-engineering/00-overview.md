@@ -59,5 +59,3 @@ Prompt engineering, the way it survives production, is not "wording tricks" — 
 > Reading order, and the Case A/B split, live in [README.md](README.md). The companion guides are [`../study-ai-engineering/`](../study-ai-engineering/README.md) (the systems lens on the same agents) and [`../study-system-design/`](../study-system-design/README.md).
 
 ---
-Updated: 2026-06-16 — Updated the eval row to Case A (Phase 3 `eval/` ships) and rebuilt the `what's MISSING` diagram band into "eval/ suite (Phase 3)" + a smaller residual gap list. Real receipt: monitoring Phase 2.5 fix → loose recall 6.7% → 33.3% with framing limit honestly named.
-Updated: 2026-06-19 — AptKit migration + Olist removal: prompts now ship via `@aptkit/prompts` (active) with `lib/agents/legacy-prompts/` preserving the previous markdown (legacy). The Phase 3 `eval/` harness and its 6.7% → 33.3% receipt are gone — reverted 05 to Case B and removed the eval band from the architecture diagram. Updated 01 and 03 lines to name the package boundary as the new authoring seam.

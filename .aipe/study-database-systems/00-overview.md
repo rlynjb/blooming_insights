@@ -185,4 +185,3 @@ None of these are speculation about a far future. They're the natural next steps
 - `study-distributed-systems` — why per-instance caches diverge under load
 
 ---
-Updated: 2026-06-19 — Olist SQLite tier removed (PR #8, commit 62c24d7). Synthetic data source landed (commit c75ec3e) and is in-process / no persistence. Verdict reverts to "no DB in this codebase"; sections 02/03/04/05/07 revert to "not yet exercised"; 10-embedded-sqlite-fixture retained with RETIRED banner.

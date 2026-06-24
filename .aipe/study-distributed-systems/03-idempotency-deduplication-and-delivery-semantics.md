@@ -392,5 +392,3 @@ Not caching error results. If a 429 (which arrives as `isError: true` inside HTT
 - `.aipe/study-testing/` — the cache + retry tests live in `test/data-source/bloomreach-data-source.test.ts` (and friends)
 
 ---
-Updated: 2026-06-16 — Verdict + zoom-out cover both adapters' dedup (Bloomreach: 60s TTL; Olist: none); line refs migrated to `lib/data-source/bloomreach-data-source.ts`; flagged the asymmetric cache as a deliberate design choice tied to transport cost.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

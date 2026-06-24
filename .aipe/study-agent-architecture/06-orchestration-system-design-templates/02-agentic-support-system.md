@@ -114,4 +114,3 @@ So the template's structural elements are *present* (router, ReAct, validators, 
 The honest order to do this is *don't*, until the product decision changes. Read-only + suggestion-output is a deliberate design with a real benefit: there is no class of bug in the agent that can corrupt the user's Bloomreach workspace. That benefit goes away the moment the first write tool is added.
 
 ---
-Updated: 2026-05-29 — created

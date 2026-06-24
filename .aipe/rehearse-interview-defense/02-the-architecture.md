@@ -273,6 +273,3 @@ The architecture's cleanest seam is the shared `runAgentLoop` — four agents, o
 **What you'd change:** Keep the AptKit-runtime + Blooming-adapters split; pull the NDJSON streaming + demo-replay framing out of the route handlers into a reusable layer so `/api/briefing` and `/api/agent` stop duplicating that scaffolding.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-02 — Added the ALS-scoped `RequestStore` (`lib/mcp/auth.ts` L47) to the auth band of the architecture diagram — it's now a load-bearing pattern documented in study-security and worth being able to point at on the whiteboard.
-Updated: 2026-06-20 — Whiteboard diagram rewritten: 5 bands now show (1) UI with 3 extracted hooks + shared readNdjson, (2) routes, (3) AptKit runtime + 3 Blooming-owned adapter classes (aptkit-adapters.ts), (4) DataSource seam serving 3 adapters (Bloomreach + Synthetic + interface), (5) providers. The architecture walk and interrupt-map updated to reflect that AptKit owns the loop and Blooming owns the boundary. Added 2 new follow-up questions ("Why three adapters behind one interface?" and "Why use AptKit at all?"). insights.ts session-key fix referenced as RESOLVED. The one-page summary captures the new spine.

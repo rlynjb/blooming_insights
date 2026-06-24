@@ -160,4 +160,3 @@ PR G: eval/results/2026-06-15-score-baseline/regression-summary.md
 The eval flywheel discipline is named in `../05-evals-and-observability/01-eval-set-types.md` (every surfaced bug becomes a permanent fixture), `../05-evals-and-observability/02-eval-methods.md` (the right rung per surface), `../05-evals-and-observability/03-llm-as-judge-bias.md` (calibration receipts as honest mitigation for self-preference), and `../05-evals-and-observability/05-regression-evals.md` (the baseline-relative decision rule). Read them together — the four-pillar suite is the worked example of the architecture described above.
 
 ---
-Updated: 2026-06-16 — new file. The 4-pillar eval suite shipped in Phase 3 is exactly this template: detection (set-overlap) + reasoning (per-criterion rubric) + action (lighter rubric) + regression (structural diff + similarity judge), with calibration receipts and the flywheel discipline. Worked example with file/results citations.

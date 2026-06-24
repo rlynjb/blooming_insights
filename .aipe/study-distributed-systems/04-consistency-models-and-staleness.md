@@ -412,5 +412,3 @@ When the user closes the tab between steps. sessionStorage is per-tab. Reopening
 - `.aipe/study-system-design/audit.md#state-ownership-and-source-of-truth` — the architectural take on state ownership
 
 ---
-Updated: 2026-06-16 — Verdict + Part 2 cover the asymmetric staleness contract (Bloomreach: 60s TTL; Olist: always fresh); line refs migrated to `lib/data-source/bloomreach-data-source.ts`.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

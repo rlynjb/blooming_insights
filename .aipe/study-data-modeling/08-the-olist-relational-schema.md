@@ -370,7 +370,3 @@ A: One real bug, one drift risk. The real bug is **`price_brl` (and `value_brl`,
 - `05-migrations-and-evolution.md` — drop-and-reseed as the legitimate "no migrations" strategy here.
 - `09-deterministic-synthetic-data.md` — how the data lands in this schema (mulberry32 + the seeded anomalies).
 - `10-units-in-column-names.md` — the `price_brl` bug walked end-to-end with the eval evidence.
-
----
-Created: 2026-06-16 — new file covering the Phase 2 Olist DB schema as a worked relational-modeling example.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

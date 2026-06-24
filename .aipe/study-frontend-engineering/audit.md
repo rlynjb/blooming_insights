@@ -340,9 +340,3 @@ The kernel handles flush-trailing-buffer, malformed-line skip, and `cancelOn` po
 ---
 
 End of audit.
-
----
-Updated: 2026-06-16 — Top findings #1 (page-decomposition / 14 useState slots) and #2 (NDJSON kernel duplication) RESOLVED in production code via page-decomposition refactor + `lib/streaming/ndjson.ts` hoist. Finding #5 (feed `<aside>` hand-rolled) promoted to top live finding. `bi:mode` value tier updated to 3-mode `'demo' \| 'live-sql' \| 'live-bloomreach'`.
-
----
-Updated: 2026-06-19 — bi:mode union changed: `'live-sql'` removed (Olist), `'live-synthetic'` added (the new Blooming-owned in-process synthetic adapter). 3-value toggle is now demo | live-bloomreach | live-synthetic. UI surface otherwise unchanged.

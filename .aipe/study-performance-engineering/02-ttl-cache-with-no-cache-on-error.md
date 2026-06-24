@@ -490,4 +490,3 @@ The full picture — key derivation, read path, miss path, write path with the e
 - `04-synthesize-as-cost-concentration.md` — the unmeasured cost line that no cache helps with
 - `.aipe/study-agent-architecture/05-production-serving/01-cross-turn-caching.md` — the three cache scopes and why semantic similarity is off the table
 - `.aipe/study-ai-engineering/06-production-serving/01-llm-caching.md` — Anthropic's prompt-prefix caching (a related-but-different cache at a different layer)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

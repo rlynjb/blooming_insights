@@ -36,5 +36,3 @@ Operational discipline first (you can't iterate a prompt you can't budget or eva
 > Curriculum-loaded: each file carries a `## Project exercises` block citing `aieng-curriculum.md` concept IDs (C1.7, C1.10, C1.12, C3.1–C3.3, C5.7, plus the NEW Tier-1/Tier-2 concepts) for provenance, with every exercise targeting blooming insights' own files.
 
 ---
-Updated: 2026-06-16 — Flipped eval-driven iteration (05) from Case B → Case A (Phase 3 ships the 4-pillar `eval/` suite with measured Phase 2.5 monitoring-prompt receipts: loose recall 6.7% → 33.3%).
-Updated: 2026-06-19 — AptKit migration + eval/ removal: prompts now ship via `@aptkit/prompts` (active path, via `@aptkit/core@0.3.0`); previous markdown lives at `lib/agents/legacy-prompts/`. Reverted 05 (eval-driven iteration) from Case A → Case B — the `eval/` harness and its 6.7% → 33.3% receipt are no longer in the repo.

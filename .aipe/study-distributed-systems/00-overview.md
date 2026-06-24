@@ -163,13 +163,3 @@ Everything else on the standard distributed-systems checklist — consensus, lea
 - **`study-runtime-systems/`** — owns the event loop inside one Vercel instance. The "stateful server" failure mode lives at the boundary between *that* file (one instance) and *this* file (many instances).
 
 Cross-link rather than re-teach.
-
----
-
-Updated: 2026-06-01 — Initial generation as v1.55 distributed-systems guide (Partially Case B). Single-process app; boundaries to external services + cross-instance coordination gap are the real distributed-systems surface. Consensus / replication / leader-election explicitly NOT YET EXERCISED.
-
----
-Updated: 2026-06-16 — Phase 2 added a SECOND distributed transport (stdio to mcp-server-olist subprocess) behind the same DataSource interface; renamed/repathed McpClient → BloomreachDataSource; added Seam F (subprocess pipe) and the heterogeneous-backend pattern; added file 10 (transport-agnostic protocol design); flagged the Phase 3 parallel-eval K=10 race as the real distributed-systems anecdote for file 05.
-
----
-Updated: 2026-06-19 — Olist subprocess adapter removed (PR #8); reverted to ONE distributed transport (HTTP+SSE to Bloomreach). SyntheticDataSource (in-process, no IPC) replaces Olist as the second adapter behind the DataSource seam but does not add a distributed surface. Zoom-out, structure pass, seams (Seam F removed), and reading-order verdicts revised; file 10 retired with banner; "five things" collapsed to "four things."

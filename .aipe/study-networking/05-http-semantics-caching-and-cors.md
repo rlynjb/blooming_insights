@@ -373,4 +373,3 @@ The OAuth callback is a cross-site return: Bloomreach's IdP 302s the browser to 
   → `04-tls-and-trust-establishment.md` — the cookie crypto these attributes wrap.
   → `06-websockets-sse-streaming-and-realtime.md` — why NDJSON over GET and not SSE.
   → `../study-system-design/05-streaming-ndjson.md` — the bytes-on-the-wire framing.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

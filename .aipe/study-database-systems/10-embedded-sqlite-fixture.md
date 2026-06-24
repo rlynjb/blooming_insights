@@ -465,5 +465,3 @@ Anchor: `lib/mcp/schema.ts` L232-273; `mcp-server-olist/scripts/seed-olist.ts` L
 - `study-system-design` — when this pattern stops being the right shape
 
 ---
-Updated: 2026-06-16 — created. Phase 2 introduced the SQLite-backed mcp-server-olist; this file teaches the "data as fixture" pattern across all four layers (seed determinism, committed binary, readonly open, prepared-statement tool queries).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

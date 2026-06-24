@@ -518,4 +518,3 @@ Partly, yes — interview frequency *is* one of the three lenses, and LeetCode i
 ## See also
 
 → chapters 01 through 07 (the audits this plan ranks) · → `me.md` (the portfolio status that calibrates "build vs rehearse") · → IK curriculum (the structured drilling path many of the ranked items follow)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

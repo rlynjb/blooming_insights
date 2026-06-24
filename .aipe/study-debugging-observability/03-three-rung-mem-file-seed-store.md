@@ -436,5 +436,3 @@ The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the even
 - `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern (system-design angle).
 
 ---
-Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this 3-rung store is now the only persistence layer for trace evidence in the repo.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

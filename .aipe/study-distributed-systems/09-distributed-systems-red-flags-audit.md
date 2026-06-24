@@ -288,9 +288,3 @@ The day someone adds a write tool — `create_voucher`, `start_campaign`, anythi
 - `10-transport-agnostic-protocol-design.md` — RETIRED; the Phase-2 two-transport design RISK 10 attached to
 - `.aipe/study-system-design/audit.md#system-design-red-flags-audit` — the system-design twin of this audit
 - `.aipe/study-security/` — security-shaped risks at the same boundaries
-
----
-Updated: 2026-06-16 — RISK 2 reframed as adapter-asymmetric (Olist fixed, Bloomreach not); added RISK 9 (parallel-eval race + EVAL_RUN_TAG mitigation) and RISK 10 (subprocess lifecycle); table extended with both new risks; "first three fixes" updated to point at the now-mirrorable Olist timeout pattern.
-
----
-Updated: 2026-06-19 — RISK 9 and RISK 10 RETIRED (resolved-by-deletion: Olist adapter and eval pipeline removed in PR #8 on 2026-06-18). RISK 2 reverts to a single non-asymmetric finding ("no per-tool timeout on the MCP call"). Top-3 ordering replaces top-4; primary diagram, "first three fixes," and implementation table updated; retired-risk markers kept so readers who saw the previous refresh can trace what happened.

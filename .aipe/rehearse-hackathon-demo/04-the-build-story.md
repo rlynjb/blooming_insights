@@ -276,5 +276,3 @@ chapter 4, say that one line and move to chapter 5.
 ```
 
 Read chapter 5 next.
-
-Updated: 2026-06-02 — v1.59.2 drift refresh: softened "60 lines" claim on the schema-gate subsystem (categories.ts is now 160 lines) into "one file"; the four named exports (schemaCapabilities, coverageFor, coverageReport, runnableCategories) all still match the codebase.

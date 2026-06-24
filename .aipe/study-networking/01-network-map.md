@@ -437,4 +437,3 @@ Anchor: "the only timeout in play is the platform's hard kill — that's a gap."
   → `05-http-semantics-caching-and-cors.md` — the cookies and headers that hold this together.
   → `07-timeouts-retries-pooling-and-backpressure.md` — the rate-limit playbook at hop 2a.
   → `../study-system-design/05-streaming-ndjson.md` — the line-buffering contract on the wire.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

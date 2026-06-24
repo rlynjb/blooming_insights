@@ -362,4 +362,3 @@ Asymmetric resumption. The browser cannot tell us "resume from event 42" — NDJ
   → `04-tls-and-trust-establishment.md` — what rides on top of every TCP here.
   → `06-websockets-sse-streaming-and-realtime.md` — the alternative connection-lifecycle shapes we do NOT use.
   → `07-timeouts-retries-pooling-and-backpressure.md` — the rate-limit logic at the application layer.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

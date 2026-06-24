@@ -322,5 +322,3 @@ Diagram: the version-column UPDATE pattern.
 - `study-runtime-systems` — Node's event loop and the within-tick atomicity claim
 
 ---
-Updated: 2026-06-19 — Olist note removed (sibling SQLite tier gone). Main-app concurrency gap unchanged; the rate-limit-budget-per-instance finding is still the load-bearing concurrency story here.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

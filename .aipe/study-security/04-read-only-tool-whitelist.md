@@ -575,4 +575,3 @@ Real defenses for this: per-tool result-shaping middleware that strips PII field
 → [audit.md](./audit.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md) · [05-open-tool-surface-gap.md](./05-open-tool-surface-gap.md)
 
 Cross-reference: `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the LLM-angle treatment of why tool-scope discipline is the structural defense for agents.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

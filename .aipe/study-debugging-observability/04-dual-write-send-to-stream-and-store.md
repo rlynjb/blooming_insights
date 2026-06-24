@@ -442,5 +442,3 @@ The order of the writes also matters: push first, enqueue second. If `enqueue` t
 - `.aipe/study-system-design/05-streaming-ndjson.md` — the wire half of the dual-write (system-design angle).
 
 ---
-Updated: 2026-06-19 — cross-link to `06-` retained with RETIRED hint after PR #8 removed the Olist eval pipeline; this dual-write is now the only place the trace gets captured-while-emitted in the repo.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -545,7 +545,3 @@ A: When the system under test is the *transport* itself — OAuth, rate limiting
 - `09-deterministic-synthetic-data.md` — RETIRED. The predecessor pattern (mulberry32 + SQLite + seeded_anomalies). The cousin: same intent (deterministic owned-by-repo fixture), different implementation (in-process vs DB-backed).
 - `study-system-design/03-provider-abstraction.md` — the system-design framing of the same seam (provider abstraction over the upstream data source).
 - `study-testing/audit.md` — how the synthetic adapter is used in the agent-loop test suite.
-
----
-Created: 2026-06-19 — new pattern file covering the in-process synthetic fixture (`lib/data-source/synthetic-data-source.ts`). Replaces the data-modeling-for-test slot previously held by the deterministic-synthetic-data file (09), which is now RETIRED.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -593,4 +593,3 @@ No. The `recursive: true` is a parameter passed to Node's `fs.promises.mkdir`. T
 ## See also
 
 → `04-trees-tries-and-balanced-indexes.md` (trees are the natural data structure for recursion; tree walks are the canonical recursive algorithm) · → `05-graphs-and-traversals.md` (DFS is recursion with a visited set; backtracking is DFS plus undo) · → `06-sorting-searching-and-selection.md` (merge sort, quicksort, quickselect are all recursive/divide-and-conquer — `not yet exercised` directly here, but V8's Timsort uses recursion internally) · → `08-dsa-foundations-practice-map.md` (where these three rank in the practice plan)
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

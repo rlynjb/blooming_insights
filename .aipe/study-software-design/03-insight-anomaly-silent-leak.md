@@ -416,5 +416,3 @@ Interview-defense diagram — surface fix vs deeper fix
 - `04-synthesize-recovery-duplication.md` — RESOLVED, same fix shape (same logic in two places, lifted to one owner).
 
 ---
-Updated: 2026-06-16 — verdict RESOLVED; surface fix landed (colocation + intentional-drop comment + round-trip test); deeper wire-format fix deliberately not done; kept as worked example with post-fix lesson on comments as carriers of intent TypeScript can't enforce.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -404,5 +404,3 @@ Interview-defense diagram — the spacing gate, why it's load-bearing
 - `04-synthesize-recovery-duplication.md` — RESOLVED; the prediction in the original file came true — the recovery was absorbed into `runAgentLoop` the same way rate-limit retries are absorbed into `BloomreachDataSource`.
 
 ---
-Updated: 2026-06-16 — class renamed to `BloomreachDataSource` and moved to `lib/data-source/bloomreach-data-source.ts` in Phase 2 PR A; internals unchanged; `lib/mcp/client.ts` kept as 17-line shim; depth analysis still holds; cross-refs updated to flag resolved sibling files.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

@@ -107,5 +107,3 @@ The honest version of "how to make it apply" is: don't, unless a feature genuine
 The pattern to name in interview: *measurement → fix → re-measurement → discovery of the next thing.* That's what an eval flywheel looks like in production, and it's the work blooming insights actually did. The supervisor-worker topology refactor above is hypothetical; the eval discipline is shipped.
 
 ---
-Updated: 2026-05-29 — created
-Updated: 2026-06-16 — Added closing "eval flywheel" case study (PR D → Phase 2.5 → PR E BRL bug → PR F recurrence → PR G drift) — the senior-level systems pattern this template's "Eval framing" bullet asks for, anchored to the actual Phase 3 work.

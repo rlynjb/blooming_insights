@@ -416,11 +416,3 @@ example     → imitated → gaps filled by analogy   ← stronger structural co
 → 01-anatomy.md · → 02-structured-outputs.md · → 09-chain-of-thought.md · → 04-token-budgeting.md
 
 ---
-Updated: 2026-05-29 — Resynced monitoring.md exemplar refs after the `{categories}` shift: EQL reminders L43–48→L49–54, Suggested query plan L33–41→L39–47 (with inner step annotations L35–41→L41–47), output exemplar L54–64→L73–85 (verified against the live JSON block, which sits lower than the +6 estimate due to the expanded field-rules).
-Updated: 2026-05-29 — Resynced sibling-prompt refs (pre-existing drift): diagnostic.md EQL reminders L26–34→L27–37 and negative-example L33→L35, diagnostic.md output exemplar L48–66→L63–85, recommendation.md output exemplar L49–59→L49–74 and id-ban L64→L82.
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-16 — Added items 4 (dual-adapter format exemplars: prompt now carries parallel Bloomreach-EQL + Olist-SQL exemplar blocks since Phase 2) and 5 (enumerated 3-dim scan plan as exemplars-as-checklist few-shot — measured 5x loose-recall lift on the Phase 3 eval suite).
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

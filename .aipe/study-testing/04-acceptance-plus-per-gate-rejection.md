@@ -402,4 +402,3 @@ The diagnostic value of isolation
 - `01-scripted-anthropic-harness.md` — the agent layer that depends on these guards as fallback triggers
 - `02-fixture-driven-schema-parser.md` — the parser output that flows into these guards (after parsing)
 - `03-vi-stubenv-isolation.md` — the test isolation that lets parallel-worker runs of validate.test.ts stay clean
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

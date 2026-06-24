@@ -470,10 +470,3 @@ chunk2: 'ol_call_start"...}\n'→ buf+chunk completes the line → parse
 → 04-structured-outputs.md · → 01-what-an-llm-is.md · → 06-token-economics.md
 
 ---
-Updated: 2026-05-28 — `maxDuration` 60→300; documented schema bootstrap moved inside the `ReadableStream` (+ try/catch error events, briefing route mirror); NDJSON consumer relocated from the investigate page to the StrictMode-safe `useInvestigation` hook; re-derived all route.ts/hook line refs.
-Updated: 2026-05-29 — Added "Briefing route — a second streaming surface" (local `BriefingEvent` superset L54–L58 that does NOT widen the shared `AgentEvent`; demo paced replay `REPLAY_DELAY_MS = 140` vs the agent route's 180; per-category `coverage_item` streaming L209–L212 that fills the grid tile-by-tile); refreshed drifted refs — briefing `maxDuration` L16→L17, and the feed's briefing reader from the stale `app/page.tsx` L311–L312 to the live reader (`getReader()` L323, loop L439–L457, `BriefingEvent` L28–L32).
-Updated: 2026-05-30 — Migrated to study.md v1.47 template (Phase 1+2 mechanical): removed Tradeoffs / Tech reference / Summary sections; renamed "In this codebase" → "Implementation in codebase"; moved See also to a bottom block. "Why care" preserved pending Phase 3 (Zoom out, then zoom in + LAYERS diagram) authoring.
-Updated: 2026-05-30 — Phase 3 of study.md v1.47 migration: replaced "Why care" block with "Zoom out, then zoom in" (LAYERS diagram + zoom-in paragraph) per format.md.
-Updated: 2026-05-31 — Applied study.md v1.48: scrubbed "How it works" of file paths, line refs, and real-code fences; replaced with generic role labels + pseudocode per format.md. Codebase-specific anchoring lives exclusively in "Implementation in codebase".
-Updated: 2026-05-31 — Applied study.md v1.50: added Structure pass block (layers · axis · seams) between Zoom out and How it works per format.md's new Block 3.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

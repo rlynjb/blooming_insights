@@ -458,4 +458,3 @@ five-option decision matrix, and `04-success-metrics-and-
 feedback-loop.md` for the two-layer success frame.
 
 ---
-Updated: 2026-06-03 — Q3 "how do you know diagnoses are right" now names the queue-head eval drill (`.aipe/drills/evals-observability-induce-eval-gap-build-min-eval-harness.md`) as the concrete first build, with the keystone-missing framing from `.aipe/audit-refactor-eval-substrate/00-overview.md`.

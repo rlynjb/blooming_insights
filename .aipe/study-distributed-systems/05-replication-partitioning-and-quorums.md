@@ -406,5 +406,3 @@ A shared workspace where two users see the same briefing. That breaks the per-bi
 - `.aipe/study-system-design/audit.md#storage-choice-and-durability-boundaries` — the architectural take on why no database
 
 ---
-Updated: 2026-06-16 — Added Part 6: the K=10 parallel-eval race + EVAL_RUN_TAG fix as a real single-host multi-process distributed-systems anecdote; added the eval code side-by-side; cross-link to study-testing.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

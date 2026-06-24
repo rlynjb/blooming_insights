@@ -385,5 +385,3 @@ sonnet judge biases toward "same substance"
 → 01-eval-set-types.md · → 02-eval-methods.md · → 03-llm-as-judge-bias.md · → 04-llm-observability.md · → ../07-system-design-templates/03-multi-rubric-eval-pipeline.md
 
 ---
-Updated: 2026-06-16 — new file. Documents the regression-eval pillar shipped in Phase 3: capture/score modes, structural-diff + similarity-judge two-mode scoring, the 30% semantic baseline as the load-bearing finding, fixture inventory under `eval/fixtures/regression-golden/`, and the paper trail at `eval/results/2026-06-15-score-baseline/regression-summary.md`.
-Updated: 2026-06-24 — Stripped `## Validate` block per spec v1.68.3 (the Validate primitive was removed from the per-concept template; block 10 is now `See also`).

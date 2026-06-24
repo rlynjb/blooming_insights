@@ -13,4 +13,3 @@ A **system design template** is an interview reframe of the codebase: the verbat
 Read the prompt and the standard architecture as if you were at the whiteboard — they are the answer you would give in any interview, codebase or not. Then read the last two bullets as the honest follow-up an interviewer drills into: *"your repo has this; does it actually implement what you just described?"* The value of these files is the gap between the canonical design and the real code — and being able to defend why blooming insights chose live tool-call retrieval over a search index, a one-shot grounded answerer over a full RAG-plus-escalation support stack, and (for the eval pipeline) the multi-rubric architecture with calibration receipts over a single LLM-judge or no evals at all.
 
 ---
-Updated: 2026-06-16 — added `03-multi-rubric-eval-pipeline.md` (the senior-level system-design reframe for which this codebase's 4-pillar eval suite IS the worked example).

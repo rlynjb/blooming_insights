@@ -23,4 +23,3 @@ Phase 1 of the blooming insights AI-engineering study guide: the load-bearing fa
 All citations are to blooming insights files (verified line numbers) and curriculum IDs for provenance only.
 
 ---
-Updated: 2026-05-28 — Refreshed the 05-streaming entry for `maxDuration = 300`, bootstrap-in-stream, and the consumer's move to the `useInvestigation` hook; the rest of the index verified accurate against the current source.

@@ -114,4 +114,3 @@ The typed `Diagnosis` is the message; carriers are function args (in-process) an
   - `../06-orchestration-system-design-templates/` — the refactor targets for every Case B file in this sub-section
 
 ---
-Updated: 2026-05-29 — created
