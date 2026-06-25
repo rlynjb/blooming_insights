@@ -124,32 +124,41 @@ answer — there's no eval harness. Don't pretend otherwise.
 
   ### The answer that holds
 
-> I don't. There's no eval set, no labeled ground truth, no
-> systematic accuracy measurement. The codebase's own AI-
-> engineering audit (`study-ai-engineering/00-overview.md`)
-> names this explicitly: "evals are the Case-B gap."
+> I don't have a *current* eval set. But this isn't "we never
+> built one" — between the hackathon and today, I built a
+> 4-pillar eval suite (detection precision/recall, diagnosis
+> 5-criterion rubric, recommendation 3-criterion rubric,
+> regression capture-and-score), calibrated the LLM-as-judge
+> against manual spot-checks (8/8 + 3/3 agreement), ran 30
+> cases, and surfaced three real bugs:
 >
-> What the build *does* substitute for an eval, deliberately,
-> is **legibility**: the full reasoning trace, the citations to
-> the exact EQL queries, the current-vs-prior numbers in the
-> evidence panel, the hypotheses considered with their pass/fail
-> verdicts. A judge or user can read the trace and form their
-> own opinion on whether the diagnosis is right. That's not
-> "the diagnoses are right" — that's "the diagnoses are
-> *auditable*." Different claim.
+> **(1)** a BRL cents-vs-Reais unit-narration bug — the
+> recommendation agent narrated R$131,965 as an AOV, caught at
+> run 8 by the judge on the "numerical plausibility" criterion.
+> **(2)** binary calibration in 29/30 diagnosis runs — the
+> judge was scoring 0 or 1, never the middle, which meant the
+> rubric wasn't being used (a harness bug, not an agent bug).
+> **(3)** conclusion instability at a 30% baseline — same
+> anomaly, different diagnosis 30% of the time at the model
+> temperature in use.
 >
-> If this became a product, the first investment would be
-> labeled ground truth: 50–200 anomalies the team independently
-> agreed on (importance + action), then measure the agent's
-> match rate against that set. ~2 weeks of work. Not done; not
-> hidden — the starter version is already spec'd as the queue-
-> head drill (`.aipe/drills/evals-observability-induce-eval-gap-
-> build-min-eval-harness.md`): five files in `evals/` (goldset,
-> rubric, runner, LLM-as-judge, agreement test), ~5 hours, and
-> the eval substrate (NDJSON trace + deterministic replay) is
-> already built — the harness is the keystone, and the keystone
-> is the only stone missing (`.aipe/audit-refactor-eval-
-> substrate/00-overview.md`).
+> Then I retired it. The eval suite scored against an Olist
+> e-commerce SQLite substrate the project owned end-to-end via
+> a Phase 2 MCP subprocess. When the substrate was cut (PR #8,
+> commit 62c24d7), the suite went with it — `eval/` deleted,
+> `mcp-server-olist/` deleted, the DataSource SEAM survived
+> (now serves Bloomreach + Synthetic). So today: no current
+> eval, but the receipts of having built one once live in the
+> git history.
+>
+> What the build still substitutes for an eval is **legibility**:
+> full reasoning trace, citations to the exact EQL queries,
+> current-vs-prior numbers in the evidence panel, hypotheses
+> with pass/fail verdicts. That's auditability, not accuracy.
+> Round 2 of the eval suite — same patterns, scored against the
+> Synthetic adapter — is ~5 hours of work because the patterns
+> are known. Not currently in tree; deliberately not, until the
+> investment is worth making.
 
   ### The answer that loses
 
@@ -159,19 +168,20 @@ answer — there's no eval harness. Don't pretend otherwise.
 
   ### Five-second version
 
-> "I don't have an eval set. The substitute is making the
-> reasoning fully auditable — but that's auditability, not
-> accuracy. If this went past the hackathon, evals are the
-> first build."
+> "Built the eval once in Phase 3, caught 3 real bugs, retired
+> it with the substrate it scored against. Today: legibility
+> not accuracy; round 2 against Synthetic is ~5h, deliberately
+> not in tree."
 
   ### Why this holds
 
-The codebase's own audit named this gap. Citing your own honest
-self-audit (rather than hiding the gap until pressed) is a
-strong move. The reframe — "auditability ≠ accuracy, but
-auditability is itself valuable for a transparent-reasoning
-product" — gives the reviewer a place to land that isn't
-"caught lying."
+It's the strongest version of this answer the build can give.
+"No eval" is weak; "we built one, it surfaced bugs, we retired
+it with its substrate, round 2 is ~5h and deferred" is judgement.
+The three named bugs (BRL units, binary calibration, conclusion
+instability) are concrete, verifiable in git, and signal that
+the eval *worked* — the reason for retiring isn't "we couldn't
+make it work" but "the substrate it scored against was cut."
 
   ## Question 4 — "What about yesterday's anomalies? Or sharing with my team? Or history?"
 
@@ -375,6 +385,139 @@ weight. "I'm in a pivot, I needed an artifact, the contest had
 a deadline that would force completion" is a respectable answer
 that doesn't try to be more than it is.
 
+  ## Question 8 — "You built an MCP server (Olist), shipped agents on it, then deleted it. Why?"
+
+The Phase 2 retirement question. A reviewer who's read the
+codebase or the git history sees that there was once an
+`mcp-server-olist/` and an `eval/` tree, and they're gone (PR
+#8, commit 62c24d7). The honest answer makes that decision look
+like judgement, not failure.
+
+  ### The answer that holds
+
+> Phase 2 was a deliberate experiment: build my own MCP server
+> over an Olist e-commerce SQLite as a portfolio-credible answer
+> to "I depend on a vendor's alpha endpoint that revokes tokens."
+> The agents got a substrate the project owned end-to-end, and
+> I added a DataSource SEAM at `lib/data-source/types.ts` so
+> the agent code didn't care which substrate was beneath it.
+>
+> Phase 3 built the eval suite (covered in question 3) against
+> that Olist substrate.
+>
+> Then I retired both. Two reasons:
+>
+> **(1) The Olist substrate was carrying less weight than I
+> built it to carry.** The agents had two seams to maintain
+> (Bloomreach + Olist), the MCP subprocess added operational
+> surface (process lifecycle, port binding, deploy story), and
+> the eval-against-Olist findings were starting to be
+> Olist-specific in ways that wouldn't transfer to the real
+> Bloomreach use case.
+>
+> **(2) The Synthetic adapter (`lib/data-source/synthetic-data-source.ts`,
+> 516 LOC) does what Olist was doing — in-process, no subprocess,
+> Blooming-owned deterministic ecommerce events — without the
+> operational surface. Same DataSource SEAM, same agent contracts,
+> simpler to maintain.
+>
+> What I kept from Phase 2: the SEAM itself, the discipline of
+> "agents shouldn't know which substrate they're talking to,"
+> and the receipts in git that the Phase 3 eval suite was
+> built, ran, and worked. What I cut: the operational weight.
+> A senior engineer's job includes deciding when something built
+> stops being worth maintaining; the retire is that judgement.
+
+  ### The answer that loses
+
+> "It didn't work out." [no detail; sounds like failure]
+>
+> "It was a learning experience." [hedging; signals you can't
+> defend the original investment]
+
+  ### Five-second version
+
+> "Phase 2 was a deliberate own-the-substrate experiment.
+> Phase 3 was the eval against it. When the substrate stopped
+> carrying its operational weight, I cut both — and the
+> Synthetic adapter inherited the role without the subprocess
+> surface. The SEAM survived because the SEAM was the lesson."
+
+  ### Why this holds
+
+It names the original decision as deliberate, the work that came
+out of it as real (eval suite that surfaced bugs), and the retire
+as judgement-not-failure. The Synthetic adapter is the proof
+that the lesson transferred — same shape, less weight. A reviewer
+who pushes on "wasted effort" hits "the SEAM survived because
+the SEAM was the lesson" and lands.
+
+  ## Question 9 — "You wrote your own agent loop, then migrated to a library. Wasn't that wasted work?"
+
+The AptKit migration question. The git log shows hand-rolled
+agents migrating to `@aptkit/core@0.3.0` between commits 4d26e73
+and c006b24. A reviewer might frame that as either "you
+NIH-syndromed it and had to walk it back" or "you wrote
+throwaway code." Both framings lose. The honest framing wins.
+
+  ### The answer that holds
+
+> No, and the migration arc is the strongest agent-architecture
+> story I have. Two beats:
+>
+> **(1) At hackathon time, there was no library that fit the
+> shape.** I needed NDJSON streaming over `ReadableStream`,
+> a forced-final synthesis turn so the agent always returns
+> structured output, a bounded tool-call budget, and a
+> trace-as-UI surface. Fighting a library that didn't expose
+> those would have been more work than writing 200 lines of
+> loop. So I wrote `lib/agents/base.ts` (now preserved at
+> `lib/agents/base-legacy.ts`) and shipped.
+>
+> **(2) After the hackathon, the loop turned out to be 80%
+> reusable across projects.** That's when I lifted the kernel
+> into `@aptkit/core` and migrated the five active agents
+> (monitoring / diagnostic / query / recommendation / intent)
+> to be thin wrappers over the library's runtime. The
+> Blooming-specific code is now concentrated in
+> `lib/agents/aptkit-adapters.ts` (206 LOC, 3 bridges:
+> `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`,
+> `BloomingTraceSinkAdapter`) — that's the domain seam, and
+> it's the *interesting* code. The library swallows the
+> boilerplate.
+>
+> The pattern has a name: **defer-then-migrate**. Build it
+> ourselves when no library fits; lift to a library when the
+> contracts have settled and the kernel turns out to be
+> reusable. Both decisions were right at the time they were
+> made. The legacy path is preserved (`*-legacy.ts` files)
+> as a rollback if AptKit ever drifts somewhere the agents
+> can't tolerate.
+
+  ### The answer that loses
+
+> "I just wanted to use the library properly." [signals you
+> didn't have a reason; concedes the NIH framing]
+>
+> "Yeah I probably should have used a library from the start."
+> [retroactively undermines the original decision]
+
+  ### Five-second version
+
+> "Defer-then-migrate. No library fit the shape at hackathon
+> time; the loop turned out to be 80% reusable; lifted the
+> kernel to @aptkit/core, kept the domain adapter on the
+> Blooming side. Both decisions were right at the time."
+
+  ### Why this holds
+
+It names the pattern (defer-then-migrate), names what the
+domain seam is (the adapters), names the rollback (legacy
+path preserved), and treats both decisions as deliberate.
+Building it ourselves wasn't NIH; migrating wasn't capitulation.
+A reviewer who's seen real codebases recognizes the pattern
+and respects the judgement.
+
   ## The dodge — what NOT to do under pressure
 
 A reviewer pressing harder than expected can push you toward
@@ -404,7 +547,7 @@ two failure modes. Both are recoverable if you notice them:
 
   ## The five-second cheat sheet
 
-The seven holding lines, all on one page, for the morning of an
+The nine holding lines, all on one page, for the morning of an
 interview or demo Q&A.
 
 ```
@@ -415,8 +558,8 @@ interview or demo Q&A.
   │  → no saved dashboards in this workspace; every metric is  │
   │    ad-hoc EQL — agent's job is deciding what to query      │
   ├─ Q3: how do you know the diagnoses are right? ─────────────┤
-  │  → no eval set; substitute is full auditability via the    │
-  │    reasoning trace; evals are first build past hackathon   │
+  │  → built eval in Phase 3, caught 3 real bugs, retired      │
+  │    with substrate; legibility today; round 2 = ~5h         │
   ├─ Q4: what about yesterday's anomalies / sharing? ──────────┤
   │  → cut deliberately; no DB by design; smallest add is      │
   │    Vercel KV ~200 LOC, ~$5/month                          │
@@ -429,20 +572,30 @@ interview or demo Q&A.
   ├─ Q7: honestly why did YOU build this? ─────────────────────┤
   │  → AI-pivot artifact + contest deadline + brand-new MCP    │
   │    surface; portfolio + contest, not startup               │
+  ├─ Q8: why retire the Olist MCP server you built? ───────────┤
+  │  → Phase 2 deliberate own-the-substrate; Phase 3 eval ran  │
+  │    against it; Synthetic adapter inherited the role        │
+  │    without subprocess weight; SEAM survived                │
+  ├─ Q9: why migrate to AptKit after writing your own loop? ───┤
+  │  → defer-then-migrate; no library fit at hackathon time;   │
+  │    kernel turned out 80% reusable; legacy path preserved   │
+  │    as rollback                                             │
   └────────────────────────────────────────────────────────────┘
 ```
 
   ## What this chapter establishes
 
 ```
-  → seven real skeptical-reviewer questions have answers ready
+  → nine real skeptical-reviewer questions have answers ready
+    (seven original + two post-hackathon: Olist retirement
+    and AptKit migration)
   → every answer is grounded in repo evidence or honest naming
     of the gap
   → for each: the holding answer, the failing answer, and the
     five-second version
   → the dodge patterns (invent / collapse) are named so you
     catch yourself in the room
-  → the cheat sheet collects the seven one-liners on one page
+  → the cheat sheet collects the nine one-liners on one page
 ```
 
 The brief is done. Three reads of this chapter before any high-

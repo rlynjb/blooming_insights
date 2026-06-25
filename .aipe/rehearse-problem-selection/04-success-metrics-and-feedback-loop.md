@@ -236,6 +236,77 @@ a build that anchors the AI-pivot conversation across 30
 interviews is a strong outcome. A top-3 hackathon placement with
 a build that never comes up in interview is a weaker outcome.
 
+  ## Layer 1.5 — the Phase 3 receipts (measured once, then retired)
+
+A layer that didn't exist in the June 2026 brief, and one that's
+stronger than the planned-discovery framing the chapter originally
+ended on. **Between the hackathon and today, the eval suite that
+chapter 02 named as a cut got built, ran, surfaced real bugs, and
+was retired with the substrate it scored against.** That's a real
+measurement layer, not a planned one.
+
+```
+  THE FOUR NUMBERS PHASE 3 ACTUALLY MEASURED
+
+  ┌─ E1  detection precision/recall ───────────────────────────┐
+  │  measured: the monitoring agent's anomaly detection         │
+  │            against a labeled set of 30 cases                │
+  │  result:   captured in the retired eval/ tree (see PR #8    │
+  │            commit 62c24d7 for the deletion); summaries      │
+  │            live in the retired Phase 3 artifact set         │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ E2  diagnosis 5-criterion LLM-as-judge rubric ────────────┐
+  │  measured: 30 runs scored against 5 criteria                │
+  │  finding:  binary calibration — 29/30 scored 0 or 1, never  │
+  │            the middle; the judge wasn't using the rubric    │
+  │            it was given (a real bug in the harness, not the │
+  │            agent)                                           │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ E3  recommendation 3-criterion LLM-as-judge rubric ───────┐
+  │  measured: recommendation quality on Olist e-commerce data │
+  │  finding:  BRL cents-vs-Reais unit-narration bug caught at  │
+  │            run 8 — the agent narrated R$131,965 as an AOV,  │
+  │            which is implausible for any real merchant. The  │
+  │            judge caught it on the rubric criterion          │
+  │            "numerical plausibility"                         │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ E4  regression capture-and-score ─────────────────────────┐
+  │  measured: re-running the same anomalies after agent        │
+  │            prompt changes                                    │
+  │  finding:  conclusion instability at a 30% baseline — same  │
+  │            anomaly, different diagnosis 30% of the time at  │
+  │            the model temperature in use                     │
+  └────────────────────────────────────────────────────────────┘
+```
+
+**Judge calibration:** 8/8 + 3/3 manual spot-check agreement
+(human reviewer scored the same items the LLM-as-judge scored;
+both agreed on every case in the calibration set). That's the
+discipline that made the E2-E4 findings trustworthy enough to act
+on.
+
+**Why this layer is stronger than "planned discovery":** the
+original chapter ended on D1-D4 — "discovery work that would be
+required before product investment." Now, three of those four
+discovery questions (D2 partly, D3 fully, D4 not) have been
+*pre-validated by the Phase 3 flywheel*. The thing the eval
+harness was supposed to demonstrate — that the project could
+build, calibrate, and act on an evaluation pipeline — was
+demonstrated. The receipts are in the git history.
+
+**Why it was retired:** the substrate it scored against (Olist
+e-commerce SQLite via the project-owned MCP subprocess) was
+removed in PR #8 (commit 62c24d7), and the eval suite went with
+it. The retire was deliberate: the Olist substrate was a Phase 2
+build that turned out to be more weight than it was carrying;
+when the substrate was cut, the artifacts that depended on it
+were cut too. Round 2 of the suite — same patterns, scored against
+the Synthetic adapter instead — is the named-but-not-current
+investment.
+
   ## What is NOT a success metric here
 
 The non-metrics list. These look like success metrics, but for
@@ -250,7 +321,10 @@ this project specifically they are not.
        quoted in the spec as a rubric-anchor phrase, but
        there are no users to measure on — chapter 01 evidence
   → "diagnosis accuracy %"
-       no eval harness — chapter 02 cut 2
+       no current eval harness — chapter 02 cut 2 (was built
+       in Phase 3, retired with the Olist substrate; the
+       Phase 3 finding was that binary calibration was the
+       bug to fix before accuracy numbers meant anything)
   → "recommendation outcome lift"
        no recommendations have been applied — chapter 02
        cut 3 (no write actions)
@@ -345,12 +419,15 @@ would lead to it can be named.
       → measured: agent's match rate vs the labeled set
       → measured: false-positive rate on "found an anomaly
         that wasn't real"
-      → starter version already spec'd as the queue-head drill
-        (`.aipe/drills/evals-observability-induce-eval-gap-
-        build-min-eval-harness.md`): 10-case goldset +
-        rubric + runner + LLM-as-judge + agreement test,
-        five files in `evals/`, ~5 hours of work — the
-        substrate (NDJSON trace + replay) is already built
+      → **PARTIAL CREDIT FROM PHASE 3.** The eval harness was
+        built once (4-pillar suite, LLM-as-judge calibrated
+        8/8 + 3/3, ran 30 cases), exposed 3 real bugs in the
+        agent and judge, then was retired with the Olist
+        substrate. Round 2 against the Synthetic adapter is
+        ~5 hours of work because the patterns are now known.
+        The discovery question isn't "can we build this" —
+        it's "is the round-2 investment worth making before
+        merchant-side validation in D1/D2."
 
   D4  if D1–D3 land positive, attempt a 4-week pilot with
       1–2 design partners
@@ -368,13 +445,17 @@ a product." That's the answer that holds.
   ## What this chapter establishes
 
 ```
-  → two real success layers exist for this build (contest +
-    portfolio), each with its own metrics and feedback loop
+  → two-and-a-half real success layers exist for this build:
+      layer 1 (contest), layer 1.5 (Phase 3 receipts —
+      measured then retired), and layer 2 (portfolio)
   → seven typical "product success" metrics are explicitly
     OFF the list for this project, with reasons
+  → the Phase 3 receipts give the brief a "we measured this
+    once, here's what we learned, here's why we retired it"
+    posture stronger than the original "we plan to measure"
   → the discovery questions that WOULD make product-success
-    metrics meaningful are named; the work to answer them is
-    not pretended to have been done
+    metrics meaningful are named; D3 specifically now carries
+    partial credit from the retired Phase 3 work
   → the feedback-loop diagram is one picture both layers
     share — open it when you're tempted to overclaim
 ```

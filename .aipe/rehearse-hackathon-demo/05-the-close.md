@@ -97,6 +97,14 @@ is a session/auth scoping change. None of them exists in the
 current repo. All of them are buildable from the current
 foundation.
 
+An optional second-vision line, if the judges are infra-fluent
+and you have breath for it: the DataSource seam means a third
+adapter — Shopify, BigCommerce, a Postgres warehouse — is a
+new file, not a rewrite. The agents don't know what they're
+querying. That's a road to "the same agent on any ecommerce
+backend." Use it only if the room reads senior and you have
+the seconds to spare; skip it otherwise to keep the beat tight.
+
   ## Beat 2 — the ask   (9:00–9:10)
 
 Ten seconds. ONE ask. Specific. Concrete. Not "any feedback is

@@ -42,12 +42,17 @@ demo all five rubric criteria. Anything not in this list was cut.
   └─────────────────────────────────────────────────────────────┘
 
   ┌─ the infra that holds it together ──────────────────────────┐
-  │  → 4 single-purpose agents on one shared runAgentLoop       │
+  │  → 5 single-purpose agents (monitoring / diagnostic /        │
+  │    query / recommendation / intent) now thin wrappers over   │
+  │    @aptkit/core@0.3.0 (post-hackathon migration);            │
+  │    runAgentLoop preserved at lib/agents/base-legacy.ts       │
+  │  → DataSource SEAM (lib/data-source/types.ts) with 2         │
+  │    adapters: Bloomreach + Synthetic                          │
   │  → McpClient with cache + rate-limit spacing + retry         │
   │  → OAuth (PKCE + DCR) with encrypted cookie store            │
   │  → NDJSON streaming over ReadableStream                     │
   │  → schema-gated coverage (free filter before expensive scan) │
-  │  → vitest test suite (169 tests, pure logic + agent fakes)   │
+  │  → vitest test suite (221 tests, pure logic + agent fakes)   │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -130,36 +135,89 @@ yesterday's anomalies?" is asking a real product question, but
 not a hackathon-rubric question. Chapter 05 question 4 has the
 answer that holds.
 
-  ### Cut 2 — no evals [STRUCTURAL]
+  ### Cut 2 — no evals [STRUCTURAL] — then BUILT, USED, RETIRED
 
-[E] `.aipe/study-ai-engineering/00-overview.md` legend:
-*"evals are the Case-B gap"* — explicitly called out in the
-audit. No labeled ground truth, no accuracy measurement, no
-regression suite for agent outputs.
+[E] At the time of the hackathon (June 2026), this was a clean
+cut: `.aipe/study-ai-engineering/00-overview.md` legend named
+*"evals are the Case-B gap"* explicitly. No labeled ground
+truth, no accuracy measurement, no regression suite.
+
+**Post-hackathon, this cut got the most interesting arc of any
+in the brief: it was unwound, exercised, then put back.** The
+story is worth telling end-to-end because it's the strongest
+"shipped engineering judgement under pressure" signal in the
+codebase.
 
 ```
-  what's cut          → systematic measurement of diagnosis
+  THE PHASE 3 EVAL FLYWHEEL — built · used · retired
+
+  ┌─ phase 2 (own MCP server over Olist e-commerce SQLite) ────┐
+  │  built mcp-server-olist; added DataSource SEAM at           │
+  │  lib/data-source/types.ts; ran agents over a substrate     │
+  │  the project owned end-to-end                              │
+  └────────────────────────────┬───────────────────────────────┘
+                               ▼
+  ┌─ phase 3 (build the eval suite the cut named) ─────────────┐
+  │  4-pillar suite:                                            │
+  │   1. detection precision/recall on labeled anomalies        │
+  │   2. diagnosis 5-criterion rubric (LLM-as-judge)            │
+  │   3. recommendation 3-criterion rubric (LLM-as-judge)       │
+  │   4. regression capture-and-score                           │
+  │  judge calibration: 8/8 + 3/3 manual spot-check agreement  │
+  └────────────────────────────┬───────────────────────────────┘
+                               ▼
+  ┌─ what the flywheel actually surfaced (3 real bugs) ────────┐
+  │  → BRL cents-vs-Reais unit-narration: recommendation judge  │
+  │    caught at run 8 — R$131,965 implausible AOV              │
+  │  → binary calibration in 29/30 diagnosis runs (the rubric   │
+  │    judges scored 0 or 1, never the middle)                  │
+  │  → conclusion instability at 30% regression baseline        │
+  └────────────────────────────┬───────────────────────────────┘
+                               ▼
+  ┌─ phase 3 RETIRED with the Olist substrate (PR #8) ─────────┐
+  │  62c24d7: cleaned up retired Olist references;              │
+  │  eval/ deleted, mcp-server-olist/ deleted;                  │
+  │  DataSource SEAM survived (still serves 2 adapters today:   │
+  │   Bloomreach + Synthetic)                                   │
+  └────────────────────────────────────────────────────────────┘
+```
+
+```
+  what's cut TODAY    → systematic measurement of diagnosis
                         quality / recommendation quality
+                        (same gap as June 2026 — but now with
+                        receipts of having shipped it once)
   what's preserved    → vitest suite for the deterministic
-                        infra (the agent loops, the validators,
-                        the cache/retry, the streaming)
-  what this enables   → ship in 7 days without first authoring
-                        50–200 labeled anomaly→diagnosis pairs
-  what this prevents  → confident claims about accuracy ·
-                        regression detection when models update ·
-                        any defensible "this works better than X"
+                        infra (221 tests today, up from 169)
+                        + the DataSource SEAM + the Synthetic
+                        adapter as a deterministic substrate
+                        the next eval round would score against
+  what this enabled   → originally: ship in 7 days
+                        post-hackathon: prove the gap was a
+                        deliberate cut by closing it once and
+                        choosing to re-open it (different signal
+                        than "never built")
+  what this prevents  → confident accuracy claims TODAY · but
+                        not "I don't know how to build an eval
+                        harness" — the build + retire arc is
+                        the demonstration
 ```
 
-This is the cut with the highest *future cost*. If the project
-went past the hackathon, this is the first thing you'd build.
-~2 weeks of work to author a starter eval set + harness.
+**Why retire it.** The eval suite scored against Olist e-commerce
+data through a project-owned MCP subprocess. When the Olist
+substrate was removed (PR #8, commit 62c24d7), the suite had
+nothing to score against — the eval/ directory was deleted in
+the same cleanup. The receipts (the 3 bugs surfaced) live in the
+git history and in the retired study artifacts; the substrate
+that produced them does not.
 
-The cut is honestly defensible for a hackathon because the rubric
-doesn't grade accuracy — it grades whether the agent is *visible
-in its work* (criterion 5, innovation). The reasoning trace
-substitutes for an eval at the level of "can the judge see what
-the agent did and form their own opinion." It does not substitute
-for an eval at the level of "are the diagnoses correct."
+This is the cut whose **future cost is now bounded by experience,
+not by speculation**. Round 2 of the eval suite would score
+against the Synthetic adapter — same agent contracts, same
+NDJSON trace shape — and the build cost is ~5 hours not ~2 weeks
+because the patterns are now known. Honestly defensible for the
+current state because what's been demonstrated is judgement
+(when to invest, when to retire), not absence of capability.
 
   ### Cut 3 — no write actions / no autonomy [LOAD-BEARING]
 
@@ -194,10 +252,16 @@ specifies "human review for any business-impacting action"
   ### Cut 4 — no multi-tenant [STRUCTURAL]
 
 [E] `blooming-insights-spec.md` L31: *"not multi-tenant (single
-workspace: wobbly-ukulele)."* `audit.md` Ceiling 1 documents the
-actual constraint: the in-memory `Map` in `lib/state/insights.ts`
-is global per Vercel instance, so two users on the same instance
-clobber each other.
+workspace: wobbly-ukulele)."* The original audit.md Ceiling 1
+documented a concurrent-user wipe bug: the in-memory `Map` in
+`lib/state/insights.ts` was global per Vercel instance, so two
+users on the same instance clobbered each other.
+
+**That specific bug is RESOLVED.** `lib/state/insights.ts` is now
+session-keyed (Map<sessionId, SessionFeed>); the concurrent-user
+wipe no longer happens. The broader cut still stands —
+workspace switcher, per-tenant authorization, tenant-isolated
+rate-limit budgets — but the in-process state hazard is closed.
 
 ```
   what's cut          → "log in with your own Bloomreach workspace"
@@ -315,6 +379,56 @@ specific. Stack them and the architecture is the result.
    other has to give. that compounding IS the architecture.
 ```
 
+  ## The cuts that came back (or that the architecture quietly took back)
+
+A separate section because these aren't "scope cuts" in the same
+sense — they're cuts the original brief named that the codebase
+has since either unwound deliberately or sidestepped through a
+different architectural choice. Each one is a signal that the
+brief is alive, not a tombstone.
+
+```
+  CUT REVISITS — what the brief said, what the code now does
+
+  ┌─ cut 2 (no evals) ─────────────────────────────────────────┐
+  │   ORIGINAL: deferred for time                                │
+  │   PHASE 3:  built 4-pillar suite, calibrated judge,           │
+  │             surfaced 3 real bugs (BRL unit-narration,         │
+  │             binary calibration, conclusion instability)       │
+  │   TODAY:    retired with the Olist substrate; receipts in    │
+  │             git; would rebuild against Synthetic in ~5h      │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ cut 4 (no multi-tenant) ──────────────────────────────────┐
+  │   ORIGINAL: single workspace + global Map = concurrent      │
+  │             user wipe bug                                    │
+  │   TODAY:    Map<sessionId, SessionFeed> resolved the wipe;   │
+  │             multi-tenant still cut, but state hazard closed │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ "MCP-native by design" (chapter 01 exclusion) ────────────┐
+  │   ORIGINAL: tool path = Bloomreach MCP only                 │
+  │   TODAY:    DataSource SEAM (lib/data-source/types.ts)      │
+  │             serves 2 adapters — Bloomreach + Synthetic.     │
+  │             The "MCP-native" claim is narrower now: the     │
+  │             agent contracts are MCP-shaped; the substrate   │
+  │             is pluggable.                                   │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ "built the agent loop from scratch" (implicit) ───────────┐
+  │   ORIGINAL: hand-rolled runAgentLoop at lib/agents/base.ts  │
+  │   TODAY:    5 active agents are thin wrappers over          │
+  │             @aptkit/core@0.3.0; runAgentLoop preserved at   │
+  │             lib/agents/base-legacy.ts. See chapter 03 for   │
+  │             the option-revisit framing.                     │
+  └────────────────────────────────────────────────────────────┘
+```
+
+This section exists because **a static problem brief is a
+liability**. The brief that says "we cut X for time" and is
+silent two months later when X has been built, used, and re-cut
+loses a credibility moment it should have claimed.
+
   ## The non-goals list — say these out loud
 
 Memorise this list. When a reviewer asks "did you consider X?"
@@ -329,7 +443,10 @@ the answer is "we deliberately scoped X out — here's why." Not
   → multi-tenant onboarding flow
   → durable storage of insights / history / yesterday's runs
   → share feeds / collaborate across teammates
-  → evaluate diagnosis quality systematically (no eval harness)
+  → evaluate diagnosis quality systematically TODAY
+       (Phase 3 eval harness was built + retired with its
+        Olist substrate; rebuild round 2 against Synthetic
+        is named, not in the current slice)
   → measure recommendation outcome (no feedback loop on actions)
   → embedding-based RAG over historical data (live MCP only)
   → support workspaces outside Bloomreach (MCP-native by design)
@@ -353,6 +470,10 @@ Each one has a defensible reason it's out of scope. Naming them
     of stacking them, not a separate design choice
   → twelve non-goals are explicit; "we didn't get to X" is
     not the answer to any of them
+  → four cuts have been revisited since June 2026 — evals
+    (built/used/retired), wipe bug (resolved), MCP-native
+    (broadened to a SEAM), own loop (migrated to AptKit);
+    the brief is alive, not a tombstone
 ```
 
 Read chapter 03 next — the options analysis, including "do

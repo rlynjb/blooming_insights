@@ -12,14 +12,35 @@ the investigate page, the recommendation flow, the auth, the
 streaming…" Don't. Lists are forgettable. One concrete shipped
 thing plus one concrete hard thing is what lands.
 
-The hard part you crack in this chapter is **schema-gated
-coverage** — the runtime check that compares the workspace's
-real event schema against the ten anomaly categories and only
-runs the agent on the ones the data can actually support. It's
-real, it's in `lib/agents/categories.ts`, it's gated at three
-layers (route, agent prompt, coverage grid UI), and it's the
-thing that turns the demo from "look at the agent" into "look at
-the agent being honest about what it can and can't see."
+You have two strong candidates for the hard part now:
+
+```
+  CANDIDATE A — schema-gated coverage
+    the runtime gate in lib/agents/categories.ts that compares
+    the workspace's event schema to each anomaly category's
+    required deps. green = runnable; faded = honestly missing.
+    the agent never wastes a call on a category it can't run.
+    GOOD: visual (the coverage grid on screen) · concrete · the
+    line "honest about what it can't see" is sticky.
+
+  CANDIDATE B — the eval flywheel (built, used, retired)
+    built a 4-pillar eval suite with K=10 and an LLM-as-judge
+    calibrated 8/8 + 3/3, ran it against the agents, surfaced
+    three real bugs (BRL cents-vs-Reais, binary calibration,
+    conclusion instability), fixed them, then retired the whole
+    substrate when the synthetic adapter shipped because the
+    in-process shape was cleaner. "Built, used in anger,
+    refactored away when it stopped earning its keep."
+    GOOD: shows engineering maturity senior judges respect ·
+    "shipped an eval pipeline and then deleted it" is the kind
+    of story that lands at a senior interview.
+```
+
+Default to A for a general hackathon crowd (visual, concrete,
+ties to what's on screen). Switch to B if the judges are senior
+engineers or if you sense they're probing for engineering depth.
+The chapter below walks both options — the run sheet defaults
+to A but flags the B substitution.
 
   ## The time-budget bar
 
@@ -102,19 +123,22 @@ spends its budget on a category it can't actually run.
 Twenty seconds. Three concrete things. Numbers.
 
 ```
-  ┃ "built end-to-end in the hackathon window: four agents
-  ┃  driving a real bloomreach MCP integration with oauth,
-  ┃  three streaming Next.js routes, and a schema-gated
-  ┃  ten-category anomaly checklist that runs against the
-  ┃  workspace data the user actually has."
+  ┃ "five agents wrapping a published agent-loop library i
+  ┃  also wrote, a DataSource seam with two live adapters —
+  ┃  real bloomreach MCP and in-process synthetic — three
+  ┃  streaming Next.js routes, a schema-gated ten-category
+  ┃  anomaly checklist, 221 tests."
 ```
 
 That sentence carries weight because every part of it is in the
-repo. Four agents (monitoring, diagnostic, recommendation,
-query — one file each in `lib/agents/`). Three streaming routes
-(`/api/briefing`, `/api/agent`, and the OAuth callback chain in
-`/api/mcp/`). Schema-gated checklist (the categories diagram
-above). No invented features.
+repo. Five agents (monitoring, diagnostic, recommendation,
+query, intent — one file each in `lib/agents/`, all built on
+`@aptkit/core@0.3.0`). DataSource seam (`lib/data-source/types.ts`
+with `bloomreach-data-source.ts` and `synthetic-data-source.ts`
+implementations). Three streaming routes (`/api/briefing`,
+`/api/agent`, OAuth callback chain in `/api/mcp/`). Schema gate
+(`lib/agents/categories.ts`). 221 tests across `*.test.ts`. No
+invented features.
 
   ## Beat 2 — the hard part   (8:20–8:45)
 
@@ -161,21 +185,63 @@ serverless instances, NDJSON streaming, prompt synthesis when
 the model won't stop calling tools) is engineering. The
 schema-gated coverage is the one that's a product idea.
 
+  ## Beat 2 ALT — the eval flywheel (for senior judges)   (8:20–8:45)
+
+If the judges read senior, swap beat 2 for this. Same 25 seconds.
+Same anchor pattern (one obstacle, one move). The story is "built
+an eval pipeline, used it in anger, learned three real bugs,
+deleted it when a cleaner shape arrived."
+
+```
+  ┃ "the hard part wasn't shipping the agent — it was deciding
+  ┃  whether to trust it. so i built a 4-pillar eval suite,
+  ┃  K=10, with an LLM-as-judge calibrated against my own labels
+  ┃  8 of 8 and 3 of 3. it surfaced three real bugs: BRL prices
+  ┃  in cents getting reported as Reais, binary calibration
+  ┃  fooling the confidence rating, and conclusion instability
+  ┃  across reruns. i fixed all three. then i retired the whole
+  ┃  substrate because the in-process synthetic adapter shipped
+  ┃  and made the eval pipeline the wrong shape. the discipline
+  ┃  stayed; the scaffolding didn't."
+```
+
+```
+  ┃ "i built an eval pipeline, found three real bugs, fixed
+  ┃  them, then deleted the pipeline when a cleaner shape
+  ┃  arrived. the discipline stayed; the scaffolding didn't."
+```
+
+That alt-line is the senior-judge anchor. Most hackathon builds
+don't have evals at all; very few have an eval pipeline the
+presenter chose to retire. The story signals "I know when
+infrastructure has stopped earning its keep" — which is a
+staff-engineer move.
+
+You can't use both beats in 25 seconds. Pick one before the
+slot starts. Default to schema-gate; swap to eval flywheel if
+the room reads senior.
+
   ## The script lines to nail
 
 Two lines. The first is the "what shipped" line, the second is
-the "hard part" line.
+the "hard part" line (pick A or B before the slot).
 
 ```
-  ┃ "built end-to-end in the hackathon window: four agents
-  ┃  driving a real bloomreach MCP integration with oauth,
-  ┃  three streaming Next.js routes, and a schema-gated
-  ┃  ten-category anomaly checklist."
+  ┃ "five agents wrapping a published agent-loop library, a
+  ┃  DataSource seam with two live adapters, three streaming
+  ┃  routes, a schema gate, 221 tests."
 ```
 
 ```
-  ┃ "the hard part was teaching the agent to be honest about
-  ┃  what it CAN'T see."
+  ┃  (A — default) "the hard part was teaching the agent to be
+  ┃                 honest about what it CAN'T see."
+```
+
+```
+  ┃  (B — senior)  "i built an eval pipeline, found three real
+  ┃                 bugs, fixed them, then deleted the pipeline
+  ┃                 when a cleaner shape arrived. the discipline
+  ┃                 stayed; the scaffolding didn't."
 ```
 
   ## Strong vs weak — the build-story trap
@@ -256,22 +322,31 @@ chapter 4, say that one line and move to chapter 5.
   ┌───────────────────────────────────────────────────────────┐
   │ BUILD STORY · 8:00–8:45 · 45 seconds                      │
   ├───────────────────────────────────────────────────────────┤
-  │ 8:00   "built end-to-end in the hackathon window: four    │
-  │         agents, three streaming routes, a schema-gated    │
-  │         ten-category checklist."                          │
+  │ 8:00   "five agents wrapping a published agent-loop       │
+  │         library, a DataSource seam with two live          │
+  │         adapters, three streaming routes, a schema gate,  │
+  │         221 tests."                                       │
   │ 8:20   point at the coverage-grid diagram (or the live    │
   │         grid in the feed if it's still on screen)         │
-  │ 8:25   "the hard part was teaching the agent to be        │
-  │         honest about what it CAN'T see."                  │
-  │ 8:35   point at a faded tile · "would 'check' for cart    │
-  │         events on a workspace that didn't have them"      │
+  │ 8:25   ── pick one ──                                     │
+  │         (A) "the hard part was teaching the agent to be   │
+  │              honest about what it CAN'T see."             │
+  │         (B) "i built an eval pipeline, found three real   │
+  │              bugs, fixed them, then deleted it when a     │
+  │              cleaner shape arrived."                      │
+  │ 8:35   (A) point at a faded tile · "cart events the       │
+  │             workspace doesn't emit"                       │
+  │         (B) "the synthetic adapter made the eval pipeline │
+  │             the wrong shape · so it had to go"            │
   │ 8:42   bridge: "here's where this goes next."             │
   ├───────────────────────────────────────────────────────────┤
-  │ MUST NAIL   the hard-part line                            │
-  │ IF BREAKS   say the hard-part line over any screen ·       │
-  │             don't try to show source code on stage        │
-  │ TIGHTEN     drop "the fix is three pure functions…" →     │
-  │             drop beat 1 → collapse to one line             │
+  │ PRE-PICK    A (default for general audience)              │
+  │             B (senior engineers · staff-engineer signal)  │
+  │ MUST NAIL   whichever hard-part line you chose            │
+  │ IF BREAKS   say the line over any screen · don't try to   │
+  │             show source code on stage                     │
+  │ TIGHTEN     drop the third sentence → drop beat 1 →       │
+  │             collapse to one line                          │
   └───────────────────────────────────────────────────────────┘
 ```
 

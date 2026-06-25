@@ -27,8 +27,8 @@ Evidence the decision is real, not accidental:
 - `app/investigate/[id]/recommend/page.tsx:1` `'use client';`
 - `app/debug/page.tsx:1` `'use client';`
 - `app/layout.tsx:1-28` — server component but only renders the body shell + `metadata`; no data fetching, no `<Suspense>`, no `<Provider>`.
-- `package.json:16-18` — Next 16.2.6, React 19.2.4, React-DOM 19.2.4. React 19's `use(promise)`, server actions, `useFormStatus`, `useOptimistic`, `useTransition`: grep returns **zero hits** across `app/`, `components/`, `lib/`.
-- Two hand-written `fetch` + `ReadableStream` reader loops do the data work: `app/page.tsx:258-476` (feed) and `lib/hooks/useInvestigation.ts:45-213` (both investigation steps). A third smaller copy at `components/chat/StreamingResponse.tsx:89-136`.
+- `package.json:17-19` — Next 16.2.6, React 19.2.4, React-DOM 19.2.4. React 19's `use(promise)`, server actions, `useFormStatus`, `useOptimistic`, `useTransition`: grep returns **zero hits** across `app/`, `components/`, `lib/`.
+- Four hand-written `fetch` + NDJSON consumers do the data work, all calling the now-shared `readNdjson` kernel at `lib/streaming/ndjson.ts:17-64`: `lib/hooks/useBriefingStream.ts:288` (feed — extracted from `app/page.tsx` as part of the page decomposition), `lib/hooks/useInvestigation.ts:194` (both investigation steps), `lib/hooks/useDemoCapture.ts:84` (dev capture), `components/chat/StreamingResponse.tsx:108` (chat). The `app/page.tsx` feed page itself is now down to 461 LOC and composes three Blooming-owned hooks (`useBriefingStream`, `useDemoCapture`, `useReconnectPolicy`).
 - The full audit of what's not exercised is in `.aipe/study-frontend-engineering/audit.md` (the "Not yet exercised" lines for each lens).
 
 ---
@@ -58,11 +58,11 @@ Evidence the decision is real, not accidental:
   │                                                                    │
   │  Next.js 16     Turbopack build, App Router file layout,           │
   │                 serverless functions, 300s maxDuration             │
-  │                 (app/api/agent/route.ts:20, briefing/route.ts:20)  │
+  │                 (app/api/agent/route.ts:22, briefing/route.ts:19)  │
   │                                                                    │
   │  React 19       function components, hooks (useState, useEffect,   │
   │                 useRef, useParams), StrictMode (with manual        │
-  │                 latch — useInvestigation.ts:43, 47-48)             │
+  │                 latch — useInvestigation.ts:44, 48-49)             │
   │                                                                    │
   │  Tailwind 4     utility classes for layout + CSS variables on      │
   │                 :root for the color palette                        │
@@ -85,16 +85,18 @@ Evidence the decision is real, not accidental:
                                        ▼
   ┌─ What does the data work ─────────────────────────────────────────┐
   │                                                                    │
-  │  fetch() + response.body.getReader() + TextDecoder + buf.split    │
-  │  ('\n') + lines.pop() + per-line JSON.parse + handle(event) switch│
+  │  fetch() → readNdjson(body, onEvent, opts?) → per-event handler    │
+  │  (the buf.split('\n') + lines.pop() + per-line JSON.parse loop     │
+  │   now lives ONCE inside lib/streaming/ndjson.ts:17-64)             │
   │                                                                    │
-  │  Lives in:                                                         │
-  │    app/page.tsx:258-476            (feed briefing, inline)        │
-  │    lib/hooks/useInvestigation.ts   (investigation, in a hook)     │
-  │    components/chat/StreamingResponse.tsx:89-136  (chat, inline)   │
+  │  Lives in (each is a thin caller of the shared kernel):           │
+  │    lib/hooks/useBriefingStream.ts:288   (feed, hook-extracted)    │
+  │    lib/hooks/useInvestigation.ts:194    (investigation, in a hook)│
+  │    lib/hooks/useDemoCapture.ts:84       (dev capture, in a hook)  │
+  │    components/chat/StreamingResponse.tsx:108   (chat, inline)     │
   │                                                                    │
   │  State: useState in the owning hook or page. Plus a parallel       │
-  │  closure mirror (useInvestigation.ts:65-67) because setState is    │
+  │  closure mirror (useInvestigation.ts:66-68) because setState is    │
   │  async and the 'done' handler stashes synchronously.               │
   │                                                                    │
   │  Cross-mount durability: sessionStorage (per tab, per step,        │
@@ -109,7 +111,7 @@ Three load-bearing details that follow:
 
 1. **`'use client'` covers every routed page.** Not "the streaming pages are client, the static pages are server." Every page. The mental model is "this is an SPA on top of Next.js's runtime." A future settings page would still be `'use client'` to stay uniform, unless and until the cost of inconsistency is genuinely lower than the cost of unifying.
 
-2. **The reader loop kernel is duplicated across three files.** This is documented honestly in `study-frontend-engineering/audit.md` red-flag #2 and tracked as the natural seam for a future `useNdjsonReader(url, handle)` extraction. The duplication is a cleanup cost, not an architectural defect. The architectural call (do we have one shared reader, or do hooks each own their own?) hasn't been made because doing the extraction in one place — `useInvestigation` already exists — would still leave the feed's reader as a single call site. The fix is the same as the feed-page-hooks extraction (`study-software-design/02-shallow-module-page-component.md`).
+2. **The reader-loop kernel is hoisted ONCE into `lib/streaming/ndjson.ts:17-64`.** All four streaming surfaces call it via `await readNdjson<E>(res.body, handle, opts?)`. The previous duplication red-flag (`study-frontend-engineering/audit.md` #2) is closed. The page decomposition shipped at the same time: `app/page.tsx` dropped from 817 to 461 LOC by extracting three hooks (`useBriefingStream` at 313 LOC, `useDemoCapture` at 146 LOC, `useReconnectPolicy` at 123 LOC). The architectural call ("do hooks own their own reader, or is there one shared kernel?") was made in favor of the shared kernel because all four surfaces wanted the same line-buffering + cancellation-polling + malformed-line tolerance — and the kernel is generic over the event type, so each surface's discriminated union (e.g. the briefing's local `BriefingEvent` superset of `AgentEvent`) rides through `<E>` without widening the shared contract.
 
 3. **The framework's loading/error primitives aren't substitutes for streaming UI.** A `loading.tsx` segment fires once, until the route resolves. A `<Suspense>` boundary falls back until its promise resolves. Neither animates from event #1 of N. The progressive skeleton + stepper composition (`study-frontend-engineering/02-progressive-skeleton-with-stepper.md`) IS the loading UX — it's not absent, it's hand-rolled because the framework's version doesn't render the right shape.
 
@@ -140,7 +142,7 @@ Add a data-fetch library; let it own caching, invalidation, request deduplicatio
 **Why it lost:**
 
 - SWR and React Query both model "fetch a value, cache it by key, revalidate it." Our data shape is "subscribe to a stream of N events whose handler mutates 14 state slots." The libraries' primitives (`useSWR(key, fetcher)`, `useQuery({ queryKey, queryFn })`) want one value back, not a reader loop. We would end up smuggling the reader loop into a `queryFn` that resolves *once* at the end of the stream, which removes the per-event UI updates that are the entire product.
-- The cache layer we DO have (`sessionStorage` per step, per insight id — `useInvestigation.ts:50-63`) is owned by the hook and tested in isolation. A library cache would add cache-key semantics we do not have a use for, with invalidation rules we'd have to maintain in parallel with the existing `sessionStorage` keys.
+- The cache layer we DO have (`sessionStorage` per step, per insight id — `useInvestigation.ts:51-64`) is owned by the hook and tested in isolation. A library cache would add cache-key semantics we do not have a use for, with invalidation rules we'd have to maintain in parallel with the existing `sessionStorage` keys.
 - Both libraries add an `Provider` at the app root, which would touch `app/layout.tsx` (currently a 28-line server component with no providers). That's the kind of "small change" that becomes a discoverability tax — every new contributor has to learn the provider's semantics before reading any data-fetch code.
 - The auto-retry / auto-refetch behavior that's the libraries' default value-add is *actively wrong* for non-idempotent GETs that cost Anthropic tokens (same disqualifier as SSE in RFC-002).
 
@@ -155,7 +157,7 @@ Lift the streaming state into a global store; let pages subscribe; let the reade
 - There is no state shared across pages that needs a global store. The feed owns its briefing state. The diagnose page owns its diagnosis state. The recommend page owns its recommendation state. The cross-page handoff IS `sessionStorage` + URL params, by design (RFC-001's "stateful client, stateless server" stance extended into the page-to-page boundary).
 - Adding a global store invites the wrong refactor: "let's move the 14 `useState` slots in the feed page into the store." That doesn't fix the feed page's depth problem (documented in `study-software-design/02-shallow-module-page-component.md` — the fix is hook extraction, not state lifting). It moves the depth problem into the store.
 - Same provider tax as alternative B: another `<Provider>` at the root, another concept a contributor has to learn before reading data-fetch code.
-- The state that IS shared (`bi:mode` localStorage flag for demo vs live mode — `app/page.tsx:132, 144`) is one boolean. A global store for one boolean is overkill.
+- The state that IS shared (`bi:mode` localStorage flag for demo vs live mode — now a 3-way enum `'demo' | 'live-bloomreach' | 'live-synthetic'` at `app/page.tsx:73-78` with the live-bloomreach/live-synthetic distinction belonging to RFC-005's DataSource seam) is one flag. A global store for one flag is overkill.
 
 ### Alternative D: Mix — Server Components for static pages, hand-rolled streams for live pages
 
@@ -201,13 +203,13 @@ Selective adoption invites inconsistency. Better to be uniformly declined than s
 
 We chose to decline the framework's data-fetch primitives uniformly, accepting:
 
-1. **The reader loop kernel is duplicated three times.** `app/page.tsx`, `lib/hooks/useInvestigation.ts`, `components/chat/StreamingResponse.tsx` each carry their own `getReader` + `TextDecoder` + `buf.split('\n')` + `lines.pop()` implementation. *We accept this for now — the architectural call (one shared `useNdjsonReader` vs hooks each own their own) hasn't been made, and the feed-page-hooks extraction (`study-software-design/02-shallow-module-page-component.md`) is the natural seam to make it.*
+1. **The reader-loop kernel and the feed-page extraction both landed.** RESOLVED — `lib/streaming/ndjson.ts` is the one shared kernel; `app/page.tsx` dropped from 817 to 461 LOC after extracting `useBriefingStream` (313 LOC), `useDemoCapture` (146 LOC), `useReconnectPolicy` (123 LOC). *What we still accept: each hook owns its own `fetch` + state plumbing — only the inner `readNdjson` loop is shared. That is the deliberate seam: the kernel is event-type-agnostic, the hooks own the discriminated-union dispatch for their surface.*
 
-2. **Loading and error UX are hand-rolled per route.** The auth-revoked auto-reconnect regex appears in two places on the feed (`app/page.tsx:407` inside the stream handler and `app/page.tsx:650` in the JSX). Each page has its own error rendering. *We accept this — a shared `<RouteError>` component is the small win when this gets touched again. The `error.tsx` segment doesn't help because errors mid-stream are not the same as errors-loading-the-route.*
+2. **Loading and error UX are hand-rolled per route — but the auth-revoked path is now one hook.** The previous duplication (`app/page.tsx:407` + `:650`) is closed: the auth-revoked auto-reconnect lives in `lib/hooks/useReconnectPolicy.ts` (`isAuthErrorAuto` regex at `:33`, `useReconnectPolicy()` hook at `:68`), composed into the feed via callbacks (`onAuthError: reconnectPolicy.handle`, `onStreamComplete: reconnectPolicy.clearFlag` at `app/page.tsx:111-112`). *We accept what remains: each page still hand-rolls its own loading + error JSX (no shared `<RouteError>` component yet). The `error.tsx` segment doesn't help because errors mid-stream are not the same as errors-loading-the-route.*
 
 3. **No `<Suspense>` means no concurrent-rendering primitives.** `useTransition`, `useDeferredValue`, the whole concurrent-rendering surface stays unused. *We accept this — the streaming UX is the product's bottleneck, and concurrent rendering doesn't help with "20-50 events over 60 seconds" in a measurable way.*
 
-4. **No React Query / SWR means no built-in cache invalidation.** `sessionStorage` is the cache; clearing it is manual. *We accept this — invalidation is per-step, per-insight, owned by the hook, and the test coverage is in place (`useInvestigation.ts:50-63` is the hydrate path, tested at `test/hooks/useInvestigation.test.ts`).*
+4. **No React Query / SWR means no built-in cache invalidation.** `sessionStorage` is the cache; clearing it is manual. *We accept this — invalidation is per-step, per-insight, owned by the hook, and the test coverage is in place (`useInvestigation.ts:51-64` is the hydrate path, tested at `test/hooks/useInvestigation.test.ts`).*
 
 5. **The bundle ships React 19 + React-DOM 19 but uses ~30% of their feature surface.** ~50KB of features we don't reach for. *We accept this — the alternative (downgrading to React 18 to "use what we use") would lose the StrictMode improvements and the React 19 bug fixes we DO benefit from, while adding the migration cost of a major-version downgrade.*
 
@@ -221,10 +223,10 @@ We chose to decline the framework's data-fetch primitives uniformly, accepting:
 |------|----------|------------|
 | Contributor adds `<Suspense>` to one page on instinct → drift between framework-primitive and hand-rolled approaches | Medium | This RFC is the canonical answer to "why no Suspense?" Cross-referenced from `study-frontend-engineering/audit.md` rendering-and-reactivity lens. |
 | A future framework version makes the hand-rolled reader loop unnecessary (e.g., a React `useStream(asyncIterable)` primitive ships) | Low today | We re-evaluate. The reader loop is 50 lines; a migration to a first-party primitive is mechanical. |
-| The reader-loop duplication grows from 3 copies to 4+ as more streaming surfaces are added | Medium | Extraction to `useNdjsonReader(url, handle)` is the natural seam, named in `study-frontend-engineering/audit.md` red-flag #2. The extraction is gated on the feed-page-hooks refactor (`study-software-design/02-shallow-module-page-component.md`). |
+| The reader-loop duplication grows from 3 copies to 4+ as more streaming surfaces are added | Closed | `lib/streaming/ndjson.ts` is the shared kernel; every surface calls `readNdjson<E>(body, onEvent, opts?)`. New surfaces add a fifth caller, not a fifth copy. |
 | A product feature lands that genuinely fits RSC — e.g., a settings page, an admin dashboard — and we keep the uniform `'use client'` stance out of habit | Medium | The non-goals explicitly call this out: the day a page fits RSC, adopt RSC *for that page*. Uniform declination is a default, not a rule. |
 | Bundle size grows as the React 19 + Next.js 16 surface area we ship-but-don't-use grows | Low | We ship default Turbopack output; no manual bundle splitting. If the production bundle crosses a threshold the user perceives, revisit. Not a concern today. |
-| The auth-revoked regex duplication causes drift between the in-stream handler and the JSX render branch | Medium | Same regex string at `app/page.tsx:407` and `:650`. The extraction is a small refactor; named here so reviewers can spot the drift before it bites. |
+| The auth-revoked regex duplication causes drift between the in-stream handler and the JSX render branch | Closed | Regex hoisted to `lib/hooks/useReconnectPolicy.ts:33` (`AUTH_ERROR_RE_AUTO`); the hook exports `isAuthErrorAuto` for the in-stream check and `isAuthErrorButton` for the JSX render branch. One regex, two consumers, one tested file. |
 
 ---
 
@@ -258,7 +260,7 @@ The interesting migration scenario is *future*: the day a page lands that genuin
 
 ## Open questions
 
-1. **When does the reader-loop duplication earn an extraction?** Today: three copies (feed page, investigation hook, chat component). The natural trigger is "a fourth streaming surface ships." Today there isn't one. The extraction (`lib/hooks/useNdjsonReader.ts`?) is also gated on the feed-page-hooks refactor — extracting from the hook alone leaves the feed as a single call site, which doesn't earn its own hook.
+1. **When does the reader-loop duplication earn an extraction?** RESOLVED — extracted to `lib/streaming/ndjson.ts` as `readNdjson<E>(body, onEvent, opts?)`; consumed by all four streaming surfaces. The companion page decomposition shipped at the same time (feed page 817 → 461 LOC; three hooks extracted). The next question in this thread is "do the per-hook fetch + state plumbings themselves want a higher-level `useStreamingFetch<E>` abstraction?" — open. Today each hook owns its own state shape and that's deliberate (different surfaces accumulate different state slots).
 
 2. **What's the trigger for adopting RSC + `<Suspense>` for a new page?** Tentative answer: when a new routed page's data shape is request-response and the page has at least one non-trivial async data dependency. A settings page reading user preferences from an API fits. A streaming surface doesn't.
 
@@ -296,33 +298,33 @@ We ship ~50KB of features we don't use. We benefit from React 19's StrictMode im
 
 > "Three copies of the reader loop is a smell."
 
-It's a known smell — `study-frontend-engineering/audit.md` red-flag #2 documents it. The fix (extract `useNdjsonReader(url, handle)`) is gated on the feed-page-hooks refactor (`study-software-design/02-shallow-module-page-component.md`). The architectural call is "do hooks own their own reader, or is there one shared kernel?" — and the call gets made when the feed-page extraction lands, not before. That's deliberate sequencing, not avoidance.
+Was — closed. `lib/streaming/ndjson.ts` is the one shared kernel; the four streaming surfaces (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`) call it. The page decomposition that gated the call (817 → 461 LOC on `app/page.tsx`, three hooks extracted) shipped at the same time. The architectural call landed: hooks own their own state plumbing, the kernel is the shared inner loop. Generic over the event type so the briefing's local `BriefingEvent` superset rides through without widening the shared `AgentEvent` contract.
 
 ---
 
 ## References
 
-- `package.json:16-18` — Next 16.2.6, React 19.2.4, React-DOM 19.2.4 (the runtime we adopted)
+- `package.json:17-19` — Next 16.2.6, React 19.2.4, React-DOM 19.2.4 (the runtime we adopted)
 - `next.config.ts:3` — empty config (no `experimental` flags, no overrides)
 - `app/layout.tsx:1-28` — the only server component in the routed surface (body shell + `metadata` only)
 - `app/page.tsx:1` — `'use client'` (feed)
-- `app/page.tsx:258-476` — the inline reader loop + state owner
+- `app/page.tsx` — 461 LOC, composes `useBriefingStream` + `useDemoCapture` + `useReconnectPolicy`
 - `app/investigate/[id]/page.tsx:1, :38` — `'use client'` + `useInvestigation(id, 'diagnose')`
 - `app/investigate/[id]/recommend/page.tsx:1, :37` — `'use client'` + `useInvestigation(id, 'recommend')`
 - `app/debug/page.tsx:1` — `'use client'`
-- `lib/hooks/useInvestigation.ts:45-213` — the hook-shaped reader loop (the canonical good shape)
-- `lib/hooks/useInvestigation.ts:50-63` — `sessionStorage` hydrate path (the cache we have)
-- `lib/hooks/useInvestigation.ts:43, 47-48` — `startedRef` StrictMode latch (the React 19 surface we DO use)
-- `components/chat/StreamingResponse.tsx:89-136` — the third smaller reader loop
+- `lib/streaming/ndjson.ts:17-64` — the shared `readNdjson<E>` kernel (one file, four consumers)
+- `lib/hooks/useBriefingStream.ts:288` — feed consumer
+- `lib/hooks/useInvestigation.ts:194` — investigation consumer
+- `lib/hooks/useInvestigation.ts:51-64` — `sessionStorage` hydrate path (the cache we have)
+- `lib/hooks/useInvestigation.ts:44, 48-49` — `startedRef` StrictMode latch (the React 19 surface we DO use)
+- `lib/hooks/useDemoCapture.ts:84` — dev-capture consumer
+- `lib/hooks/useReconnectPolicy.ts:33, 38, 43, 68` — auth-revoked regex + `isAuthErrorAuto` / `isAuthErrorButton` + the `useReconnectPolicy` hook
+- `components/chat/StreamingResponse.tsx:108` — chat consumer
 - `.aipe/study-frontend-engineering/audit.md` — the full audit of what's there and what's not yet exercised
 - `.aipe/study-frontend-engineering/01-ndjson-stream-reader-hook.md` — the hook-shaped reader loop pattern walk
 - `.aipe/study-frontend-engineering/02-progressive-skeleton-with-stepper.md` — the loading UX we built instead of `loading.tsx`
-- `.aipe/study-software-design/02-shallow-module-page-component.md` — the 817-LOC feed page (the gated refactor)
+- `.aipe/study-software-design/02-shallow-module-page-component.md` — the page-decomposition story (now shipped)
 - `.aipe/study-system-design/07-client-stream-handoff.md` — the `sessionStorage` cross-page handoff (the pattern that would break under RSC)
 - `.aipe/rehearse-design-doc/02-ndjson-fetch-stream-over-sse.md` — the wire-format / transport RFC (this RFC is the consumer-side complement)
 - React 19 release notes — the marquee features we deliberately don't use
 - WHATWG Streams spec — the primitive that makes the hand-rolled reader loop work
-
----
-
-**Updated:** 2026-06-03 — initial RFC. Frames the deliberate decision to adopt Next.js 16 + React 19's runtime while declining their data-fetch primitives (no RSC in routed surface, no Suspense, no `use()`, no Server Actions, no global store, no SWR/React Query). Anchored to the FE-engineering audit's verdict that the framework is underused on purpose.

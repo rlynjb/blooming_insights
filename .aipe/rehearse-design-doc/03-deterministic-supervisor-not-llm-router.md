@@ -23,7 +23,7 @@ Two separate concerns sit at the multi-agent boundary:
 
 The decision is about that second concern: who owns the order. The frame of 2026 makes a default visible — "make it multi-agent with a supervisor" via LangGraph / CrewAI / Autogen / a custom orchestrator agent is the path of least typing. This RFC explains why we did the simpler thing on purpose.
 
-Implementation: `app/api/agent/route.ts:196-254` (the `if`-ladder + the pipeline calls), `lib/agents/base.ts:48-176` (the shared per-stage ReAct loop), `lib/agents/diagnostic.ts` / `lib/agents/recommendation.ts` / `lib/agents/monitoring.ts` / `lib/agents/query.ts` (the per-stage definitions), `lib/agents/intent.ts:14` (Haiku for cheap classification, Sonnet everywhere else).
+Implementation: `app/api/agent/route.ts:228-299` (the `if`-ladder + the pipeline calls), `lib/agents/diagnostic.ts` / `lib/agents/recommendation.ts` / `lib/agents/monitoring.ts` / `lib/agents/query.ts` (the per-stage definitions, now thin wrappers over `@aptkit/core`'s runtime — see RFC-006 for the primitive boundary), `lib/agents/aptkit-adapters.ts:75-97` (the Blooming-owned `BloomingToolRegistryAdapter` that AptKit's loop calls into), `lib/agents/intent.ts:16` (Haiku for cheap classification, Sonnet everywhere else). The hand-rolled per-stage loop has been preserved at `lib/agents/base-legacy.ts:86-176` as the legacy path; the architectural call this RFC documents (the *between*-stage supervisor) is unchanged by that migration.
 
 ---
 
@@ -70,25 +70,29 @@ Implementation: `app/api/agent/route.ts:196-254` (the `if`-ladder + the pipeline
   │  send({ type: 'done' });                                             │
   └──────────────────────────────────┬───────────────────────────────────┘
                                      │
-  ┌─ Per-agent definitions (each is a ReAct loop) ──────────────────────┐
+  ┌─ Per-agent definitions (thin wrappers over AptKit's runtime) ───────┐
   │  monitoring.ts │ diagnostic.ts │ recommendation.ts │ query.ts        │
   │                                                                      │
-  │  Each defines:                                                       │
-  │    - its system prompt                                               │
-  │    - its tool subset (from the full MCP surface)                     │
-  │    - its maxToolCalls budget   (monitoring 6, diag 6, rec 4, query 6)│
-  │    - its synthesisInstruction  (forced-final turn copy)              │
-  │    - its typed output schema   (Anomaly, Diagnosis, Recommendation)  │
+  │  Each wires:                                                         │
+  │    - AnthropicModelProviderAdapter  (Blooming's Anthropic client →   │
+  │                                       AptKit's ModelProvider port)   │
+  │    - BloomingToolRegistryAdapter    (DataSource → ToolRegistry port) │
+  │    - BloomingTraceSinkAdapter       (CapabilityTraceSink → NDJSON)   │
+  │    - workspace schema + per-stage knobs (categories, etc.)           │
+  │  The Blooming-owned typed return (Anomaly / Diagnosis /              │
+  │  Recommendation) is mapped from AptKit's shape at the wrapper.       │
   └──────────────────────────────────┬───────────────────────────────────┘
                                      │
-  ┌─ Shared ReAct loop (lib/agents/base.ts:48-176) ─────────────────────┐
-  │  runAgentLoop({ anthropic, mcp, system, userPrompt, toolSchemas,    │
-  │                 maxTurns, maxToolCalls, synthesisInstruction, ... }) │
+  ┌─ Per-stage ReAct loop (@aptkit/core, since v0.3.0) ─────────────────┐
+  │  AptKit owns the loop body — model.complete → parse tool_use →      │
+  │  tools.callTool → append → repeat until natural stop OR budget hit  │
+  │  (forced synthesis turn). The hand-rolled equivalent lives at       │
+  │  lib/agents/base-legacy.ts:86-176 for the legacy path.              │
   │                                                                      │
   │  while (turn < maxTurns) {                                          │
-  │    response = anthropic.messages.create(messages + toolSchemas)     │
+  │    response = model.complete(messages + tools)                      │
   │    if (no tool_use blocks)  break  // natural stop                  │
-  │    for each tool_use: result = mcp.callTool(...); append            │
+  │    for each tool_use: result = tools.callTool(...); append          │
   │    if (totalToolCalls >= maxToolCalls) force-synthesis-turn         │
   │  }                                                                  │
   └─────────────────────────────────────────────────────────────────────┘
@@ -96,9 +100,9 @@ Implementation: `app/api/agent/route.ts:196-254` (the `if`-ladder + the pipeline
 
 The supervisor is the `if`-ladder. It is 6 lines. It encodes one fact: the order is `monitoring → diagnostic → recommendation`, with `query` as a separate single-stage path for free-form questions.
 
-The decomposition is real. Each agent has a different prompt (`lib/agents/prompts/`), a different tool subset (`lib/mcp/tools.ts` exposes per-agent filtering), a different budget (`maxToolCalls: 6/6/4/6`), and a different output schema. They share the loop, not the configuration.
+The decomposition is real. Each agent has a different prompt (now owned by AptKit's per-agent classes — `AnomalyMonitoringAgent`, `DiagnosticInvestigationAgent`, etc.), a different tool subset (`lib/mcp/tools.ts` exposes per-agent filtering and is passed in via the tool-registry adapter), a different budget (configured on each AptKit agent), and a different output schema. They share the AptKit runtime, not the configuration. The legacy hand-rolled equivalents at `lib/agents/{monitoring,diagnostic,recommendation,query}-legacy.ts` defined the same per-stage knobs explicitly (`maxToolCalls: 6/6/4/6`, `synthesisInstruction`) so the migration could be verified against a known-good baseline — see RFC-006 for the boundary discipline.
 
-The classifier intent agent (`lib/agents/intent.ts:14`) uses Claude Haiku 4.5 instead of Sonnet 4.6 — same "pay only for what the job needs" instinct, applied at the per-call level. Classification doesn't need Sonnet-grade reasoning.
+The classifier intent agent (`lib/agents/intent.ts:16`) uses Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) instead of Sonnet 4.6 (the `AGENT_MODEL` constant at `lib/agents/base.ts:7`) — same "pay only for what the job needs" instinct, applied at the per-call level. Classification doesn't need Sonnet-grade reasoning.
 
 ---
 
@@ -191,13 +195,13 @@ We chose the deterministic `if`-ladder, accepting:
 
 1. **No adaptive routing.** If a diagnostic conclusion is "inconclusive — need more data", we don't auto-route to a deeper specialist. The user re-runs or moves on. *We accept this — the deeper-specialist agent doesn't exist yet, and inventing it requires also inventing the routing logic.*
 
-2. **The route file is the supervisor.** It's not labeled as such. A new engineer reading the codebase might miss that the orchestration happens in 6 lines of `if`s, not in a file called `pipeline.ts`. *We accept this — the comment at `app/api/agent/route.ts:196-200` flags it.*
+2. **The route file is the supervisor.** It's not labeled as such. A new engineer reading the codebase might miss that the orchestration happens in 6 lines of `if`s, not in a file called `pipeline.ts`. *We accept this — the `leadAgent` constant at `app/api/agent/route.ts:228-230` is the load-bearing line.*
 
 3. **Adding a stage means editing the route.** Not a generic `pipeline.add(stage)` call, an actual code change with a code review. *We accept this — it makes the supervisor changes visible in git, which is what we want for orchestration changes.*
 
 4. **The Combined Run (`step=null`) vs Split Steps (`step=diagnose|recommend`) duality.** The same supervisor handles both: Combined Run does both stages in one request (used for the demo-capture path), Split Steps does one per request (production). *We accept this — collapsing them would re-introduce the 115s-in-one-request shape we deliberately moved off of (RFC-002 covers the streaming side).*
 
-5. **Cross-request typed handoff via `sessionStorage` + URL param.** Because the supervisor lives in the route and the two split steps are two separate requests, the typed `Diagnosis` from step 2 has to travel through the browser's `sessionStorage` to be handed in as a URL param on step 3 (`app/api/agent/route.ts:222-240`, `parseDiagnosis`). *We accept this — the alternative is server-side investigation state, which RFC-001 ruled out.*
+5. **Cross-request typed handoff via `sessionStorage` + URL param.** Because the supervisor lives in the route and the two split steps are two separate requests, the typed `Diagnosis` from step 2 has to travel through the browser's `sessionStorage` to be handed in as a URL param on step 3 (`app/api/agent/route.ts:84-95`, `parseDiagnosis`). *We accept this — the alternative is server-side investigation state, which RFC-001 ruled out.*
 
 6. **No supervisor reasoning logs.** Production logs say "ran diagnostic, then recommendation." They don't say *why*. Because the why is "because the code says so." *We accept this — the trade is "structured production logs with no LLM in them" vs. "less-structured logs with LLM reasoning we don't actually need to debug."*
 
@@ -209,8 +213,8 @@ We chose the deterministic `if`-ladder, accepting:
 |------|----------|------------|
 | Hidden coupling between stages bleeds into the supervisor (e.g., recommendation needs context only diagnostic generated) | Medium | The typed `Diagnosis` is the only allowed inter-stage carrier. New cross-stage data demands a new field on `Diagnosis` (visible in the type), not a side-channel. |
 | Engineer adds a new stage in the wrong order | Low | The route's `if`-ladder is short and reviewed. A misordering would fail the `parseDiagnosis` check at the recommend step. |
-| Per-stage `maxToolCalls` budget tuned wrong → forced synthesis fires too early or too late | Medium | Tunable per-stage (`lib/agents/base.ts:60-61, 86-90`). Adjusted based on real runs; current values (6/6/4/6) reflect observed agent behavior. |
-| `lib/agents/intent.ts` Haiku-vs-Sonnet split drifts (Sonnet sneaks into classification, or Haiku gets used for reasoning) | Low | One constant (`CLASSIFIER_MODEL` at `lib/agents/intent.ts:14`), one constant (`AGENT_MODEL` at `lib/agents/base.ts:9`). Grep-visible. |
+| Per-stage `maxToolCalls` budget tuned wrong → forced synthesis fires too early or too late | Medium | Configured per-stage via the AptKit agent classes; the legacy path's explicit knobs (`lib/agents/base-legacy.ts:86-176`) document the values verified before the migration. Current values (6/6/4/6) reflect observed agent behavior. |
+| `lib/agents/intent.ts` Haiku-vs-Sonnet split drifts (Sonnet sneaks into classification, or Haiku gets used for reasoning) | Low | One constant (`CLASSIFIER_MODEL` at `lib/agents/intent.ts:16`), one constant (`AGENT_MODEL` at `lib/agents/base.ts:7`). Grep-visible. |
 | `step=null` Combined Run path bit-rots (used only by demo-capture) | Medium | Test coverage at `test/agents/*.test.ts`; cache-replay path exercises the full event sequence on every demo. |
 | The cross-request `sessionStorage` handoff fails (the user navigates between tabs, the storage gets wiped) | Medium | The recommend step throws "no diagnosis was handed over — open the diagnosis step first" (`app/api/agent/route.ts:228-230`). The error is honest; the UX guides the user back to step 2. |
 | We outgrow the if-ladder shape | Future | RFC successor when the route file has >3 cases or any case depends on runtime data. The trigger is named, not theoretical. |
@@ -221,7 +225,9 @@ We chose the deterministic `if`-ladder, accepting:
 
 Day-one shape. The interesting migration that already happened: the original single mega-agent was decomposed into four single-purpose agents *before* the route was wired as a supervisor — i.e., decomposition first (to fix the structural failures), then deterministic supervision (because adaptive supervision wasn't needed). The route was always code.
 
-The recent migration that matters: the introduction of the `step` query param (`app/api/agent/route.ts:117-118`) that splits the combined diagnose+recommend run into two requests. The supervisor's logic gained a new dimension (`if step === 'recommend'` vs `if step !== 'diagnose'`) but stayed in the same shape — `if`s in one file. The classifier-model split (Haiku for intent, Sonnet for reasoning) was a similar code-level decision, not a framework adoption.
+The recent migration that matters: the introduction of the `step` query param (`app/api/agent/route.ts:115-116`) that splits the combined diagnose+recommend run into two requests. The supervisor's logic gained a new dimension (`if step === 'recommend'` vs `if step !== 'diagnose'`) but stayed in the same shape — `if`s in one file. The classifier-model split (Haiku for intent, Sonnet for reasoning) was a similar code-level decision, not a framework adoption.
+
+The more consequential migration since: the per-stage ReAct loop moved out of Blooming-owned code into `@aptkit/core`'s runtime (the active path) while the hand-rolled equivalent was preserved at `lib/agents/base-legacy.ts:86-176` (the legacy path). The supervisor's `if`-ladder did NOT move — it sits above the per-stage loop and is agnostic to which loop implementation runs inside each stage. That the supervisor's discipline (deterministic between-stage control + the `maxToolCalls` budget + forced synthesis turn) survived the swap *unchanged* is what RFC-006 calls "the seam held." The same seam survives both — the per-stage agent classes (`monitoring.ts`, `diagnostic.ts`, etc.) and their legacy counterparts (`*-legacy.ts`) both satisfy what the supervisor needs from them.
 
 ---
 
@@ -235,7 +241,7 @@ The recent migration that matters: the introduction of the `step` query param (`
 
 4. **Forced-synthesis turn behavior.** When `maxToolCalls` is hit (`lib/agents/base.ts:90`), the loop forces the model to synthesize a final answer from what it has so far. The `synthesisInstruction` per stage shapes this. Quality of forced-synthesis answers vs. natural-stop answers is uneven; tuning is per-stage trial-and-error. Worth more rigorous eval.
 
-5. **Cross-agent observability.** Each agent emits its own reasoning steps and tool calls (via `hooksFor(agent)` at `app/api/agent/route.ts:181-195`). There's no global "trace ID" linking the diagnostic and recommendation phases of one investigation — they're correlated by `insightId` only. Probably fine; flagged for the future.
+5. **Cross-agent observability.** Each agent emits its own reasoning steps and tool calls (via `hooksFor(agent)` at `app/api/agent/route.ts:196-210`, which builds the hook shape that `BloomingTraceSinkAdapter` translates AptKit's `CapabilityEvent`s into). There's no global "trace ID" linking the diagnostic and recommendation phases of one investigation — they're correlated by `insightId` only. Probably fine; flagged for the future.
 
 ---
 
@@ -259,26 +265,25 @@ It scales to ~3 stages and ~1 engineer. It would not scale to 20 stages and a te
 
 > "The `if`-ladder is fragile. One typo and the wrong agent runs."
 
-The test suite covers it (`test/agents/*.test.ts` — 169 tests, none require an API key thanks to RFC-N+1 on provider abstraction). The supervisor's choices are deterministic, so testing them is testing `if` branches, not "what did the LLM decide this time."
+The test suite covers it (221 tests across the suite, with the supervisor's `if` branches exercised by route integration tests — none require an API key thanks to the DataSource seam in RFC-005). The supervisor's choices are deterministic, so testing them is testing `if` branches, not "what did the LLM decide this time."
 
 ---
 
 ## References
 
-- `app/api/agent/route.ts:196-200` — the `leadAgent` `if`-ladder (the supervisor)
-- `app/api/agent/route.ts:210-218` — the query-flow branch (one-agent path)
-- `app/api/agent/route.ts:224-249` — the investigation pipeline (diagnostic → recommendation)
-- `app/api/agent/route.ts:222-240` — the cross-request `Diagnosis` handoff via `parseDiagnosis(diagnosisParam)`
-- `lib/agents/base.ts:9` — `AGENT_MODEL = 'claude-sonnet-4-6'` (everywhere except classification)
-- `lib/agents/base.ts:48-176` — the shared `runAgentLoop` (what every stage runs inside)
-- `lib/agents/base.ts:60-61, 86-90` — `maxToolCalls` + forced-synthesis turn
-- `lib/agents/intent.ts:14` — `CLASSIFIER_MODEL = 'claude-haiku-4-5-...'` (the cheap-model split)
-- `lib/agents/diagnostic.ts`, `recommendation.ts`, `monitoring.ts`, `query.ts` — per-stage definitions
+- `app/api/agent/route.ts:228-230` — the `leadAgent` `if`-ladder (the supervisor)
+- `app/api/agent/route.ts:247-260` — the query-flow branch (one-agent path)
+- `app/api/agent/route.ts:262-299` — the investigation pipeline (diagnostic → recommendation)
+- `app/api/agent/route.ts:84-95` — the cross-request `Diagnosis` handoff via `parseDiagnosis(diagnosisParam)`
+- `lib/agents/base.ts:7` — `AGENT_MODEL = 'claude-sonnet-4-6'` (everywhere except classification)
+- `lib/agents/intent.ts:16` — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (the cheap-model split)
+- `lib/agents/diagnostic.ts`, `recommendation.ts`, `monitoring.ts`, `query.ts` — per-stage definitions (AptKit wrappers)
+- `lib/agents/aptkit-adapters.ts:26-72` — `AnthropicModelProviderAdapter` (Anthropic SDK → AptKit ModelProvider)
+- `lib/agents/aptkit-adapters.ts:75-97` — `BloomingToolRegistryAdapter` (DataSource → AptKit ToolRegistry)
+- `lib/agents/aptkit-adapters.ts:100-142` — `BloomingTraceSinkAdapter` (AptKit CapabilityEvent → Blooming NDJSON hooks)
+- `lib/agents/base-legacy.ts:86-176` — the hand-rolled `runAgentLoop` (legacy path, preserved as the receipt the migration was a substitution)
 - `lib/mcp/tools.ts` — per-agent tool subset filtering
+- `.aipe/rehearse-design-doc/06-aptkit-primitives-and-blooming-adapter-boundary.md` — the per-stage runtime swap (the change RFC-003's supervisor was deliberately insulated from)
 - `.aipe/study-agent-architecture/03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` — deeper teaching guide on the escalation gate
 - `.aipe/study-agent-architecture/03-multi-agent-orchestration/03-sequential-pipeline.md` — deeper teaching guide on the topology we chose
 - Anthropic, "Building Effective Agents" (2026) — the canonical reference for "don't auto-route what you can hand-route"
-
----
-
-**Updated:** 2026-06-03 — no architectural drift. The recon and cleanup audits surfaced eval / observability gaps (no LLM eval; `res.usage` dropped on the floor at four call sites; no phase-timing on the 300s budget) that are real but live in the cleanup-and-readiness layer, not the supervisor decision. The supervisor's `if`-ladder remains the right shape; the gaps are additive instrumentation, not RFC-worthy reversals.

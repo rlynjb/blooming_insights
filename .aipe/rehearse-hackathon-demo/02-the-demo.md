@@ -92,10 +92,35 @@ is the script for executing it.
 ```
 
 The marker at 3:00 is non-negotiable. Rehearse with a timer
-until you can hit it within ten seconds. If you can't, the demo
-mode replay is fast enough — the briefing snapshot streams at
-~140ms per event, the investigation replay at ~180ms per event,
-so the timing is predictable.
+until you can hit it within ten seconds.
+
+  ## The mode you actually run — live-synthetic
+
+`bi:mode` has three values and the demo runs on **live-synthetic**.
+This is the killer demo path:
+
+```
+  demo              cached snapshot · instant · feels canned if
+                    a judge probes
+  live-bloomreach   real Bloomreach MCP server · OAuth dance ·
+                    rate-limited 1 req/10s · alpha-server fragile
+  live-synthetic    real agents · real model · real reasoning ·
+                    in-process synthetic data (no upstream) ★
+```
+
+Live-synthetic gives you the property that wins this slot: the
+diagnostic trace materializing on screen is the model actually
+reasoning, not a recording. The EQL queries in the status log are
+the queries the model just generated. The conclusion in the
+EvidencePanel is what the model just synthesized. No OAuth, no
+rate-limit penalty, nothing between you and the demo except the
+Anthropic API. The investigation typically takes ~30-90 seconds
+of model latency — which fits cleanly inside beats 2 and 3's
+budget.
+
+Set the toggle to "live · synthetic" before the slot. If a judge
+later asks "but is this against real Bloomreach data?", you have
+the answer in chapter 6 (probe 1).
 
   ## Beat 1 — the feed orientation   (1:00–1:30)
 
@@ -150,12 +175,13 @@ ninety seconds is to point at things and let the room read.
   first reasoning step streams      "that's the diagnostic agent.
    "reading the workspace schema…"    it's thinking out loud — and
                                       every blue line is a real
-                                      tool call to bloomreach."
+                                      tool call the model just
+                                      generated."
   ──────────────────────────        ───────────────────────────
   first tool_call_start renders     "this is the actual analytics
-   "execute_analytics_eql"            query language it just
+   "execute_analytics_eql"            query language the model just
    the EQL query text fills the       wrote and ran against the
-   status line                        live workspace."
+   status line                        workspace data."
   ──────────────────────────        ───────────────────────────
   tool result lands · next          (silent · let them read the
    reasoning step                     query and the result)
@@ -165,7 +191,8 @@ ninety seconds is to point at things and let the room read.
   second tool fires · third         "every query is the agent
                                       testing a hypothesis. it's
                                       not retrieving a saved
-                                      answer — it's investigating."
+                                      answer — it's investigating
+                                      right now."
 ```
 
 The discipline here: do not narrate the clicks. Do not say "okay
@@ -192,13 +219,12 @@ This is the moment. Stop talking. Let it land.
   ──────────────────────────        ───────────────────────────
   cursor moves to the conclusion    "the agent investigated four
    text                                hypotheses, ran four real
-                                      queries against bloomreach,
-                                      and concluded — with high
-                                      confidence — that this is
-                                      double-firing of checkout
-                                      events. it didn't just spot
-                                      the anomaly. it figured out
-                                      WHY."
+                                      queries, and concluded —
+                                      with high confidence — that
+                                      this is double-firing of
+                                      checkout events. it didn't
+                                      just spot the anomaly. it
+                                      figured out WHY."
 ```
 
 ```
@@ -207,9 +233,10 @@ This is the moment. Stop talking. Let it land.
 
 That line is the money-shot line. Say it once, with weight.
 Don't qualify it. Don't add "kind of" or "we think." Either it
-figured it out or it didn't, and on this insight in demo mode it
-did. The cached snapshot is from a real run. The conclusion is
-the conclusion the live agent actually produced.
+figured it out or it didn't, and on live-synthetic it just did.
+The trace the room saw stream in is the model that just ran. The
+conclusion in the EvidencePanel is the conclusion that model
+just produced — not a cached one.
 
   ## Beat 4 — the action layer   (3:45–5:30)
 
@@ -316,29 +343,36 @@ Three jobs, three sources, no overlap.
   ## ╔══════════════════════════════════════════════════════════╗
   ## ║ IF IT BREAKS — the demo                                   ║
   ## ║                                                            ║
-  ## ║ Demo mode by default. The mode toggle in the feed header  ║
-  ## ║ is set to "demo" and the snapshot replay is captured from ║
-  ## ║ a real live run, so it shows real EQL queries with real   ║
-  ## ║ results. The judges cannot tell it from live (and they    ║
-  ## ║ shouldn't have to — it IS what the live agent does).      ║
+  ## ║ Live-synthetic is the default. The toggle is set to        ║
+  ║ "live · synthetic" so the agents really run against the       ║
+  ║ in-process DataSource. No OAuth, no upstream dependency,      ║
+  ║ no rate-limit penalty. The only failure surface is model      ║
+  ║ latency or an Anthropic API hiccup.                           ║
   ## ║                                                            ║
-  ## ║ The investigate page hangs → switch tabs to the recorded  ║
-  ## ║ screen capture, scrub to the money-shot frame, say "let   ║
-  ## ║ me show you the diagnosis from a fresh run earlier today,"║
-  ## ║ deliver the money-shot line over the recording, and       ║
-  ║ continue to beat 4 from the live app once it recovers.        ║
+  ## ║ The investigate page hangs (model slow / API hiccup) →    ║
+  ║ click "demo" in the mode toggle and click the card again.    ║
+  ║ The cached snapshot replays in ~3 seconds. Say: "let me       ║
+  ║ show you the diagnosis from an earlier run." Don't mention    ║
+  ║ the toggle switch — judges don't need to see the recovery.    ║
+  ║ Deliver the money-shot line over the cached replay and        ║
+  ║ continue to beat 4 normally.                                  ║
   ## ║                                                            ║
-  ## ║ The diagnosis text is blank → the EvidencePanel handles    ║
-  ## ║ this — it shows "no diagnosis yet" rather than a crash.    ║
-  ## ║ If it appears in front of the judges, say: "the cached    ║
-  ## ║ replay just hiccuped — here's what it produced in the run  ║
-  ## ║ behind this snapshot," and screen-switch to the recording. ║
+  ## ║ Both modes hang (rare — would mean Anthropic AND the       ║
+  ║ static snapshot route are both broken) → switch tabs to the   ║
+  ║ recorded screen capture, scrub to the money-shot frame, say   ║
+  ║ "here's the diagnosis from a run earlier today," deliver the  ║
+  ║ money-shot line over the recording, continue.                 ║
+  ## ║                                                            ║
+  ║ The diagnosis text is blank → the EvidencePanel renders       ║
+  ║ "no diagnosis yet" rather than crashing. If it appears, say:  ║
+  ║ "let me show you the one from earlier" and toggle to demo.    ║
   ## ║                                                            ║
   ## ║ A judge interrupts mid-stream with "is this live?" → say  ║
-  ## ║ "this is a replay of a real run from this morning; the    ║
-  ║ live mode is the same flow against the live workspace. I can ║
-  ## ║ toggle it after the demo if you want to see." Then keep    ║
-  ## ║ going. Do NOT try to toggle live mid-demo.                 ║
+  ║ "the agents are running live right now against deterministic  ║
+  ║ ecommerce data — no auth dance for the slot. live-bloomreach  ║
+  ║ in the toggle runs against the real workspace; happy to       ║
+  ║ show you after." Then keep going. Do NOT toggle to            ║
+  ║ live-bloomreach mid-demo — the OAuth dance eats your slot.    ║
   ## ╚══════════════════════════════════════════════════════════╝
 
   ## Tighten it — if you're running long
@@ -378,7 +412,7 @@ orientation.
   │ 1:30   ★ CLICK the critical card                          │
   │ 1:35   "watch the right side."                            │
   │ 1:50   "that's the diagnostic agent. blue lines = real    │
-  │         tool calls to bloomreach."                        │
+  │         tool calls the model just generated."             │
   │ 2:10   "this is the actual analytics query language…"     │
   │ 2:30   (let the trace stream · silent)                    │
   │ 3:00   ★★★ MONEY SHOT — diagnosis materializes ★★★         │
@@ -396,8 +430,11 @@ orientation.
   │         watch, decide."                                   │
   │ 5:50   bridge: "now let me show you how that works."      │
   ├───────────────────────────────────────────────────────────┤
+  │ PRE-ROLL    toggle = "live · synthetic" (real agents,     │
+  │             in-process data, no creds)                    │
   │ MUST NAIL   money-shot line · 3s silence at 3:30          │
-  │ IF BREAKS   recorded clip · narrate money shot from it    │
+  │ IF BREAKS   model hangs → toggle to "demo" (cached) and   │
+  │             reclick · NEVER toggle to live-bloomreach     │
   │ TIGHTEN     cut beat 5 → beat 4 → beat 1's coverage line  │
   │             NEVER cut the money shot                      │
   └───────────────────────────────────────────────────────────┘

@@ -8,7 +8,7 @@
 
 ## Context
 
-`/api/agent` runs a Claude tool-use loop that calls Bloomreach MCP tools under a ~1 request/second rate limit. The combined diagnose+recommend flow takes about 100-115 seconds wall-clock. The split-step flow (one agent per request) is ~50-60 seconds. `app/api/agent/route.ts:20` sets `maxDuration = 300` (Vercel Pro's ceiling).
+`/api/agent` runs a Claude tool-use loop that calls Bloomreach MCP tools under a ~1 request/second rate limit. The combined diagnose+recommend flow takes about 100-115 seconds wall-clock. The split-step flow (one agent per request) is ~50-60 seconds. `app/api/agent/route.ts:22` sets `maxDuration = 300` (Vercel Pro's ceiling).
 
 `/api/briefing` runs the monitoring agent over 7-10 anomaly categories with the schema-gated coverage stream. Similar order-of-magnitude latency, similar shape.
 
@@ -20,7 +20,7 @@ Three facts shape the design:
 
 3. **The connection runs through Vercel's edge.** Anything that exceeds platform timeouts, requires sticky sessions, or needs bidirectional traffic adds infrastructure surface.
 
-Implementation lives at `app/api/agent/route.ts:168-267` (the producer side), `app/api/briefing/route.ts` (the sibling briefing producer), `lib/hooks/useInvestigation.ts:153-212` (the consumer side), `lib/mcp/events.ts:4-22` (the wire format).
+Implementation lives at `app/api/agent/route.ts:183-344` (the producer side), `app/api/briefing/route.ts` (the sibling briefing producer), `lib/streaming/ndjson.ts:17-64` (the shared `readNdjson` kernel consumed by every UI surface), `lib/hooks/useInvestigation.ts` (one of four kernel consumers), `lib/mcp/events.ts:4-22` (the wire format).
 
 ---
 
@@ -107,11 +107,11 @@ AgentEvent =
 
 Three load-bearing pieces:
 
-1. **The producer enqueues the moment it has something to write.** No buffering, no batching. The schema-bootstrap reasoning step at `app/api/agent/route.ts:201` fires *before* the schema read, so the user sees a log line in ~50ms instead of staring at silence for ~1.5s.
+1. **The producer enqueues the moment it has something to write.** No buffering, no batching. The schema-bootstrap reasoning step at `app/api/agent/route.ts:231` fires *before* the schema read at `:235`, so the user sees a log line in ~50ms instead of staring at silence for ~1.5s.
 
 2. **The consumer's `buf.split('\n')` + `lines.pop()` pattern handles chunk-boundary line splits.** TCP can split a JSON line mid-byte; the trailing partial is held in `buf` until the next chunk completes it. This is the one mechanism that has to be correct — getting it wrong produces sporadic parse errors that depend on TCP segmentation.
 
-3. **The cache-replay path uses the same wire format.** `app/api/agent/route.ts:127-141` writes encoded events from a cached array with a 180ms paced delay between them. The consumer doesn't know it's a replay. Same contract, different producer.
+3. **The cache-replay path uses the same wire format.** `app/api/agent/route.ts:129-141` writes encoded events from a cached array with a 180ms paced delay between them. The consumer doesn't know it's a replay. Same contract, different producer.
 
 ---
 
@@ -216,7 +216,7 @@ We chose NDJSON over fetch-stream, accepting:
 
 4. **No event IDs / resume.** A reconnecting client can't ask for "events after the last one I saw." *We accept this — see open question #1.*
 
-5. **Two consumers of the wire format** (actually three — `components/chat/StreamingResponse.tsx:107-132` carries a smaller third copy). `lib/hooks/useInvestigation.ts:184-201` (investigation hook) and `app/page.tsx:268-419` (feed page) each have their own copy of the reader loop. Drift risk. The duplication is also called out in `.aipe/study-frontend-engineering/audit.md` red-flag #2 — the architectural call (one shared `useNdjsonReader` vs hooks each own their own) is gated on the feed-page-hooks extraction. RFC-004 owns the framing for that gating. *We accept this — extraction is mechanical refactor work, not architectural.*
+5. **One kernel, four streaming surfaces.** RESOLVED — the `buf.split('\n') + lines.pop()` line-buffering loop is now hoisted to `lib/streaming/ndjson.ts` (the shared `readNdjson<E>(body, onEvent, opts?)` kernel) and consumed by all four streaming surfaces: `lib/hooks/useBriefingStream.ts:288` (feed), `lib/hooks/useInvestigation.ts:194` (investigation), `lib/hooks/useDemoCapture.ts:84` (dev capture), `components/chat/StreamingResponse.tsx:108` (chat). Drift risk closed; the shared kernel handles cancellation polling and malformed-line tolerance in one place. *We accept the cost we still pay: every consumer is responsible for the `switch (e.type)` event-dispatch beneath the kernel — the kernel doesn't know the union shape, by design (it stays event-type-agnostic so the briefing route's `BriefingEvent` superset works without widening the shared `AgentEvent` contract).*
 
 6. **The briefing route's `BriefingEvent` is a local superset of `AgentEvent`.** We deliberately did NOT widen the shared union (which would force the investigation view to handle event types it never receives). Two consumers, one core contract, one local extension. *We accept this — the discipline is "extend locally, never widen the contract."*
 
@@ -226,13 +226,13 @@ We chose NDJSON over fetch-stream, accepting:
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Consumer's line-buffering bug → silent parse failures | Medium | The per-line `catch` block at `useInvestigation.ts:195-199` ignores malformed lines instead of failing the stream. Bugs in the buffer produce missing events, not crashes. Tests: `test/mcp/events.test.ts`. |
+| Consumer's line-buffering bug → silent parse failures | Medium | The per-line `catch` block lives ONCE inside `lib/streaming/ndjson.ts:45-49` (the shared kernel) — malformed lines are silently dropped (or surfaced via the optional `onMalformed` callback). Bugs in the buffer produce missing events, not crashes. Tests: `test/streaming/ndjson.test.ts`, `test/mcp/events.test.ts`. |
 | TCP chunk lands mid-JSON, partial line discarded by mistake | Medium | `buf = lines.pop() ?? ''` is the load-bearing line. Diagrammed at `.aipe/study-system-design/05-streaming-ndjson.md`. Test covered. |
-| Producer throws after first event sent → can't return HTTP 500 (headers already gone) | Medium | The `try`/`catch` inside `start()` converts thrown errors into `{ type: 'error', message }` NDJSON events. Consumer's switch handles `'error'` → `setError`. `app/api/agent/route.ts:255-260`. |
-| Serverless function timeout cuts the stream before `done` | Medium | `maxDuration = 300` at `app/api/agent/route.ts:20` is Vercel Pro's max; combined run is ~100-115s, comfortable margin. Split-step flow reduces per-request to ~50-60s. On a stricter limit (Hobby's 60s), the combined run does NOT fit — partly why the flow split exists. |
-| CDN buffers the response and the user sees nothing until the end | Low | `Cache-Control: no-cache, no-transform` header at `app/api/agent/route.ts:107-110` tells intermediaries not to buffer. Verified against Vercel's edge. |
+| Producer throws after first event sent → can't return HTTP 500 (headers already gone) | Medium | The `try`/`catch` inside `start()` converts thrown errors into `{ type: 'error', message }` NDJSON events. Consumer's switch handles `'error'` → `setError`. `app/api/agent/route.ts:303-316`. |
+| Serverless function timeout cuts the stream before `done` | Medium | `maxDuration = 300` at `app/api/agent/route.ts:22` is Vercel Pro's max; combined run is ~100-115s, comfortable margin. Split-step flow reduces per-request to ~50-60s. On a stricter limit (Hobby's 60s), the combined run does NOT fit — partly why the flow split exists. |
+| CDN buffers the response and the user sees nothing until the end | Low | `Cache-Control: no-cache, no-transform` header at `app/api/agent/route.ts:105-108` tells intermediaries not to buffer. Verified against Vercel's edge. |
 | React StrictMode double-invokes the effect → two fetches → two agent runs | Medium | `startedRef` guard in `useInvestigation.ts:32-36, 43, 47-48` blocks the second invocation. We deliberately do NOT cancel on cleanup — cancelling on StrictMode's first cleanup while the guard blocks the re-mount aborts the stream and leaves the trace empty. |
-| Multi-byte UTF-8 character split across two TCP chunks | Low | `TextDecoder.decode(value, { stream: true })` at `useInvestigation.ts:190` defers multi-byte sequences across calls. Without `{ stream: true }` the character becomes U+FFFD. |
+| Multi-byte UTF-8 character split across two TCP chunks | Low | `TextDecoder.decode(value, { stream: true })` at `lib/streaming/ndjson.ts:39` (shared kernel) defers multi-byte sequences across calls. Without `{ stream: true }` the character becomes U+FFFD. |
 
 ---
 
@@ -240,9 +240,9 @@ We chose NDJSON over fetch-stream, accepting:
 
 This was day-one shape. No rollout question.
 
-The recent migration that matters: `bootstrapSchema()` moved *inside* the `ReadableStream` (`app/api/agent/route.ts:196-202`), with a `reasoning_step` emitted before the schema read. Before, the user stared at silence for 1-2s while the schema loaded. After, the first log line lands in ~50ms. Same architecture, better cadence.
+The recent migration that matters: `bootstrapSchema()` moved *inside* the `ReadableStream` (`app/api/agent/route.ts:227-235`), with a `reasoning_step` emitted before the schema read. Before, the user stared at silence for 1-2s while the schema loaded. After, the first log line lands in ~50ms. Same architecture, better cadence.
 
-The second recent migration: the `step` query param (`'diagnose' | 'recommend'`) splits the combined run into two requests. Each step runs one agent (live) or filters the cached snapshot for that step's events (replay). This lowered per-request wall-clock from ~115s to ~50-60s, gave us comfortable margin against any timeout, and matches the two-page UI flow. The wire format did not change. `app/api/agent/route.ts:66-84` (filter), `app/api/agent/route.ts:117-118` (parse).
+The second recent migration: the `step` query param (`'diagnose' | 'recommend'`) splits the combined run into two requests. Each step runs one agent (live) or filters the cached snapshot for that step's events (replay). This lowered per-request wall-clock from ~115s to ~50-60s, gave us comfortable margin against any timeout, and matches the two-page UI flow. The wire format did not change. `app/api/agent/route.ts:64-82` (filter), `app/api/agent/route.ts:115-116` (parse).
 
 ---
 
@@ -252,7 +252,7 @@ The second recent migration: the `step` query param (`'diagnose' | 'recommend'`)
 
 2. **Backpressure.** Producer writes as fast as it can; consumer reads as fast as it can. The `ReadableStream`'s `desiredSize` / `pull` mechanism is not used. For our event sizes (small JSON objects, 50-200 bytes after encode) and rates (10-100 events over 115s = far less than 1KB/s), buffer pressure is not a real concern. The day we stream large tool results raw, this changes.
 
-3. **Two consumer loops, one wire format.** `useInvestigation.ts` and `app/page.tsx` each have their own `buf.split('\n')` loop. Extraction to a shared `readNdjsonStream(res, handle)` is straightforward. Not done yet because the two loops have slightly different error-handling needs (the feed page deals with `BriefingEvent`, the hook with `AgentEvent`). Mechanical refactor; deferred.
+3. **Two consumer loops, one wire format.** RESOLVED — `lib/streaming/ndjson.ts` now exports `readNdjson<E>(body, onEvent, opts?)` and the four consumers (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`) all call it. The generic `<E>` keeps the briefing route's local `BriefingEvent` superset working without widening the shared `AgentEvent` contract. The kernel's tests live at `test/streaming/ndjson.test.ts`.
 
 4. **The `error` event is the only mechanism for mid-stream failures.** The consumer handles it by setting `error` state. There's no retry-with-backoff, no "fall back to cached result." If the live run fails halfway, the user sees the error and re-runs by hand. Acceptable for current scope; will need a retry policy if/when we ship to less patient users.
 
@@ -268,7 +268,7 @@ We're not fighting the platform — we're choosing a protocol whose reconnect se
 
 > "You wrote your own line-buffering. That's a maintenance burden."
 
-Four lines of code, tested by `test/mcp/events.test.ts`. The alternative (SSE) would have written its own bug — re-running a 115s agent on a flaky connection. The trade isn't "buffer code" vs. "no buffer code"; it's "buffer code" vs. "duplicate billing."
+Four lines of code, hoisted ONCE into `lib/streaming/ndjson.ts`, tested by `test/streaming/ndjson.test.ts` and `test/mcp/events.test.ts`. The alternative (SSE) would have written its own bug — re-running a 115s agent on a flaky connection. The trade isn't "buffer code" vs. "no buffer code"; it's "buffer code in one tested file" vs. "duplicate billing."
 
 > "What if the connection drops?"
 
@@ -287,16 +287,18 @@ For sending ~50 small events over ~115 seconds, the protocol overhead is in the 
 ## References
 
 - `lib/mcp/events.ts:4-22` — the `AgentEvent` wire contract + `encodeEvent` / `decodeEvent`
-- `app/api/agent/route.ts:20` — `maxDuration = 300`
-- `app/api/agent/route.ts:105` — `REPLAY_DELAY_MS = 180` (cache-replay pacing)
-- `app/api/agent/route.ts:107-110` — NDJSON headers (`Content-Type` + `Cache-Control`)
-- `app/api/agent/route.ts:127-141` — cache-replay producer (same wire format)
-- `app/api/agent/route.ts:168-267` — live producer (`ReadableStream` + `send`)
-- `app/api/agent/route.ts:196-202` — bootstrap-inside-stream (first-line cadence fix)
-- `lib/hooks/useInvestigation.ts:32-36, 43, 47-48` — `startedRef` StrictMode guard
-- `lib/hooks/useInvestigation.ts:153-212` — consumer loop
-- `lib/hooks/useInvestigation.ts:184-201` — line-buffering kernel (`buf.split('\n')` + `lines.pop()`)
-- `app/page.tsx:268-419` — second consumer loop (feed / briefing)
+- `app/api/agent/route.ts:22` — `maxDuration = 300`
+- `app/api/agent/route.ts:103` — `REPLAY_DELAY_MS = 180` (cache-replay pacing)
+- `app/api/agent/route.ts:105-108` — NDJSON headers (`Content-Type` + `Cache-Control`)
+- `app/api/agent/route.ts:129-141` — cache-replay producer (same wire format)
+- `app/api/agent/route.ts:184-344` — live producer (`ReadableStream` + `send`)
+- `app/api/agent/route.ts:227-235` — bootstrap-inside-stream (first-line cadence fix)
+- `lib/hooks/useInvestigation.ts` — investigation consumer (now calls the shared kernel)
+- `lib/hooks/useBriefingStream.ts:288` — briefing consumer (now calls the shared kernel)
+- `lib/hooks/useDemoCapture.ts:84` — demo-capture consumer (now calls the shared kernel)
+- `components/chat/StreamingResponse.tsx:108` — chat consumer (now calls the shared kernel)
+- `lib/streaming/ndjson.ts:17-64` — the shared `readNdjson<E>` kernel (`buf.split('\n')` + `lines.pop()` + `cancelOn` polling + malformed-line tolerance)
+- `test/streaming/ndjson.test.ts` — kernel tests
 - `.aipe/study-system-design/05-streaming-ndjson.md` — deeper teaching guide on the mechanism
 - `.aipe/study-networking/06-websockets-sse-streaming-and-realtime.md` — the broader transport landscape
 - `.aipe/study-frontend-engineering/01-ndjson-stream-reader-hook.md` — the consumer-side walk (the hook-shaped reader loop)
@@ -304,7 +306,3 @@ For sending ~50 small events over ~115 seconds, the protocol overhead is in the 
 - `.aipe/rehearse-design-doc/04-framework-runtime-without-data-primitives.md` — the consumer-side companion RFC (why we hand-roll the reader instead of reaching for Suspense / use() / SWR)
 - WHATWG HTML spec — `EventSource` (the standard we deliberately don't use)
 - RFC 7230 — HTTP/1.1 chunked transfer encoding (the primitive that makes streaming work)
-
----
-
-**Updated:** 2026-06-03 — cross-references added to `study-frontend-engineering/audit.md` and RFC-004 (the consumer-side companion). Reader-loop duplication tradeoff #5 expanded to acknowledge the third copy in `StreamingResponse.tsx` and the RFC-004 framing of the gated extraction.

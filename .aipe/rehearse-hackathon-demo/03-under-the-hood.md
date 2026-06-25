@@ -15,10 +15,19 @@ mechanism in the codebase, you draw one diagram of it, and you
 explain it in three sentences. Then you move on.
 
 The one mechanism worth showing for blooming insights is the
-NDJSON streaming pipeline that bridges the agent loop running on
-the server to the React UI rendering in the browser. It's what
-makes the money shot possible. Every other architectural choice
-serves it.
+**adapter boundary** — `@aptkit/core` owns the agent loop
+runtime, three Blooming-owned adapters bridge it to Anthropic
+and to a `DataSource` interface, and the DataSource has two
+implementations (Bloomreach MCP, or in-process synthetic). The
+NDJSON streaming pipeline sits on top of it and bridges the
+loop's callbacks to the React UI. The whole thing is what makes
+the money shot possible AND what makes live-synthetic the killer
+demo path. Every other architectural choice serves it.
+
+This is the senior selling point: **library owns the loop,
+Blooming owns the domain.** Swapping data sources doesn't touch
+the agents. Swapping the model provider doesn't touch the
+agents. The seam is where credibility lives.
 
   ## The time-budget bar
 
@@ -40,115 +49,126 @@ you draw on screen or hold up on a slide. Everything you say in
 chapter 3 maps onto a part of this diagram.
 
 ```
-  the streaming pipeline · click → live reasoning → diagnosis
+  the architecture · adapter boundaries make live-synthetic work
 
   ┌─ browser ───────────────────────────────────────────────────┐
-  │  useInvestigation()  ← hook in lib/hooks/useInvestigation    │
+  │  useInvestigation()  ← lib/hooks/useInvestigation.ts         │
   │   reader = res.body.getReader()                              │
   │   for each '\n'-delimited line:                              │
-  │     JSON.parse(line) as AgentEvent                           │
-  │     switch (e.type) { reasoning_step | tool_call_start | … } │
-  │     setItems((p) => [...p, traceItem])  ← React state grows  │
+  │     setItems((p) => [...p, JSON.parse(line)])                │
   └─────────────────────────────────────────┬───────────────────┘
                                             │  HTTP body, NDJSON
-                                            │  Content-Type:
-                                            │   application/x-ndjson
                                             ▼
-  ┌─ server (app/api/agent/route.ts) ────────────────────────────┐
-  │  new ReadableStream({                                        │
-  │    async start(controller) {                                 │
-  │      const send = (e: AgentEvent) =>                         │
-  │        controller.enqueue(encoder.encode(encodeEvent(e)))    │
-  │      …                                                       │
-  │      const diag = await diagAgent.investigate(anomaly, {     │
-  │        onToolCall:   (tc) => send({ type:'tool_call_start',  │
-  │                                     toolName, agent }),      │
-  │        onToolResult: (tc) => send({ type:'tool_call_end',… })│
-  │        onText:       (t)  => send({ type:'reasoning_step',…})│
-  │      })                                                      │
-  │      send({ type:'diagnosis', diagnosis: diag })             │
-  │      send({ type:'done' })                                   │
-  │    }                                                         │
-  │  })                                                          │
+  ┌─ Next.js route (app/api/agent/route.ts) ─────────────────────┐
+  │  ReadableStream wraps the agent run; every callback becomes  │
+  │  one NDJSON line on the wire (AgentEvent contract)           │
   └─────────────────────────────────────────┬───────────────────┘
-                                            │  injected hooks
+                                            │  agent.investigate(…)
                                             ▼
-  ┌─ agent loop (lib/agents/base.ts · runAgentLoop) ─────────────┐
-  │  for (turn = 0; turn < maxTurns; turn++) {                   │
-  │    res = await anthropic.messages.create({ tools, … })       │
-  │    onText?(textBlocks…)            ← fires every turn        │
-  │    for each tool_use in res:                                 │
-  │      onToolCall?(tc)               ← fires per tool call     │
-  │      const r = await mcp.callTool(tu.name, tu.input)         │
-  │      onToolResult?(tc)             ← fires after result      │
-  │    if (no tool_use) return finalText                         │
-  │  }                                                           │
-  └─────────────────────────────────────────┬───────────────────┘
-                                            │  MCP JSON-RPC
-                                            ▼
-  ┌─ bloomreach mcp server ─────────────────────────────────────┐
-  │  execute_analytics_eql · get_event_schema · …                │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Blooming-owned agents (lib/agents/*.ts) ────────────────────┐
+  │  diagnostic.ts · monitoring.ts · recommendation.ts ·         │
+  │  query.ts · intent.ts                                         │
+  │   ↓ thin wrappers — each constructs an @aptkit/core agent    │
+  │     with two adapters injected:                              │
+  └──────────────┬───────────────────────────┬───────────────────┘
+                 │                           │
+                 ▼                           ▼
+  ┌─ AptKit loop ───────────┐  ┌─ aptkit-adapters.ts (Blooming) ─┐
+  │  @aptkit/core@0.3.0      │  │  AnthropicModelProviderAdapter  │
+  │  owns the agent runtime  │  │   → Anthropic SDK              │
+  │  (think→tool→observe     │  │  McpToolRegistryAdapter        │
+  │   loop, retries, budget) │  │   → DataSource                 │
+  │  Blooming does NOT       │  │  CapabilityTraceSink           │
+  │  own this anymore        │  │   → onText/onToolCall callbacks │
+  └──────────────┬──────────┘  └────────────┬─────────────────────┘
+                 │  loop calls tools          │
+                 ▼                           ▼
+  ┌─ DataSource seam (lib/data-source/types.ts) ─────────────────┐
+  │   interface DataSource {                                     │
+  │     getSchema(): WorkspaceSchema                             │
+  │     executeAnalyticsEql(query): EqlResult                    │
+  │     …                                                        │
+  │   }                                                          │
+  └─────────────┬───────────────────────────┬───────────────────┘
+                │                           │
+   live-bloomreach                  live-synthetic
+                ▼                           ▼
+  ┌─ BloomreachDataSource ─┐   ┌─ SyntheticDataSource ──────────┐
+  │ lib/data-source/        │   │ lib/data-source/                │
+  │  bloomreach-data-source │   │  synthetic-data-source.ts       │
+  │  → MCP JSON-RPC over    │   │  → in-process deterministic     │
+  │    HTTP to alpha server │   │    ecommerce data (516 LOC)     │
+  │  OAuth + rate limits    │   │  no auth · no network · runs    │
+  │                         │   │  anywhere with ANTHROPIC_API_KEY│
+  └─────────────────────────┘   └─────────────────────────────────┘
 ```
 
 The reasoning steps don't reach React after the agent finishes —
-they reach React as the agent thinks them. That's the whole
-trick. Read that diagram once a day until the demo.
+they reach React as the agent thinks them. And the agents don't
+know whether they're talking to Bloomreach or to in-process
+synthetic data; the DataSource seam hides it. Same agent code
+serves both. Read that diagram once a day until the demo.
 
   ## The three sentences
 
 You explain this in three sentences. Practice them. Don't
 improvise; you'll over-explain.
 
-  ## Sentence 1 — the loop   (6:00–6:30)
+  ## Sentence 1 — the adapter boundary   (6:00–6:30)
 
 ```
-  ┃ "every agent — monitoring, diagnostic, recommendation — runs
-  ┃  the same loop: claude asks for a tool, we call bloomreach
-  ┃  through mcp, we feed the result back, and we keep going
-  ┃  until claude has no more tool calls left."
+  ┃ "i don't own the agent loop anymore — i pulled it out into
+  ┃  a published library, @aptkit/core. my five agents are thin
+  ┃  wrappers that hand the loop two adapters: one to anthropic,
+  ┃  one to a DataSource interface. the loop runs the
+  ┃  think-tool-observe cycle; the adapters know what 'a tool'
+  ┃  and 'a model' actually mean in my domain."
 ```
 
-Then point at the third band of the diagram. Don't elaborate.
-Don't say "this is implemented in TypeScript with async/await"
-— the room can see it's code. The shape is the point.
+Then point at the middle of the diagram — the AptKit box on the
+left, the adapter box on the right. The senior point: the loop
+is reusable infrastructure; the domain plugs in through
+adapters.
 
-  ## Sentence 2 — the streaming bridge   (6:30–7:00)
-
-```
-  ┃ "the agent loop fires three callbacks as it runs — every
-  ┃  thought, every tool call start, every tool result. the
-  ┃  route turns each callback into one line of NDJSON and
-  ┃  pushes it into a streaming response. the browser reads the
-  ┃  stream line-by-line and appends each event to react state.
-  ┃  that's why the trace fills in live instead of all at once."
-```
-
-Then point at the top two bands. The whole pipeline is three
-files end-to-end — the agent loop in `lib/agents/base.ts` is
-the bottom of the diagram, the route in
-`app/api/agent/route.ts` is the middle, and the
-`useInvestigation` hook in `lib/hooks/useInvestigation.ts` is
-the top.
-
-  ## Sentence 3 — the load-bearing constraint   (7:00–7:30)
-
-This is the engineering detail that earns credibility. Pick the
-constraint, name it, name what would break without it.
+  ## Sentence 2 — the DataSource seam   (6:30–7:00)
 
 ```
-  ┃ "the bloomreach server rate-limits at one request every ten
-  ┃  seconds globally per user. the client parses the rate-limit
-  ┃  error to find out how long to wait, waits exactly that
-  ┃  long, then retries — capped at three. without that, a
-  ┃  single investigation would burn its budget on the first
-  ┃  rate-limit hit and produce nothing."
+  ┃ "the DataSource seam is what makes this demo possible. the
+  ┃  agents call into a DataSource interface — they don't know
+  ┃  whether it's the real Bloomreach MCP server or a 500-line
+  ┃  in-process synthetic ecommerce dataset i wrote. same agent
+  ┃  code path. that's how this demo runs with zero auth and
+  ┃  zero upstream dependencies, while still being a real agent
+  ┃  run with real model reasoning."
+```
+
+Then point at the DataSource band of the diagram. The two
+implementations — `BloomreachDataSource`, `SyntheticDataSource`
+— are both in `lib/data-source/`. The agents don't import
+either; they import the interface. Vendor swaps don't touch
+domain code.
+
+  ## Sentence 3 — the NDJSON streaming bridge   (7:00–7:30)
+
+This is the engineering detail that earns credibility for the
+money shot specifically — it's the reason the reasoning trace
+materializes line-by-line on screen instead of arriving as a
+blob at the end.
+
+```
+  ┃ "the agent loop fires callbacks on every thought, tool call
+  ┃  start, and tool result. the route encodes each one as one
+  ┃  line of NDJSON and pushes it into a streaming response.
+  ┃  the browser reads the stream line-by-line and appends each
+  ┃  event to react state. that's why the trace fills in live
+  ┃  instead of all at once."
 ```
 
 That sentence is the difference between "I built a UI for an
-agent" and "I built around the real failure modes of a
-production-grade API." Judges who have shipped systems will
-notice.
+agent" and "I built the live observability surface that lets a
+user trust the agent." Judges who have shipped systems will
+notice — and it's the load-bearing part of the money shot they
+just watched.
 
   ## The "I built one" beat — 30 seconds left   (7:30–8:00)
 
@@ -161,8 +181,9 @@ they just watched is real.
   SHOW (on screen)                  SAY (out loud)
   ──────────────────────────        ───────────────────────────
   scroll the status log up so       "every blue line in this log
-   the EQL query text from the        is a real query the agent
-   live trace is visible              wrote. nothing is canned."
+   the EQL query text from the        is a real query the model
+   live trace is visible              just generated. nothing is
+                                      canned."
   ──────────────────────────        ───────────────────────────
   hand-off into chapter 4           "let me tell you the part
                                       that was hard to build."
@@ -212,10 +233,13 @@ budget. Trust the diagram. Three sentences.
   ║    demo. for now, this is the one thing i want to show you." ║
   ## ║                                                            ║
   ## ║ Then finish the three sentences. The q&a chapter (06) has ║
-  ## ║ the answers prepped: claude sonnet 4.6, model context     ║
-  ## ║ protocol because bloomreach already speaks it, the agent   ║
-  ## ║ loop is in lib/agents/base.ts, the rate-limit handling in  ║
-  ║ lib/mcp/client.ts. You're ready for it — just not right now.  ║
+  ## ║ the answers prepped: claude sonnet 4.6, MCP because        ║
+  ║ bloomreach already speaks it, the agent loop comes from       ║
+  ║ @aptkit/core (i own the published package), the DataSource    ║
+  ║ seam in lib/data-source/types.ts is what enables live-        ║
+  ║ synthetic, the legacy hand-rolled loop is preserved at        ║
+  ║ lib/agents/base-legacy.ts for reference. You're ready for it  ║
+  ║ — just not right now.                                         ║
   ## ╚══════════════════════════════════════════════════════════╝
 
   ## Tighten it — if you're running long
@@ -228,22 +252,26 @@ order:
   cut 1   drop the "I built one" beat at 7:30
             saves 30s · costs only the bridge into chapter 4
 
-  cut 2   drop sentence 3 (the rate-limit constraint)
-            saves 30s · costs the credibility moment with
-            engineers in the room. you keep the streaming-
-            pipeline story, which is the load-bearing part.
+  cut 2   drop sentence 3 (the NDJSON streaming bridge)
+            saves 30s · costs the money-shot explanation. you
+            keep the adapter-boundary + DataSource story, which
+            is the load-bearing part for the senior selling
+            point.
 
   cut 3   show the diagram for 5 seconds without explaining
-            it, say "the short version is: real agent loop,
-            streamed live, real MCP calls" and skip to ch 4.
+            it, say "the short version: the loop comes from a
+            library i wrote, the data source has two impls,
+            this demo is one of them" and skip to ch 4.
             saves 60s · costs almost everything. only do this
             if you're at 7:30 with chapter 3 still on screen.
 ```
 
-The floor: the streaming-pipeline diagram and at least one
-sentence about it. That's the irreducible minimum. The diagram
-alone (with the right line) is enough to land "this is real
-infrastructure, not a wrapper."
+The floor: the architecture diagram and sentences 1+2 (the
+adapter boundary and the DataSource seam). That's the irreducible
+minimum. The streaming bridge is the third sentence; cut it
+before the boundary story. The boundary IS the senior selling
+point — "library owns the loop, Blooming owns the domain" is the
+sentence judges with infra background care about.
 
   ## ────────────── RUN SHEET — chapter 3 ─────────────────────
 
@@ -251,24 +279,29 @@ infrastructure, not a wrapper."
   ┌───────────────────────────────────────────────────────────┐
   │ UNDER THE HOOD · 6:00–8:00 · 2 minutes                    │
   ├───────────────────────────────────────────────────────────┤
-  │ 6:00   show the streaming-pipeline diagram                │
-  │ 6:05   SENTENCE 1 — the agent loop                        │
-  │         "every agent runs the same loop: claude asks for  │
-  │          a tool, we call bloomreach, we feed it back…"    │
-  │ 6:30   SENTENCE 2 — the streaming bridge                  │
-  │         "the loop fires three callbacks · the route turns │
-  │          each into NDJSON · browser appends to react…"    │
-  │ 7:00   SENTENCE 3 — the rate-limit constraint             │
-  │         "bloomreach rate-limits 1 req per 10s globally.   │
-  │          the client parses the error, waits, retries…"    │
+  │ 6:00   show the architecture diagram                      │
+  │ 6:05   SENTENCE 1 — the adapter boundary                  │
+  │         "i don't own the agent loop anymore — @aptkit/    │
+  │          core does. my agents are thin wrappers with two  │
+  │          adapters: anthropic and a DataSource interface." │
+  │ 6:30   SENTENCE 2 — the DataSource seam                   │
+  │         "the agents don't know if they're talking to      │
+  │          bloomreach or to my in-process synthetic data.   │
+  │          same agent code. that's why this demo runs with  │
+  │          zero auth and zero upstream dependency."         │
+  │ 7:00   SENTENCE 3 — the NDJSON streaming bridge           │
+  │         "the loop fires callbacks · the route turns each  │
+  │          into NDJSON · browser appends to react. that's   │
+  │          why the trace fills in live."                    │
   │ 7:30   scroll the status log up, show real EQL text       │
-  │         "every blue line is a real query."                │
+  │         "every blue line is a real query the model just   │
+  │          generated."                                      │
   │ 7:55   bridge: "let me tell you the part that was hard."  │
   ├───────────────────────────────────────────────────────────┤
-  │ MUST NAIL   the streaming-pipeline diagram + 1 sentence   │
+  │ MUST NAIL   diagram + sentence 1 (the adapter boundary)   │
   │ IF BREAKS   "i'll cover that in q&a" · finish sentences   │
-  │ TIGHTEN     cut the "i built one" beat → sentence 3 →     │
-  │             diagram alone + one line                       │
+  │ TIGHTEN     cut "i built one" → cut sentence 3 → diagram  │
+  │             alone + the boundary line                      │
   └───────────────────────────────────────────────────────────┘
 ```
 

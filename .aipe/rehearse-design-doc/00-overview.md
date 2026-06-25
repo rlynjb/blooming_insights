@@ -1,8 +1,8 @@
 # Design docs — blooming insights
 
-Four RFCs. Each documents a decision already made in the codebase, written the way it should have been written when it was made — for a skeptical reviewer who will ask "why this and not the obvious thing?"
+Six RFCs. Each documents a decision already made in the codebase, written the way it should have been written when it was made — for a skeptical reviewer who will ask "why this and not the obvious thing?"
 
-This is not a backfill of every choice the repo contains. Most of what's in this codebase is the obvious default for a Next.js + MCP + Claude app. These four are the ones where a reviewer will stop, push back, and ask for the alternatives matrix.
+This is not a backfill of every choice the repo contains. Most of what's in this codebase is the obvious default for a Next.js + MCP + Claude app. These six are the ones where a reviewer will stop, push back, and ask for the alternatives matrix.
 
 ## The decisions
 
@@ -42,25 +42,48 @@ This is not a backfill of every choice the repo contains. Most of what's in this
   │           Suspense?" is the literal first reviewer question; the    │
   │           uniform `'use client'` stance shapes every page; the      │
   │           non-adoption is deliberate, not framework illiteracy      │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  RFC-005  DataSource seam + adapter pattern at the backend boundary │
+  │           Rejected: per-backend route handlers, agents coupled to   │
+  │                     McpClient directly, a generic ORM abstraction,  │
+  │                     framework-supplied tool registry                │
+  │           Why it's RFC-worthy: this seam already survived three     │
+  │           adapter swaps in production (Olist added, Olist removed,  │
+  │           Synthetic added) without changing one caller surface;     │
+  │           a reviewer who hasn't seen the history will ask "why not  │
+  │           just call BloomreachDataSource directly?" — the answer    │
+  │           is the receipts                                            │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  RFC-006  AptKit primitives + Blooming-owned adapter boundary       │
+  │           Rejected: keep the hand-rolled runAgentLoop forever,      │
+  │                     vendor AptKit-the-library directly into routes, │
+  │                     adopt LangChain / LangGraph instead, build our  │
+  │                     own ModelProvider / ToolRegistry primitives     │
+  │           Why it's RFC-worthy: the agent loop is the hottest        │
+  │           load-bearing logic in the codebase. Moving it from        │
+  │           Blooming-owned code to a generic library is the kind of   │
+  │           dependency call a reviewer interrogates; the legacy path  │
+  │           is preserved at `base-legacy.ts` as the receipt that the  │
+  │           swap was a substitution, not a rewrite                    │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Why these four (and not others)
+## Why these six (and not others)
 
 A design doc is expensive attention. The test for "warrants a doc" is four-part — every one of these clears all four:
 
 ```
-  Test                          RFC-001    RFC-002    RFC-003    RFC-004
-  ─────────────────────────     ───────    ───────    ───────    ───────
-  hard to reverse               yes        yes        yes        yes
-  a real alternative existed    yes        yes        yes        yes
-  cross-cutting impact          yes        yes        yes        yes
-  reviewer will ask "why?"      yes        yes        yes        yes
+  Test                       001  002  003  004  005  006
+  ─────────────────────────  ───  ───  ───  ───  ───  ───
+  hard to reverse            yes  yes  yes  yes  yes  yes
+  a real alternative existed yes  yes  yes  yes  yes  yes
+  cross-cutting impact       yes  yes  yes  yes  yes  yes
+  reviewer will ask "why?"   yes  yes  yes  yes  yes  yes
 ```
 
 The candidates that DIDN'T make the cut (and why):
 
-- **Provider abstraction (`McpCaller` / `McpTransport`)** — a real decision, but the alignment story is internal to the test suite. `.aipe/study-system-design/03-provider-abstraction.md` already defends it for an interview reader. A team aligning on architecture would treat it as a default ("we own our interface, not the vendor's") rather than a contested choice.
+- **Provider abstraction (`McpCaller` / `McpTransport`)** — folded INTO RFC-005. The internal `McpCaller` type (now `Pick<DataSource, 'callTool'>` at `lib/agents/base.ts:14` and `base-legacy.ts:24`) and the `McpTransport` test seam are sub-pieces of the same boundary RFC-005 defends. Keeping them as separate RFCs would split the same decision across three documents.
 
 - **Schema-gated coverage** — a clever pattern, well-named, and a real win in the briefing route. But it's a *local* decision (one stage of one route), not cross-cutting. It does not change how the rest of the codebase is written.
 
@@ -68,7 +91,15 @@ The candidates that DIDN'T make the cut (and why):
 
 - **Vercel as the host** — not actually a decision in the repo; inherited from the Next.js scaffold. RFC-worthy decisions are decisions someone could have made differently; this one is upstream of the codebase.
 
-- **Deferring the eval substrate** — flagged by the recon audit and the eval-substrate refactor notebook. Real decision, real cost (the recon places the repo at L1-with-one-L2-spike specifically because of the missing eval harness). But deferring isn't hard-to-reverse architecturally; adding evals is additive, not migrational. Lives in the cleanup-and-readiness layer, not the design-doc layer.
+- **The session-keyed insights map (`lib/state/insights.ts`)** — a real bug fix (the concurrent-user wipe) and structurally important, but the fix lives inside the no-database stance RFC-001 already defends. It's noted as a *resolved* open question on RFC-001 rather than its own RFC.
+
+- **The NDJSON kernel extraction (`lib/streaming/ndjson.ts`)** — the shared `readNdjson` consumed by all four streaming surfaces. Architecturally significant, but it's the cleanup payoff of RFC-002 and RFC-004 (it closes their "two/three consumer copies" tradeoff). Noted in those RFCs rather than promoted to its own.
+
+- **Page decomposition (`useBriefingStream` / `useDemoCapture` / `useReconnectPolicy`)** — `app/page.tsx` dropped from 817 → 461 LOC by extracting three hooks. Real shipped work, but it's the implementation of an existing software-design verdict, not a contested design decision. Lives in `study-software-design/`.
+
+- **The Eval flywheel (built and retired)** — Phase 3 stood up a 4-pillar eval suite (detection precision/recall, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score), calibrated by 8/8 and 3/3 manual spot-check agreement, surfaced 3 real bugs, and was retired with the Olist substrate (PR #8). Retired-on-purpose isn't an active design decision — it's a closed chapter. Its lessons inform a future eval-substrate RFC if/when the substrate question reopens.
+
+- **Deferring the eval substrate** — flagged by the recon audit. Real decision, real cost. But deferring isn't hard-to-reverse architecturally; adding evals is additive, not migrational. Lives in the cleanup-and-readiness layer.
 
 ## How to use these docs
 
@@ -78,12 +109,10 @@ The "Open questions" section at the end of each doc is not a weakness — it's t
 
 ## On the size of this collection
 
-Four RFCs is right for *this* codebase. blooming insights is one engineer building one product on one host with one upstream API. Most of its choices are defaults that don't need defending in writing. The four that do — no database, NDJSON over the alternatives, deterministic supervisor over the LLM-supervisor default, framework runtime adopted but data-fetch primitives declined — are the four where the architecture would have to change shape if any one were reversed.
+Six RFCs is right for *this* codebase as of today. blooming insights is one engineer building one product on one host with one upstream API. Most of its choices are defaults that don't need defending in writing.
 
-The honest framing: 3 was the right number until the FE-engineering audit (2026-06-03) surfaced the framework-underuse decision as a load-bearing one — every routed page is `'use client'`, no Server Components, no Suspense, no use(), no Server Actions, no React Query / SWR, no global store, and the non-adoption is uniform and deliberate. That decision shapes every page; it's the literal first thing a React 19 reviewer asks about. Adding it as RFC-004 reflects the codebase's actual architecture; not adding it would mean the most cross-cutting decision in the frontend lives only in an audit observation.
+The four original RFCs (no database, NDJSON over the alternatives, deterministic supervisor over the LLM-supervisor default, framework runtime adopted but data-fetch primitives declined) are still the four where the architecture would have to change shape if any one were reversed.
 
-A team-scale codebase would generate more RFCs over time as more decisions earn the bar. Until then, these are the four.
+The two newer RFCs (RFC-005, RFC-006) document the load-bearing design moves of Phase 2: the DataSource seam that lets a non-trivial adapter (Synthetic, in-process, 516 LOC) ride the same caller surface as the Bloomreach one, and the AptKit primitive migration that moved the agent loop's runtime out of Blooming-owned code while keeping every Blooming-owned concern (model provider, tool registry, trace sink) at the boundary. Both pivots survived a real cycle of "add an adapter / retire an adapter" — the receipt is in the diff history (the deleted Olist adapter that the seam survived).
 
----
-
-**Updated:** 2026-06-03 — added RFC-004 (framework runtime adopted, data-fetch primitives declined); revised "3 is right" → "4 is right" with the honest delta against the FE-engineering audit.
+A team-scale codebase would generate more RFCs over time. Until then, these are the six.

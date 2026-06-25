@@ -106,6 +106,39 @@ scrutiny. Portfolio audience is named, not inferred.
 This is the gap the rubric criterion 1 is asking you to close
 with a story, not the gap user research has closed with data.
 
+  ### A fourth real beneficiary — anyone running the demo without Bloomreach creds [E]
+
+The hackathon book named two real audiences (judges + portfolio
+reviewers) and one inferred one (merchants). A fourth real
+audience appeared post-hackathon when the **synthetic data
+source** (`lib/data-source/synthetic-data-source.ts`, 516 LOC,
+commit `c75ec3e`) shipped: **anyone evaluating the agents
+without depending on the Bloomreach alpha being up.**
+
+```
+  THE FOURTH AUDIENCE (post-hackathon, real)
+
+  ┌── tier 2.5: creds-free reviewers and contributors ─────────┐
+  │  bi:mode is now a 3-way toggle: demo | live-bloomreach |   │
+  │  live-synthetic. live-synthetic runs the SAME agents       │
+  │  against the SAME tool contracts, but the data source is   │
+  │  Blooming-owned deterministic ecommerce events             │
+  │  (purchase / view_item / session_start / cart_update) —    │
+  │  no Bloomreach token, no alpha-server quirks, no rate      │
+  │  limit. evidence: lib/data-source/synthetic-data-source.ts │
+  │  + the 3-way mode toggle on app/page.tsx                   │
+  └────────────────────────────────────────────────────────────┘
+```
+
+This is a real expansion of who can experience the product
+end-to-end. A hiring reviewer cloning the repo can now exercise
+the full agent loop on the synthetic adapter without obtaining
+a Bloomreach workspace token. That removes a friction point that
+existed in the original brief (demo-mode was instant but
+inert-for-live-queries; now live-synthetic gives them a live
+agent loop on data they trust because it's deterministic and
+owned by the project).
+
   ### Exclusions — who is intentionally outside scope
 
 The spec names these directly. Restate them so the reviewer can't
@@ -117,7 +150,10 @@ push you into them.
   → enterprise data teams with dedicated analysts
        (they already have the SQL+BI muscle this replaces)
   → marketers on platforms other than Bloomreach
-       (the build is MCP-native; deliberately not portable)
+       (the build is MCP-native; deliberately not portable —
+        though the DataSource SEAM at lib/data-source/types.ts
+        now serves 2 adapters: Bloomreach + Synthetic; the
+        "MCP-native" claim is narrower than it was in June 2026)
   → ops/support roles who need transactional answers
        (it's a what-changed-and-why tool, not a customer-lookup)
   → operators wanting writes / autonomous action
@@ -306,6 +342,12 @@ tokens after minutes** (`.aipe/project/context.md` L88–L89).
        on impossible categories (lib/agents/categories.ts)
   → demo mode that replays a committed snapshot for the live demo
        (because live mode is too fragile for a presentation)
+  → POST-HACKATHON: the synthetic adapter
+       (lib/data-source/synthetic-data-source.ts) as a third
+       mode entirely — no rate limit, no token revocation,
+       same agent-facing tool contracts. The constraint is
+       still real for live-bloomreach mode; it no longer gates
+       reviewer evaluation of the agents.
 ```
 
 This is an evidenced operational constraint, not a hypothetical

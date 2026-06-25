@@ -93,7 +93,7 @@ Concretely:
 - **The key** is `SHA-256(process.env.AUTH_SECRET)` — produces exactly 32 bytes regardless of operator input length. `lib/mcp/auth.ts:51-60`.
 - **The orchestration** decrypts ONCE per request, holds the decrypted store in an `AsyncLocalStorage` context for the lifetime of the request, and flushes ONCE at the end if anything wrote. This avoids Next's request-vs-response cookie split (`cookies().get()` after `cookies().set()` in the same request returns the OLD value). `lib/mcp/auth.ts:86-104`.
 - **Cookie flags** are `httpOnly` (JS can never read it — XSS exfil contained), `secure` (HTTPS-only), `sameSite: 'none'` (must survive the cross-site round-trip from the Bloomreach IdP back to `/api/mcp/callback`), 10-day `maxAge`.
-- **Insights and investigations** live in `lib/state/insights.ts` (`Map<id, Insight>`) and `lib/state/investigations.ts` (`Map<id, AgentEvent[]>`). The investigation flow hands diagnoses from step 2 to step 3 via the browser's `sessionStorage`, not the server — see `app/api/agent/route.ts:222-240` (the `parseDiagnosis(diagnosisParam)` path).
+- **Insights and investigations** live in `lib/state/insights.ts` (`Map<sessionId, SessionFeed>`, where each `SessionFeed` is its own `{ insights, investigations, anomalies }` sub-map) and `lib/state/investigations.ts` (`Map<id, AgentEvent[]>`). The outer map is session-keyed so a warm Vercel instance serving two concurrent users does NOT wipe one user's feed when the other's briefing finishes — `putInsights(sessionId, …)` clears only that session's sub-map (`lib/state/insights.ts:57-71`). The investigation flow hands diagnoses from step 2 to step 3 via the browser's `sessionStorage`, not the server — see `app/api/agent/route.ts:84-95` (the `parseDiagnosis(diagnosisParam)` path).
 
 The pattern: **stateful client, stateless server.** Every byte of durable state lives on the browser. The server reconstructs the world from cookies + URL params + sessionStorage handoffs on every request. RFC-004 extends this same stance to the page-to-page boundary on the frontend — no global store, no provider, page hand-offs via `sessionStorage` + URL params.
 
@@ -209,7 +209,7 @@ No rollout question — this was the architecture from day one. The interesting 
 
 1. Schema lives alongside the cookie, doesn't replace it. The cookie stays the source-of-truth for OAuth state (the round-trip requires SameSite=None and a browser-resident store, which the DB doesn't replace). The DB takes new state — saved searches, audit logs, per-user history — that *cannot* fit in a cookie.
 
-2. `lib/state/insights.ts`'s `putInsights() / insights.clear()` pattern (`lib/state/insights.ts:4-6`) is the first thing that moves. The torn-state risk under concurrent briefings on different instances is already documented in `.aipe/study-database-systems/00-overview.md`; that pattern is the canary for "we need shared storage now."
+2. `lib/state/insights.ts`'s `Map<sessionId, SessionFeed>` is the first thing that moves. The same-instance concurrent-user wipe bug is already resolved (session-keying — `lib/state/insights.ts:8-23, 57-71`); what's NOT resolved is the *cross-instance* case where R1 lands on instance A and R2 lands on instance B. Today the briefing fetch is short enough that the user almost always lands on the same warm instance for the duration of one session, but the day we ship to two concurrent users on a busy region, the cross-instance torn-state is the trigger.
 
 3. Drizzle + Vercel Postgres (or Neon) is the obvious entry point. The pooling story is solved by those providers; we don't need to reinvent PgBouncer.
 
@@ -223,7 +223,7 @@ No rollout question — this was the architecture from day one. The interesting 
 
 2. **Graceful rotation.** Add a key-version byte prefix to the encrypted payload + an `AUTH_SECRET_OLD` env var, decrypt new-then-old. Rotation becomes a transition window instead of a one-way break. Not yet implemented. Tracked in audit finding C4.
 
-3. **When does `lib/state/insights.ts` need to move to a real store?** The trigger is "two concurrent briefings on different instances tear the `insights` Map." Today we ship one user; the trigger hasn't fired. The day we ship to two concurrent users we will see it. The RFC that supersedes this one starts with that line.
+3. **When does `lib/state/insights.ts` need to move to a real store?** RESOLVED in part: the *same-instance* concurrent-user wipe (one user's `putInsights` clearing another user's feed) is fixed via session-keying — `Map<sessionId, SessionFeed>` at `lib/state/insights.ts:8-23, 57-71`. Each user gets their own sub-map; the outer map is never cleared by a request. What remains open is the *cross-instance* case: if R1 lands on warm instance A and R2 lands on warm instance B for the same session, B's Map has no record of A's briefing. The day two concurrent users span instances enough to make this visible, the trigger fires and the RFC successor starts. Today the trigger hasn't fired.
 
 4. **`AUTH_SECRET` rotation cadence.** No policy today. Suggested annual + on suspected compromise; not formally adopted.
 
@@ -256,14 +256,11 @@ Yes, and we accept it for a single-user demo. The day we have many users, we add
 - `lib/mcp/auth.ts:34-79` — backend selection + AES-GCM crypto
 - `lib/mcp/auth.ts:86-104` — `withAuthCookies` orchestration
 - `lib/mcp/auth.ts:160-218` — `BloomreachAuthProvider` (the OAuth-SDK shape)
-- `lib/state/insights.ts:4-6` — the in-process `Map` pattern that will outgrow itself first
-- `app/api/agent/route.ts:222-240` — the sessionStorage handoff that compensates for the missing server-side investigation store
+- `lib/state/insights.ts:8-23, 57-71` — the session-keyed `Map<sessionId, SessionFeed>` (the same-instance wipe bug fix; cross-instance is the open question)
+- `app/api/agent/route.ts:84-95` — the sessionStorage handoff that compensates for the missing server-side investigation store
+- `.aipe/rehearse-design-doc/05-datasource-seam-and-adapter-pattern.md` — the same "stateful client, stateless server" stance extended to the backend boundary (no DB on the data side either, even when the data is synthetic and in-process)
 - `.aipe/study-security/01-encrypted-cookie-oauth-state.md` — deeper teaching guide on the crypto
 - `.aipe/study-database-systems/00-overview.md` — the honest accounting of "what's where" when there's no database
 - `.aipe/rehearse-design-doc/04-framework-runtime-without-data-primitives.md` — the same "stateful client, stateless server" stance extended to the page-to-page boundary (no global store, sessionStorage handoff between pages)
 - NIST SP 800-38D — AES-GCM spec, IV uniqueness requirement
 - iron-session (npm) — canonical reference implementation of this pattern
-
----
-
-**Updated:** 2026-06-03 — cross-link to RFC-004 on the "stateful client, stateless server" pattern. RFC-004 extends the same stance to the page-to-page boundary on the frontend (no global store, sessionStorage + URL params for cross-page state).

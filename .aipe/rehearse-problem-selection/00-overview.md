@@ -112,24 +112,34 @@ ride on the second's coattails, not the other way around.
   01  PROBLEM BRIEF
       who has the pain · what's evidence vs inference · why now ·
       beneficiaries and exclusions · the constraints visible
-      from the repo
+      from the repo · including the credentialed-dependency cut
+      that the synthetic adapter resolved post-hackathon
 
   02  SCOPE CUTS AND NON-GOALS
       the smallest useful slice · what NOT to build · the cuts
-      that made the build shippable in the hackathon window
+      that made the build shippable in the hackathon window ·
+      and the cuts taken THEN PUT BACK THEN REMOVED AGAIN
+      (the Phase 3 eval flywheel arc — built, used, retired
+      with its substrate)
 
   03  OPTIONS AND OPPORTUNITY COST
       five real options including DO NOTHING · what each buys
-      and what each costs · why this option won
+      and what each costs · why this option won · the
+      build-then-migrate pattern (own agent loop → AptKit core)
+      added as a worked option-revisit
 
   04  SUCCESS METRICS AND FEEDBACK LOOP
       observable outcomes for a hackathon-shaped project ·
       the rubric as the feedback loop · what "success" cannot
-      mean here (and why)
+      mean here (and why) · the Phase 3 receipts: 4 measured
+      numbers, 3 real bugs surfaced, then retired
 
   05  SKEPTICAL REVIEWER QUESTIONS
-      the seven questions a senior reviewer asks · the answer
-      that holds for each one · the dodge that does not
+      the seven (now nine) questions a senior reviewer asks ·
+      the answer that holds for each one · the dodge that does
+      not · plus the post-hackathon probes: "why retire the
+      eval substrate?", "why migrate to AptKit after building
+      your own loop?"
 ```
 
   ## How to read this brief

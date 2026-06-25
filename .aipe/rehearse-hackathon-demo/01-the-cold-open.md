@@ -67,14 +67,20 @@ the URL bar disappear, and you let the room see the page.
   ──────────────────────────        ───────────────────────────
   the feed, already loaded:         (silent for 2 seconds — let
    • the workspace header             them read)
-     "rein ecommerce demo ·          ↓
-      1,247 customers"                "this is a real bloomreach
-   • the coverage grid (10 tiles)     workspace. an agent looked
-     mostly green/teal                at it this morning and
-   • three insight cards,             flagged three things you'd
-     critical/critical/warning,       want to know."
+     "ecommerce workspace ·          ↓
+      ~1,200 customers"               "this is an ecommerce workspace.
+   • the coverage grid (10 tiles)     an agent ran against it just
+     mostly green/teal                now and flagged three things
+   • three insight cards,             you'd want to know."
+     critical/critical/warning,
      real headlines with %s
 ```
+
+The framing "ran against it just now" is honest for live-synthetic —
+the agent really did run against the in-process DataSource right
+before the demo started. Don't say "this morning"; that was the old
+Bloomreach-cached-snapshot framing. Live-synthetic means it ran on
+THIS load.
 
 The two-second silence is load-bearing. It gives the room time
 to register that they are looking at something real before you
@@ -107,12 +113,11 @@ are. Tell the room what you're about to do.
 ```
   SHOW (on screen)                  SAY (out loud)
   ──────────────────────────        ───────────────────────────
-  hover over the critical card      "each of these is a real
-   "purchases outnumber sessions      anomaly the agent found by
-    2:1"                              running its own queries
-                                      against this workspace's
-                                      analytics — not a static
-                                      dashboard."
+  hover over the critical card      "each of these is an anomaly
+   "purchases outnumber sessions      the agent found by running its
+    2:1"                              own queries against this
+                                      workspace's analytics — not a
+                                      static dashboard."
   ──────────────────────────        ───────────────────────────
   cursor pauses on the card,        "and when i click one, you
   hand hovers (don't click yet)       get to watch it figure out
@@ -150,14 +155,14 @@ is what wins.
   "hi everyone, i'm rein, and       (silent · the app is on
    today i want to show you           screen · real data visible)
    a project i built called…"
-                                    "this is a real bloomreach
-  title slide for 20 seconds         workspace. an agent looked
-                                     at it this morning and
-  "the problem is that business      flagged three things you'd
-   owners spend hours looking        want to know."
-   at dashboards trying to…"
-                                    (one-liner · then bridge into
-  problem slide for 30 seconds        the demo)
+                                    "this is an ecommerce workspace.
+  title slide for 20 seconds         an agent ran against it just
+                                     now and flagged three things
+  "the problem is that business      you'd want to know."
+   owners spend hours looking
+   at dashboards trying to…"        (one-liner · then bridge into
+                                     the demo)
+  problem slide for 30 seconds
 
   finally opens the app at 1:10     judges are leaning in at 0:30
   judges have drifted               app is doing the talking
@@ -177,9 +182,11 @@ what the app is going to do. The strong open lets the app do it.
   ## ║ chapter 2. The recovery costs you ~10 seconds, not a       ║
   ## ║ minute. Never apologize twice. Never say "the wifi…".      ║
   ## ║                                                            ║
-  ## ║ The toggle is on the wrong mode (live, broken auth) →     ║
-  ## ║ click "demo" in the header. The cached snapshot is built   ║
-  ## ║ from a real captured run — it looks identical to live.     ║
+  ## ║ The toggle is on live-bloomreach (broken auth, rate-limit ║
+  ## ║ block) → click "live · synthetic" in the header. Same      ║
+  ## ║ agents, same UI, runs in-process. If even that hangs       ║
+  ## ║ (model latency), click "demo" — the cached snapshot is     ║
+  ## ║ built from a real captured run and looks identical.        ║
   ## ╚══════════════════════════════════════════════════════════╝
 
   ## Tighten it — if you're running long
@@ -198,10 +205,11 @@ optional; the hook isn't.
   ┌───────────────────────────────────────────────────────────┐
   │ COLD OPEN · 0:00–1:00 · 1 minute                          │
   ├───────────────────────────────────────────────────────────┤
-  │ pre-roll  app on screen · feed loaded · demo mode active  │
+  │ pre-roll  app on screen · feed loaded · live-synthetic    │
+  │           mode active (real agents · no creds)            │
   │ 0:00      stand · 2-second silence · let them read        │
-  │ 0:08      "this is a real bloomreach workspace…"          │
-  │ 0:15      "an agent looked at it this morning and         │
+  │ 0:08      "this is an ecommerce workspace…"               │
+  │ 0:15      "an agent ran against it just now and           │
   │            flagged three things you'd want to know."      │
   │ 0:20      THE ONE-LINER (verbatim, once)                  │
   │ 0:35      hover the critical card · name it               │

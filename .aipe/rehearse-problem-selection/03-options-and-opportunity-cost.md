@@ -307,6 +307,91 @@ The visual that holds the whole comparison.
   with MEDIUM risk mitigated by the demo-mode cut (chapter 02).
 ```
 
+  ## A sixth option, considered AFTER the hackathon — use a library, not your own loop
+
+The original five options were "what should I spend the week
+on." This sixth one is different: a *post-hackathon* revisit
+that's worth naming in the brief because it's a real
+**defer-then-migrate** pattern, and a reviewer who's read the
+codebase will ask about it.
+
+**The option:** at hackathon time, run agents on a hand-rolled
+`runAgentLoop` (`lib/agents/base.ts`). Post-hackathon, migrate
+those agents to be thin wrappers over `@aptkit/core@0.3.0` while
+keeping a Blooming-owned adapter layer
+(`lib/agents/aptkit-adapters.ts`, 206 LOC — three bridges:
+`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`,
+`BloomingTraceSinkAdapter`). The legacy loop is preserved at
+`lib/agents/base-legacy.ts` for the legacy path.
+
+```
+  axis             reading
+  ─────────────    ────────────────────────────────────────
+  portfolio        [++] the build-then-migrate arc IS the
+                        signal — "I built my own loop, then
+                        migrated to a library, kept the
+                        domain adapter on my side" is a
+                        deeper agent-architecture story than
+                        either option alone
+  contest upside   N/A  post-hackathon decision
+  risk             [LOW] reversible — the legacy path stays
+                        in tree until the migration proves
+                        out
+  forecloses       [LOW] forecloses nothing immediately;
+                        if AptKit drifts in a direction the
+                        agents can't tolerate, base-legacy.ts
+                        is the rollback
+```
+
+**Why this was the right call at the time of the hackathon, AND
+why migrating after was also the right call.** Both are true.
+The hackathon decision was right because:
+
+1. **No library existed that fit the shape.** Building the loop
+   gave full control over the NDJSON streaming contract, the
+   forced-final synthesis turn, the bounded tool-call budget.
+   A library that didn't expose those would have been a fight.
+
+2. **Building it once is how you learn what a library should
+   look like.** Migrating later was straightforward because
+   the contracts were known.
+
+The post-hackathon migration was right because:
+
+1. **The loop turned out to be 80% reusable across projects.**
+   The agent-architecture primitive isn't Blooming-specific.
+   Centralizing it in `@aptkit/core` means the next agent
+   project starts from a tested base.
+
+2. **The domain seam (the adapters at `lib/agents/aptkit-adapters.ts`)
+   is where the *interesting* code lives.** Library swallows
+   the boilerplate; Blooming keeps the domain shape.
+
+```
+  THE DEFER-THEN-MIGRATE PATTERN, NAMED
+
+  ┌─ at decision time ─────────────────────────────────────────┐
+  │  "build it ourselves"  vs  "use a library"                  │
+  │  → no library exists that fits the shape                    │
+  │  → ship ourselves; the loop is small enough                 │
+  └────────────────────────┬───────────────────────────────────┘
+                           │  ship · learn · contracts
+                           │            settle
+                           ▼
+  ┌─ at revisit time ──────────────────────────────────────────┐
+  │  "stay self-built"  vs  "lift to library"                   │
+  │  → the loop is now 80% reusable; lift the kernel,           │
+  │    keep the domain adapter                                  │
+  │  → both paths preserved; rollback is cheap                  │
+  └────────────────────────────────────────────────────────────┘
+```
+
+This isn't a sixth option in the original decision space — it's a
+*revisit* of an implicit decision the original build made (build
+the loop ourselves) once the conditions changed (the loop became
+extractable). A senior reviewer respects "the decision was right
+then, the revisit is right now, both are deliberate."
+
   ## The opportunity cost no other option pays
 
 Every option except A pays "the week." That's the same cost
@@ -340,6 +425,10 @@ That's the asymmetry that tips the call.
     its loss case is narrow and named
   → option E wins on the only ++ in BOTH portfolio AND contest,
     with the highest-recoverable opportunity cost
+  → a sixth option (build-then-migrate to @aptkit/core) was
+    revisited post-hackathon and named; the build-then-migrate
+    arc is itself the signal, not a contradiction of the
+    original choice
 ```
 
 The selection holds. Chapter 04 picks up the question of how

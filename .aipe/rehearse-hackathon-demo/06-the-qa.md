@@ -62,25 +62,31 @@ follow-up belongs to them. If they want more, they'll ask.
 
   ## Probe 1 — "Is this actually working? Or is the demo canned?"
 
-The most important question to answer correctly. The default
-mode is demo (cached replay), but the snapshot is real — it was
-captured from a live agent run. The live mode runs the real
-agents against the real workspace right now. You own this
-matter-of-factly.
+The most important question to answer correctly. With
+live-synthetic as the demo mode, the honest answer is "the
+agents are running live right now." Own that directly.
 
 ```
-  ┃ "the demo mode is a cached replay of a live agent run from
-  ┃  this morning — same UI, same data, same EQL queries. live
-  ┃  mode in the header runs the agents against bloomreach in
-  ┃  real time; i defaulted to demo for the slot because the
-  ┃  alpha server rate-limits and a live investigation takes
-  ┃  about two minutes."
+  ┃ "what you just watched was live — real agent loop, real
+  ┃  anthropic calls, real reasoning. the data source is an
+  ┃  in-process synthetic ecommerce dataset i wrote, because
+  ┃  the live bloomreach mode needs an OAuth dance i'm not
+  ┃  going to do on stage. there's a third mode — 'demo' —
+  ┃  that replays a cached snapshot for when the model latency
+  ┃  is too long for the slot. all three are real toggles in
+  ┃  the header."
 ```
 
-If they push: offer to switch to live for them after the demos.
-Don't switch on stage. The route in `app/api/briefing/route.ts`
-makes the demo-vs-live decision based on the `?demo=cached`
-query string; both paths emit the same NDJSON event stream.
+If they push: the toggle is `bi:mode` in `localStorage`, three
+values: `demo` | `live-bloomreach` | `live-synthetic`. The route
+in `app/api/agent/route.ts` branches on it. Live-bloomreach
+goes through the OAuth handshake, hits the rate-limited alpha
+server, and takes ~2 minutes per investigation. Live-synthetic
+goes through the same agent code path but the DataSource
+(`lib/data-source/synthetic-data-source.ts`, 516 LOC) is
+in-process — no auth, no rate limit, just model latency. Offer
+to toggle to live-bloomreach after the demos if they want to
+see the OAuth flow. Don't switch on stage.
 
   ## Probe 2 — "What was the hard part?"
 
@@ -108,17 +114,23 @@ Specific, no padding. Versions only if asked.
 
 ```
   ┃ "Next.js 16 App Router, React 19, TypeScript, Tailwind for
-  ┃  styling. Anthropic SDK for the model — claude sonnet 4.6.
-  ┃  Bloomreach via the MCP SDK with OAuth and dynamic client
-  ┃  registration. NDJSON over a Next.js streaming response
-  ┃  bridges the agent loop to the React UI."
+  ┃  styling. @aptkit/core 0.3 for the agent runtime — it's a
+  ┃  library i published. anthropic SDK for the model — claude
+  ┃  sonnet 4.6. bloomreach via the MCP SDK with OAuth and
+  ┃  dynamic client registration. NDJSON over a Next.js
+  ┃  streaming response bridges the agent loop callbacks to
+  ┃  React."
 ```
 
 If they push on infrastructure: vercel for hosting,
 encrypted-cookie session store for cross-instance OAuth state,
 in-process MCP client with rate-limit retry and a 60s response
 cache. Files: `lib/mcp/client.ts`, `lib/mcp/auth.ts`,
-`lib/mcp/connect.ts`.
+`lib/mcp/connect.ts`. The Blooming agents are thin wrappers
+over `@aptkit/core` agents — `lib/agents/aptkit-adapters.ts`
+(206 LOC) holds the three bridge classes (model provider, tool
+registry, trace sink). The legacy hand-rolled loop is preserved
+at `lib/agents/base-legacy.ts` for reference.
 
   ## Probe 4 — "Did you build this during the hackathon?"
 
@@ -126,17 +138,21 @@ Own it. Don't defend.
 
 ```
   ┃ "yes — the agents, the schema gate, the streaming routes,
-  ┃  the coverage grid, the investigate flow. the bones are
-  ┃  the next.js scaffold, the MCP SDK, and the anthropic
+  ┃  the coverage grid, the investigate flow, the DataSource
+  ┃  seam and both adapters. i also published the agent-loop
+  ┃  library, @aptkit/core, as a separate package. the bones
+  ┃  are the next.js scaffold, the MCP SDK, and the anthropic
   ┃  SDK; everything app-specific is hackathon-window code."
 ```
 
 If they're skeptical: the git history shows the build order —
-the most recent commits are the coverage grid, the diagnostic
-time-series query, the tier-1/tier-2 UI enrichment. The full
-log is in the repo. You wrote the architecture decisions; you
-wrote the prompts; you wrote the streaming protocol; you wrote
-the schema gate.
+the most recent commits are the synthetic DataSource (c75ec3e),
+the Olist substrate removal (PR #8 / 62c24d7), the AptKit 0.3
+upgrade, the page decomposition (817 → 461 LOC), and the
+session-keyed state fix for the concurrent-user wipe bug. 221
+tests across `*.test.ts`. You wrote the architecture decisions;
+you wrote the prompts; you wrote the streaming protocol; you
+wrote the schema gate; you wrote @aptkit/core.
 
   ## Probe 5 — "Is there a business here? What's next?"
 
@@ -228,13 +244,112 @@ If they push on hallucination specifically: the diagnostic
 agent's synthesis call (`lib/agents/diagnostic.ts`) is
 tool-less and hands the model only the evidence already
 gathered, then asks for a structured Diagnosis. The validator
-in `lib/mcp/validate.ts` parses the JSON and falls back to a
-"insufficient data" diagnosis if it can't. Hallucinated numbers
-are bounded — the model is reading from real tool results, not
-guessing them. What I don't have yet is a real eval — a goldset
-of hand-curated cases with a judge that scores diagnosis quality
-against ground truth. That's the next engineering move and
-there's a drill spec for it in `.aipe/drills/`.
+parses the JSON and falls back to a "insufficient data"
+diagnosis if it can't. Hallucinated numbers are bounded — the
+model is reading from real tool results, not guessing them.
+
+On evals specifically: i built a 4-pillar eval suite earlier
+in the project — K=10 reruns, an LLM-as-judge calibrated 8/8
+and 3/3 against my own labels, ran against an Olist
+e-commerce substrate. It surfaced three real bugs: BRL prices
+in cents getting reported as Reais, binary calibration fooling
+the confidence rating, and conclusion instability across
+reruns. I fixed all three. Then i retired the substrate when
+the synthetic adapter shipped — the in-process shape made
+the eval pipeline the wrong shape, and i'd rather have no
+scaffolding than the wrong scaffolding. The replacement for
+it isn't built yet; that's the honest gap.
+
+  ## Probe 9 — "Why pull the agent loop out into a library? Isn't that over-engineering for a hackathon?"
+
+A senior probe. The honest answer is "I built three agents
+hand-rolling the same loop, noticed the duplication, and
+extracted it — and then realized the seam was useful for more
+than deduplication."
+
+```
+  ┃ "i hand-rolled it three times — monitoring, diagnostic,
+  ┃  recommendation — and the third time it was clearly the
+  ┃  same loop with different prompts. so i extracted it into
+  ┃  @aptkit/core and published the package. the win wasn't
+  ┃  just deduping the code — it was that the adapter boundary
+  ┃  let me swap the data source without touching the agents.
+  ┃  that's how live-synthetic shipped — a new DataSource
+  ┃  adapter, zero agent changes. the legacy hand-rolled loop
+  ┃  is still in lib/agents/base-legacy.ts if you want to see
+  ┃  what i moved away from."
+```
+
+If they push: AptKit is `@aptkit/core@0.3.0`, source at
+`github.com/rlynjb/aptkit-core`. The Blooming-owned adapters
+(`lib/agents/aptkit-adapters.ts`, 206 LOC) are three classes:
+`AnthropicModelProviderAdapter` (bridges to the Anthropic SDK),
+`McpToolRegistryAdapter` (bridges to the DataSource interface),
+and a trace sink that fires Blooming's callback shapes. Three
+files, one boundary. The loop is library code; the domain
+shapes are Blooming code.
+
+  ## Probe 10 — "Isn't synthetic data just fake data? That's not a real demo."
+
+Engineers will push on this. The answer is structural: the
+agent code path is real, the model call is real, the reasoning
+is real — only the queried substrate is synthetic. That's a
+much smaller claim than "fake demo" and a much bigger claim
+than "cached replay."
+
+```
+  ┃ "the agent loop is real. the anthropic call is real. the
+  ┃  EQL queries on screen are queries the model just generated.
+  ┃  the only thing that's synthetic is the data the queries
+  ┃  hit — and it's deterministic, in-process, designed to
+  ┃  exercise the same anomaly patterns the real bloomreach
+  ┃  workspace would. swap the DataSource adapter for the
+  ┃  bloomreach one and the agents don't know the difference.
+  ┃  that IS the test — if the seam is right, the agents are
+  ┃  oblivious to the substrate."
+```
+
+If they push: the synthetic data source is
+`lib/data-source/synthetic-data-source.ts` (516 LOC). It
+implements the same `DataSource` interface as
+`bloomreach-data-source.ts`. The agents (and the agent code in
+`@aptkit/core` they wrap) import the interface, not either
+implementation. That's the load-bearing property: "vendor
+swappability" isn't a slogan; it's something you can prove by
+running the same agents through a different DataSource and
+watching them behave identically.
+
+  ## Probe 11 — "You built an eval pipeline and then deleted it. Why?"
+
+The "show your engineering judgment" probe. Senior judges will
+ask this if you opened the door in the build story. The honest
+answer is that the eval substrate was tied to the wrong shape,
+and when the right shape arrived, keeping the old eval would
+have been worse than starting over.
+
+```
+  ┃ "the eval suite was built against an Olist e-commerce
+  ┃  substrate i'd swapped in for testing — public dataset,
+  ┃  rich enough to exercise the agents. when the in-process
+  ┃  synthetic adapter shipped, the substrate was redundant —
+  ┃  i had a cleaner shape that ran in the same process as
+  ┃  the agents. keeping the old eval pipeline against a
+  ┃  retired substrate would mean maintaining two data paths
+  ┃  to test one. the discipline of writing evals stayed; the
+  ┃  scaffolding of THAT eval pipeline didn't. the next eval
+  ┃  is a smaller, in-process suite against the synthetic
+  ┃  adapter — and i haven't built it yet. that's the honest
+  ┃  gap right now."
+```
+
+If they push on judgment: the eval flywheel earned its keep
+while it ran. It surfaced three real bugs the agents had — BRL
+cents-vs-Reais, binary calibration in the confidence rating,
+conclusion instability across reruns. All three got fixed.
+Then the substrate retired and the pipeline came with it. The
+move is "delete what's no longer earning its keep," not
+"abandon evals." Documented in `.aipe/audits/refactors/` and
+`.aipe/audit-refactor-eval-substrate/`.
 
   ## The followup decision tree
 
@@ -329,14 +444,17 @@ Two sentences. Then stop. The discipline IS the answer.
   ├───────────────────────────────────────────────────────────┤
   │ PATTERN     direct sentence + one repo anchor + stop      │
   │                                                            │
-  │ "is it working?"   demo = real cached run · live in       │
-  │                    header runs against bloomreach now     │
+  │ "is it working?"   what you watched WAS live · synthetic  │
+  │                    DataSource adapter · real loop+model · │
+  │                    bloomreach mode exists, OAuth on stage │
+  │                    is the only reason to skip it          │
   │ "hard part?"       schema gate · 3 pure fns in            │
   │                    lib/agents/categories.ts                │
-  │ "stack?"           next 16 · react 19 · anthropic sdk ·   │
-  │                    MCP sdk · NDJSON streaming             │
+  │ "stack?"           next 16 · react 19 · @aptkit/core 0.3  │
+  │                    (i wrote it) · anthropic sdk · MCP sdk │
   │ "in hackathon?"    yes — agents · gate · routes · UI ·    │
-  │                    bones are scaffolds                     │
+  │                    DataSource seam · both adapters ·       │
+  │                    @aptkit/core (separate package)         │
   │ "business?"        $99/mo per workspace · slack briefings │
   │                    · 15 min with a bloomreach customer    │
   │ "used AI?"         heavily · prompts + boilerplate ·       │
@@ -345,8 +463,17 @@ Two sentences. Then stop. The discipline IS the answer.
   │ "why MCP?"         bloomreach speaks it · model picks the │
   │                    right tool · industry convergence       │
   │ "when it's wrong?" trace shows work · confidence rating · │
-  │                    forced-synthesis turn · validator falls │
-  │                    back to "insufficient data"             │
+  │                    forced-synthesis turn · had an eval     │
+  │                    pipeline, surfaced 3 bugs, retired it   │
+  │ "why a library?"   hand-rolled the loop 3 times · third   │
+  │                    time it was clearly the same loop ·     │
+  │                    seam → DataSource swap is free          │
+  │ "isn't synthetic   the agent code is real · the model     │
+  │  just fake?"        call is real · only the substrate is  │
+  │                    synthetic · agents are oblivious to it │
+  │ "you deleted        the substrate retired · the eval was  │
+  │  the eval?"         tied to it · 3 real bugs found+fixed  │
+  │                    before retirement · next eval not yet  │
   │                                                            │
   │ "i don't know"     name what you DO know · offer follow-up │
   │                    after demos · never bluff               │
@@ -356,6 +483,8 @@ Two sentences. Then stop. The discipline IS the answer.
   ├───────────────────────────────────────────────────────────┤
   │ MUST NAIL   the answer pattern (direct · evidence · stop) │
   │ MUST OWN    AI assistance · own it matter-of-factly       │
+  │ MUST OWN    retired eval pipeline · "delete what stopped  │
+  │             earning its keep" is a SENIOR move             │
   └───────────────────────────────────────────────────────────┘
 ```
 

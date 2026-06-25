@@ -95,8 +95,7 @@ your app open, before you say a word about architecture.
 
 Blooming insights is an AI agent that watches an ecommerce
 workspace and surfaces anomalies the business owner should care
-about. It runs a real monitoring loop against the live Bloomreach
-MCP server, calls real analytics tools, parses real schemas, and
+about. It calls real analytics tools, parses real schemas, and
 fires a diagnostic agent live when the user clicks a card. The
 money shot is the diagnostic agent's reasoning + tool calls
 materializing in front of the judges while a structured Diagnosis
@@ -105,6 +104,43 @@ crystalizes on the right.
 It is not a SaaS product. It is not a multi-tenant deployment.
 The judges will assume both. Don't oversell. Demo what is real
 and frame what is next in chapter 5.
+
+  ## The mode you actually run for judges — live-synthetic
+
+The `bi:mode` toggle now has three values, not two:
+
+```
+  demo              cached NDJSON snapshot replay · instant · no model
+                    call · creds-free · safe but obviously canned
+                    if a judge asks
+
+  live-bloomreach   real agents against the real Bloomreach MCP server ·
+                    requires OAuth · alpha server rate-limits 1 req/10s
+                    and revokes tokens after minutes · fragile on stage
+
+  live-synthetic    real agents · real Anthropic API calls · real
+                    reasoning trace · against Blooming-owned in-process
+                    deterministic ecommerce data (lib/data-source/
+                    synthetic-data-source.ts, 516 LOC) · no OAuth ·
+                    no upstream dependency · runs anywhere with just an
+                    ANTHROPIC_API_KEY ★ RECOMMENDED DEMO MODE ★
+```
+
+For the slot, run **live-synthetic**. It is "live" in the meaningful
+sense — the agent loop actually runs, the model actually reasons, the
+tool calls are real (just against an in-process DataSource adapter
+instead of the Bloomreach MCP server). The trace materializing on the
+investigate page is the agent thinking right now, not a replay. And
+because the substrate is in-process, nothing can go down between you
+and the demo: no auth handshake, no rate-limit penalty window, no
+"the alpha server is having a moment."
+
+When a judge asks "is this actually working?" in Q&A you answer
+honestly: yes, the agents are running live against synthetic data
+because the live workspace needs an OAuth dance I'm not going to do
+on stage. Same agent code path. Same model. Same reasoning. That
+answer is stronger than "cached replay" and more honest than
+"production live."
 
   ## The rehearsal order
 
@@ -149,14 +185,16 @@ expected.
   ## The non-negotiables you carry into the room
 
 ```
-  → the demo runs in DEMO mode, not LIVE, by default
-       (instant · creds-free · same UI as live)
+  → the demo runs in LIVE-SYNTHETIC mode by default
+       (real agents · real model · creds-free · in-process data)
+       DEMO mode (cached snapshot) is the backup if the model
+       times out
   → the money shot is the diagnostic agent streaming live
        on the investigate page, NOT the coverage grid
   → never narrate clicks ("now I click here")
        speak value while the hands do the clicking
-  → if something breaks, switch to the recorded clip and
-       keep moving — never apologize twice
+  → if the live-synthetic run hangs, switch to DEMO mode or
+       the recorded clip and keep moving — never apologize twice
   → end on the close line, not on "yeah so that's it"
 ```
 
