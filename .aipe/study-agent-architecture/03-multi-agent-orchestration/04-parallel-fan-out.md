@@ -214,6 +214,8 @@ Right now there's no fan-out anywhere. The query agent handles one free-form que
 
 *Now:* the query agent processes one question at a time. If the question spans multiple domains (e.g. "compare funnel AND conversion AND retention"), the agent serializes the analytics calls inside its single loop — it makes 4 sequential tool calls under the ~1.1s spacer, totaling ~5 seconds for the data alone.
 
+**Where the constraint and the would-be fan-out point live in the repo.** The constraint that makes wide fan-out impractical today is `lib/mcp/connect.ts` L92 — `minIntervalMs: 1100` on the McpClient constructor options (the per-MCP-call spacer). The single-domain path that would become fan-out at the breakpoint is `QueryAgent.answer()` in `lib/agents/query.ts` L41–L42 (the current `maxToolCalls: 6` budget for one agent handling the whole question).
+
 *If a multi-domain query arrived:* the classifier (or the planner agent) would emit a list of 4 sub-questions; 4 sub-agents would fan out, each running their own ReAct loop for their domain; a merge agent (or a function-call merge with a synthesis prompt) would combine them. The latency win: ~max(t1, t2, t3, t4) ≈ 2 seconds per agent + merge ≈ ~3 seconds total, vs ~5+ sequential. The cost: 4 worker LLM loops + 1 merge LLM call instead of 1 worker loop.
 
 The takeaway: **fan-out earns its overhead when the per-domain latency × N exceeds the parallel max × N × concurrency-overhead.** That's a quantitative breakpoint. Under the current MCP rate limit, N=2 with two-domain queries is plausibly worth it; N=8 isn't.
@@ -288,46 +290,6 @@ Parallel fan-out — full picture
   MCP rate limit means N>1 fan-out would serialize at the MCP
   layer anyway. See the orchestration system-design templates
   for the refactor.
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.**
-
-blooming insights does not fan out. The pipeline is strictly sequential (monitoring → diagnostic → recommendation), user-gated between stages, and the recommendation stage's data dependency on the diagnosis is enforced by the function signature `propose(anomaly, diagnosis, hooks)`. The free-form query path also runs a single QueryAgent end-to-end, not a fan-out of sub-queries.
-
-The honest sentence: **the codebase doesn't fan out today, and the ~1 req/s MCP rate limit (`connect.ts` L92, `minIntervalMs: 1100`) makes wide concurrency a poor fit even if it did** — any fan-out would have to serialize through the same MCP spacer at the tool-call layer, which collapses the latency win back toward sequential.
-
-For the refactor: see `../06-orchestration-system-design-templates/` (the "multi-agent research assistant" template uses fan-out as the standard architecture) and `../05-production-serving/02-fan-out-backpressure.md` (the concurrency-cap mechanic that makes fan-out safe).
-
-**The constraint that makes wide fan-out impractical today**
-**File:** `lib/mcp/connect.ts`
-**Function / class:** the McpClient constructor options
-**Line range:** L92 — `minIntervalMs: 1100` (the per-MCP-call spacer)
-
-**The single-domain path that would become fan-out at the breakpoint**
-**File:** `lib/agents/query.ts`
-**Function / class:** `QueryAgent.answer()`
-**Line range:** L41–L42 (the current `maxToolCalls: 6` budget for one agent handling the whole question)
-
-```
-shape (what a future fan-out would look like, NOT current code):
-
-  // hypothetical: in route.ts query branch
-  const intent = await classifyIntent(anthropic, q);
-  if (intent === 'multi-domain') {
-    const subQuestions = await splitIntoSubQuestions(q);  // code or LLM
-    const results = await semaphoreFanOut(
-      subQuestions,
-      async (sq) => new QueryAgent(...).answer(sq, classifyIntent(sq)),
-      { concurrency: 2 }   // capped by MCP rate limit
-    );
-    const merged = await mergeAgent.synthesize(q, results);  // or fn-call merge
-    return merged;
-  }
-  // today: single QueryAgent end-to-end
 ```
 
 ---

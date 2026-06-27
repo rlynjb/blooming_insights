@@ -226,9 +226,7 @@ This diagram spans the authoring pipeline and shows where it joins the existing 
 
 A reader who sees only this should grasp: meta-prompting acts at authoring time, the human review is in the critical path, the output is an ordinary prompt file, and the runtime path is completely unaffected.
 
----
-
-## Implementation in codebase
+### Code in this codebase
 
 **Not yet implemented.** Nothing in blooming insights generates a prompt; the four agent prompts (`lib/agents/prompts/monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md`) are hand-written `.md` files loaded verbatim via `readFileSync` (`lib/agents/diagnostic.ts` L13, `monitoring.ts` L12, `recommendation.ts` L14, `query.ts` L13).
 

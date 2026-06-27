@@ -195,6 +195,32 @@ Spacing controls one caller's rate; backpressure controls a *system's* behavior 
 
 ---
 
+### Code in this codebase
+
+Partially implemented — fixed-interval spacing is built; queueing, backpressure, and load-shedding are not.
+
+#### Fixed-interval inter-call spacing (Case A)
+
+**File:** `lib/mcp/client.ts`
+**Function / class:** `McpClient.liveCall`
+**Line range:** L148–L163 (`elapsed` L149, sleep gate L150–L151, transport call L154, `lastCallAt = Date.now()` L155). State field `lastCallAt` at L81; default `minIntervalMs = 200` at L88.
+
+#### The 1100 ms interval for Bloomreach (Case A)
+
+**File:** `lib/mcp/connect.ts`
+**Function / class:** `connectMcpInner`
+**Line range:** L66–L107; the rate-limit comment at L81–L88 and the `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }` construction at L91–L96. The route's `maxDuration = 300` budget that this spacing must fit inside is at `app/api/agent/route.ts` L20.
+
+Note: both routes now guard the pre-stream setup. In `app/api/agent/route.ts` L155–L165 (and the parallel `app/api/briefing/route.ts` L62–L72), `getOrCreateSessionId()` + `connectMcp()` run inside a `try/catch` that returns the real error JSON (`/api/agent setup · <message>`, status 500) instead of a bare 500 — so a setup throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production) surfaces the actual cause. The 401 `needsAuth`/`authUrl` response follows a successful connect.
+
+#### Request queue + backpressure + load shedding (Case B — Not yet implemented)
+
+**Not yet implemented.** blooming insights spaces a single serial caller with a timestamp-and-sleep (`liveCall`) but has no request queue, no depth bound, no backpressure signal, and no load-shedding — concurrent call chains contend on `lastCallAt` with no ordering, and each `connectMcp` builds a fresh per-instance spacer (`lib/mcp/connect.ts` L91–L96) so multiple users are uncoordinated.
+
+Where it would live: a concurrency-bounded queue would wrap `liveCall` inside `McpClient` (`lib/mcp/client.ts` L148), serializing all callers through one ordered queue with a max depth that triggers backpressure (reject or block) when full. Cross-user coordination would require a shared limiter (a Redis/Upstash sliding window keyed per Bloomreach user) constructed in `connectMcp` (`lib/mcp/connect.ts` L91) instead of a per-instance field.
+
+---
+
 ## Rate limiting + backpressure — diagram
 
 This diagram spans the Agent, Service (McpClient), and Provider layers. The spacing gate is built (solid); the queue/backpressure layer is the gap (dashed).
@@ -231,32 +257,6 @@ This diagram spans the Agent, Service (McpClient), and Provider layers. The spac
 ```
 
 A reader who sees only this diagram should grasp: one serial caller is correctly spaced at 1100 ms; concurrent callers and burst load have no queue, bound, or shedding.
-
----
-
-## Implementation in codebase
-
-Partially implemented — fixed-interval spacing is built; queueing, backpressure, and load-shedding are not.
-
-### Fixed-interval inter-call spacing (Case A)
-
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.liveCall`
-**Line range:** L148–L163 (`elapsed` L149, sleep gate L150–L151, transport call L154, `lastCallAt = Date.now()` L155). State field `lastCallAt` at L81; default `minIntervalMs = 200` at L88.
-
-### The 1100 ms interval for Bloomreach (Case A)
-
-**File:** `lib/mcp/connect.ts`
-**Function / class:** `connectMcpInner`
-**Line range:** L66–L107; the rate-limit comment at L81–L88 and the `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }` construction at L91–L96. The route's `maxDuration = 300` budget that this spacing must fit inside is at `app/api/agent/route.ts` L20.
-
-Note: both routes now guard the pre-stream setup. In `app/api/agent/route.ts` L155–L165 (and the parallel `app/api/briefing/route.ts` L62–L72), `getOrCreateSessionId()` + `connectMcp()` run inside a `try/catch` that returns the real error JSON (`/api/agent setup · <message>`, status 500) instead of a bare 500 — so a setup throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production) surfaces the actual cause. The 401 `needsAuth`/`authUrl` response follows a successful connect.
-
-### Request queue + backpressure + load shedding (Case B — Not yet implemented)
-
-**Not yet implemented.** blooming insights spaces a single serial caller with a timestamp-and-sleep (`liveCall`) but has no request queue, no depth bound, no backpressure signal, and no load-shedding — concurrent call chains contend on `lastCallAt` with no ordering, and each `connectMcp` builds a fresh per-instance spacer (`lib/mcp/connect.ts` L91–L96) so multiple users are uncoordinated.
-
-Where it would live: a concurrency-bounded queue would wrap `liveCall` inside `McpClient` (`lib/mcp/client.ts` L148), serializing all callers through one ordered queue with a max depth that triggers backpressure (reject or block) when full. Cross-user coordination would require a shared limiter (a Redis/Upstash sliding window keyed per Bloomreach user) constructed in `connectMcp` (`lib/mcp/connect.ts` L91) instead of a per-instance field.
 
 ---
 

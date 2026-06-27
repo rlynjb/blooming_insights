@@ -158,6 +158,8 @@ If you're coming from frontend, this is the same shape as "the data layer is an 
 
 The practical consequence: the agentic loop shape generalizes across retriever types. You can drop a vector index in beside a live API and the model can route between them (covered in the retrieval-routing note). The loop's structure — reason, retrieve, observe, repeat — doesn't change.
 
+**Where the loop and the retriever live in the repo.** The agentic-RAG engine is `runAgentLoop()` in `lib/agents/base.ts` L48–L176 — loop body at L85, `tool_use` detection at L116–L124, observation fed back at L171, budget/forced-final at L90–L101. All four agents (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`) call this one function. The retriever isn't named in `base.ts` — it's whichever tool the model chooses, hidden behind the `McpCaller` interface (L16–L22). The actual retriever-as-tool is the `execute_analytics_eql` schema in `lib/mcp/tools.ts`: the model emits `tool_use` with `name: "execute_analytics_eql"` and `input: { eql: "..." }`; the loop runs it via `mcp.callTool` (`base.ts` L144) and feeds the JSON result back as the next observation. No vector index sits behind this — it's a live HTTP call into Bloomreach.
+
 ### The "no embedding-RAG" case — why this codebase skipped the vector index
 
 The technical thing: blooming insights does agentic retrieval without ever building an embedding index. The retriever is a live analytics tool call against Bloomreach — not a nearest-neighbor lookup over chunked documents.
@@ -197,6 +199,23 @@ shared agent loop — the loop has two off-switches
 ```
 
 The practical consequence: an agentic investigation never spends more than ~6 tool calls. If the diagnostic agent can't reach a conclusion in 6 queries it's forced to synthesize from what it has — including "I couldn't establish a populated window" if that's the honest answer. The cost is occasional truncation; the win is a bounded latency budget the route handler's per-investigation ceiling (300s) can sit on top of.
+
+**Where the budget lives in the repo.** Each agent declares its cap in its `runAgentLoop` invocation — `maxToolCalls` is 6 for monitoring/diagnostic/query and 4 for recommendation. The per-agent cap files are `lib/agents/monitoring.ts`, `lib/agents/diagnostic.ts`, `lib/agents/query.ts`, `lib/agents/recommendation.ts`. The cap is what turns adaptability from "unbounded" into "bounded."
+
+```
+shape (not full impl):
+  // base.ts L85 — the agentic-RAG loop
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const res = await anthropic.messages.create({ tools, messages });
+    const toolUses = res.content.filter(b => b.type === 'tool_use');
+    if (toolUses.length === 0) return { finalText, toolCalls };  // model stops
+    for (const tu of toolUses) {
+      const { result } = await mcp.callTool(tu.name, tu.input); // RETRIEVE
+      toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: ... });
+    }
+    messages.push({ role: 'user', content: toolResults });       // observe
+  }
+```
 
 The principle: an agentic loop without a cap is a runaway. The cap is what makes the adaptability cost-controlled instead of unbounded.
 
@@ -253,46 +272,6 @@ blooming insights: agentic retrieval over a live API
   The loop length is variable — the model writes it. The retriever
   is a live API call. The cap is a budget the route's per-investigation
   window sits on.
-```
-
----
-
-## Implementation in codebase
-
-**The loop**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L48–L176 (loop body L85; tool_use detection L116–L124; observation fed back L171; budget/forced-final L90–L101)
-
-This is the agentic-RAG engine. All four agents (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`) call this one function. The retriever isn't named in this file — it's whichever tool the model chooses, hidden behind the `McpCaller` interface (L16–L22).
-
-**The retriever**
-**File:** `lib/mcp/tools.ts`
-**Function / class:** the `execute_analytics_eql` tool schema
-**Line range:** the EQL tool definition
-
-The retriever-as-tool. The model emits `tool_use` with `name: "execute_analytics_eql"` and `input: { eql: "..." }`; the loop runs it via `mcp.callTool` (`base.ts` L144) and feeds the JSON result back as the next observation. No vector index sits behind this — it's a live HTTP call into Bloomreach.
-
-**The budget**
-**File:** `lib/agents/diagnostic.ts` / `monitoring.ts` / `query.ts` / `recommendation.ts`
-**Function / class:** each agent's `runAgentLoop` invocation
-**Line range:** the `maxToolCalls` argument per agent (6 for monitoring/diagnostic/query; 4 for recommendation)
-
-The cap that turns adaptability from "unbounded" into "bounded." Each agent declares how many tool calls it gets before the loop forces a final answer.
-
-```
-shape (not full impl):
-  // base.ts L85 — the agentic-RAG loop
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const res = await anthropic.messages.create({ tools, messages });
-    const toolUses = res.content.filter(b => b.type === 'tool_use');
-    if (toolUses.length === 0) return { finalText, toolCalls };  // model stops
-    for (const tu of toolUses) {
-      const { result } = await mcp.callTool(tu.name, tu.input); // RETRIEVE
-      toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: ... });
-    }
-    messages.push({ role: 'user', content: toolResults });       // observe
-  }
 ```
 
 ---

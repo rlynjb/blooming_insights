@@ -309,6 +309,90 @@ A few classic data-modeling concerns under this heading still don't apply:
 
 The right index is the one that matches the access path. When the access path is "by id," a hash is the only index. When the access path is "by content over a rate-limited remote," the optimization moves UP a layer — bundle, cache, budget. The data-modeling skill doesn't translate; the *spirit* does — every query has a cost, name the cost, design the access path to minimize it. In this repo, the cost is rate-limit slots, and the design moves are the bundled recipes plus the budget gate plus the TTL cache. None of them look like an index, but all of them play the same role.
 
+### Code in this codebase
+
+The repo anchors for the access paths Move 2 walked — both the in-memory paths and the cost-layer pieces (bundled recipes, budget gate, content-hash cache).
+
+#### The in-memory access paths
+
+```
+lib/state/insights.ts  (lines 44–54)
+
+  export function getInsight(id: string): Insight | null {
+    return insights.get(id) ?? null;          ← Map.get, O(1)
+  }
+
+  export function getAnomaly(id: string): Anomaly | null {
+    return anomalies.get(id) ?? null;
+  }
+
+  export function listInsights(): Insight[] {
+    return [...insights.values()];            ← O(n); n capped at 10 by the
+  }                                            ← monitoring agent's slice(0, 10)
+       │
+       └─ no secondary indexes. no filtering. no sorting. the only access
+          pattern is "give me this id" (or "give me all"). that's why
+          there's no index layer.
+```
+
+#### A bundled EQL recipe
+
+```
+lib/agents/categories.ts  (lines 24–33)
+
+  {
+    id: 'conversion_drop',
+    label: 'conversion rate drop',
+    requires: ['view_item', 'checkout', 'purchase'],
+    whyItMatters: '...',
+    eql: () => `select count event view_item,
+                       count event checkout,
+                       count event purchase
+                  in last 90 days`,           ← THREE metrics in ONE round-trip
+    thresholds: { critical: 20, warning: 10 },
+  }
+       │
+       └─ this is the "covering index" analog for the rate-limit world:
+          ask for everything the category needs in one call. firing three
+          separate `count event` calls would burn 3× the budget and 3×
+          the rate-limit slots for the same data.
+```
+
+#### The budget gate
+
+```
+lib/agents/monitoring.ts  (lines 100–106)
+
+  maxTurns: 8,
+  maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
+  synthesisInstruction:
+    'You have NO more tool calls available. Stop querying now and output ' +
+    'your final answer. Respond with ONLY a JSON array of anomaly objects ' +
+    'in a ```json fence (or [] if nothing meaningful), based on the data ' +
+    'you have already gathered.',
+       │
+       └─ when the budget is spent, runAgentLoop drops the tool schemas
+          from the next Anthropic call and appends the synthesisInstruction
+          as a user message. the agent is forced to answer from what it
+          already queried. this is the "no more query budget" path.
+```
+
+#### The cache key (a content-hash index)
+
+```
+lib/mcp/client.ts  (around line 102 — referenced in software-design audit)
+
+  const key = `${name}:${JSON.stringify(args)}`;
+                          ↑
+                          identical (name, args) → identical result
+                          cache hit skips both network and rate-limit slot
+       │
+       └─ this is the only piece of the repo that does anything index-like.
+          it's an exact-match content cache, no rewrite, no overlap detection.
+          good enough because the agent's recipe set is small and the args
+          are stable across a single run.
+```
+
 ---
 
 ## Primary diagram
@@ -349,90 +433,6 @@ Access paths and their costs, recap.
   │   "indexes" needed today: none — the repo can't add them   │
   │                                                            │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### The in-memory access paths
-
-```
-lib/state/insights.ts  (lines 44–54)
-
-  export function getInsight(id: string): Insight | null {
-    return insights.get(id) ?? null;          ← Map.get, O(1)
-  }
-
-  export function getAnomaly(id: string): Anomaly | null {
-    return anomalies.get(id) ?? null;
-  }
-
-  export function listInsights(): Insight[] {
-    return [...insights.values()];            ← O(n); n capped at 10 by the
-  }                                            ← monitoring agent's slice(0, 10)
-       │
-       └─ no secondary indexes. no filtering. no sorting. the only access
-          pattern is "give me this id" (or "give me all"). that's why
-          there's no index layer.
-```
-
-### A bundled EQL recipe
-
-```
-lib/agents/categories.ts  (lines 24–33)
-
-  {
-    id: 'conversion_drop',
-    label: 'conversion rate drop',
-    requires: ['view_item', 'checkout', 'purchase'],
-    whyItMatters: '...',
-    eql: () => `select count event view_item,
-                       count event checkout,
-                       count event purchase
-                  in last 90 days`,           ← THREE metrics in ONE round-trip
-    thresholds: { critical: 20, warning: 10 },
-  }
-       │
-       └─ this is the "covering index" analog for the rate-limit world:
-          ask for everything the category needs in one call. firing three
-          separate `count event` calls would burn 3× the budget and 3×
-          the rate-limit slots for the same data.
-```
-
-### The budget gate
-
-```
-lib/agents/monitoring.ts  (lines 100–106)
-
-  maxTurns: 8,
-  maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
-  synthesisInstruction:
-    'You have NO more tool calls available. Stop querying now and output ' +
-    'your final answer. Respond with ONLY a JSON array of anomaly objects ' +
-    'in a ```json fence (or [] if nothing meaningful), based on the data ' +
-    'you have already gathered.',
-       │
-       └─ when the budget is spent, runAgentLoop drops the tool schemas
-          from the next Anthropic call and appends the synthesisInstruction
-          as a user message. the agent is forced to answer from what it
-          already queried. this is the "no more query budget" path.
-```
-
-### The cache key (a content-hash index)
-
-```
-lib/mcp/client.ts  (around line 102 — referenced in software-design audit)
-
-  const key = `${name}:${JSON.stringify(args)}`;
-                          ↑
-                          identical (name, args) → identical result
-                          cache hit skips both network and rate-limit slot
-       │
-       └─ this is the only piece of the repo that does anything index-like.
-          it's an exact-match content cache, no rewrite, no overlap detection.
-          good enough because the agent's recipe set is small and the args
-          are stable across a single run.
 ```
 
 ---

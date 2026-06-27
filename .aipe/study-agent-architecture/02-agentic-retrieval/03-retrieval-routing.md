@@ -184,6 +184,8 @@ Source layer — one source, no fork
 
 The practical consequence: the source-routing pattern this file teaches doesn't apply to this codebase *yet*. The day a second knowledge source goes in — a vector store over past investigations, a web search for fresh PR mentions, a local SQL cache — the router becomes necessary; until then, dispatching to one source is a no-op.
 
+**Where the single retriever lives in the repo.** `McpClient.callTool` in `lib/mcp/client.ts` L97–L146 (the single retrieval path) → MCP transport → Bloomreach. Every agent in this codebase retrieves through here; the tool schemas live in `lib/mcp/tools.ts`. No fork above this layer to route between.
+
 The condition under which the absence is okay: the one source covers the question surface. The typed analytics query language can answer every analytics question the agents currently ask. The day a question shape lands that it can't express (free-text similarity, real-world freshness), the source-routing pattern earns its place beside what's already here.
 
 ### What blooming insights has *adjacent* — the coverage gate, a capability route
@@ -220,6 +222,22 @@ The coverage gate — capability routing, not source routing
 ```
 
 The practical consequence: the coverage gate prunes the monitoring agent's question space *before* the agentic-RAG loop spends a turn. The agent never wastes a tool call asking about `view_item` in a workspace that doesn't emit `view_item` — the gate already filtered that category out. This is routing in the broader sense (pick the right next action based on a pre-check), at the *capability* layer rather than the *source* layer.
+
+**Where this lives in the repo.** The gate itself: `lib/agents/categories.ts` — `schemaCapabilities()` at L121–L127 (reads available events + catalogs into a `Set<string>`), `coverageFor()` at L131–L136 (per-category gate: missing a hard `requires` → `'unavailable'`; missing only a soft `enriches` → `'limited'`; else `'full'`), `runnableCategories()` at L158–L160 (filters the 10-category checklist to the runnable subset). The caller: `app/api/briefing/route.ts` — the briefing stream `start()` body at L200–L204 (coverage computation + runnable filter) and L222 (the streamed log `"checking N of 10 categories"`). The briefing route runs the gate once per investigation and hands `runnable` (not the full registry) to the monitoring agent, so the agent only ever sees the categories its workspace can support.
+
+```
+shape (not full impl):
+  // app/api/briefing/route.ts — capability route runs BEFORE the loop
+  const capabilities = schemaCapabilities(schema);     // L200ish
+  const coverage = coverageReport(capabilities);        // L203
+  const runnable = runnableCategories(capabilities);    // L204
+  step(`checking ${runnable.length} of 10 categories…`);
+  // monitoring agent gets ONLY runnable — its question space is pre-routed
+
+  // A source router would slot HERE if a second retriever shipped:
+  //   const source = pickSource(question);    // heuristic + LLM fallback
+  //   await runAgentLoop({ mcp: source === 'analytics' ? mcpClient : vectorClient, ... });
+```
 
 The condition under which the gate works: the schema has to be authoritative about what's queryable. The MCP server returns the workspace's events and catalogs; if the workspace genuinely emits an event but the schema is stale, the gate falsely marks the category unavailable. The mitigation is treating the schema bootstrap as the route's premise check (it runs once per investigation).
 
@@ -303,49 +321,6 @@ Canonical retrieval routing (multi-source) — and where this codebase sits
   WHAT IT DOESN'T HAVE:
     source router — there's only one source; the dispatch would be
     a no-op until a second source ships
-```
-
----
-
-## Implementation in codebase
-
-**Case B — source-level retrieval routing is not implemented.** The honest sentence: there's only one knowledge source (Bloomreach via MCP), so there is no source-routing layer; if a vector store or web tool ships beside it, a router would slot in front of the agentic-RAG loop's tool-pick step.
-
-What exists adjacent to the pattern (the pre-retrieval capability route):
-
-**The capability gate**
-**File:** `lib/agents/categories.ts`
-**Function / class:** `schemaCapabilities()` → `coverageFor()` → `runnableCategories()`
-**Line range:** L121–L127 (capability set), L131–L136 (per-category gate), L158–L160 (the runnable filter)
-
-This is the closest thing to routing the codebase has. `schemaCapabilities` reads the workspace's available events and catalogs into a `Set<string>`. `coverageFor(cat, available)` is a pure gate: missing a hard dep (`requires`) → `'unavailable'`; missing only a soft dep (`enriches`) → `'limited'`; else `'full'`. `runnableCategories` filters the 10-category checklist to the subset the schema can support. This runs *before* the monitoring agent's agentic loop, pruning the question space upstream so the 6-call budget doesn't get spent on categories the data can't answer.
-
-**The gate's caller**
-**File:** `app/api/briefing/route.ts`
-**Function / class:** the briefing stream `start()` body
-**Line range:** L200–L204 (coverage computation and runnable filter), L222 (the streamed log "checking N of 10 categories")
-
-The briefing route runs the coverage gate once per investigation and hands `runnable` (not the full registry) to the monitoring agent. The agent only ever sees the categories its workspace can support.
-
-**The single retriever**
-**File:** `lib/mcp/client.ts`, `lib/mcp/tools.ts`
-**Function / class:** `McpClient.callTool` → MCP transport → Bloomreach
-**Line range:** `client.ts` L97–L146 (the single retrieval path)
-
-One source, one path. Every agent in this codebase retrieves through here. No fork above this layer to route between.
-
-```
-shape (not full impl):
-  // app/api/briefing/route.ts — capability route runs BEFORE the loop
-  const capabilities = schemaCapabilities(schema);     // L200ish
-  const coverage = coverageReport(capabilities);        // L203
-  const runnable = runnableCategories(capabilities);    // L204
-  step(`checking ${runnable.length} of 10 categories…`);
-  // monitoring agent gets ONLY runnable — its question space is pre-routed
-
-  // A source router would slot HERE if a second retriever shipped:
-  //   const source = pickSource(question);    // heuristic + LLM fallback
-  //   await runAgentLoop({ mcp: source === 'analytics' ? mcpClient : vectorClient, ... });
 ```
 
 ---

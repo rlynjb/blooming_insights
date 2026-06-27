@@ -196,6 +196,86 @@ When `result.isError === true` the function returns immediately without writing 
 
 Idempotent reads with stable inputs cache cleanly. Writes and error responses do not. This matches React Query's `staleTime` design: queries cache; mutations do not.
 
+### Code in this codebase
+
+Every moving part above lives in one file (`lib/mcp/client.ts`). Open the line ranges below to read them.
+
+#### Files, functions, and line ranges
+
+| Symbol | File | Lines |
+|---|---|---|
+| `isRateLimited` | `lib/mcp/client.ts` | L18–L22 |
+| `parseRetryAfterMs` | `lib/mcp/client.ts` | L31–L38 |
+| `sleep` | `lib/mcp/client.ts` | L40–L42 |
+| `ClientOpts` interface | `lib/mcp/client.ts` | L5–L12 |
+| `McpClient` cache field | `lib/mcp/client.ts` | L80 |
+| `McpClient` constructor | `lib/mcp/client.ts` | L87–L95 |
+| `callTool` — cache check | `lib/mcp/client.ts` | L105–L110 |
+| `callTool` — retry loop | `lib/mcp/client.ts` | L121–L132 |
+| `callTool` — no-cache-on-error | `lib/mcp/client.ts` | L137–L139 |
+| `callTool` — cache write | `lib/mcp/client.ts` | L143–L144 |
+| `liveCall` | `lib/mcp/client.ts` | L148–L163 |
+| `listTools` | `lib/mcp/client.ts` | L169–L171 |
+| `connectMcp` — 1100 ms construction | `lib/mcp/connect.ts` | L91–L96 |
+
+#### Test coverage (`test/mcp/client.test.ts`)
+
+| Test | Lines | What it exercises |
+|---|---|---|
+| cache miss, `fromCache: false` | L15–L23 | basic transport delegation |
+| cache hit within TTL | L24–L32 | `fromCache: true`, 1 transport call |
+| per-`name+args` keying | L33–L40 | different args → different entries |
+| `skipCache` bypass | L41–L48 | read skip, write-through confirmed |
+| TTL expiry | L49–L59 | `vi.advanceTimersByTime(1001)` |
+| `minIntervalMs` spacing | L60–L79 | 199 ms → still waiting; 200 ms → done |
+| `listTools` delegation | L80–L88 | transport passthrough |
+| no-cache-on-error | L89–L100 | error result not served from cache |
+| retry then succeed | L101–L110 | rate-limit response, then succeeds |
+| parsed retry-after window | L111–L141 | waits the "(1 per 10 second)" window, then caches |
+| explicit "Retry after ~N seconds" hint | L142–L168 | parsed hint preferred over backoff base |
+| exhaust `maxRetries` | L169–L177 | returns final error after `maxRetries+1` calls |
+| wraps transport throw as `McpToolError` | L178–L189 | tagged with tool name + detail |
+| includes thrown `error.cause` in detail | L190–L197 | nested cause surfaced |
+
+#### Pseudocode of `callTool` flow
+
+```
+callTool(name, args, options):
+  key = name + ":" + JSON.stringify(args)
+  ttl = options.cacheTtlMs ?? 60_000
+
+  if not options.skipCache:
+    entry = cache.get(key)
+    if entry and entry.expiresAt > Date.now():
+      return { result: entry.result, fromCache: true, durationMs: 0 }
+
+  start = Date.now()
+  result = await liveCall(name, args)       // enforces minIntervalMs
+
+  retries = 0
+  while isRateLimited(result) and retries < maxRetries:
+    retries++
+    await sleep(retryDelayMs)
+    result = await liveCall(name, args)
+
+  durationMs = Date.now() - start
+
+  if result.isError:
+    return { result, durationMs, fromCache: false }   // do NOT write cache
+
+  cache.set(key, { result, expiresAt: Date.now() + ttl })
+  return { result, durationMs, fromCache: false }
+```
+
+#### GitHub links
+
+- `lib/mcp/client.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts
+- `callTool` (L97–L146): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L97-L146
+- `liveCall` (L148–L163): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L148-L163
+- `isRateLimited` (L18–L22): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L18-L22
+- `connect.ts` 1100 ms construction (L91–L96): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L91-L96
+- `test/mcp/client.test.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/test/mcp/client.test.ts
+
 ---
 
 ## Caching + rate-limiting — diagram
@@ -258,86 +338,6 @@ This diagram shows one call's complete path from entry to result. The Service la
 ```
 
 The spacing gate and the retry loop both live inside the Service layer, so Bloomreach never sees bursts regardless of how many callers queue up above `McpClient`.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-| Symbol | File | Lines |
-|---|---|---|
-| `isRateLimited` | `lib/mcp/client.ts` | L18–L22 |
-| `parseRetryAfterMs` | `lib/mcp/client.ts` | L31–L38 |
-| `sleep` | `lib/mcp/client.ts` | L40–L42 |
-| `ClientOpts` interface | `lib/mcp/client.ts` | L5–L12 |
-| `McpClient` cache field | `lib/mcp/client.ts` | L80 |
-| `McpClient` constructor | `lib/mcp/client.ts` | L87–L95 |
-| `callTool` — cache check | `lib/mcp/client.ts` | L105–L110 |
-| `callTool` — retry loop | `lib/mcp/client.ts` | L121–L132 |
-| `callTool` — no-cache-on-error | `lib/mcp/client.ts` | L137–L139 |
-| `callTool` — cache write | `lib/mcp/client.ts` | L143–L144 |
-| `liveCall` | `lib/mcp/client.ts` | L148–L163 |
-| `listTools` | `lib/mcp/client.ts` | L169–L171 |
-| `connectMcp` — 1100 ms construction | `lib/mcp/connect.ts` | L91–L96 |
-
-### Test coverage (`test/mcp/client.test.ts`)
-
-| Test | Lines | What it exercises |
-|---|---|---|
-| cache miss, `fromCache: false` | L15–L23 | basic transport delegation |
-| cache hit within TTL | L24–L32 | `fromCache: true`, 1 transport call |
-| per-`name+args` keying | L33–L40 | different args → different entries |
-| `skipCache` bypass | L41–L48 | read skip, write-through confirmed |
-| TTL expiry | L49–L59 | `vi.advanceTimersByTime(1001)` |
-| `minIntervalMs` spacing | L60–L79 | 199 ms → still waiting; 200 ms → done |
-| `listTools` delegation | L80–L88 | transport passthrough |
-| no-cache-on-error | L89–L100 | error result not served from cache |
-| retry then succeed | L101–L110 | rate-limit response, then succeeds |
-| parsed retry-after window | L111–L141 | waits the "(1 per 10 second)" window, then caches |
-| explicit "Retry after ~N seconds" hint | L142–L168 | parsed hint preferred over backoff base |
-| exhaust `maxRetries` | L169–L177 | returns final error after `maxRetries+1` calls |
-| wraps transport throw as `McpToolError` | L178–L189 | tagged with tool name + detail |
-| includes thrown `error.cause` in detail | L190–L197 | nested cause surfaced |
-
-### Pseudocode of `callTool` flow
-
-```
-callTool(name, args, options):
-  key = name + ":" + JSON.stringify(args)
-  ttl = options.cacheTtlMs ?? 60_000
-
-  if not options.skipCache:
-    entry = cache.get(key)
-    if entry and entry.expiresAt > Date.now():
-      return { result: entry.result, fromCache: true, durationMs: 0 }
-
-  start = Date.now()
-  result = await liveCall(name, args)       // enforces minIntervalMs
-
-  retries = 0
-  while isRateLimited(result) and retries < maxRetries:
-    retries++
-    await sleep(retryDelayMs)
-    result = await liveCall(name, args)
-
-  durationMs = Date.now() - start
-
-  if result.isError:
-    return { result, durationMs, fromCache: false }   // do NOT write cache
-
-  cache.set(key, { result, expiresAt: Date.now() + ttl })
-  return { result, durationMs, fromCache: false }
-```
-
-### GitHub links
-
-- `lib/mcp/client.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts
-- `callTool` (L97–L146): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L97-L146
-- `liveCall` (L148–L163): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L148-L163
-- `isRateLimited` (L18–L22): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/client.ts#L18-L22
-- `connect.ts` 1100 ms construction (L91–L96): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L91-L96
-- `test/mcp/client.test.ts` full file: https://github.com/rlynjb/blooming_insights/blob/main/test/mcp/client.test.ts
 
 ---
 

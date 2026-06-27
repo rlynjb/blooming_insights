@@ -159,6 +159,8 @@ code assigns:          { id: random_uuid(), ...r }
 
 The split is deliberate: the prompt and validator agree on what the *model* controls; the system owns *identity*. Letting the model invent ids risks collisions and non-UUID strings. The "Do NOT include an id" line is a prose instruction doing a job a native schema would do with `additionalProperties: false` — and it has to be repeated in the recommendation agent's synthesis instruction too, because the synthesis path bypasses the main prompt.
 
+**Code in this codebase — the prompt-side JSON instruction.** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md` — the `## Output` section of each prompt. `monitoring.md` L69–97 (array, fenced, severity-sorted, field rules); `diagnostic.md` L59–103 (object of exact shape + the empty-case shape L94–101); `recommendation.md` L47–91 (≤3 objects + field rules, including the id-omission at L82). Requests fenced JSON in prose and sculpts the shape (including which fields to omit).
+
 ---
 
 ### The fence-strip-first bug, and why the regex runs first
@@ -195,6 +197,8 @@ the bug class this defends against:
 
 I have shipped a feature where a teammate added "be concise and well-formatted" to a prompt that relied on schema mode, and overnight the model started fencing its JSON as a courtesy — well-formatted, to a model, means a code block. The parser that did bare-parse-first broke for every call. The fix was the exact ordering you see here: strip the fence before you trust the body. This is not theoretical; it is the literal reason the fence regex runs before the bare parse.
 
+**Code in this codebase — extract.** `lib/mcp/validate.ts`, function `parseAgentJson(text)`, L3–13 — fence regex (L4) first, bare `JSON.parse` (L6), first-bracket-to-last-bracket substring scan (L7–10), throw (L12). Pulls the JSON out of fenced/bare/prose-wrapped output; fence-first by design.
+
 ---
 
 ### Validate: shape proofs, not casts
@@ -213,6 +217,8 @@ is-recommendation-array  every item: title, rationale,
 
 A guard returning `false` is not an error — it routes to the repair or the floor. The monitoring agent does the simplest thing: `if not is_anomaly_array(parsed): return []`. The guard is the gate that decides whether the model's output is trustworthy enough to ship.
 
+**Code in this codebase — validate.** `lib/mcp/validate.ts`, functions `isAnomalyArray`, `isDiagnosis`, `isRecommendationArray` at L17–27, L29–35, L42–53; enum sets `SEVERITIES` (L15), `FEATURES`/`CONFIDENCE` (L37–38). The recommendation guard validates `Omit<Recommendation,'id'>[]` (L42). Proves shape field-by-field; the recommendation guard skips `id` because the system assigns it.
+
 ---
 
 ### Repair: the clean-context synthesize retry
@@ -226,6 +232,10 @@ When the loop's final text doesn't parse-and-validate, the diagnostic and recomm
 ```
 
 The synthesize path is a *separate* call to the provider SDK with **no tools and no loop history** — it formats the gathered evidence as text and asks for ONLY the JSON. Why a fresh call instead of one more loop turn: the loop history is full of `tool_use`/`tool_result` pairs and the model has momentum toward "I should query more." A clean single-turn call breaks that momentum. The recommendation agent has the identical structure. The monitoring agent has no synthesize path — it degrades straight to `[]`, because an empty anomaly list is a safe, honest answer; a missing diagnosis is not.
+
+**Code in this codebase — repair + floor.** `lib/agents/{diagnostic,recommendation,monitoring}.ts` — `synthesize()` and the fallback chain: diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L73–77), `synthesize` (L82–121), `FALLBACK` (L15–19); recommendation `tryParseRecommendations ?? synthesize` then `[]`, ids assigned (L69–76), `synthesize` (L82–127); monitoring parse-or-`[]` (L85–92, no synthesize). Clean-context retry then a model-independent floor; monitoring's floor is `[]` directly.
+
+**Why this is a codebase strength.** The output contract works against any text model and is fully exercisable in the test suite with injected fakes — no live structured-output API needed. The id-assignment-after-validation detail shows the boundary was thought through precisely. And the fence-first ordering encodes a real lesson rather than a guessed one.
 
 ---
 
@@ -273,44 +283,6 @@ This diagram spans the producer and the contract. The model emits prose-with-fen
 ```
 
 The fence is asked for in prose, stripped first in code; the typed value is manufactured by extract → validate → repair, with a model-independent floor.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### The prompt-side JSON instruction
-
-- **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md`
-- **Function / class:** the `## Output` section of each prompt
-- **Line range:** `monitoring.md` L69–97 (array, fenced, severity-sorted, field rules); `diagnostic.md` L59–103 (object of exact shape + the empty-case shape L94–101); `recommendation.md` L47–91 (≤3 objects + field rules, including the id-omission at L82).
-- **Role:** requests fenced JSON in prose and sculpts the shape (including which fields to omit).
-
-### Extract
-
-- **File:** `lib/mcp/validate.ts`
-- **Function / class:** `parseAgentJson(text)`
-- **Line range:** L3–13 — fence regex (L4) first, bare `JSON.parse` (L6), first-bracket-to-last-bracket substring scan (L7–10), throw (L12).
-- **Role:** pulls the JSON out of fenced/bare/prose-wrapped output; fence-first by design.
-
-### Validate
-
-- **File:** `lib/mcp/validate.ts`
-- **Function / class:** `isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`
-- **Line range:** L17–27, L29–35, L42–53; enum sets `SEVERITIES` (L15), `FEATURES`/`CONFIDENCE` (L37–38). The recommendation guard validates `Omit<Recommendation,'id'>[]` (L42).
-- **Role:** proves shape field-by-field; the recommendation guard skips `id` because the system assigns it.
-
-### Repair + floor
-
-- **File:** `lib/agents/{diagnostic,recommendation,monitoring}.ts`
-- **Function / class:** `synthesize()` and the fallback chain
-- **Line range:** diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L73–77), `synthesize` (L82–121), `FALLBACK` (L15–19); recommendation `tryParseRecommendations ?? synthesize` then `[]`, ids assigned (L69–76), `synthesize` (L82–127); monitoring parse-or-`[]` (L85–92, no synthesize).
-- **Role:** clean-context retry then a model-independent floor; monitoring's floor is `[]` directly.
-
-### Why this is a codebase strength
-
-The output contract works against any text model and is fully exercisable in the test suite with injected fakes — no live structured-output API needed. The id-assignment-after-validation detail shows the boundary was thought through precisely. And the fence-first ordering encodes a real lesson rather than a guessed one.
 
 ---
 

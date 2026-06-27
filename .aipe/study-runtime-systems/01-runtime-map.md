@@ -228,62 +228,7 @@ Two external runtimes (live-bloomreach mode) plus, since Phase 2, one *internal*
 
 What breaks without the spacing gate: rapid-fire MCP calls land inside the same 1-second window and the server returns rate-limit errors carrying its own retry hint, which `McpClient` then has to wait out — costing ~10s per overrun instead of ~1s of upfront spacing.
 
-### Move 3 — the principle
-
-**A runtime map is not a deployment diagram — it's a *state-and-time* diagram.** Where does each piece of state live, and how long does it live? "It runs on Node" is a deploy fact; "the `cached` schema lives for the warm-instance lifetime, and the `bi_auth` cookie lives for 10 days" is a runtime fact. The second one tells you what will break in production; the first doesn't.
-
----
-
-## Primary diagram
-
-The full runtime topology, with state ownership and the lifetimes that matter:
-
-```
-  The runtime map — bands, owners, lifetimes
-
-  ┌─ Browser V8 (per tab) ─────────────────────────────────────────────────┐
-  │  React state         → component lifetime                              │
-  │  sessionStorage      → tab lifetime (survives reload, not new tab)      │
-  │  useInvestigation    → reads NDJSON; does NOT abort on unmount         │
-  └────────────────────────────────│───────────────────────────────────────┘
-                                   │  HTTPS chunked
-  ┌─ Vercel function (Node 20) ────▼───────────────────────────────────────┐
-  │                                                                        │
-  │  ┌─ Per-request (ALS-scoped) ────────────────────────────────────────┐ │
-  │  │  AsyncLocalStorage<RequestStore> in lib/mcp/auth.ts:47           │ │
-  │  │   → decrypted auth store, dirty flag, flushed on request end     │ │
-  │  └──────────────────────────────────────────────────────────────────┘ │
-  │                                                                        │
-  │  ┌─ Per-warm-instance (module scope) ────────────────────────────────┐ │
-  │  │  insights      Map<string, Insight>     lib/state/insights.ts:4   │ │
-  │  │  investigations Map<string, AgentEvent[]> lib/state/investigations.ts:11│
-  │  │  schema cache  let cached: WS|null      lib/mcp/schema.ts:131     │ │
-  │  │  McpClient.cache Map<string, {result,exp}> lib/mcp/client.ts:80   │ │
-  │  └──────────────────────────────────────────────────────────────────┘ │
-  │                                                                        │
-  │  ┌─ Per-call (stack-local) ──────────────────────────────────────────┐ │
-  │  │  runAgentLoop messages[]                lib/agents/base.ts:79     │ │
-  │  │  toolCalls[] / collected[]              lib/agents/base.ts:83     │ │
-  │  └──────────────────────────────────────────────────────────────────┘ │
-  │                                                                        │
-  │     budget walls:                                                      │
-  │       maxDuration       = 300s   (route)                               │
-  │       minIntervalMs     = 1100   (McpClient)                           │
-  │       maxToolCalls      = 6      (per agent)                           │
-  │       maxRetries        = 3      (rate-limit retry)                    │
-  │       MCP cache TTL     = 60s    (callTool default)                    │
-  └────────────────────────────────│───────────────────────────────────────┘
-                                   │  HTTPS + OAuth bearer
-  ┌─ External providers ───────────▼───────────────────────────────────────┐
-  │  Anthropic API            Bloomreach loomi-connect MCP                  │
-  │   stateless per call      ~1 req/s/user                                 │
-  │   ~2-15s per call         retry-hint in error body                      │
-  └────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 5) Code in this codebase
 
 **Use cases.** Every entry point exercises this map.
 
@@ -358,6 +303,59 @@ The full runtime topology, with state ownership and the lifetimes that matter:
                                           StrictMode survivability. The cost
                                           (server keeps running after tab close)
                                           is real — see 07.
+```
+
+### Move 3 — the principle
+
+**A runtime map is not a deployment diagram — it's a *state-and-time* diagram.** Where does each piece of state live, and how long does it live? "It runs on Node" is a deploy fact; "the `cached` schema lives for the warm-instance lifetime, and the `bi_auth` cookie lives for 10 days" is a runtime fact. The second one tells you what will break in production; the first doesn't.
+
+---
+
+## Primary diagram
+
+The full runtime topology, with state ownership and the lifetimes that matter:
+
+```
+  The runtime map — bands, owners, lifetimes
+
+  ┌─ Browser V8 (per tab) ─────────────────────────────────────────────────┐
+  │  React state         → component lifetime                              │
+  │  sessionStorage      → tab lifetime (survives reload, not new tab)      │
+  │  useInvestigation    → reads NDJSON; does NOT abort on unmount         │
+  └────────────────────────────────│───────────────────────────────────────┘
+                                   │  HTTPS chunked
+  ┌─ Vercel function (Node 20) ────▼───────────────────────────────────────┐
+  │                                                                        │
+  │  ┌─ Per-request (ALS-scoped) ────────────────────────────────────────┐ │
+  │  │  AsyncLocalStorage<RequestStore> in lib/mcp/auth.ts:47           │ │
+  │  │   → decrypted auth store, dirty flag, flushed on request end     │ │
+  │  └──────────────────────────────────────────────────────────────────┘ │
+  │                                                                        │
+  │  ┌─ Per-warm-instance (module scope) ────────────────────────────────┐ │
+  │  │  insights      Map<string, Insight>     lib/state/insights.ts:4   │ │
+  │  │  investigations Map<string, AgentEvent[]> lib/state/investigations.ts:11│
+  │  │  schema cache  let cached: WS|null      lib/mcp/schema.ts:131     │ │
+  │  │  McpClient.cache Map<string, {result,exp}> lib/mcp/client.ts:80   │ │
+  │  └──────────────────────────────────────────────────────────────────┘ │
+  │                                                                        │
+  │  ┌─ Per-call (stack-local) ──────────────────────────────────────────┐ │
+  │  │  runAgentLoop messages[]                lib/agents/base.ts:79     │ │
+  │  │  toolCalls[] / collected[]              lib/agents/base.ts:83     │ │
+  │  └──────────────────────────────────────────────────────────────────┘ │
+  │                                                                        │
+  │     budget walls:                                                      │
+  │       maxDuration       = 300s   (route)                               │
+  │       minIntervalMs     = 1100   (McpClient)                           │
+  │       maxToolCalls      = 6      (per agent)                           │
+  │       maxRetries        = 3      (rate-limit retry)                    │
+  │       MCP cache TTL     = 60s    (callTool default)                    │
+  └────────────────────────────────│───────────────────────────────────────┘
+                                   │  HTTPS + OAuth bearer
+  ┌─ External providers ───────────▼───────────────────────────────────────┐
+  │  Anthropic API            Bloomreach loomi-connect MCP                  │
+  │   stateless per call      ~1 req/s/user                                 │
+  │   ~2-15s per call         retry-hint in error body                      │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

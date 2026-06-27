@@ -177,6 +177,66 @@ schema.projectId ──.replace('{project_id}')──→ system prompt
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.**
+
+#### Schema mapping (MCP defs → Anthropic tools)
+
+- **File:** `lib/agents/tool-schemas.ts`
+- **Function / class:** `filterToolSchemas` (+ `McpToolDef` interface L3–L7)
+- **Line range:** L9–L21
+- **Role:** Maps `McpToolDef[]` → `Anthropic.Messages.Tool[]`, renaming `inputSchema` → `input_schema`, defaulting `description` to `''`, and filtering to the allowed name set (L15).
+
+#### The caller seam
+
+- **File:** `lib/agents/base.ts`
+- **Function / class:** `McpCaller` interface
+- **Line range:** L16–L22
+- **Role:** The single typed boundary `runAgentLoop` depends on; `callTool(name, args, opts?) => { result, durationMs, fromCache }`. Production `McpClient` and test fakes both satisfy it structurally.
+
+#### The round-trip executor
+
+- **File:** `lib/agents/base.ts`
+- **Function / class:** `runAgentLoop` — per-tool execution loop
+- **Line range:** L129–L171; tools attached to the request at L101; `mcp.callTool` at L144; `tool_result` built at L161–L167; pushed as user turn at L171
+- **Role:** For each `tool_use` block, runs the tool, captures `durationMs`, truncates the payload (`MAX_TOOL_RESULT_CHARS = 16_000`, L29), and feeds a `tool_result` keyed by `tool_use_id` back into `messages`.
+
+#### Per-agent tool subsets
+
+- **File:** `lib/mcp/tools.ts`
+- **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
+- **Line range:** L5–L13, L15–L25, L27–L34, L38–L40
+- **Role:** The name arrays passed as `allowed` into `filterToolSchemas` — each agent is shown only its relevant tools. (Routing detail in 04-tool-routing.md.)
+
+#### project_id injection
+
+- **File:** `lib/agents/diagnostic.ts` L48 (`recommendation.ts` L43, `monitoring.ts` L71, `query.ts` L27)
+- **Function / class:** system-prompt construction in each agent's entry method
+- **Line range:** the `.replace(/\{project_id\}/g, this.schema.projectId)` call
+- **Role:** Injects the real workspace id into the prompt so the model includes `project_id` in every tool call's `input`.
+
+**Pseudocode — one tool round-trip** (`base.ts` L116–L171):
+
+```typescript
+const toolUses = res.content.filter(b => b.type === 'tool_use');   // L116
+if (toolUses.length === 0) return { finalText, toolCalls };        // L121 (no call → done)
+
+const toolResults = [];
+for (const tu of toolUses) {                                        // L129
+  onToolCall?.(tc);                                                 // L138 (action event)
+  const { result, durationMs } = await mcp.callTool(tu.name, tu.input);  // L144 (HANDS)
+  toolResults.push({
+    type: 'tool_result',
+    tool_use_id: tu.id,                                             // L163 (pairing)
+    content: truncate(JSON.stringify(result)),                      // L150/164 (16k cap)
+  });
+}
+messages.push({ role: 'user', content: toolResults });             // L171 (result back)
+```
+
+---
+
 ## Tool calling — diagram
 
 The diagram spans three layers. The Model layer decides; the Loop layer (your code) dispatches; the Provider boundary runs the real call. The schema flows down (what is callable) and the result flows up (what happened).
@@ -210,66 +270,6 @@ The diagram spans three layers. The Model layer decides; the Loop layer (your co
 ```
 
 A reader who sees only this diagram should grasp: the model names the tool, the loop runs it, the result comes back up, and the seam (`McpCaller`) is swappable.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### Schema mapping (MCP defs → Anthropic tools)
-
-- **File:** `lib/agents/tool-schemas.ts`
-- **Function / class:** `filterToolSchemas` (+ `McpToolDef` interface L3–L7)
-- **Line range:** L9–L21
-- **Role:** Maps `McpToolDef[]` → `Anthropic.Messages.Tool[]`, renaming `inputSchema` → `input_schema`, defaulting `description` to `''`, and filtering to the allowed name set (L15).
-
-### The caller seam
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `McpCaller` interface
-- **Line range:** L16–L22
-- **Role:** The single typed boundary `runAgentLoop` depends on; `callTool(name, args, opts?) => { result, durationMs, fromCache }`. Production `McpClient` and test fakes both satisfy it structurally.
-
-### The round-trip executor
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop` — per-tool execution loop
-- **Line range:** L129–L171; tools attached to the request at L101; `mcp.callTool` at L144; `tool_result` built at L161–L167; pushed as user turn at L171
-- **Role:** For each `tool_use` block, runs the tool, captures `durationMs`, truncates the payload (`MAX_TOOL_RESULT_CHARS = 16_000`, L29), and feeds a `tool_result` keyed by `tool_use_id` back into `messages`.
-
-### Per-agent tool subsets
-
-- **File:** `lib/mcp/tools.ts`
-- **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
-- **Line range:** L5–L13, L15–L25, L27–L34, L38–L40
-- **Role:** The name arrays passed as `allowed` into `filterToolSchemas` — each agent is shown only its relevant tools. (Routing detail in 04-tool-routing.md.)
-
-### project_id injection
-
-- **File:** `lib/agents/diagnostic.ts` L48 (`recommendation.ts` L43, `monitoring.ts` L71, `query.ts` L27)
-- **Function / class:** system-prompt construction in each agent's entry method
-- **Line range:** the `.replace(/\{project_id\}/g, this.schema.projectId)` call
-- **Role:** Injects the real workspace id into the prompt so the model includes `project_id` in every tool call's `input`.
-
-**Pseudocode — one tool round-trip** (`base.ts` L116–L171):
-
-```typescript
-const toolUses = res.content.filter(b => b.type === 'tool_use');   // L116
-if (toolUses.length === 0) return { finalText, toolCalls };        // L121 (no call → done)
-
-const toolResults = [];
-for (const tu of toolUses) {                                        // L129
-  onToolCall?.(tc);                                                 // L138 (action event)
-  const { result, durationMs } = await mcp.callTool(tu.name, tu.input);  // L144 (HANDS)
-  toolResults.push({
-    type: 'tool_result',
-    tool_use_id: tu.id,                                             // L163 (pairing)
-    content: truncate(JSON.stringify(result)),                      // L150/164 (16k cap)
-  });
-}
-messages.push({ role: 'user', content: toolResults });             // L171 (result back)
-```
 
 ---
 

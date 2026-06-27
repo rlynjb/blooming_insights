@@ -165,6 +165,27 @@ adjacency matrix       O(V²)      O(V)           O(1)
 picking heuristic: adjacency list unless dense or O(1) edge-test is needed
 ```
 
+**Code in this codebase — the bootstrap chain LOOKS like a graph but isn't (`lib/mcp/schema.ts` L151–L192).**
+
+```ts
+// lib/mcp/schema.ts L154 (resolveProject)
+const orgs = unwrap<...>(await callOrThrow(mcp, 'list_cloud_organizations', {})).data;
+...
+const projects = unwrap<...>(
+  await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }),
+).data;
+
+// L178–L181 (bootstrapSchema)
+const eventSchema  = await callOrThrow(mcp, 'get_event_schema', args);
+const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
+const catalogs     = await callOrThrow(mcp, 'list_catalogs', args);
+const overview     = await callOrThrow(mcp, 'get_project_overview', args);
+```
+
+This *looks* like it might be a graph traversal — call A, use A's result to call B, use B's result to call C, D, E, F. But it isn't a traversal in the algorithmic sense. There's no "what's the next node?" decision. There's no visited set (because there's no risk of revisiting — each call is a different tool). There's no frontier data structure. The order is *fixed at compile time* — six tool calls in a specific sequence, dictated by the data dependencies. That's a **pipeline**, not a traversal. If you tried to model this as a graph, the "graph" would be a 6-node directed acyclic graph, and the "traversal" would be `for (const tool of [a,b,c,d,e,f]) await call(tool)` — at which point the graph abstraction is pure overhead. The codebase wisely doesn't reach for it.
+
+The same is true of the agent pipeline (`app/api/briefing/route.ts`): `monitoringAgent.scan() → diagnosticAgent.investigate() → recommendationAgent.propose()` — three stages, fixed order, output of stage N is input to stage N+1. Not a graph; not a traversal. A pipeline.
+
 ### Move 2 — BFS (breadth-first search)
 
 BFS visits nodes in increasing distance from a starting node. Uses a **queue** as the frontier. The visited set prevents revisiting. The discovery order is by *level* — all distance-1 nodes before any distance-2 node, etc. That property is what makes BFS find shortest paths in unweighted graphs.
@@ -273,6 +294,8 @@ DFS execution trace — start at A on the same graph (recursive version):
 - **Strongly connected components (Tarjan, Kosaraju)** — DFS with stack-of-roots tracking.
 - **Backtracking algorithms** — n-queens, sudoku, maze solving. DFS plus "undo on dead end."
 
+**Code in this codebase — BFS, DFS, and Dijkstra are `not yet exercised`.** No `Map<NodeId, Neighbors[]>` anywhere, no `queue` or `stack` used for traversal frontier (the NDJSON `buf` is a one-slot queue but for byte framing, not graph traversal), no `visited` set used in a traversal sense. The user's portfolio (`reincodes/Graph.ts`, `reincodes/Graph2.ts` with BFS, DFS, Dijkstra) has implementations from scratch — but none of them have been reached for in `blooming_insights`. The plausible triggers: (1) tool dependency resolution growing into a DAG that needs topological sort; (2) cross-insight relationships (insights linked by "causes" edges) requiring DFS; (3) multi-step recommendation chains that need BFS over a "ready-to-execute" frontier. None has fired.
+
 ### Move 2 variant — the BFS/DFS shared kernel (the load-bearing graph skeleton)
 
 BFS and DFS share an irreducible kernel. The only difference is the frontier data structure — queue vs stack.
@@ -373,57 +396,6 @@ The graph algorithm family — kernel, frontier choices, cost, and presence in t
    in repo: NOT YET           in repo: NOT YET          in repo: NOT YET
    EXERCISED                  EXERCISED                 EXERCISED
 ```
-
----
-
-## Implementation in codebase
-
-The closest-things, named honestly. None of these are graph algorithms.
-
-### **The bootstrap chain — a fixed pipeline, NOT a traversal (`lib/mcp/schema.ts` L151–L192)**
-
-```ts
-// lib/mcp/schema.ts L154 (resolveProject)
-const orgs = unwrap<...>(await callOrThrow(mcp, 'list_cloud_organizations', {})).data;
-...
-const projects = unwrap<...>(
-  await callOrThrow(mcp, 'list_projects', { cloud_organization_id: orgs[0].id }),
-).data;
-
-// L178–L181 (bootstrapSchema)
-const eventSchema  = await callOrThrow(mcp, 'get_event_schema', args);
-const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
-const catalogs     = await callOrThrow(mcp, 'list_catalogs', args);
-const overview     = await callOrThrow(mcp, 'get_project_overview', args);
-```
-
-This *looks* like it might be a graph traversal — call A, use A's result to call B, use B's result to call C, D, E, F. But it isn't a traversal in the algorithmic sense. There's no "what's the next node?" decision. There's no visited set (because there's no risk of revisiting — each call is a different tool). There's no frontier data structure. The order is *fixed at compile time* — six tool calls in a specific sequence, dictated by the data dependencies. That's a **pipeline**, not a traversal.
-
-If you tried to model this as a graph, the "graph" would be a 6-node directed acyclic graph, and the "traversal" would be `for (const tool of [a,b,c,d,e,f]) await call(tool)` — at which point the graph abstraction is pure overhead. The codebase wisely doesn't reach for it.
-
-### **The agent pipeline — also fixed (`app/api/briefing/route.ts`)**
-
-```
-monitoringAgent.scan() → diagnosticAgent.investigate() → recommendationAgent.propose()
-```
-
-Same pattern: three stages, fixed order, output of stage N is input to stage N+1. Not a graph; not a traversal. A pipeline.
-
-### **No adjacency list, no BFS, no DFS, no Dijkstra**
-
-Confirmed: no `Map<NodeId, Neighbors[]>` anywhere, no `queue` or `stack` used for traversal frontier (the NDJSON `buf` is a one-slot queue but for byte framing, not graph traversal), no `visited` set used in a traversal sense. The user's portfolio (`reincodes/Graph.ts`, `reincodes/Graph2.ts` with BFS, DFS, Dijkstra) has implementations from scratch — but none of them have been reached for in `blooming_insights`.
-
-### **What would trigger reaching for a graph here?**
-
-Three concrete triggers:
-
-1. **Tool dependency resolution.** If an agent's plan involved tools where some require the output of others (e.g. "to call `analyze_funnel`, you first need to call `list_funnel_events`, which requires `list_events`"), the natural representation is a DAG of tool dependencies, and the right algorithm is topological sort to compute call order. Today the bootstrap chain is hardcoded; if it grew to 20+ tools with conditional dependencies, the DAG-based approach would beat the manual sequence.
-
-2. **Cross-insight relationships.** If insights related to each other ("this revenue drop *caused* this funnel leak"), the natural model is a directed graph of insight nodes with "causes" edges. Walking it (DFS from a root insight to find all downstream effects) would be a real graph algorithm. Today insights are flat.
-
-3. **Multi-step recommendation chains.** If a recommendation could only be acted on after a prerequisite recommendation was completed, you'd have a DAG of recommendations and need topological sort (or BFS over "ready-to-execute" recommendations) to surface the right one first. Today recommendations are independent.
-
-None of these triggers has fired. They're plausible product directions, not current requirements.
 
 ---
 

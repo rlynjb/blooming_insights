@@ -151,6 +151,14 @@ An embedding converts a fuzzy human judgment — "do these mean the same thing?"
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — there is no embedding model call, no vector, and no cosine similarity anywhere in the repo.
+
+The closest present behavior is two things, both honest non-embedding analogs. First, schema *delivery*: `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) hands the model a truncated text list of the top-20 events and their properties, and the *model* — not code — does the fuzzy "which events are relevant" judgment in its head. Second, term *matching*: `parseIntent` (`lib/agents/intent.ts` L6–L12) does the crudest possible semantic match — `t.includes('monitoring')` — which is exactly the substring matching that embeddings exist to replace. An embedding layer would live next to `lib/mcp/schema.ts` (it already produces the `WorkspaceSchema.events[].name` list that is the natural thing to embed) with the vector store in `lib/state/`. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Embeddings — diagram
 
 This diagram spans the Service layer (where embedding would happen) and the State layer (where vectors would be stored). A reader who sees only this should grasp that text goes in, a fixed float array comes out, and comparison is a distance computation over those arrays.
@@ -180,14 +188,6 @@ This diagram spans the Service layer (where embedding would happen) and the Stat
 ```
 
 The model assigns coordinates once; the State layer caches them; the Service layer does cheap distance math on every query.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — there is no embedding model call, no vector, and no cosine similarity anywhere in the repo.
-
-The closest present behavior is two things, both honest non-embedding analogs. First, schema *delivery*: `schemaSummary` (`lib/agents/monitoring.ts` L15–L48) hands the model a truncated text list of the top-20 events and their properties, and the *model* — not code — does the fuzzy "which events are relevant" judgment in its head. Second, term *matching*: `parseIntent` (`lib/agents/intent.ts` L6–L12) does the crudest possible semantic match — `t.includes('monitoring')` — which is exactly the substring matching that embeddings exist to replace. An embedding layer would live next to `lib/mcp/schema.ts` (it already produces the `WorkspaceSchema.events[].name` list that is the natural thing to embed) with the vector store in `lib/state/`. The `Project exercises` block below is the primary buildable target.
 
 ---
 

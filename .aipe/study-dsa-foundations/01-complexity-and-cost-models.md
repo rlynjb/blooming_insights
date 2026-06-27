@@ -149,6 +149,15 @@ The interesting move isn't naming big-O; it's *picking the right comparison*. Si
 
 The TTL cache picks Map because it does many reads per key over a session. The CATEGORIES registry stays as an array because there are 10 of them and the only "lookup" is a `.map` over all of them.
 
+**Code in this codebase — `lib/mcp/client.ts` L80 picks `Map`, not an array.**
+
+```ts
+// lib/mcp/client.ts L80
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+```
+
+Why a `Map` and not an `Array<{key, value, expiresAt}>`? Because `callTool` does many lookups per key across a session. Lookup on an array is O(N) — every call would walk the cache from the start. Lookup on a `Map` is O(1) average — the cost doesn't grow with the number of cached tools. The space cost is identical (both store one entry per key); the time cost is the difference between O(1) per call and O(N) per call. With N growing across a session, this is the comparison the design has to win, and `Map` wins it asymptotically.
+
 #### **dedup: Set vs nested loop**
 
 ```
@@ -167,6 +176,17 @@ The TTL cache picks Map because it does many reads per key over a session. The C
 ```
 
 `queryTools` uses the Set approach for the union of three tool arrays. The space cost is the price of going from O(N²) to O(N) — you can't get linear time without linear space here.
+
+**Code in this codebase — `lib/mcp/tools.ts` L38–L40 collapses three arrays in one expression.**
+
+```ts
+// lib/mcp/tools.ts L38–L40
+export const queryTools = [
+  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
+] as const;
+```
+
+The "natural" implementation of dedup would be a nested loop: for each candidate, check whether it's already in the result. That's O(N²). The `new Set(...)` version is O(N) — one pass to insert (each insertion is O(1) hash), one pass to spread. The cost trade is *space*: the Set holds N entries in a hash table. For N=15 tools that's nothing; the principle scales to N=15 million the same way.
 
 #### **frame: per-chunk vs amortized over the stream**
 
@@ -199,6 +219,18 @@ The per-chunk view looks bad — three O(buf) passes per iteration. The amortize
 
 The whole purpose of the spacing gate is to *bound* the amortized throughput. The per-call wait isn't a bug, it's the load-bearer.
 
+**Code in this codebase — `lib/mcp/client.ts` L148–L163 makes amortized cost physical.**
+
+```ts
+// lib/mcp/client.ts L148–L163 (excerpt)
+const elapsed = Date.now() - this.lastCallAt;
+if (elapsed < this.minIntervalMs) {
+  await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+}
+```
+
+This sleep is the cost being paid to *enforce* an amortized throughput bound of 1 call per `minIntervalMs`. Per-call worst case: 1100 ms wait. Amortized throughput over a long sequence: 0.9 req/sec. The design defends itself only when you read it amortized — per-call, it looks like wasted time.
+
 #### **traversal: O(C·D) walk-per-cat vs O(N) flatten-once**
 
 ```
@@ -216,6 +248,23 @@ The whole purpose of the spacing gate is to *bound* the amortized throughput. Th
 ```
 
 This is the same "pay O(N) once, get O(1) per query" pattern as the Map. The coverage gate's whole performance argument is in this comparison.
+
+**Code in this codebase — `lib/agents/categories.ts` L116–L127 builds the flat Set once.**
+
+```ts
+// lib/agents/categories.ts L116–L127
+export function schemaCapabilities(schema): Set<string> {
+  const set = new Set<string>();
+  for (const e of schema.events ?? []) {
+    set.add(e.name);
+    for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
+  }
+  for (const c of schema.catalogs ?? []) set.add(`catalog:${c.name}`);
+  return set;
+}
+```
+
+This is the "amortized" decision made explicit. Building the `Set` is O(schema size). Then every category check is O(deps) with O(1) `has` per dep. Naive walk would be O(categories × deps × schema) per check — multiply by 10 categories and it's a real cost. The trade is the same: O(N) once to build, O(1) per query thereafter. The `has` calls in `coverageFor` (L131–L136) collect the payoff.
 
 #### **sort: comparator stable sort cost**
 
@@ -313,65 +362,6 @@ Every cost-model decision in this codebase, in one frame.
   Set dedup is      over a burst.                    compares).
   O(N), not O(N²)
 ```
-
----
-
-## Implementation in codebase
-
-Where cost reasoning shaped a real decision in this repo. Three sites.
-
-### **`lib/mcp/client.ts` L80 — the TTL cache uses a `Map`, not an array**
-
-```ts
-// lib/mcp/client.ts L80
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-```
-
-Why a `Map` and not an `Array<{key, value, expiresAt}>`? Because `callTool` does many lookups per key across a session. Lookup on an array is O(N) — every call would walk the cache from the start. Lookup on a `Map` is O(1) average — the cost doesn't grow with the number of cached tools. The space cost is identical (both store one entry per key); the time cost is the difference between O(1) per call and O(N) per call. With N growing across a session, this is the comparison the design has to win, and `Map` wins it asymptotically.
-
-### **`lib/mcp/tools.ts` L38–L40 — Set-union dedup avoids the O(N²) nested loop**
-
-```ts
-// lib/mcp/tools.ts L38–L40
-export const queryTools = [
-  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
-] as const;
-```
-
-The "natural" implementation of dedup would be a nested loop: for each candidate, check whether it's already in the result. That's O(N²). The `new Set(...)` version is O(N) — one pass to insert (each insertion is O(1) hash), one pass to spread. The cost trade is *space*: the Set holds N entries in a hash table. For N=15 tools that's nothing; the principle scales to N=15 million the same way.
-
-### **`lib/agents/categories.ts` L116–L127 — flatten once, query many**
-
-```ts
-// lib/agents/categories.ts L116–L127
-export function schemaCapabilities(schema): Set<string> {
-  const set = new Set<string>();
-  for (const e of schema.events ?? []) {
-    set.add(e.name);
-    for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
-  }
-  for (const c of schema.catalogs ?? []) set.add(`catalog:${c.name}`);
-  return set;
-}
-```
-
-This is the "amortized" decision made explicit. Building the `Set` is O(schema size). Then every category check is O(deps) with O(1) `has` per dep. Naive walk would be O(categories × deps × schema) per check — multiply by 10 categories and it's a real cost. The trade is the same: O(N) once to build, O(1) per query thereafter. The `has` calls in `coverageFor` (L131–L136) collect the payoff.
-
-### **`lib/mcp/client.ts` L148–L163 — the spacing gate is amortized cost made physical**
-
-```ts
-// lib/mcp/client.ts L148–L163 (excerpt)
-const elapsed = Date.now() - this.lastCallAt;
-if (elapsed < this.minIntervalMs) {
-  await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-}
-```
-
-This sleep is the cost being paid to *enforce* an amortized throughput bound of 1 call per `minIntervalMs`. Per-call worst case: 1100 ms wait. Amortized throughput over a long sequence: 0.9 req/sec. The design defends itself only when you read it amortized — per-call, it looks like wasted time.
-
-### **`.aipe/study-software-design/audit.md#complexity-in-this-codebase`** — design complexity (a different sense of the word)
-
-That file uses "complexity" in the *A Philosophy of Software Design* sense — interface complexity, conceptual load on the reader. This file uses "complexity" in the *algorithmic* sense — operations per N. Same word, different lens; both apply to this codebase, and they don't always agree. A simple algorithm (linear scan) can have ugly cost (O(N²)); a complex algorithm (Timsort) can have great cost (O(N log N)). Don't conflate them.
 
 ---
 
@@ -481,4 +471,4 @@ For some of it, yes — and that's fine. The codebase doesn't pre-tune for huge 
 
 ## See also
 
-→ `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/audit.md#complexity-in-this-codebase` (the design-complexity lens, different sense of the word)
+→ `02-arrays-strings-and-hash-maps.md` (where O(1) lookup shows up most) · → `06-sorting-searching-and-selection.md` (where O(N log N) shows up) · → `.aipe/study-software-design/audit.md#complexity-in-this-codebase` (the design-complexity lens — different sense of the word: interface load on the reader, not operations per N)

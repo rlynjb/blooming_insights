@@ -148,6 +148,11 @@ The principle: **the interface promises what the caller can rely on; the adapter
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- The agent loop in `lib/agents/base.ts` calls `dataSource.callTool(name, args, { signal })` and reads `{result, durationMs, fromCache}`. The same code runs whether the user is in `live-bloomreach` mode (HTTP+SSE to the remote MCP server) or `live-sql` mode (stdio to the local subprocess). Adding a new backend wouldn't require touching the agent at all.
+- The briefing route (`app/api/briefing/route.ts:160-189`) decides which adapter to use based on `?mode=`, calls `makeDataSource(mode, sid)`, then runs the same `bootstrap()` → `monitoringAgent.runScan(...)` pipeline regardless of mode. The `finally` block calls `dsResult.dispose()` — no-op for Bloomreach (cookie-scoped client), real subprocess cleanup for Olist.
+- The factory's `ok: false` branch lets the Bloomreach OAuth-expired path bubble up as `{ ok: false, authUrl }` so the route handler can redirect the browser. The Olist branch never returns `ok: false` (no auth to fail), keeping the route's error-handling simple but the factory's union type accommodates both.
+
 #### Part 1 — the interface itself: three methods + one envelope
 
 The `DataSource` interface (`lib/data-source/types.ts:64-72`) is deliberately tiny — three things the agent loop actually uses. Adding methods to the interface forces both adapters to grow; that pressure is the right kind. The envelope `{result, durationMs, fromCache}` matches what `McpClient` returned pre-Phase-2 exactly, so the seam was extracted without behavior change.
@@ -175,6 +180,36 @@ The `DataSource` interface (`lib/data-source/types.ts:64-72`) is deliberately ti
 ```
 
 Boundary condition: `result: unknown` means callers must `unwrap<T>(result)` (in `lib/mcp/schema.ts`) to get a typed value. The cost is type-narrowing at call sites; the benefit is the interface stays protocol-agnostic — a future SQL-direct adapter wouldn't even have an MCP envelope, and `result` could be a row set.
+
+```
+  lib/data-source/types.ts  (lines 38-72)
+
+  export interface DataSourceCallOptions {
+    signal?: AbortSignal;
+  }                                                    ← minimal; only what
+                                                          the agent passes today
+  export interface DataSourceCallResult {
+    result: unknown;                                  ← protocol-agnostic;
+    durationMs: number;                                  callers narrow as needed
+    fromCache: boolean;                                ← cosmetic on Olist
+  }
+
+  export interface DataSource {
+    callTool(
+      name: string,
+      args: Record<string, unknown>,
+      opts?: DataSourceCallOptions,
+    ): Promise<DataSourceCallResult>;
+
+    listTools(opts?: DataSourceListOptions): Promise<unknown>;
+  }
+       │
+       └─ this IS the seam. Three method signatures, one envelope. Adding
+          a property to the envelope forces every adapter to provide it;
+          that pressure keeps the surface small. Note: no dispose() here —
+          disposal is a concrete-class concern, and the factory result
+          exposes the uniform dispose() instead.
+```
 
 #### Part 2 — the two adapters with two failure ontologies
 
@@ -217,6 +252,72 @@ The adapters are where the transport-specific work lives. Same shape (`callTool`
 ```
 
 The lesson surfaces in the table: where the Bloomreach adapter has retry + cache + spacing, the Olist adapter has timeout + idempotent-connect + dispose. Neither is wrong; each fits its transport. The interface above stays unchanged.
+
+```
+  lib/data-source/olist-data-source.ts  (lines 93-141, 176-196)
+
+  export class OlistDataSource implements DataSource {
+    private client: Client | null = null;
+    private transport: StdioClientTransport | null = null;
+    private connectPromise: Promise<void> | null = null;
+    // ...
+
+    /** Lazy-connect on first use. Idempotent — concurrent callers share
+     *  one in-flight promise so the subprocess is spawned exactly once. */
+    async connect(): Promise<void> {
+      if (this.client) return;                       ← fast-path: already up
+      if (this.connectPromise) return this.connectPromise;  ← join in flight
+      this.connectPromise = this.doConnect();
+      try { await this.connectPromise; }
+      finally { this.connectPromise = null; }
+    }
+
+    private async doConnect(): Promise<void> {
+      if (!existsSync(this.serverEntry)) {
+        throw new Error(
+          `OlistDataSource: server entry not found at ${this.serverEntry}.
+           Run 'npm run build' in mcp-server-olist/ first.`,
+        );                                           ← clear pre-spawn error
+      }
+      const transport = new StdioClientTransport({
+        command: this.nodeExecutable,                ← node binary
+        args: [this.serverEntry],                    ← the built JS entry
+        stderr: 'inherit',                           ← child stderr → parent
+      });                                               (so logs reach us; stdio
+                                                        reserved for protocol)
+      const client = new Client(
+        { name: 'blooming-insights-olist-adapter', version: '0.1.0' },
+        { capabilities: {} },
+      );
+      await client.connect(transport);               ← MCP handshake over stdio
+      this.transport = transport;
+      this.client = client;
+    }
+
+    /** Tear down the subprocess + client cleanly. Idempotent. */
+    async dispose(): Promise<void> {
+      const client = this.client;
+      const transport = this.transport;
+      this.client = null;
+      this.transport = null;                         ← reset BEFORE close,
+      if (client) {                                     so re-entry is safe
+        try { await client.close(); }
+        catch { /* best-effort */ }
+      }
+      if (transport) {
+        try { await transport.close(); }
+        catch { /* best-effort */ }
+      }
+    }
+  }
+       │
+       └─ the subprocess lifecycle is right here: lazy spawn (one child per
+          instance, exactly once under concurrency), explicit dispose with
+          state-reset-before-close so a re-disposed instance doesn't
+          double-close. The "best-effort" catches are intentional — there's
+          nothing useful for the route handler to do if a teardown fails;
+          surfacing the error would just noise the cleanup path.
+```
 
 #### Part 3 — the factory that hides bootstrap asymmetry
 
@@ -263,6 +364,51 @@ The lesson surfaces in the table: where the Bloomreach adapter has retry + cache
 ```
 
 The asymmetry has to live somewhere. The factory absorbs it; the route handler just calls `await result.bootstrap(signal)` and `await result.dispose()`, identical code regardless of mode.
+
+```
+  lib/data-source/index.ts  (lines 73-109)
+
+  export async function makeDataSource(
+    mode: LiveMode,
+    sessionId: string,
+  ): Promise<MakeDataSourceResult> {
+    if (mode === 'live-sql') {
+      const ds = new OlistDataSource();
+      await ds.connect();                            ← spawn at construction
+      return {
+        ok: true,
+        mode,
+        dataSource: ds,
+        bootstrap: async () => olistWorkspaceSchema(),  ← synthesized;
+                                                           Olist has no
+                                                           schema discovery
+                                                           tools
+        dispose: () => ds.dispose(),                 ← real subprocess kill
+      };
+    }
+    // live-bloomreach — defer to the existing connect path.
+    const conn: ConnectResult = await connectMcp(sessionId);
+    if (!conn.ok) {
+      return { ok: false, mode, authUrl: conn.authUrl };  ← route redirects
+    }
+    return {
+      ok: true,
+      mode,
+      dataSource: conn.mcp,
+      bootstrap: (signal?: AbortSignal) =>
+        bootstrapSchema(conn.mcp, { signal }),       ← live MCP discovery
+      dispose: async () => {},                       ← no-op; cookie owns
+                                                        the session
+    };
+  }
+       │
+       └─ the factory is the ONE place that knows both adapters exist.
+          It hides three asymmetries: (1) construction (spawn vs OAuth
+          handshake), (2) bootstrap (synthesized vs live discovery),
+          (3) dispose (real vs no-op). The route handler downstream
+          gets a uniform envelope and writes one `finally` block
+          regardless of mode.
+```
 
 #### Part 4 — JSON-RPC 2.0 as the protocol both transports carry
 
@@ -384,158 +530,6 @@ The composability piece is the most interesting one for the future. A decorator 
       = { ok: true, mode, dataSource, bootstrap, dispose }
       | { ok: false, mode: 'live-bloomreach', authUrl }
     route handler calls `result.dispose()` in finally — uniform regardless of mode.
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- The agent loop in `lib/agents/base.ts` calls `dataSource.callTool(name, args, { signal })` and reads `{result, durationMs, fromCache}`. The same code runs whether the user is in `live-bloomreach` mode (HTTP+SSE to the remote MCP server) or `live-sql` mode (stdio to the local subprocess). Adding a new backend wouldn't require touching the agent at all.
-- The briefing route (`app/api/briefing/route.ts:160-189`) decides which adapter to use based on `?mode=`, calls `makeDataSource(mode, sid)`, then runs the same `bootstrap()` → `monitoringAgent.runScan(...)` pipeline regardless of mode. The `finally` block calls `dsResult.dispose()` — no-op for Bloomreach (cookie-scoped client), real subprocess cleanup for Olist.
-- The factory's `ok: false` branch lets the Bloomreach OAuth-expired path bubble up as `{ ok: false, authUrl }` so the route handler can redirect the browser. The Olist branch never returns `ok: false` (no auth to fail), keeping the route's error-handling simple but the factory's union type accommodates both.
-
-**Code side by side.**
-
-```
-  lib/data-source/types.ts  (lines 38-72)
-
-  export interface DataSourceCallOptions {
-    signal?: AbortSignal;
-  }                                                    ← minimal; only what
-                                                          the agent passes today
-  export interface DataSourceCallResult {
-    result: unknown;                                  ← protocol-agnostic;
-    durationMs: number;                                  callers narrow as needed
-    fromCache: boolean;                                ← cosmetic on Olist
-  }
-
-  export interface DataSource {
-    callTool(
-      name: string,
-      args: Record<string, unknown>,
-      opts?: DataSourceCallOptions,
-    ): Promise<DataSourceCallResult>;
-
-    listTools(opts?: DataSourceListOptions): Promise<unknown>;
-  }
-       │
-       └─ this IS the seam. Three method signatures, one envelope. Adding
-          a property to the envelope forces every adapter to provide it;
-          that pressure keeps the surface small. Note: no dispose() here —
-          disposal is a concrete-class concern, and the factory result
-          exposes the uniform dispose() instead.
-```
-
-```
-  lib/data-source/olist-data-source.ts  (lines 93-141, 176-196)
-
-  export class OlistDataSource implements DataSource {
-    private client: Client | null = null;
-    private transport: StdioClientTransport | null = null;
-    private connectPromise: Promise<void> | null = null;
-    // ...
-
-    /** Lazy-connect on first use. Idempotent — concurrent callers share
-     *  one in-flight promise so the subprocess is spawned exactly once. */
-    async connect(): Promise<void> {
-      if (this.client) return;                       ← fast-path: already up
-      if (this.connectPromise) return this.connectPromise;  ← join in flight
-      this.connectPromise = this.doConnect();
-      try { await this.connectPromise; }
-      finally { this.connectPromise = null; }
-    }
-
-    private async doConnect(): Promise<void> {
-      if (!existsSync(this.serverEntry)) {
-        throw new Error(
-          `OlistDataSource: server entry not found at ${this.serverEntry}.
-           Run 'npm run build' in mcp-server-olist/ first.`,
-        );                                           ← clear pre-spawn error
-      }
-      const transport = new StdioClientTransport({
-        command: this.nodeExecutable,                ← node binary
-        args: [this.serverEntry],                    ← the built JS entry
-        stderr: 'inherit',                           ← child stderr → parent
-      });                                               (so logs reach us; stdio
-                                                        reserved for protocol)
-      const client = new Client(
-        { name: 'blooming-insights-olist-adapter', version: '0.1.0' },
-        { capabilities: {} },
-      );
-      await client.connect(transport);               ← MCP handshake over stdio
-      this.transport = transport;
-      this.client = client;
-    }
-
-    /** Tear down the subprocess + client cleanly. Idempotent. */
-    async dispose(): Promise<void> {
-      const client = this.client;
-      const transport = this.transport;
-      this.client = null;
-      this.transport = null;                         ← reset BEFORE close,
-      if (client) {                                     so re-entry is safe
-        try { await client.close(); }
-        catch { /* best-effort */ }
-      }
-      if (transport) {
-        try { await transport.close(); }
-        catch { /* best-effort */ }
-      }
-    }
-  }
-       │
-       └─ the subprocess lifecycle is right here: lazy spawn (one child per
-          instance, exactly once under concurrency), explicit dispose with
-          state-reset-before-close so a re-disposed instance doesn't
-          double-close. The "best-effort" catches are intentional — there's
-          nothing useful for the route handler to do if a teardown fails;
-          surfacing the error would just noise the cleanup path.
-```
-
-```
-  lib/data-source/index.ts  (lines 73-109)
-
-  export async function makeDataSource(
-    mode: LiveMode,
-    sessionId: string,
-  ): Promise<MakeDataSourceResult> {
-    if (mode === 'live-sql') {
-      const ds = new OlistDataSource();
-      await ds.connect();                            ← spawn at construction
-      return {
-        ok: true,
-        mode,
-        dataSource: ds,
-        bootstrap: async () => olistWorkspaceSchema(),  ← synthesized;
-                                                           Olist has no
-                                                           schema discovery
-                                                           tools
-        dispose: () => ds.dispose(),                 ← real subprocess kill
-      };
-    }
-    // live-bloomreach — defer to the existing connect path.
-    const conn: ConnectResult = await connectMcp(sessionId);
-    if (!conn.ok) {
-      return { ok: false, mode, authUrl: conn.authUrl };  ← route redirects
-    }
-    return {
-      ok: true,
-      mode,
-      dataSource: conn.mcp,
-      bootstrap: (signal?: AbortSignal) =>
-        bootstrapSchema(conn.mcp, { signal }),       ← live MCP discovery
-      dispose: async () => {},                       ← no-op; cookie owns
-                                                        the session
-    };
-  }
-       │
-       └─ the factory is the ONE place that knows both adapters exist.
-          It hides three asymmetries: (1) construction (spawn vs OAuth
-          handshake), (2) bootstrap (synthesized vs live discovery),
-          (3) dispose (real vs no-op). The route handler downstream
-          gets a uniform envelope and writes one `finally` block
-          regardless of mode.
 ```
 
 ---

@@ -147,6 +147,8 @@ size():     return arr.length
 
 **What would trigger reaching for a stack here?** An interactive query builder that supports undo. A markdown export that needs to balance nested fences. A recursive walk of the schema deep enough to risk stack overflow (currently the schema is two levels deep, fine for runtime recursion).
 
+**Code in this codebase — `not yet exercised`.** No file path. The trigger conditions: if the schema grew deep enough (10+ levels), runtime recursion could overflow and you'd convert to an explicit stack. If the UI added "undo last investigation" you'd push the previous state. If you wrote a query parser for the agent intent (`lib/agents/intent.ts`), the shunting-yard algorithm uses two stacks.
+
 ### Move 2 — queue (FIFO)
 
 A queue is first in, first out. Enqueue at one end, dequeue from the other. The naive array implementation is `arr.push` to enqueue and `arr.shift` to dequeue — but `shift` is O(N) because it has to move every other element. The right implementations are a ring buffer (fixed-size array with a head pointer) or a doubly-linked list, both giving O(1) enqueue and dequeue.
@@ -194,6 +196,32 @@ buf as an implicit FIFO queue (one-slot variant)
 
 The "implicit queue" framing is honest: there's no data structure called `Queue` in the code, but the *behavior* is FIFO, and reasoning about it as a queue is what makes the framing invariant defensible.
 
+**Code in this codebase — Queue (implicit FIFO): the NDJSON reader's `buf` (`lib/hooks/useInvestigation.ts` L184–L208).**
+
+```ts
+// lib/hooks/useInvestigation.ts L184–L208 (excerpt)
+const reader = res.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });   // ← "enqueue" decoded bytes
+  const lines = buf.split('\n');
+  buf = lines.pop() ?? '';                      // ← save trailing partial
+  for (const line of lines) {                   // ← "dequeue" complete records
+    if (!line.trim()) continue;
+    try {
+      handle(JSON.parse(line) as AgentEvent);
+    } catch { /* ignore */ }
+  }
+}
+```
+
+The `buf` is not a `Queue<string>` — it's a `string`. But it *behaves* like a one-slot queue: bytes go in (appended), records come out (in arrival order), and the discipline is FIFO. The `for (const line of lines)` loop processes records in their arrival order; the saved `buf` between iterations is the queue's "next item to be completed." Walk through what breaks if the discipline were LIFO: chunk 2's records would be processed before chunk 1's tail, so a multi-chunk `tool_call_start` would either be missed or paired with the wrong `tool_call_end`. The reverse-scan reconciliation in `replaceRunningTool` (`useInvestigation.ts` L86–L95) assumes "the running tool I'm closing started before me in the items array" — that assumption depends on the queue discipline up the pipeline.
+
+This is the codebase's only exercise of an ordering discipline beyond raw array order.
+
 ### Move 3 — deque (double-ended queue)
 
 A deque (pronounced "deck") supports push and pop at *both* ends, all in O(1). It's the most flexible of the four — strictly more powerful than a stack or a queue. The implementation is usually a doubly-linked list, a circular buffer, or two stacks glued back-to-back.
@@ -215,6 +243,8 @@ popBack():     // O(1)
 **In this codebase:** `not yet exercised`. There's no algorithm that needs both-end access. The NDJSON buffer is single-end (FIFO). The recommendation pipeline is single-direction (anomaly → diagnosis → recommendation, no back-and-forth).
 
 **What would trigger reaching for a deque here?** A sliding-window analysis over the live monitoring stream — e.g. "max severity in the last 60 seconds" updated as events arrive. A back-and-forth UI like a swipeable insight carousel where prefetching happens on both ends.
+
+**Code in this codebase — `not yet exercised`.** No file path. The canonical trigger: a "max severity in last N seconds" live indicator on the monitoring stream — the standard solution is a monotonic deque (push new values at the back, pop from the back while they're smaller than the new value, pop from the front when they fall out of the window). That's the canonical "sliding window max" pattern.
 
 ### Move 4 — heap (priority queue)
 
@@ -271,6 +301,8 @@ A min-heap (numbers smaller = higher priority):
 **In this codebase:** `not yet exercised`. The codebase never needs "the next-highest-priority thing." Anomalies are sorted *once* with `.sort()` (O(N log N) for a one-shot sort) and then `.slice(0, 10)` — that's all the prioritization needed. No streaming priority logic, no scheduling.
 
 **What would trigger reaching for a heap here?** A live monitoring stream where you want to emit "top 5 most severe anomalies seen so far" in real time as new ones arrive. A retry scheduler that fires retries by their wake-up time. A job queue that processes diagnostic investigations in severity order.
+
+**Code in this codebase — `not yet exercised`.** No file path. The anomaly sort (`lib/agents/monitoring.ts` L119) is `.sort()` + `.slice(0, 10)` — O(N log N) for a one-shot sort over N=30. A heap would be O(N + K log N) for top-K, which is marginally faster but completely irrelevant at this N. The user's own portfolio has `reincodes/BinaryHeap.ts` and `PriorityQueue.ts` from scratch, so the *implementation knowledge* exists; the *trigger* hasn't shown up in this codebase yet. The canonical trigger: top-K over a *stream* (anomalies arriving live, always show top 10) — the right data structure is a min-heap of size K, for each incoming item, if it's larger than the root, pop the root and push the item. That's O(log K) per item, O(K) space.
 
 ### Move 2 variant — the queue kernel (the one this codebase exercises)
 
@@ -364,56 +396,6 @@ All four ordering disciplines, with their kernel ops, cost, and the codebase's u
   • deque: need both-end access; sliding window
   • heap:  need "the best one" repeatedly; Dijkstra; top-K stream
 ```
-
----
-
-## Implementation in codebase
-
-One site that exercises the queue discipline (implicitly); three honest `not yet exercised` notes.
-
-### **Queue (implicit FIFO) — the NDJSON reader's `buf` (`lib/hooks/useInvestigation.ts` L184–L208)**
-
-```ts
-// lib/hooks/useInvestigation.ts L184–L208 (excerpt)
-const reader = res.body.getReader();
-const dec = new TextDecoder();
-let buf = '';
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += dec.decode(value, { stream: true });   // ← "enqueue" decoded bytes
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';                      // ← save trailing partial
-  for (const line of lines) {                   // ← "dequeue" complete records
-    if (!line.trim()) continue;
-    try {
-      handle(JSON.parse(line) as AgentEvent);
-    } catch { /* ignore */ }
-  }
-}
-```
-
-The `buf` is not a `Queue<string>` — it's a `string`. But it *behaves* like a one-slot queue: bytes go in (appended), records come out (in arrival order), and the discipline is FIFO. The `for (const line of lines)` loop processes records in their arrival order; the saved `buf` between iterations is the queue's "next item to be completed." Walk through what breaks if the discipline were LIFO: chunk 2's records would be processed before chunk 1's tail, so a multi-chunk `tool_call_start` would either be missed or paired with the wrong `tool_call_end`. The reverse-scan reconciliation in `replaceRunningTool` (`useInvestigation.ts` L86–L95) assumes "the running tool I'm closing started before me in the items array" — that assumption depends on the queue discipline up the pipeline.
-
-This is the codebase's only exercise of an ordering discipline beyond raw array order. Full streaming case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
-
-### **Stack — `not yet exercised`**
-
-The codebase has no manual stack. The closest is JavaScript's own call stack used implicitly by `await` and `mkdir({recursive: true})`. No undo/redo. No iterative DFS over the schema (the schema walk in `lib/mcp/schema.ts` L92–L100 is a top-down loop, not a recursive descent that would need stack management).
-
-**When this changes:** if the schema grew deep enough (10+ levels), runtime recursion could overflow and you'd convert to an explicit stack. If the UI added "undo last investigation" you'd push the previous state. If you wrote a query parser for the agent intent (`lib/agents/intent.ts`), the shunting-yard algorithm uses two stacks.
-
-### **Deque — `not yet exercised`**
-
-No code needs push/pop at both ends. No sliding-window analysis. No work-stealing.
-
-**When this changes:** if you added a "max severity in last N seconds" live indicator to the monitoring stream, the standard solution is a monotonic deque (push new values at the back, pop from the back while they're smaller than the new value, pop from the front when they fall out of the window). That's the canonical "sliding window max" pattern.
-
-### **Heap / priority queue — `not yet exercised`**
-
-No code needs O(log N) extract-min. The anomaly sort (`lib/agents/monitoring.ts` L119) is `.sort()` + `.slice(0, 10)` — O(N log N) for a one-shot sort over N=30. A heap would be O(N + K log N) for top-K, which is marginally faster but completely irrelevant at this N. No retry scheduler, no event timeline, no Dijkstra.
-
-**When this changes:** if you needed top-K over a *stream* (anomalies arriving live, always show top 10) the right data structure is a min-heap of size K — for each incoming item, if it's larger than the root, pop the root and push the item. That's O(log K) per item, O(K) space — much better than re-sorting on every insert. The user's own portfolio has `reincodes/BinaryHeap.ts` and `PriorityQueue.ts` from scratch, so the *implementation knowledge* exists; the *trigger* hasn't shown up in this codebase yet.
 
 ---
 

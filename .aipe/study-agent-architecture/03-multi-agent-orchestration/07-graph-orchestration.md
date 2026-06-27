@@ -244,6 +244,8 @@ The condition under which this works: the UI has to support pause/resume — whi
 
 *Now:* the orchestration is imperative TypeScript in the route handler. The step-stepper UI component is a UI state machine for *rendering* the step UI — it tracks which view is active (diagnose, recommend, complete) but it doesn't own agent state. Agent state is collected in the SSE stream and accumulated client-side in an investigation hook. The "step 2 → step 3" gate works because the client persists the typed Diagnosis to session storage; the route's step 3 request reads it back. This is pause/resume *manually implemented* via the cross-request handoff — it's not graph orchestration.
 
+**Where this lives in the repo.** The imperative orchestration (what graph would replace) is `app/api/agent/route.ts` `GET` stream `start()` body at L199–L249 — lead-agent select, query branch, pipeline transitions, error handling. The UI step state machine (NOT the graph runtime) is `lib/hooks/useInvestigation.ts` and the ProcessStepper UI component — the SSE handler's reducer of event types into UI state at L66–L150 accumulates agent events into UI state; does not own agent context or expose checkpoints. The manual cross-request pause/resume (the "human-in-the-loop" today, not via a graph engine) is in `lib/hooks/useInvestigation.ts` `case 'done':` handler at L130–L143 — writes the `Diagnosis` to `sessionStorage`; the next request reads it via `parseDiagnosis` in `route.ts` L86–L97.
+
 *If a graph runtime were adopted:* the route file would shrink dramatically. Each agent would be wrapped in a node function. Edges would express the transitions. The graph engine would own state persistence — session storage would become a thread id passed to the engine. Human-in-the-loop pauses would be first-class. Debugging would shift from "read the route file and replay one trajectory" to "open the graph viewer and see which node failed at which state."
 
 The takeaway: **graphs trade imperative simplicity for inspectable orchestration.** Worth it when the orchestration grows complex enough that imperative is opaque, or when checkpointing/human-in-the-loop becomes a hard requirement.
@@ -316,57 +318,6 @@ Graph orchestration — full picture
   imperative TypeScript in the route handler. The step-stepper
   UI component is a UI state machine, NOT an agent-orchestration
   graph runtime.
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented as an agent-orchestration graph runtime.**
-
-blooming insights' orchestration is imperative TypeScript in `app/api/agent/route.ts` — a 50-line `if`-ladder + sequential function calls. There is no graph definition, no engine, no checkpoint store, no human-in-the-loop pause primitive.
-
-The honest sentence: **the UI ProcessStepper is a UI state machine — it tracks which view is rendered — but it is NOT an agent-orchestration graph runtime.** A graph runtime would own server-side state, persist checkpoints, and expose pause/resume APIs. The ProcessStepper does none of this. The "user gates step 3" UX works because the client persists the typed `Diagnosis` to `sessionStorage` and the next request reads it back — this is pause/resume *manually implemented*, not via a graph engine.
-
-For the refactor: `../06-orchestration-system-design-templates/` includes a "graph-based investigation workflow" template that names the LangGraph nodes, edges, and state schema this codebase would adopt; the four agents themselves wouldn't change — they'd be wrapped in node functions.
-
-**The imperative orchestration (what graph would replace)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body
-**Line range:** L199–L249 — lead-agent select, query branch, pipeline transitions, error handling
-
-**The UI step state machine (NOT the graph runtime)**
-**File:** `lib/hooks/useInvestigation.ts` and the ProcessStepper UI component
-**Function / class:** the SSE handler's reducer of event types into UI state
-**Line range:** L66–L150 — accumulates agent events into UI state; does not own agent context or expose checkpoints
-
-**The manual cross-request pause/resume (the "human-in-the-loop" today, not via a graph engine)**
-**File:** `lib/hooks/useInvestigation.ts`
-**Function / class:** the `case 'done':` handler
-**Line range:** L130–L143 — writes the `Diagnosis` to `sessionStorage`; the next request reads it via `parseDiagnosis` in `route.ts` L86–L97
-
-```
-shape (the absence — what a graph definition would look like, not current code):
-
-  // hypothetical: graph.ts
-  const graph = new StateGraph(InvestigationState)
-    .add_node("monitor",     monitorNode)
-    .add_node("diagnose",    diagnoseNode)
-    .add_node("review_diag", humanReviewNode)
-    .add_node("recommend",   recommendNode)
-    .add_conditional_edge("diagnose", (s) =>
-      s.diagnosis.confidence === "low" ? "review_diag" : "recommend"
-    )
-    .add_conditional_edge("review_diag", (s) =>
-      s.user_approval === "approved" ? "recommend" : "diagnose"
-    )
-    .add_edge("monitor", "diagnose")
-    .add_edge("recommend", END);
-
-  // route.ts would become:
-  const engine = graph.compile({ checkpointer: new SqliteSaver(...) });
-  const events = engine.stream({ anomaly }, { configurable: { thread_id: insightId }});
-  for await (const e of events) send(e);
 ```
 
 ---

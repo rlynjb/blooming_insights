@@ -111,6 +111,14 @@ Skeleton mapped. Now walk the replay loop end to end.
 
 ### Move 2 — walk the parts
 
+**Use cases.** Three real moments replay carries the load:
+
+- **Demo offline.** No Anthropic key, no Bloomreach OAuth, no network. A captured `insightId` from `lib/state/demo-investigations.json` replays cleanly because the route short-circuits before any auth/key check. This is the *whole point* of the demo seed rung — you can clone the repo, `npm run dev`, click the seeded insight, and watch the full investigation play out at the same pace it originally ran.
+
+- **Reproducing a captured bug.** A captured `insightId` produced a bad diagnosis. You replay it (cache hits), scrub the trace, identify the event where the agent went off the rails, change one thing (prompt, tool description, evidence weighting), re-run *live* with the same `insightId` (passing `?live=1`) to see if the change fixed it. The replay path is the diagnosis tool; the `live=1` escape hatch is the verification tool.
+
+- **The split-step UX.** The user clicks "investigate" and the route replays the diagnose-phase events only (`step=diagnose` applies `filterByStep`). Later they click "recommend" and the route replays the recommend-phase events from the *same* cached run. Two requests, one cache hit per request, same `insightId`. The filter inside the replay path makes this work without re-capturing or splitting the cache.
+
 #### The cache-first short-circuit — replay wins when cache hits
 
 The reader anchor: you've written `if (cache.has(key)) return cache.get(key)`. Same shape — but here the "value" being returned is an entire ordered event stream, not a single result. The short-circuit happens *before* any agent setup: no Anthropic key required, no MCP connection required, no auth required. The route's first decision after parsing the query string is "do we have a cached run for this insightId?"
@@ -133,6 +141,54 @@ Boundary: the cache-first check happens before `process.env.ANTHROPIC_API_KEY` v
                                                             ▼
                                                      (no auth check before this point —
                                                       replay needs no creds)
+```
+
+**Code in this codebase — the gate.** The first decision after parsing the query:
+
+```
+  app/api/agent/route.ts  (lines 125-141)
+
+  // Cache-first: replay a precomputed investigation (no auth/key needed),
+  // filtered to the requested step. Query results are never cached.
+  const cached = insightId && !live ? getCachedInvestigation(insightId) : null;  ← the gate
+  if (cached) {
+    const events = step ? filterByStep(cached, step) : cached;                   ← optional slice
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const e of events) {                                                 ← order preserved
+          controller.enqueue(encoder.encode(encodeEvent(e)));                    ← same encoder as live
+          await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));              ← 180ms tick
+        }
+        controller.close();                                                       ← clean terminal
+      },
+    });
+    return new Response(stream, { headers: NDJSON_HEADERS });                    ← same headers as live
+  }
+        │
+        └─ this 15-line block IS the replay. It short-circuits before
+           ANTHROPIC_API_KEY validation, before MCP setup, before agent
+           construction — nothing past line 141 runs on a cache hit.
+```
+
+**Code in this codebase — the cache read it relies on.** First non-null wins across 3 rungs:
+
+```
+  lib/state/investigations.ts  (lines 22-28)
+
+  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+    if (mem.has(insightId)) return mem.get(insightId)!;                          ← rung 1: process mem
+    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;      ← rung 2: dev file
+    if (fromFile) return fromFile;
+    const fromDemo = readJson(DEMO_FILE)[insightId];                             ← rung 3: committed seed
+    return fromDemo ?? null;                                                      ← null → live run path
+  }
+        │
+        └─ returns AgentEvent[] (typed) or null. The null path is what
+           lets the replay gate fall through to the live setup. The
+           typed return is what lets the for-loop iterate without
+           runtime validation — TypeScript trusts the cache shape
+           because the union is closed.
 ```
 
 #### The paced re-emit loop — six lines that ARE the replay
@@ -161,6 +217,20 @@ Boundary: the 180ms is hard-coded. A captured run that had bursty original timin
                                  "instant flush" — UI sees a wall of events
                                  in one tick, looks broken. The 180ms is
                                  what makes it look like a real run.
+```
+
+**Code in this codebase — the constant that defines the replay's character:**
+
+```
+  app/api/agent/route.ts  (line 105)
+
+  const REPLAY_DELAY_MS = 180;
+                          │
+                          └─ 180ms isn't a hyperparameter to tune for
+                             performance — it's a UX choice. Faster
+                             feels canned, slower feels laggy. Drop the
+                             await entirely and the cached events flush
+                             in one tick; the UI looks broken.
 ```
 
 #### Optional step filtering — replay a slice of the run
@@ -196,6 +266,21 @@ Boundary: this transparency is the *feature*. If a future requirement asks the U
       'no-cache, no-transform'                       'no-cache, no-transform'
 
   IDENTICAL. The consumer cannot distinguish.
+```
+
+**Code in this codebase — the shared headers.** The consumer-transparency guarantee made explicit:
+
+```
+  app/api/agent/route.ts  (lines 107-110)
+
+  const NDJSON_HEADERS = {
+    'Content-Type': 'application/x-ndjson; charset=utf-8',                       ← used by BOTH live and replay
+    'Cache-Control': 'no-cache, no-transform',                                   ← same in both paths
+  };
+        │
+        └─ the constant is named NDJSON_HEADERS (not LIVE_HEADERS or
+           REPLAY_HEADERS) because it's the same headers either way.
+           The naming itself is the transparency guarantee.
 ```
 
 #### Move 3 — the principle
@@ -248,99 +333,6 @@ The full replay path, gate-to-close, with file:line markers.
   │  switch (e.type) { … 8 cases, identical to live … }                  │
   │  → CANNOT distinguish live vs replay                                  │
   └──────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-Three real moments replay carries the load:
-
-- **Demo offline.** No Anthropic key, no Bloomreach OAuth, no network. A captured `insightId` from `lib/state/demo-investigations.json` replays cleanly because the route short-circuits before any auth/key check. This is the *whole point* of the demo seed rung — you can clone the repo, `npm run dev`, click the seeded insight, and watch the full investigation play out at the same pace it originally ran.
-
-- **Reproducing a captured bug.** A captured `insightId` produced a bad diagnosis. You replay it (cache hits), scrub the trace, identify the event where the agent went off the rails, change one thing (prompt, tool description, evidence weighting), re-run *live* with the same `insightId` (passing `?live=1`) to see if the change fixed it. The replay path is the diagnosis tool; the `live=1` escape hatch is the verification tool.
-
-- **The split-step UX.** The user clicks "investigate" and the route replays the diagnose-phase events only (`step=diagnose` applies `filterByStep`). Later they click "recommend" and the route replays the recommend-phase events from the *same* cached run. Two requests, one cache hit per request, same `insightId`. The filter inside the replay path makes this work without re-capturing or splitting the cache.
-
-### Code side by side, with a line-by-line read
-
-The gate — first decision after parsing the query:
-
-```
-  app/api/agent/route.ts  (lines 125-141)
-
-  // Cache-first: replay a precomputed investigation (no auth/key needed),
-  // filtered to the requested step. Query results are never cached.
-  const cached = insightId && !live ? getCachedInvestigation(insightId) : null;  ← the gate
-  if (cached) {
-    const events = step ? filterByStep(cached, step) : cached;                   ← optional slice
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        for (const e of events) {                                                 ← order preserved
-          controller.enqueue(encoder.encode(encodeEvent(e)));                    ← same encoder as live
-          await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));              ← 180ms tick
-        }
-        controller.close();                                                       ← clean terminal
-      },
-    });
-    return new Response(stream, { headers: NDJSON_HEADERS });                    ← same headers as live
-  }
-        │
-        └─ this 15-line block IS the replay. It short-circuits before
-           ANTHROPIC_API_KEY validation, before MCP setup, before agent
-           construction — nothing past line 141 runs on a cache hit.
-```
-
-The constant that defines the replay's character:
-
-```
-  app/api/agent/route.ts  (line 105)
-
-  const REPLAY_DELAY_MS = 180;
-                          │
-                          └─ 180ms isn't a hyperparameter to tune for
-                             performance — it's a UX choice. Faster
-                             feels canned, slower feels laggy. Drop the
-                             await entirely and the cached events flush
-                             in one tick; the UI looks broken.
-```
-
-The headers shared between live and replay — the consumer-transparency guarantee:
-
-```
-  app/api/agent/route.ts  (lines 107-110)
-
-  const NDJSON_HEADERS = {
-    'Content-Type': 'application/x-ndjson; charset=utf-8',                       ← used by BOTH live and replay
-    'Cache-Control': 'no-cache, no-transform',                                   ← same in both paths
-  };
-        │
-        └─ the constant is named NDJSON_HEADERS (not LIVE_HEADERS or
-           REPLAY_HEADERS) because it's the same headers either way.
-           The naming itself is the transparency guarantee.
-```
-
-The cache read it relies on — first non-null wins across 3 rungs:
-
-```
-  lib/state/investigations.ts  (lines 22-28)
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;                          ← rung 1: process mem
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;      ← rung 2: dev file
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];                             ← rung 3: committed seed
-    return fromDemo ?? null;                                                      ← null → live run path
-  }
-        │
-        └─ returns AgentEvent[] (typed) or null. The null path is what
-           lets the replay gate fall through to the live setup. The
-           typed return is what lets the for-loop iterate without
-           runtime validation — TypeScript trusts the cache shape
-           because the union is closed.
 ```
 
 ---

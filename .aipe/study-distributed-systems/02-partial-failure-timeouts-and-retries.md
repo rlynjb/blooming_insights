@@ -102,6 +102,12 @@ Five parts. Remove any one and the loop breaks in a specific way:
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- An agent runs a long investigation that hits a `execute_analytics_eql` call right as another concurrent request bursts on the same user's token. The first call gets a 429; the retry loop parses "1 per 10 second" out of the body and waits ~10.5s; the second attempt succeeds. The agent loop sees only the eventual success.
+- The schema bootstrap (`bootstrapSchema` in `lib/mcp/schema.ts:170-192`) makes four sequential tool calls. Without spacing, the second call would 429 immediately. With ~1.1s spacing, all four succeed without ever entering the retry loop.
+- A misconfigured `BLOOMREACH_PROJECT_ID` causes `list_projects` to return a real error (not rate-limit). `BloomreachDataSource` does NOT retry — it returns the `isError: true` envelope to `callOrThrow` in `schema.ts:136-149`, which throws `McpToolError` with the server's text attached.
+- A `bi:mode=live-synthetic` run dispatches `execute_analytics_eql` to the in-process `SyntheticDataSource`. The call returns synchronously with fixture data — no partial-failure path is exercised. This is by design: the synthetic adapter is for presentation reliability, not for stress-testing the retry loop.
+
 #### Part 1 — the detection predicate
 
 You already know how to check `res.status === 429`. This codebase can't, because MCP returns 429s as **HTTP 200 with `isError: true` in the JSON body**. The server's rate-limit signal is *inside* the success envelope, not at the HTTP layer.
@@ -178,6 +184,46 @@ The cushion matters. If you retry *at* the boundary of the window, the server ma
 
 This is why proactive spacing matters — file 02 of `study-system-design/` walks the choice. By spacing every live call ~1.1s apart, the code makes the *first* attempt usually succeed, so the retry path is the exception not the rule.
 
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 51-55, 64-77, 164-174)
+
+  function isRateLimited(result: unknown): boolean {
+    if (!result || typeof result !== 'object' || (result as any).isError !== true)
+      return false;                                ← only consider error envelopes
+    const text = JSON.stringify((result as any).content ?? result);
+    return /rate limit|too many requests/i.test(text);
+  }                                                ← regex on the error text;
+                                                     no HTTP status to check
+
+  function parseRetryAfterMs(result: unknown): number | null {
+    const text = JSON.stringify((result as any)?.content ?? result);
+    const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
+    if (after) return parseInt(after[1], 10) * 1000;       ← shape 1
+    const perWindow = text.match(/per\s*(\d+)\s*second/i);
+    if (perWindow) return parseInt(perWindow[1], 10) * 1000;  ← shape 2
+    return null;                                            ← fallback to backoff
+  }
+
+  // inside callTool:
+  let retries = 0;
+  while (isRateLimited(result) && retries < this.maxRetries) {
+    retries++;
+    const hintMs = parseRetryAfterMs(result);
+    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);   ← 10s, 20s, 40s
+    const waitMs = Math.min(
+      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,   ← prefer the hint,
+      this.retryCeilingMs,                                       cap at ceiling
+    );
+    await sleep(waitMs);
+    result = await this.liveCall(name, args, options.signal);
+  }
+       │
+       └─ the five-part kernel is right here in 11 lines. The bound
+          (retries < this.maxRetries) is what makes this terminate;
+          remove it and a perpetually-throttling Bloomreach livelocks
+          the route until maxDuration kills it.
+```
+
 #### Part 5 — the per-call spacing (separate from retry)
 
 The other half of the partial-failure story is *avoiding* the 429 in the first place. `BloomreachDataSource.liveCall` (`lib/data-source/bloomreach-data-source.ts:190-205`) tracks `lastCallAt` and sleeps to ensure at least `minIntervalMs` (1100ms in production) between any two calls.
@@ -205,6 +251,52 @@ The other half of the partial-failure story is *avoiding* the 429 in the first p
 ```
 
 The boundary condition: spacing is per-process. Two Vercel instances running concurrent briefings for the same user each think they're respecting the limit; together, they aren't. This is a Seam B problem (file 01) leaking into the partial-failure layer.
+
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
+
+  private async liveCall(name, args, signal?): Promise<unknown> {
+    const elapsed = Date.now() - this.lastCallAt;
+    if (elapsed < this.minIntervalMs) {
+      await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+    }                                                ← proactive spacing
+    try {
+      const result = await this.transport.callTool(name, args, { signal });
+      this.lastCallAt = Date.now();                  ← record on success
+      return result;
+    } catch (err) {
+      this.lastCallAt = Date.now();                  ← record on failure too,
+      throw new McpToolError(                            so spacing applies to
+        name, errorDetail(err), { cause: err }           the next attempt
+      );
+    }
+  }
+       │
+       └─ STILL no Promise.race on transport.callTool. A hung connection
+          would await forever (until the route's 300s killed everything).
+          This is the partial-failure gap most worth closing first.
+```
+
+```
+  lib/mcp/connect.ts  (the BloomreachDataSource construction)
+
+  return {
+    ok: true,
+    mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
+      minIntervalMs: 1100,             ← spacing knob
+      retryDelayMs: 10_000,            ← fallback wait base
+      retryCeilingMs: 20_000,          ← upper bound on any single sleep
+      maxRetries: 3,                   ← total retry budget
+    }),
+  };
+       │
+       └─ the four knobs are set HERE for the production transport.
+          A different deployment (lower limit, faster window) would
+          tune these without touching BloomreachDataSource itself.
+          (Note: lib/mcp/client.ts is now a backwards-compat shim that
+          re-exports BloomreachDataSource as McpClient — the implementation
+          moved during Phase 2 PR A.)
+```
 
 #### Part 6 — what NOT YET EXERCISED looks like
 
@@ -266,104 +358,6 @@ Four pieces of standard partial-failure tooling are absent on purpose or by acci
   • transport errors      → thrown as McpToolError (NOT contained)
   • tool isError (non-RL) → returned as-is (caller decides what to do)
   • timeout (hung call)   → NOT CONTAINED — route's 300s is the only ceiling
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- An agent runs a long investigation that hits a `execute_analytics_eql` call right as another concurrent request bursts on the same user's token. The first call gets a 429; the retry loop parses "1 per 10 second" out of the body and waits ~10.5s; the second attempt succeeds. The agent loop sees only the eventual success.
-- The schema bootstrap (`bootstrapSchema` in `lib/mcp/schema.ts:170-192`) makes four sequential tool calls. Without spacing, the second call would 429 immediately. With ~1.1s spacing, all four succeed without ever entering the retry loop.
-- A misconfigured `BLOOMREACH_PROJECT_ID` causes `list_projects` to return a real error (not rate-limit). `BloomreachDataSource` does NOT retry — it returns the `isError: true` envelope to `callOrThrow` in `schema.ts:136-149`, which throws `McpToolError` with the server's text attached.
-- A `bi:mode=live-synthetic` run dispatches `execute_analytics_eql` to the in-process `SyntheticDataSource`. The call returns synchronously with fixture data — no partial-failure path is exercised. This is by design: the synthetic adapter is for presentation reliability, not for stress-testing the retry loop.
-
-**Code side by side.**
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 51-55, 64-77, 164-174)
-
-  function isRateLimited(result: unknown): boolean {
-    if (!result || typeof result !== 'object' || (result as any).isError !== true)
-      return false;                                ← only consider error envelopes
-    const text = JSON.stringify((result as any).content ?? result);
-    return /rate limit|too many requests/i.test(text);
-  }                                                ← regex on the error text;
-                                                     no HTTP status to check
-
-  function parseRetryAfterMs(result: unknown): number | null {
-    const text = JSON.stringify((result as any)?.content ?? result);
-    const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
-    if (after) return parseInt(after[1], 10) * 1000;       ← shape 1
-    const perWindow = text.match(/per\s*(\d+)\s*second/i);
-    if (perWindow) return parseInt(perWindow[1], 10) * 1000;  ← shape 2
-    return null;                                            ← fallback to backoff
-  }
-
-  // inside callTool:
-  let retries = 0;
-  while (isRateLimited(result) && retries < this.maxRetries) {
-    retries++;
-    const hintMs = parseRetryAfterMs(result);
-    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);   ← 10s, 20s, 40s
-    const waitMs = Math.min(
-      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,   ← prefer the hint,
-      this.retryCeilingMs,                                       cap at ceiling
-    );
-    await sleep(waitMs);
-    result = await this.liveCall(name, args, options.signal);
-  }
-       │
-       └─ the five-part kernel is right here in 11 lines. The bound
-          (retries < this.maxRetries) is what makes this terminate;
-          remove it and a perpetually-throttling Bloomreach livelocks
-          the route until maxDuration kills it.
-```
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
-
-  private async liveCall(name, args, signal?): Promise<unknown> {
-    const elapsed = Date.now() - this.lastCallAt;
-    if (elapsed < this.minIntervalMs) {
-      await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-    }                                                ← proactive spacing
-    try {
-      const result = await this.transport.callTool(name, args, { signal });
-      this.lastCallAt = Date.now();                  ← record on success
-      return result;
-    } catch (err) {
-      this.lastCallAt = Date.now();                  ← record on failure too,
-      throw new McpToolError(                            so spacing applies to
-        name, errorDetail(err), { cause: err }           the next attempt
-      );
-    }
-  }
-       │
-       └─ STILL no Promise.race on transport.callTool. A hung connection
-          would await forever (until the route's 300s killed everything).
-          This is the partial-failure gap most worth closing first.
-```
-
-```
-  lib/mcp/connect.ts  (the BloomreachDataSource construction)
-
-  return {
-    ok: true,
-    mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
-      minIntervalMs: 1100,             ← spacing knob
-      retryDelayMs: 10_000,            ← fallback wait base
-      retryCeilingMs: 20_000,          ← upper bound on any single sleep
-      maxRetries: 3,                   ← total retry budget
-    }),
-  };
-       │
-       └─ the four knobs are set HERE for the production transport.
-          A different deployment (lower limit, faster window) would
-          tune these without touching BloomreachDataSource itself.
-          (Note: lib/mcp/client.ts is now a backwards-compat shim that
-          re-exports BloomreachDataSource as McpClient — the implementation
-          moved during Phase 2 PR A.)
 ```
 
 ---

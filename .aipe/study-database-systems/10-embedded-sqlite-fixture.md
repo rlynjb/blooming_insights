@@ -136,6 +136,12 @@ You know how a snapshot test in Jest works — call a function, serialize the ou
 
 ### Move 2 — the moving parts
 
+**Where this is reached for in this codebase:**
+- **The eval suite** (`eval/scripts/`) runs blooming insights's agents against the Olist MCP server as a hermetic data source. Same DB binary, same agent code, same answer expected. When the answer drifts, it's the agent that changed — the data didn't.
+- **Local development** without Bloomreach credentials. Spawn `mcp-server-olist` as the MCP target and the agents run end-to-end against synthetic data.
+- **Test fixture for `mcp-server-olist/test/*.test.ts`** — 43 tests that open the DB read-only, run a tool query, and assert on the output. Hermetic, deterministic, no network.
+- **Anomaly detection ground truth.** The three injected anomalies (sp-revenue-drop-w4, electronics-spike-w2, voucher-dropoff-w10-on) are the answer key — evals score the agent by how many of the three it finds and how it characterizes them.
+
 **Move 2a — `better-sqlite3`: synchronous, embedded, sub-millisecond.**
 
 `better-sqlite3` is a synchronous SQLite binding for Node. `db.prepare(sql).all(params)` returns rows immediately — no `await`. This is the opposite of `pg` / `mysql2` / `sqlite3` (the async one), which queue I/O on the event loop.
@@ -167,14 +173,38 @@ In a stdio MCP subprocess specifically, sync IS the right choice. The standard "
 **Move 2b — `readonly: true` on open, the safety rail.**
 
 ```
-  src/db.ts L32-43 (paraphrased)
+  mcp-server-olist/src/db.ts  (lines 32–43)
 
-  new Database(path, {
-    readonly: true,           ← attempt to write throws "attempt to write a
-                                  readonly database"
-    fileMustExist: true,      ← no auto-create; if the seed hasn't run, the
-                                  open fails loudly
-  });
+  export function openDb(
+    path: string = resolveDbPath(),
+  ): Database.Database {
+    if (!existsSync(path)) {
+      throw new Error(
+        `olist.db not found at ${path} —     ← loud failure if the seed
+         run 'npm run seed' from               script never ran. better than
+         mcp-server-olist/ first.`,             a confusing "no rows" later.
+      );
+    }
+    const db = new Database(path, {
+      readonly: true,                       ← the contract: this code never
+                                               writes. attempts throw.
+      fileMustExist: true,                  ← no auto-create; we don't want
+                                               an empty DB silently created.
+    });
+    db.pragma('journal_mode = WAL');        ← future-proofs against multi-
+                                               process attachments (eval
+                                               worker pool, parallel runs).
+    db.pragma('foreign_keys = ON');         ← FK violations throw at INSERT;
+                                               the seed depends on this for
+                                               consistency checks.
+    return db;
+  }
+       │
+       └─ this 12-line function carries four design decisions: existence check
+          (loud failure path), readonly (contract), fileMustExist (no surprise
+          creates), WAL + FK pragmas (one-time, applied on every open). Each
+          flag earns its place; removing any one breaks a load-bearing
+          property of the fixture.
 ```
 
 What breaks if you drop `readonly`:
@@ -188,24 +218,27 @@ The pragmatic value: readonly is a CONTRACT that the seed script is the only wri
 **Move 2c — seeded determinism (mulberry32 + seed=42).**
 
 ```
-  scripts/seed-olist.ts L34-47
+  mcp-server-olist/scripts/seed-olist.ts  (lines 34–47)
 
-  function mulberry32(seed: number): () => number {
-    return function () {
-      seed = seed + 0x6D2B79F5 | 0;
-      let t = seed;
-      t = Math.imul(t ^ t >>> 15, t | 1);
+  function mulberry32(seed: number): () => number {  ← pure-ALU PRNG.
+    return function () {                                deterministic from
+      seed = seed + 0x6D2B79F5 | 0;                   the initial seed; no
+      let t = seed;                                    Math.random, no Date.
+      t = Math.imul(t ^ t >>> 15, t | 1);              now(), no OS entropy.
       t ^= t + Math.imul(t ^ t >>> 7, t | 61);
       return ((t ^ t >>> 14) >>> 0) / 4294967296;
     };
   }
-  const OLIST_SEED = 42;
-  const rng = mulberry32(OLIST_SEED);
+
+  const OLIST_SEED = 42;                              ← single source of
+  const rng = mulberry32(OLIST_SEED);                   "what makes this DB
+                                                         specifically this DB."
        │
-       └─ pure ALU, no allocations, no Math.random. every call to rng() is
-          determined by the previous one and the initial seed. swap Math.random
-          for this and the entire generated DB becomes a function of (seed,
-          algorithm) — reproducible across machines, OS versions, Node versions.
+       └─ every random choice during seed generation goes through rng(),
+          not Math.random. names, prices, dates, anomaly noise — all derived
+          deterministically from OLIST_SEED. change the constant, get a
+          different (but still reproducible) DB. Pure ALU, no allocations —
+          reproducible across machines, OS versions, Node versions.
 ```
 
 What breaks if you use `Math.random` instead:
@@ -242,6 +275,39 @@ What breaks if these drift:
 - new dimensions added to the seed wouldn't be available to the agent until `olistWorkspaceSchema()` is updated
 
 This is finding #12 in the red-flags audit. The fix (derive from `PRAGMA table_info()` on the DB) is straightforward but unnecessary at one-fixture scale.
+
+Side-by-side with the real code:
+
+```
+  lib/mcp/schema.ts  (lines 232–273)
+
+  export function olistWorkspaceSchema(): WorkspaceSchema {
+    return {
+      projectId: 'olist',
+      projectName: 'Olist · Brazilian e-commerce (local MCP)',
+      events: [
+        { name: 'order',   properties: [...], eventCount: 0 },
+        { name: 'payment', properties: [...], eventCount: 0 },
+        { name: 'review',  properties: [...], eventCount: 0 },
+      ],
+      customerProperties: ['state', 'city'],
+      catalogs: [],
+      totalCustomers: 0,
+      totalEvents: 0,
+      oldestTimestamp: null,
+      dataHorizon: {                          ← hard-coded from seed-olist.ts
+        from: '2025-12-01',                      L133 (END_TS = 2026-06-01).
+        to: '2026-06-01',                        if the seed window changes,
+        durationDays: 182,                       this must update by hand.
+      },
+    };
+  }
+       │
+       └─ the hand-maintained translation from "what's in the DB" to "what the
+          agent thinks is available." Bypasses the main app's `cached` slot
+          (which is for Bloomreach schemas) — comment at L228-230 names why
+          mixing the two would corrupt across mode toggles.
+```
 
 **Move 2e — the committed binary as the "backup."**
 
@@ -310,106 +376,6 @@ The deeper lesson generalizes beyond AI eval: **wherever you want to test behavi
   │  → eval/results/<date>/ paper trail (JSON, not a DB)                  │
   │  the three seeded anomalies are the ground truth the agent must find  │
   └───────────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-### Use cases
-
-- **The eval suite** (`eval/scripts/`) runs blooming insights's agents against the Olist MCP server as a hermetic data source. Same DB binary, same agent code, same answer expected. When the answer drifts, it's the agent that changed — the data didn't.
-- **Local development** without Bloomreach credentials. Spawn `mcp-server-olist` as the MCP target and the agents run end-to-end against synthetic data.
-- **Test fixture for `mcp-server-olist/test/*.test.ts`** — 43 tests that open the DB read-only, run a tool query, and assert on the output. Hermetic, deterministic, no network.
-- **Anomaly detection ground truth.** The three injected anomalies (sp-revenue-drop-w4, electronics-spike-w2, voucher-dropoff-w10-on) are the answer key — evals score the agent by how many of the three it finds and how it characterizes them.
-
-### Code side by side
-
-```
-  mcp-server-olist/src/db.ts  (lines 32–43)
-
-  export function openDb(
-    path: string = resolveDbPath(),
-  ): Database.Database {
-    if (!existsSync(path)) {
-      throw new Error(
-        `olist.db not found at ${path} —     ← loud failure if the seed
-         run 'npm run seed' from               script never ran. better than
-         mcp-server-olist/ first.`,             a confusing "no rows" later.
-      );
-    }
-    const db = new Database(path, {
-      readonly: true,                       ← the contract: this code never
-                                               writes. attempts throw.
-      fileMustExist: true,                  ← no auto-create; we don't want
-                                               an empty DB silently created.
-    });
-    db.pragma('journal_mode = WAL');        ← future-proofs against multi-
-                                               process attachments (eval
-                                               worker pool, parallel runs).
-    db.pragma('foreign_keys = ON');         ← FK violations throw at INSERT;
-                                               the seed depends on this for
-                                               consistency checks.
-    return db;
-  }
-       │
-       └─ this 12-line function carries four design decisions: existence check
-          (loud failure path), readonly (contract), fileMustExist (no surprise
-          creates), WAL + FK pragmas (one-time, applied on every open). Each
-          flag earns its place; removing any one breaks a load-bearing
-          property of the fixture.
-```
-
-```
-  mcp-server-olist/scripts/seed-olist.ts  (lines 34–47)
-
-  function mulberry32(seed: number): () => number {  ← pure-ALU PRNG.
-    return function () {                                deterministic from
-      seed = seed + 0x6D2B79F5 | 0;                   the initial seed; no
-      let t = seed;                                    Math.random, no Date.
-      t = Math.imul(t ^ t >>> 15, t | 1);              now(), no OS entropy.
-      t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-      return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    };
-  }
-
-  const OLIST_SEED = 42;                              ← single source of
-  const rng = mulberry32(OLIST_SEED);                   "what makes this DB
-                                                         specifically this DB."
-       │
-       └─ every random choice during seed generation goes through rng(),
-          not Math.random. names, prices, dates, anomaly noise — all derived
-          deterministically from OLIST_SEED. change the constant, get a
-          different (but still reproducible) DB.
-```
-
-```
-  lib/mcp/schema.ts  (lines 232–273)
-
-  export function olistWorkspaceSchema(): WorkspaceSchema {
-    return {
-      projectId: 'olist',
-      projectName: 'Olist · Brazilian e-commerce (local MCP)',
-      events: [
-        { name: 'order',   properties: [...], eventCount: 0 },
-        { name: 'payment', properties: [...], eventCount: 0 },
-        { name: 'review',  properties: [...], eventCount: 0 },
-      ],
-      customerProperties: ['state', 'city'],
-      catalogs: [],
-      totalCustomers: 0,
-      totalEvents: 0,
-      oldestTimestamp: null,
-      dataHorizon: {                          ← hard-coded from seed-olist.ts
-        from: '2025-12-01',                      L133 (END_TS = 2026-06-01).
-        to: '2026-06-01',                        if the seed window changes,
-        durationDays: 182,                       this must update by hand.
-      },
-    };
-  }
-       │
-       └─ the hand-maintained translation from "what's in the DB" to "what the
-          agent thinks is available." Bypasses the main app's `cached` slot
-          (which is for Bloomreach schemas) — comment at L228-230 names why
-          mixing the two would corrupt across mode toggles.
 ```
 
 ## Elaborate

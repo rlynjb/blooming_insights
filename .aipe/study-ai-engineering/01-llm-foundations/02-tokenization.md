@@ -182,6 +182,23 @@ Bound work in the cheapest unit that approximates the unit you actually pay in, 
 
 ---
 
+### Code in this codebase
+
+**Not the "real" tokenizer — the honest analog is character budgeting.** blooming insights never calls a tokenizer and never reads `res.usage`; it bounds prompts and tool results by `string.length` and bounds output by `max_tokens`, treating ~4 chars/token as an unstated, coarse proxy for the real unit.
+
+#### Files, functions, and line ranges
+
+- **Tool-result char budget:** `MAX_TOOL_RESULT_CHARS = 16_000` and `truncate(s)` — `lib/agents/base.ts` L29, L31–L34. Applied at L150 before each `tool_result`.
+- **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the UI event payload only.
+- **Schema-summary caps:** `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10` (`lib/agents/monitoring.ts` L21–L22), `MAX_CPROPS = 30` (L33); whole function L15–L48; intent comment at L14.
+- **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
+
+#### Where real tokenization would live
+
+A token accounting helper would sit in `lib/mcp/` (e.g. a `tokens.ts` alongside `validate.ts`), wrapping a tokenizer; `truncate` in `lib/agents/base.ts` and the caps in `schemaSummary` would call it instead of `string.length`/`.slice`, and `runAgentLoop` would read `res.usage` after `anthropic.messages.create` (L102) to log real input/output counts.
+
+---
+
 ## Tokenization — diagram
 
 This diagram spans the layers a string crosses before it reaches the model, and which budget bounds it at each step. The proxy unit (characters) governs the Service layer; the real unit (tokens) appears only as the output cap at the Provider boundary.
@@ -216,23 +233,6 @@ This diagram spans the layers a string crosses before it reaches the model, and 
 ```
 
 The Service layer governs input size in characters; the only token-denominated control in the system is `max_tokens` on the output. The input token count — what the window actually measures — is never computed.
-
----
-
-## Implementation in codebase
-
-**Not the "real" tokenizer — the honest analog is character budgeting.** blooming insights never calls a tokenizer and never reads `res.usage`; it bounds prompts and tool results by `string.length` and bounds output by `max_tokens`, treating ~4 chars/token as an unstated, coarse proxy for the real unit.
-
-### Files, functions, and line ranges
-
-- **Tool-result char budget:** `MAX_TOOL_RESULT_CHARS = 16_000` and `truncate(s)` — `lib/agents/base.ts` L29, L31–L34. Applied at L150 before each `tool_result`.
-- **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the UI event payload only.
-- **Schema-summary caps:** `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10` (`lib/agents/monitoring.ts` L21–L22), `MAX_CPROPS = 30` (L33); whole function L15–L48; intent comment at L14.
-- **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
-
-### Where real tokenization would live
-
-A token accounting helper would sit in `lib/mcp/` (e.g. a `tokens.ts` alongside `validate.ts`), wrapping a tokenizer; `truncate` in `lib/agents/base.ts` and the caps in `schemaSummary` would call it instead of `string.length`/`.slice`, and `runAgentLoop` would read `res.usage` after `anthropic.messages.create` (L102) to log real input/output counts.
 
 ---
 

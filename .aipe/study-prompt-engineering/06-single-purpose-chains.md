@@ -133,6 +133,8 @@ Each agent's job is one verb: **detect**, **diagnose**, **recommend**, **answer*
 
 This is the same decomposition rule from → 01-anatomy.md, viewed through the chain: there, the disclaimers are part of the shared anatomy; here, they are the boundaries that make the pipeline composable.
 
+**Code in this codebase — the four scoped prompts (the decomposition).** `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md`, the `## Role` section of each prompt. `monitoring.md` L5 ("do not diagnose … do not propose actions"); `diagnostic.md` L5 ("diagnose causes only"); `recommendation.md` L5 ("you do NOT execute anything"); `query.md` L5 ("Never invent numbers"). Each prompt scopes itself to one verb and disclaims the adjacent links' jobs — the typed boundaries of the pipeline.
+
 ---
 
 ### The chain is wired in code, not chosen by the model
@@ -163,6 +165,8 @@ query:          classify_intent ─▶ answer   (standalone, prose out)
 
 Wiring the chain in code (rather than letting one agent orchestrate the others) means the orchestration is deterministic, inspectable, and testable — you can unit-test each agent in isolation with a fake MCP caller, and the chain order is a code path, not a model decision.
 
+**Code in this codebase — the chain wiring (diagnose → recommend).** `app/api/agent/route.ts`, the `ReadableStream` `start()` investigation flow at L145–162 — `DiagnosticAgent.investigate` (L153), the `Diagnosis` handoff into `RecommendationAgent.propose` (L158), `saveInvestigation` (L162); the standalone query flow at L135–143. Wires the chain in deterministic code; the diagnosis is a typed value passed from link one to link two.
+
 ---
 
 ### Benefit 1 — debugging: you know which link failed
@@ -182,6 +186,8 @@ trace (agent-tagged):
 
 In a monolith, the same wrong recommendation would be buried in one undifferentiated output and you couldn't tell whether the *detection* missed it, the *diagnosis* misread it, or the *recommendation* mis-acted. The chain makes "which job failed" a question the trace answers. This is the operational payoff I reach for every time: a wrong end-result in a four-job monolith is a debugging dead end; in a four-link chain it's a labeled crime scene.
 
+**Code in this codebase — agent-tagged trace (failure localization).** `app/api/agent/route.ts`, `hooksFor(agent)` and `stepFor` at L116–131 — every `reasoning_step` / `tool_call_start` / `tool_call_end` carries the `agent` name. The trace attributes each step to its link, so a wrong end-result localizes to the link that produced it.
+
 ---
 
 ### Benefit 2 — model routing: cheap jobs, cheap model
@@ -199,6 +205,10 @@ The intent classifier has one job — map a question to `monitoring | diagnostic
 one prompt:        everything on Sonnet  → pay top-tier for the 16-token classify
 decomposed:        classify→Haiku, agents→Sonnet  → spend where capability is needed
 ```
+
+**Code in this codebase — model routing per link.** `lib/agents/base.ts`, `lib/agents/intent.ts` — `AGENT_MODEL` vs `CLASSIFIER_MODEL`. `base.ts` L9 (`claude-sonnet-4-6`, the four agents), `intent.ts` L14 (`claude-haiku-4-5-20251001`, the classifier, `max_tokens: 16` at L20). The one-job classifier runs on the cheap model; the heavy agents on the capable one — routing made possible by decomposition.
+
+**Why this is a codebase strength.** The decomposition is enforced at two layers: the prompt Roles keep each model in its lane, and the code wiring keeps the orchestration deterministic and unit-testable (each agent takes an injected MCP caller). The typed `Diagnosis` handoff means the boundary between links is a checked shape, not a free-text blob — so a failure on either side of it is attributable.
 
 ---
 
@@ -259,44 +269,6 @@ This diagram spans the prompt layer (four scoped Roles) and the orchestration la
 ```
 
 Each link does one verb; the disclaimers are the boundaries; the diagnosis is a typed value crossing from link one to link two; the agent-tagged trace and per-job model routing are the two payoffs.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### The four scoped prompts (the decomposition)
-
-- **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md`
-- **Function / class:** the `## Role` section of each prompt
-- **Line range:** `monitoring.md` L5 ("do not diagnose … do not propose actions"); `diagnostic.md` L5 ("diagnose causes only"); `recommendation.md` L5 ("you do NOT execute anything"); `query.md` L5 ("Never invent numbers").
-- **Role:** each prompt scopes itself to one verb and disclaims the adjacent links' jobs — the typed boundaries of the pipeline.
-
-### The chain wiring (diagnose → recommend)
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** the `ReadableStream` `start()` investigation flow
-- **Line range:** L145–162 — `DiagnosticAgent.investigate` (L153), the `Diagnosis` handoff into `RecommendationAgent.propose` (L158), `saveInvestigation` (L162); the standalone query flow at L135–143.
-- **Role:** wires the chain in deterministic code; the diagnosis is a typed value passed from link one to link two.
-
-### Model routing per link
-
-- **File:** `lib/agents/base.ts`, `lib/agents/intent.ts`
-- **Function / class:** `AGENT_MODEL` vs `CLASSIFIER_MODEL`
-- **Line range:** `base.ts` L9 (`claude-sonnet-4-6`, the four agents), `intent.ts` L14 (`claude-haiku-4-5-20251001`, the classifier, `max_tokens: 16` at L20).
-- **Role:** the one-job classifier runs on the cheap model; the heavy agents on the capable one — routing made possible by decomposition.
-
-### Agent-tagged trace (failure localization)
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `hooksFor(agent)` and `stepFor`
-- **Line range:** L116–131 — every `reasoning_step` / `tool_call_start` / `tool_call_end` carries the `agent` name.
-- **Role:** the trace attributes each step to its link, so a wrong end-result localizes to the link that produced it.
-
-### Why this is a codebase strength
-
-The decomposition is enforced at two layers: the prompt Roles keep each model in its lane, and the code wiring keeps the orchestration deterministic and unit-testable (each agent takes an injected MCP caller). The typed `Diagnosis` handoff means the boundary between links is a checked shape, not a free-text blob — so a failure on either side of it is attributable.
 
 ---
 

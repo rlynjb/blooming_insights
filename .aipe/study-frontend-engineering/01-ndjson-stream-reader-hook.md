@@ -74,6 +74,14 @@ Structure pass — the reader hook
 
 ## How it works
 
+**Use cases.** Three places this hook is reached for in the repo:
+
+- **Diagnose step.** `app/investigate/[id]/page.tsx:38` calls `useInvestigation(id, 'diagnose')`. The page destructures `{ items, diagnosis, complete, error }` (omits `recommendations`) and renders `<EvidencePanel diagnosis={diagnosis} loading={streaming} />` + `<StatusLog items={items} title="how this was figured out" scanning={streaming} />`. The hook owns the entire data-fetch + stream-parse + stash cycle; the page is layout + composition.
+- **Recommend step.** `app/investigate/[id]/recommend/page.tsx:37` calls `useInvestigation(id, 'recommend')`. Same destructure shape (this time it uses `recommendations`). The hook *internally* reads `bi:diag:<id>` to load the handed-over diagnosis for context display + live-mode URL parameter.
+- **Re-visits and browser-back navigation.** Both pages — when the user clicks "← diagnosis" from the recommend page back to the diagnose page, the hook hydrates from `bi:inv:diagnose:<id>` (`useInvestigation.ts:50-63`) and renders the cached result instantly without re-firing the agent. The 30-90s wait happens *once* per investigation per tab.
+
+The other three streaming surfaces — `useBriefingStream` (feed), `useDemoCapture` (dev capture), and `StreamingResponse` (chat) — are *not* this hook, but they now all share the same kernel via `readNdjson` in `lib/streaming/ndjson.ts`. The 2026-06-15 page-decomposition refactor closed audit red flag #2 by extracting the kernel; each consumer keeps its own `onEvent` switch (the typed dispatch arms) but delegates the byte-level loop.
+
 ### Move 1 — mental model: the hook is a buffered consumer + a typed switch + a React state mirror
 
 You know how `EventSource` gives you `.onmessage` callbacks and you write `setState` inside them? Same shape, three differences: (1) you bring the transport (`fetch`), (2) the messages are typed `AgentEvent` objects (not stringly-typed `data:` blobs), and (3) the loop runs inside `useEffect` so it inherits React's lifecycle, which makes you write a guard.
@@ -158,6 +166,41 @@ Pseudocode — the kernel
 - The trailing-line flush after the loop → the last event of the stream is silently dropped if the server didn't emit `\n` after it (some servers don't).
 - The `try / catch` around `JSON.parse` → one malformed line kills the entire stream and the UI never reaches `done`.
 
+**Code in this codebase — `lib/hooks/useInvestigation.ts:184-208`:**
+
+```
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });   ← {stream:true} is what
+                                                     handles multi-byte UTF-8
+                                                     split across chunks
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';                      ← partial trailing line stays
+                                                     in the buffer for the next
+                                                     iteration to complete
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        handle(JSON.parse(line) as AgentEvent);   ← typed dispatch
+      } catch {
+        /* ignore malformed line */                ← do NOT throw — one bad line
+                                                     should not kill the stream
+      }
+    }
+  }
+  if (buf.trim()) {                                ← flush trailing event after
+    try {                                            stream close (some producers
+      handle(JSON.parse(buf) as AgentEvent);         omit the final '\n')
+    } catch {
+      /* ignore */
+    }
+  }
+```
+
 ### Move 2.2 — the started-guard (the StrictMode latch)
 
 React 18+ StrictMode (dev only) double-invokes effects: it runs the effect, runs its cleanup, runs the effect again on the same fiber. The textbook fix is to make the effect cancellable — return a cleanup that aborts. That fix is wrong here: aborting the first run cancels the stream, the re-run opens a fresh one, you double the cost OR you guard the re-run and end up with no completed stream at all.
@@ -191,6 +234,49 @@ The latch is `useRef`, not `useState`, on purpose. Changing a ref does *not* tri
 
 - The latch → effect runs twice in dev; either two streams open (double-cost on the alpha MCP server which is rate-limited, also confusing logs) or the cancel-on-cleanup workaround leaves you with empty logs.
 
+**Code in this codebase — `lib/hooks/useInvestigation.ts:43, 47-48`** (the latch declaration and guard):
+
+```
+  const startedRef = useRef(false);              ← ref, not useState — no re-render
+                                                    on mutation; persists across the
+                                                    StrictMode mount → cleanup →
+                                                    re-mount because React reuses
+                                                    the same fiber
+
+  useEffect(() => {
+    if (!id) return;
+    if (startedRef.current) return;              ← STRIC MODE GUARD
+    startedRef.current = true;                   ←   if dev double-invokes, the
+                                                    second run returns immediately
+       │
+       └─ this two-line guard is the *entire* StrictMode adaptation.
+          no AbortController, no cleanup-cancel, no signal — load-bearing
+          for a one-shot stream where aborting is worse than allowing
+          a tiny amount of wasted work on a mid-stream navigate-away.
+```
+
+The same effect also short-circuits before any fetch when a stash exists — turning re-visits into zero-cost renders. **`lib/hooks/useInvestigation.ts:50-63`** (hydrate path):
+
+```
+  try {
+    const raw = sessionStorage.getItem(stashKey(step, id));     ← key:
+    if (raw) {                                                     'bi:inv:diagnose:<id>'
+      const s = JSON.parse(raw) as Partial<InvestigationState>;     OR
+      setItems(s.items ?? []);                                      'bi:inv:recommend:<id>'
+      setDiagnosis(s.diagnosis ?? null);
+      setRecommendations(s.recommendations ?? []);
+      setComplete(true);                                          ← critical: tells
+      return;                                                        the consuming page
+    }                                                                we're done, no spinner
+  } catch {
+    /* ignore — fall through to a live/replay fetch */
+  }
+       │
+       └─ this is what makes a route-change away-and-back zero-cost.
+          step 2 → step 3 → back to step 2: the diagnostic agent never
+          re-runs because the stash from the first visit is read here.
+```
+
 The deeper "why no `AbortController` at all" rationale + the `sessionStorage` handoff mechanics are in `study-system-design/07-client-stream-handoff.md`. This file is the *frontend data-fetch primitive*; that file is the *system-level cross-step seam*.
 
 ### Move 2.3 — the parallel closure mirror
@@ -223,6 +309,51 @@ Pattern — two copies, one source of truth at stash time
 
 - The `done` handler reads stale React state → the stashed result is missing the last 1-3 events (whichever didn't make it through React's batched update queue before the handler fires).
 - Re-visits hydrate from a partial stash and skip the "incomplete" tell, because `complete` is set to `true` regardless.
+
+**Code in this codebase — `lib/hooks/useInvestigation.ts:65-67`** (the mirror declaration):
+
+```
+  const cItems: TraceItem[] = [];                ← parallel array, mutated
+  let cDiag: Diagnosis | null = null;               synchronously alongside
+  const cRecs: Recommendation[] = [];               the async setState calls
+       │
+       └─ the mirror exists so the `done` handler at L130-L144 can
+          synchronously read the freshest result for the stash write.
+          React state (items / diagnosis / recommendations) is updated
+          via setState, which is async and batched — closing over those
+          inside the `done` arm would stash stale values.
+```
+
+**`lib/hooks/useInvestigation.ts:130-144`** (the stash-on-done, where the mirror pays off):
+
+```
+  case 'done':
+    setComplete(true);
+    try {
+      sessionStorage.setItem(
+        stashKey(step, id),                        ← bi:inv:<step>:<id>
+        JSON.stringify({                            ← serializes the
+          items: cItems,                              CLOSURE MIRROR, not
+          diagnosis: cDiag,                           the React state
+          recommendations: cRecs,
+        }),
+      );
+      if (step === 'diagnose' && cDiag) {
+        sessionStorage.setItem(                    ← cross-step handoff:
+          diagHandoffKey(id),                         step 2 writes the
+          JSON.stringify({ diagnosis: cDiag }),       diagnosis for step 3
+        );                                            to read on its mount
+      }
+    } catch {
+      /* stash is best-effort */
+    }
+    break;
+       │
+       └─ the cross-step handoff mechanics (bi:diag:<id> → &diagnosis= URL
+          param on the recommend step) live in
+          study-system-design/07-client-stream-handoff.md — this file is the
+          data-fetch primitive; that file is the system-level handoff.
+```
 
 ### Move 3 — the principle
 
@@ -290,143 +421,6 @@ USEINVESTIGATION(id, step) — one mount, one stream, one stash
 ```
 
 The diagram is the contract. The page component above destructures `{ items, diagnosis, recommendations, complete, error }` and renders. Nothing else.
-
----
-
-## Implementation in codebase
-
-**Use cases.** Three places this hook is reached for in the repo:
-
-- **Diagnose step.** `app/investigate/[id]/page.tsx:38` calls `useInvestigation(id, 'diagnose')`. The page destructures `{ items, diagnosis, complete, error }` (omits `recommendations`) and renders `<EvidencePanel diagnosis={diagnosis} loading={streaming} />` + `<StatusLog items={items} title="how this was figured out" scanning={streaming} />`. The hook owns the entire data-fetch + stream-parse + stash cycle; the page is layout + composition.
-- **Recommend step.** `app/investigate/[id]/recommend/page.tsx:37` calls `useInvestigation(id, 'recommend')`. Same destructure shape (this time it uses `recommendations`). The hook *internally* reads `bi:diag:<id>` to load the handed-over diagnosis for context display + live-mode URL parameter.
-- **Re-visits and browser-back navigation.** Both pages — when the user clicks "← diagnosis" from the recommend page back to the diagnose page, the hook hydrates from `bi:inv:diagnose:<id>` (`useInvestigation.ts:50-63`) and renders the cached result instantly without re-firing the agent. The 30-90s wait happens *once* per investigation per tab.
-
-The other three streaming surfaces — `useBriefingStream` (feed), `useDemoCapture` (dev capture), and `StreamingResponse` (chat) — are *not* this hook, but they now all share the same kernel via `readNdjson` in `lib/streaming/ndjson.ts`. The 2026-06-15 page-decomposition refactor closed audit red flag #2 by extracting the kernel; each consumer keeps its own `onEvent` switch (the typed dispatch arms) but delegates the byte-level loop.
-
-### Code side by side, with a line-by-line read
-
-`lib/hooks/useInvestigation.ts:43, 47-48` (the started-guard):
-
-```
-  const startedRef = useRef(false);              ← ref, not useState — no re-render
-                                                    on mutation; persists across the
-                                                    StrictMode mount → cleanup →
-                                                    re-mount because React reuses
-                                                    the same fiber
-
-  useEffect(() => {
-    if (!id) return;
-    if (startedRef.current) return;              ← STRIC MODE GUARD
-    startedRef.current = true;                   ←   if dev double-invokes, the
-                                                    second run returns immediately
-       │
-       └─ this two-line guard is the *entire* StrictMode adaptation.
-          no AbortController, no cleanup-cancel, no signal — load-bearing
-          for a one-shot stream where aborting is worse than allowing
-          a tiny amount of wasted work on a mid-stream navigate-away.
-```
-
-`lib/hooks/useInvestigation.ts:50-63` (hydrate path):
-
-```
-  try {
-    const raw = sessionStorage.getItem(stashKey(step, id));     ← key:
-    if (raw) {                                                     'bi:inv:diagnose:<id>'
-      const s = JSON.parse(raw) as Partial<InvestigationState>;     OR
-      setItems(s.items ?? []);                                      'bi:inv:recommend:<id>'
-      setDiagnosis(s.diagnosis ?? null);
-      setRecommendations(s.recommendations ?? []);
-      setComplete(true);                                          ← critical: tells
-      return;                                                        the consuming page
-    }                                                                we're done, no spinner
-  } catch {
-    /* ignore — fall through to a live/replay fetch */
-  }
-       │
-       └─ this is what makes a route-change away-and-back zero-cost.
-          step 2 → step 3 → back to step 2: the diagnostic agent never
-          re-runs because the stash from the first visit is read here.
-```
-
-`lib/hooks/useInvestigation.ts:65-67` (the closure mirror):
-
-```
-  const cItems: TraceItem[] = [];                ← parallel array, mutated
-  let cDiag: Diagnosis | null = null;               synchronously alongside
-  const cRecs: Recommendation[] = [];               the async setState calls
-       │
-       └─ the mirror exists so the `done` handler at L130-L144 can
-          synchronously read the freshest result for the stash write.
-          React state (items / diagnosis / recommendations) is updated
-          via setState, which is async and batched — closing over those
-          inside the `done` arm would stash stale values.
-```
-
-`lib/hooks/useInvestigation.ts:184-208` (the kernel loop):
-
-```
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });   ← {stream:true} is what
-                                                     handles multi-byte UTF-8
-                                                     split across chunks
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';                      ← partial trailing line stays
-                                                     in the buffer for the next
-                                                     iteration to complete
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        handle(JSON.parse(line) as AgentEvent);   ← typed dispatch
-      } catch {
-        /* ignore malformed line */                ← do NOT throw — one bad line
-                                                     should not kill the stream
-      }
-    }
-  }
-  if (buf.trim()) {                                ← flush trailing event after
-    try {                                            stream close (some producers
-      handle(JSON.parse(buf) as AgentEvent);         omit the final '\n')
-    } catch {
-      /* ignore */
-    }
-  }
-```
-
-`lib/hooks/useInvestigation.ts:130-144` (the stash-on-done):
-
-```
-  case 'done':
-    setComplete(true);
-    try {
-      sessionStorage.setItem(
-        stashKey(step, id),                        ← bi:inv:<step>:<id>
-        JSON.stringify({                            ← serializes the
-          items: cItems,                              CLOSURE MIRROR, not
-          diagnosis: cDiag,                           the React state
-          recommendations: cRecs,
-        }),
-      );
-      if (step === 'diagnose' && cDiag) {
-        sessionStorage.setItem(                    ← cross-step handoff:
-          diagHandoffKey(id),                         step 2 writes the
-          JSON.stringify({ diagnosis: cDiag }),       diagnosis for step 3
-        );                                            to read on its mount
-      }
-    } catch {
-      /* stash is best-effort */
-    }
-    break;
-       │
-       └─ the cross-step handoff mechanics (bi:diag:<id> → &diagnosis= URL
-          param on the recommend step) live in
-          study-system-design/07-client-stream-handoff.md — this file is the
-          data-fetch primitive; that file is the system-level handoff.
-```
 
 ---
 

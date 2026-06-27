@@ -120,6 +120,8 @@ recommendation prompt  "Return ONLY a JSON array (in a ```json fenced block) of 
 
 "ONLY" is doing real work — it tells the model the *entire* response is the artifact, no prose around it. The fence is the extraction anchor (→ 02-structured-outputs.md). These three feed the parse-validate-repair funnel: their final text goes into the agent-JSON parser and a type guard, and a synthesize retry exists for the diagnostic and recommendation agents when the JSON doesn't materialize.
 
+**Code in this codebase — JSON-mode declarations and consumers.** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md` + their `.ts`. `## Output` (declaration) → `parseAgentJson` + type guard (enforcement). Declarations at `monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49; consumers at `monitoring.ts` L85–92 (`parseAgentJson` + `isAnomalyArray` else `[]`), `diagnostic.ts` L73–77 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), `recommendation.ts` L69–76 (`tryParseRecommendations ?? synthesize` then `[]`). Declare fenced JSON; enforce by extracting, validating, and rejecting non-conforming output to a safe floor.
+
 ---
 
 ### One agent declares prose — deliberately
@@ -140,6 +142,8 @@ query prompt — ## Output
 ```
 
 No JSON parser. No type guard. No synthesize retry returning a typed shape — the query agent's synthesis instruction says "answer the user question directly and concisely in plain prose," not "emit JSON." The prose path is a deliberately *separate* consumer from the JSON path — the modes don't share enforcement code, which is exactly what keeps the mismatch from happening.
+
+**Code in this codebase — prose-mode declaration and consumer.** `lib/agents/prompts/query.md` + `lib/agents/query.ts`. `## Output` (declaration) → `finalText.trim()` (consumption). Declaration at `query.md` L49 ("No JSON shape is required — just the answer text"); consumer at `query.ts` L47 (`finalText.trim() || '<fallback>'`); prose synthesis nudge at `query.ts` L42–44. Declares prose, consumes as a trimmed string, never touches `parseAgentJson` — the deliberately separate path.
 
 ---
 
@@ -188,6 +192,10 @@ for each agent:
 
 Step 4 is the subtle one: the mode is declared *twice* — in `## Output` and in the synthesis instruction (→ 01-anatomy.md) — and they must agree. If a refactor changed query's `## Output` to demand JSON but left the synthesis nudge saying "plain prose," the model would get conflicting mode instructions on the final turn. The reviewer's job is to check that an agent's declared mode is consistent across both places *and* matches its consumer.
 
+**Code in this codebase — the mode declared twice (must agree).** The prompt `## Output` section *and* the `synthesisInstruction`. Per-agent `synthesisInstruction` passed to `runAgentLoop`: JSON nudges at `monitoring.ts` L75–78, `diagnostic.ts` L62–66, `recommendation.ts` L58–62 (all say "JSON … fence"); prose nudge at `query.ts` L42–44 ("plain prose"). The forced-final-turn instruction must declare the same mode as `## Output`; a mismatch here gives conflicting final-turn instructions.
+
+**Why this is a codebase strength.** The two modes have *separate* consumer code — the JSON path and the prose path never share a function — so an agent can't accidentally be enforced under the wrong mode by a shared helper. And the mode is stated consistently in both `## Output` and the synthesis nudge for all four agents, so the final-turn instruction never contradicts the section above it.
+
 ---
 
 ### The principle
@@ -226,37 +234,6 @@ This diagram spans producers (four prompts, two modes) and consumers (two enforc
 ```
 
 Mode is declared per prompt and enforced per consumer; three agents share the JSON path, query is deliberately on the prose path, and any disagreement degrades silently.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### JSON-mode declarations and consumers
-
-- **File:** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md` + their `.ts`
-- **Function / class:** `## Output` (declaration) → `parseAgentJson` + type guard (enforcement)
-- **Line range:** declarations at `monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49; consumers at `monitoring.ts` L85–92 (`parseAgentJson` + `isAnomalyArray` else `[]`), `diagnostic.ts` L73–77 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), `recommendation.ts` L69–76 (`tryParseRecommendations ?? synthesize` then `[]`).
-- **Role:** declare fenced JSON; enforce by extracting, validating, and rejecting non-conforming output to a safe floor.
-
-### Prose-mode declaration and consumer
-
-- **File:** `lib/agents/prompts/query.md` + `lib/agents/query.ts`
-- **Function / class:** `## Output` (declaration) → `finalText.trim()` (consumption)
-- **Line range:** declaration at `query.md` L49 ("No JSON shape is required — just the answer text"); consumer at `query.ts` L47 (`finalText.trim() || '<fallback>'`); prose synthesis nudge at `query.ts` L42–44.
-- **Role:** declares prose, consumes as a trimmed string, never touches `parseAgentJson` — the deliberately separate path.
-
-### The mode declared twice (must agree)
-
-- **File:** the prompt `## Output` section *and* the `synthesisInstruction`
-- **Function / class:** per-agent `synthesisInstruction` passed to `runAgentLoop`
-- **Line range:** JSON nudges at `monitoring.ts` L75–78, `diagnostic.ts` L62–66, `recommendation.ts` L58–62 (all say "JSON … fence"); prose nudge at `query.ts` L42–44 ("plain prose").
-- **Role:** the forced-final-turn instruction must declare the same mode as `## Output`; a mismatch here gives conflicting final-turn instructions.
-
-### Why this is a codebase strength
-
-The two modes have *separate* consumer code — the JSON path and the prose path never share a function — so an agent can't accidentally be enforced under the wrong mode by a shared helper. And the mode is stated consistently in both `## Output` and the synthesis nudge for all four agents, so the final-turn instruction never contradicts the section above it.
 
 ---
 

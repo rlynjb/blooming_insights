@@ -212,6 +212,32 @@ The condition under which this works: the handoff protocol matches the agents' a
 
 *Now:* there's no peer handoff. The route picks one agent (query, diagnostic, or recommendation) based on the request shape, that agent runs to completion, the route may follow up with the next agent in the pipeline (only diagnostic → recommendation, deterministically). No agent can transfer control.
 
+**Where this absence lives in the repo.** The centralized routing — the absence of handoff — is at `app/api/agent/route.ts` `GET` stream `start()` body L199–L200 (lead-agent select: `const leadAgent: AgentName = q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';`). Per-agent tool subsets live in `lib/mcp/tools.ts` — each per-agent allow-list function returns MCP tool names only; no `transfer_to_*` tools anywhere. The pipeline transition that is *not* a handoff is at `app/api/agent/route.ts` L244–L249 — the route invokes `recAgent.propose(...)` after `diagAgent.investigate(...)` returns; this is a function call from the route, not a model-decided handoff.
+
+```
+shape (the absence — what a handoff would look like, not current code):
+
+  // hypothetical: a transfer_to_recommendation tool added to diagnostic's subset
+  const diagnosticTools = [
+    ...mcpToolsForDiagnostic,
+    {
+      name: 'transfer_to_recommendation',
+      description: 'Done investigating; hand off to recommendation agent.',
+      input_schema: { type: 'object', properties: { diagnosis: { ... } } }
+    },
+  ];
+
+  // hypothetical: handoff handling in runAgentLoop
+  for (const tu of toolUses) {
+    if (tu.name.startsWith('transfer_to_')) {
+      const targetAgent = tu.name.slice('transfer_to_'.length);
+      if (hopCount >= MAX_HOPS) throw new Error('max hops exceeded');
+      return { handoff: { to: targetAgent, context: tu.input }, hopCount: hopCount + 1 };
+    }
+    // ... else: normal MCP tool dispatch
+  }
+```
+
 *If peer routing earned itself:* each agent's tool subset would include `transfer_to_<peer>` tools. The diagnostic agent could decide mid-investigation that it needs deeper context only a hypothetical deep-dive agent has, and hand off. The recommendation agent could hand back to diagnostic on "this diagnosis is too thin to recommend on." A *handoff counter* would cap total transfers (`MAX_HOPS = 4` say); each agent's prompt would have clear stay-vs-handoff rules.
 
 The takeaway: **handoff distributes control to where the most context lives.** The agent running this turn has the freshest view of what's needed next. The cost: a new failure mode (infinite handoff), a new debug shape (which hop went wrong?), and harder traceability (the trajectory is fragmented across agents).
@@ -286,57 +312,6 @@ Swarm / handoff — full picture
   blooming insights: NOT IMPLEMENTED. Control is centralized
   in the route handler; no agent transfers to a peer.
   See the orchestration system-design templates for the refactor.
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.**
-
-There is no peer handoff in blooming insights. The route file (`app/api/agent/route.ts` L199–L249) picks the lead agent at the start of each request, and that agent runs to completion. The pipeline transitions (`DiagnosticAgent` → `RecommendationAgent`) happen because the route's `start()` body explicitly invokes the next agent — not because the diagnostic agent emits a handoff. Each agent's tool subset (`lib/mcp/tools.ts`) contains only MCP tools; there are no `transfer_to_<peer>` tools anywhere.
-
-The honest sentence: **control is centralized in the deterministic route, and that's a deliberate choice — peer handoff would introduce model-decided routing the route's `if`-ladder doesn't need to express today.** The user journey has exactly three flows, the next-agent decision in each flow is knowable up front, and the next-agent failure mode that worries handoff designers (infinite-handoff) is structurally absent because no agent has the capability to transfer.
-
-For the refactor: `../06-orchestration-system-design-templates/` includes a "swarm support assistant" template; per-agent `transfer_to_<peer>` tools would be added to each agent's tool subset, a `MAX_HOPS` counter would live in the route, and the route's `start()` body would loop over handoffs instead of running one agent and the next-fixed-stage.
-
-**The centralized routing (the absence of handoff)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body, lead-agent select
-**Line range:** L199–L200 — `const leadAgent: AgentName = q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';`
-
-**Per-agent tool subsets (no handoff tools today)**
-**File:** `lib/mcp/tools.ts`
-**Function / class:** the per-agent allow-list functions
-**Line range:** entire file — each function returns MCP tool names only; no `transfer_to_*` tools
-
-**The pipeline transition that is not a handoff**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body, recommendation block
-**Line range:** L244–L249 — the route invokes `recAgent.propose(...)` after `diagAgent.investigate(...)` returns; this is a function call from the route, not a model-decided handoff
-
-```
-shape (the absence — what a handoff would look like, not current code):
-
-  // hypothetical: a transfer_to_recommendation tool added to diagnostic's subset
-  const diagnosticTools = [
-    ...mcpToolsForDiagnostic,
-    {
-      name: 'transfer_to_recommendation',
-      description: 'Done investigating; hand off to recommendation agent.',
-      input_schema: { type: 'object', properties: { diagnosis: { ... } } }
-    },
-  ];
-
-  // hypothetical: handoff handling in runAgentLoop
-  for (const tu of toolUses) {
-    if (tu.name.startsWith('transfer_to_')) {
-      const targetAgent = tu.name.slice('transfer_to_'.length);
-      if (hopCount >= MAX_HOPS) throw new Error('max hops exceeded');
-      return { handoff: { to: targetAgent, context: tu.input }, hopCount: hopCount + 1 };
-    }
-    // ... else: normal MCP tool dispatch
-  }
 ```
 
 ---

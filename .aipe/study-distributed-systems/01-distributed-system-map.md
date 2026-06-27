@@ -99,6 +99,11 @@ The map isn't decoration. It's the artifact you use to predict failure. If you c
 
 ### Move 2 — the boxes and arrows
 
+**Use cases.** This map is the artifact you reach for when:
+- you find that an investigation works locally but fails on a cold-started Vercel deployment ("the insight isn't in the `Map`") — Seam B is the culprit
+- you add a new external service (a new model provider, a feature-flag service, an analytics sink) and need to predict its failure mode — you add a new box and ask "what does the response carry that lets me retry intelligently?"
+- you debug an OAuth callback that succeeds in dev but fails in production with "no PKCE code_verifier stored" — Seam E with the wrong backend chosen
+
 #### The client box
 
 You already know `useState`. The client owns React state for the current page and `sessionStorage` for the current tab. `sessionStorage` is its own ownership domain — survives reloads, dies with the tab, never crosses tabs. It carries three keys for this app: `bi:diag:<id>` (the diagnosis handed to step 3), `bi:insight:<id>` (the insight handed to the agent route when in live mode), `bi:inv:<step>:<id>` (the trace stash for instant rehydrate on back-nav).
@@ -119,6 +124,27 @@ You already know `useState`. The client owns React state for the current page an
 
 The bridge is the load-bearing detail. Without `sessionStorage`, you'd need a server-side store keyed by `insightId` that both step 2 and step 3 can read — and that store would need to be cross-instance-readable, which is exactly the problem you're avoiding.
 
+```
+  lib/hooks/useInvestigation.ts  (lines 18-19, 137-140)
+
+  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
+  const diagHandoffKey = (id) => `bi:diag:${id}`;
+                                                              ← these two keys ARE
+                                                                the cross-request
+                                                                state carriers
+  // on 'done' event for the diagnose step:
+  if (step === 'diagnose' && cDiag) {
+    sessionStorage.setItem(
+      diagHandoffKey(id),
+      JSON.stringify({ diagnosis: cDiag }),
+    );  ← step 3 will read this — the SERVER does not remember it
+  }
+       │
+       └─ this is the stateless-server / stateful-client pattern, made
+          load-bearing: the diagnosis hops client→server→client→server
+          across two route invocations. file 04 walks the consistency.
+```
+
 #### The Vercel instance box
 
 You already know a Node process. Each Vercel invocation is a Node process. Whether two requests land on the same process is a coin flip controlled by Vercel — and even if they do, the process can be recycled between them. The code holds three pieces of state at this layer: the `insights` and `investigations` `Map`s in `lib/state/`, the module-level `cached` schema variable, and the AsyncLocalStorage-scoped auth store that wraps the cookie. **None of those survive across two different instances.**
@@ -134,6 +160,27 @@ You already know a Node process. Each Vercel invocation is a Node process. Wheth
 ```
 
 The boundary condition is silent. When the `Map` is empty because the request landed on a cold instance, no error fires; the lookup just returns `null` and the caller falls through to whatever fallback exists. The `resolveAnomaly` function in `app/api/agent/route.ts:37` is exactly that fallback — try in-memory, then try the demo snapshot, then 404. The fact that the in-memory path *silently misses* on a recycled instance is the load-bearing risk.
+
+```
+  lib/state/insights.ts  (lines 4-6, 30-42)
+
+  const insights = new Map<string, Insight>();             ← process-local;
+  const investigations = new Map<string, Investigation>();    no cross-instance
+  const anomalies = new Map<string, Anomaly>();              link exists
+
+  export function putInsights(items, rawAnomalies?) {
+    insights.clear();                  ← each briefing replaces the feed;
+    anomalies.clear();                    deliberate, but doubles down on
+    items.forEach((i, idx) => {           the "one process, one truth" model
+      insights.set(i.id, i);
+      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
+    });
+  }
+       │
+       └─ this Map IS the gap. Two concurrent users on two Vercel
+          instances each get a different Map. Neither knows the other
+          exists. There's no error — the lookup just returns null.
+```
 
 #### The Bloomreach MCP box
 
@@ -165,6 +212,33 @@ Same shape as the MCP box: HTTPS, Bearer token, can rate-limit, can latency-spik
 #### The Bloomreach IdP box
 
 OAuth + PKCE + Dynamic Client Registration. The interesting part is that the *connect* request and the *callback* request are two separate HTTP requests, possibly landing on two different Vercel instances. The PKCE code verifier is generated during connect and must be readable during callback. The encrypted `bi_auth` cookie (`lib/mcp/auth.ts:86-104`) is what bridges Seam D — without it, callback fails with "no PKCE code_verifier stored for this session" because the instance that ran connect already recycled or never ran callback.
+
+```
+  lib/mcp/auth.ts  (lines 86-104)
+
+  export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+    if (process.env.NODE_ENV !== 'production') return fn();   ← dev passes through
+    const { cookies } = await import('next/headers');
+    const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+    const ctx: RequestStore = {                               ← seed ONCE from cookie
+      store: raw ? decryptStore(raw) : {},
+      dirty: false,
+    };
+    const result = await requestStore.run(ctx, fn);           ← all reads/writes hit ALS
+    if (ctx.dirty) {
+      (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
+        httpOnly: true, secure: true, sameSite: 'none',       ← cross-site so the
+        path: '/', maxAge: AUTH_COOKIE_MAX_AGE,                 IdP return preserves it
+      });
+    }
+    return result;
+  }
+       │
+       └─ this IS the mechanism that crosses Seam E (instance↔instance) —
+          the cookie is the carrier; the server is stateless across
+          instances by design. Without this, callback would fail because
+          the PKCE verifier lives on whichever instance ran connect.
+```
 
 #### The SyntheticDataSource (in-process; NOT a distributed box)
 
@@ -222,86 +296,6 @@ A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box o
     Seam D (inst↔Anthr):   API key, prompt + tool schemas
     Seam E (inst↔IdP):     PKCE verifier (saved in cookie at connect,
                            read from cookie at callback)
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** This map is the artifact you reach for when:
-- you find that an investigation works locally but fails on a cold-started Vercel deployment ("the insight isn't in the `Map`") — Seam B is the culprit
-- you add a new external service (a new model provider, a feature-flag service, an analytics sink) and need to predict its failure mode — you add a new box and ask "what does the response carry that lets me retry intelligently?"
-- you debug an OAuth callback that succeeds in dev but fails in production with "no PKCE code_verifier stored" — Seam E with the wrong backend chosen
-
-**Code side by side.**
-
-```
-  lib/state/insights.ts  (lines 4-6, 30-42)
-
-  const insights = new Map<string, Insight>();             ← process-local;
-  const investigations = new Map<string, Investigation>();    no cross-instance
-  const anomalies = new Map<string, Anomaly>();              link exists
-
-  export function putInsights(items, rawAnomalies?) {
-    insights.clear();                  ← each briefing replaces the feed;
-    anomalies.clear();                    deliberate, but doubles down on
-    items.forEach((i, idx) => {           the "one process, one truth" model
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ this Map IS the gap. Two concurrent users on two Vercel
-          instances each get a different Map. Neither knows the other
-          exists. There's no error — the lookup just returns null.
-```
-
-```
-  lib/mcp/auth.ts  (lines 86-104)
-
-  export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-    if (process.env.NODE_ENV !== 'production') return fn();   ← dev passes through
-    const { cookies } = await import('next/headers');
-    const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-    const ctx: RequestStore = {                               ← seed ONCE from cookie
-      store: raw ? decryptStore(raw) : {},
-      dirty: false,
-    };
-    const result = await requestStore.run(ctx, fn);           ← all reads/writes hit ALS
-    if (ctx.dirty) {
-      (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-        httpOnly: true, secure: true, sameSite: 'none',       ← cross-site so the
-        path: '/', maxAge: AUTH_COOKIE_MAX_AGE,                 IdP return preserves it
-      });
-    }
-    return result;
-  }
-       │
-       └─ this IS the mechanism that crosses Seam E (instance↔instance) —
-          the cookie is the carrier; the server is stateless across
-          instances by design. Without this, callback would fail because
-          the PKCE verifier lives on whichever instance ran connect.
-```
-
-```
-  lib/hooks/useInvestigation.ts  (lines 18-19, 137-140)
-
-  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
-  const diagHandoffKey = (id) => `bi:diag:${id}`;
-                                                              ← these two keys ARE
-                                                                the cross-request
-                                                                state carriers
-  // on 'done' event for the diagnose step:
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(
-      diagHandoffKey(id),
-      JSON.stringify({ diagnosis: cDiag }),
-    );  ← step 3 will read this — the SERVER does not remember it
-  }
-       │
-       └─ this is the stateless-server / stateful-client pattern, made
-          load-bearing: the diagnosis hops client→server→client→server
-          across two route invocations. file 04 walks the consistency.
 ```
 
 ---

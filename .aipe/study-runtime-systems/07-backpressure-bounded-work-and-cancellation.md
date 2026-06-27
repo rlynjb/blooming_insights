@@ -326,64 +326,7 @@ The route does `controller.enqueue(...)` without checking `controller.desiredSiz
    - clients drain faster than we produce
 ```
 
-### Move 3 — the principle
-
-**Bounded work isn't pessimism — it's the only way to make optimistic guarantees.** "This route will respond in under 300 seconds" is a real promise only if you've sized every internal budget smaller than the wall and given every budget exhaustion a graceful fallback. The repo does this well: the cheap inner bound (forced synthesis) fires before the expensive outer bound (Vercel kill), and the user gets a coherent answer rather than a truncated body. The piece this codebase deliberately gives up — cancellation — is a separate concern: it's about RESPECTING the consumer's "I'm done." Bounded work makes the system robust; cancellation makes it polite.
-
----
-
-## Primary diagram
-
-The full bounded-work picture for one investigation request, with every budget visible:
-
-```
-  One investigation request — every budget in one frame
-
-  ┌─ Vercel function ─────────────────────────────────────────────────────┐
-  │  HARD WALL: maxDuration = 300s ───────────────────────────────────────│
-  │                                                                       │
-  │  ┌─ route handler ────────────────────────────────────────────────┐   │
-  │  │                                                                │   │
-  │  │  per-event TRUNC = 4000 chars (applied to tool results)        │   │
-  │  │  REPLAY_DELAY_MS = 180 (paces cached-replay events)            │   │
-  │  │                                                                │   │
-  │  │  ┌─ runAgentLoop ──────────────────────────────────────────┐   │   │
-  │  │  │  maxTurns = 8                                          │   │   │
-  │  │  │  maxToolCalls = 6 (agent-supplied)                     │   │   │
-  │  │  │  MAX_TOOL_RESULT_CHARS = 16_000 (per turn)             │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  on forceFinal turn:                                   │   │   │
-  │  │  │    OMIT tools[] from API params                        │   │   │
-  │  │  │    APPEND synthesisInstruction to system               │   │   │
-  │  │  │    → model MUST emit final JSON                        │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  ┌─ McpClient ──────────────────────────────────────┐  │   │   │
-  │  │  │  │  minIntervalMs = 1100   (spacing gate)           │  │   │   │
-  │  │  │  │  maxRetries = 3                                  │  │   │   │
-  │  │  │  │  retryDelayMs = 10_000  (fallback per retry)     │  │   │   │
-  │  │  │  │  retryCeilingMs = 20_000 (cap per retry wait)    │  │   │   │
-  │  │  │  │  cacheTtlMs = 60_000 (per-call default)          │  │   │   │
-  │  │  │  └──────────────────────────────────────────────────┘  │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  ┌─ Diagnostic agent fallback ─────────────────────┐   │   │   │
-  │  │  │  │  if forceFinal output ≠ valid JSON:             │   │   │   │
-  │  │  │  │    synthesize() — separate tool-less call with  │   │   │   │
-  │  │  │  │    the evidence gathered so far                 │   │   │   │
-  │  │  │  │  if synthesize() fails:                         │   │   │   │
-  │  │  │  │    FALLBACK = "Insufficient data…"               │   │   │   │
-  │  │  │  └─────────────────────────────────────────────────┘   │   │   │
-  │  │  └─────────────────────────────────────────────────────────┘  │   │
-  │  │                                                                │   │
-  │  │  CANCELLATION: not implemented. Client disconnect → server     │   │
-  │  │                keeps running until natural end or maxDuration. │   │
-  │  └────────────────────────────────────────────────────────────────┘   │
-  │                                                                       │
-  └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 9) Code in this codebase
 
 **Use cases.** Every long-running route applies the same stack of bounds:
 
@@ -504,6 +447,61 @@ The full bounded-work picture for one investigation request, with every budget v
           combined with "never abort on cleanup," this gives us StrictMode-
           survivable single-shot streaming. trade: a client tab-close doesn't
           stop the server.
+```
+
+### Move 3 — the principle
+
+**Bounded work isn't pessimism — it's the only way to make optimistic guarantees.** "This route will respond in under 300 seconds" is a real promise only if you've sized every internal budget smaller than the wall and given every budget exhaustion a graceful fallback. The repo does this well: the cheap inner bound (forced synthesis) fires before the expensive outer bound (Vercel kill), and the user gets a coherent answer rather than a truncated body. The piece this codebase deliberately gives up — cancellation — is a separate concern: it's about RESPECTING the consumer's "I'm done." Bounded work makes the system robust; cancellation makes it polite.
+
+---
+
+## Primary diagram
+
+The full bounded-work picture for one investigation request, with every budget visible:
+
+```
+  One investigation request — every budget in one frame
+
+  ┌─ Vercel function ─────────────────────────────────────────────────────┐
+  │  HARD WALL: maxDuration = 300s ───────────────────────────────────────│
+  │                                                                       │
+  │  ┌─ route handler ────────────────────────────────────────────────┐   │
+  │  │                                                                │   │
+  │  │  per-event TRUNC = 4000 chars (applied to tool results)        │   │
+  │  │  REPLAY_DELAY_MS = 180 (paces cached-replay events)            │   │
+  │  │                                                                │   │
+  │  │  ┌─ runAgentLoop ──────────────────────────────────────────┐   │   │
+  │  │  │  maxTurns = 8                                          │   │   │
+  │  │  │  maxToolCalls = 6 (agent-supplied)                     │   │   │
+  │  │  │  MAX_TOOL_RESULT_CHARS = 16_000 (per turn)             │   │   │
+  │  │  │                                                        │   │   │
+  │  │  │  on forceFinal turn:                                   │   │   │
+  │  │  │    OMIT tools[] from API params                        │   │   │
+  │  │  │    APPEND synthesisInstruction to system               │   │   │
+  │  │  │    → model MUST emit final JSON                        │   │   │
+  │  │  │                                                        │   │   │
+  │  │  │  ┌─ McpClient ──────────────────────────────────────┐  │   │   │
+  │  │  │  │  minIntervalMs = 1100   (spacing gate)           │  │   │   │
+  │  │  │  │  maxRetries = 3                                  │  │   │   │
+  │  │  │  │  retryDelayMs = 10_000  (fallback per retry)     │  │   │   │
+  │  │  │  │  retryCeilingMs = 20_000 (cap per retry wait)    │  │   │   │
+  │  │  │  │  cacheTtlMs = 60_000 (per-call default)          │  │   │   │
+  │  │  │  └──────────────────────────────────────────────────┘  │   │   │
+  │  │  │                                                        │   │   │
+  │  │  │  ┌─ Diagnostic agent fallback ─────────────────────┐   │   │   │
+  │  │  │  │  if forceFinal output ≠ valid JSON:             │   │   │   │
+  │  │  │  │    synthesize() — separate tool-less call with  │   │   │   │
+  │  │  │  │    the evidence gathered so far                 │   │   │   │
+  │  │  │  │  if synthesize() fails:                         │   │   │   │
+  │  │  │  │    FALLBACK = "Insufficient data…"               │   │   │   │
+  │  │  │  └─────────────────────────────────────────────────┘   │   │   │
+  │  │  └─────────────────────────────────────────────────────────┘  │   │
+  │  │                                                                │   │
+  │  │  CANCELLATION: not implemented. Client disconnect → server     │   │
+  │  │                keeps running until natural end or maxDuration. │   │
+  │  └────────────────────────────────────────────────────────────────┘   │
+  │                                                                       │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

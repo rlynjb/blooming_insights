@@ -147,6 +147,14 @@ Keep the index current by mutating it in place — upsert and delete keyed by do
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (incremental embedding indexing).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to maintain — and a live tool call needs no indexing at all, which is part of the no-RAG rationale (`11-rag.md`): there is no index to keep current because every query reads the source live.
+
+The honest analog is `saveInvestigation` (`lib/state/investigations.ts`): it is keyed in-place upsert. `mem.set(insightId, events)` overwrites exactly the one investigation by key (leaving the rest), and in development it merges into the JSON cache by key (`all[insightId] = events`) instead of rewriting unrelated entries. That is the add/update-by-id core of incremental indexing, minus the change-detection and the delete path. `getCachedInvestigation` (`lib/state/investigations.ts`) is the keyed read. An incremental embedding index would extend this exact pattern in `lib/mcp/embeddings.ts` / `lib/state/` with a content hash (skip unchanged) and a delete path (evict ghosts). The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Incremental indexing — diagram
 
 This diagram spans the Service layer (change-detection + the three operations) and the State layer (the keyed index). A reader who sees only this should grasp that updates are per-document upserts/deletes, not a full rebuild.
@@ -172,14 +180,6 @@ This diagram spans the Service layer (change-detection + the three operations) a
 ```
 
 Cost flows with the number of changes, not the corpus size — the upsert/delete-by-key shape `saveInvestigation` already uses.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (incremental embedding indexing).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to maintain — and a live tool call needs no indexing at all, which is part of the no-RAG rationale (`11-rag.md`): there is no index to keep current because every query reads the source live.
-
-The honest analog is `saveInvestigation` (`lib/state/investigations.ts`): it is keyed in-place upsert. `mem.set(insightId, events)` overwrites exactly the one investigation by key (leaving the rest), and in development it merges into the JSON cache by key (`all[insightId] = events`) instead of rewriting unrelated entries. That is the add/update-by-id core of incremental indexing, minus the change-detection and the delete path. `getCachedInvestigation` (`lib/state/investigations.ts`) is the keyed read. An incremental embedding index would extend this exact pattern in `lib/mcp/embeddings.ts` / `lib/state/` with a content hash (skip unchanged) and a delete path (evict ghosts). The `Project exercises` block below is the primary buildable target.
 
 ---
 

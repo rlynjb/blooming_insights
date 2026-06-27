@@ -95,6 +95,11 @@ blooming insights uses pattern 0 — no writes at all. That's the load-bearing d
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- Re-visiting an investigation page in dev (React StrictMode): without `startedRef`, two fetches would issue; with it, only one runs.
+- The schema bootstrap (`bootstrapSchema`) is called by both `/api/agent` and `/api/briefing` within seconds of each other. The four underlying tool calls (`get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview`) are cached for 60s in `McpClient` *and* the parsed `WorkspaceSchema` is cached at the module level for the lifetime of the process. The combined dedup means the second route pays zero network cost.
+- The monitoring agent issues several `execute_analytics_eql` calls with different EQL bodies. Each unique EQL is a different cache key. If the agent happens to issue the *same* EQL twice (e.g. re-checking a baseline), the second one returns from cache instantly.
+
 #### Part 1 — the TTL cache, the only network-layer dedup
 
 `McpClient` keeps a `Map<cacheKey, { result, expiresAt }>` where `cacheKey = '${name}:${JSON.stringify(args)}'`. Default TTL is 60 seconds.
@@ -127,6 +132,40 @@ Three boundary conditions:
 - **`skipCache: true` bypasses read but still writes.** The `/debug` "force fresh" path uses this. Write-through, not write-around.
 - **Cache is per-process.** Two Vercel instances each have their own cache. A call cached on instance A is not visible to instance B. This is the same Seam B (file 01) problem reappearing — the cache is a local optimization, not a cross-instance contract.
 
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 144-152, 178-187)
+
+  const cacheKey = `${name}:${JSON.stringify(args)}`;     ← key includes args
+  const ttl = options.cacheTtlMs ?? 60_000;                 deterministically
+
+  if (!options.skipCache) {
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {        ← lazy TTL check;
+      return {                                                no background eviction
+        result: cached.result as T,
+        durationMs: 0,
+        fromCache: true,                                  ← caller can observe
+      };                                                     this for diagnostics
+    }
+  }
+
+  // ... after live call + retry ...
+
+  if ((result as any)?.isError === true) {
+    return { result: result as T, durationMs, fromCache: false };
+  }                                                       ← NEVER cache errors
+
+  const now = Date.now();
+  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+  return { result: result as T, durationMs, fromCache: false };
+       │
+       └─ the "don't cache errors" line is load-bearing. Without it,
+          a 429 that contained isError: true would be cached for 60s,
+          and the next call would return the rate-limit envelope from
+          cache without ever retrying. The error → cache miss → retry
+          path depends on this.
+```
+
 #### Part 2 — the React StrictMode guard
 
 `useInvestigation` (`lib/hooks/useInvestigation.ts:43-48`) uses a ref guard so the effect only runs once per mount, even under StrictMode's mount → unmount → re-mount cycle.
@@ -152,6 +191,26 @@ Three boundary conditions:
 
 The boundary condition that makes this nuanced: the comment in `useInvestigation.ts:33-36` says *"we deliberately do NOT cancel the fetch on effect cleanup."* Cancelling on cleanup *and* guarding with `startedRef` together cancelled the stream and left the logs empty. The chosen tradeoff: live with the in-flight fetch completing after unmount (the `setState`s are no-ops then), in exchange for clean StrictMode behavior. That's an at-most-once *initiation* guarantee with an at-least-once *completion* — the network call WILL finish, even if no one is listening.
 
+```
+  lib/hooks/useInvestigation.ts  (lines 43-48)
+
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (!id) return;
+    if (startedRef.current) return;     ← second StrictMode run bails
+    startedRef.current = true;           ← first run claims the slot
+
+    // ... hydrate from stash, then fetch /api/agent ...
+  }, [id, step]);
+       │
+       └─ this is the only client-side dedup. The fetch itself has
+          no AbortController on the cleanup path (deliberate, see
+          comment in file at lines 33-36) — so the in-flight request
+          completes even after unmount. That's at-most-once initiation
+          with at-least-once completion.
+```
+
 #### Part 3 — implicit delivery semantics in the NDJSON stream
 
 Events from `/api/agent` are written one line at a time to a `ReadableStream`. There's no event ID, no resumable cursor, no acknowledgment from client to server. If the client disconnects mid-stream, the server's writer keeps trying to write until it errors out (the controller closes); the client cannot reconnect and resume. Delivery is best-effort, in-order, at-most-once-per-stream.
@@ -173,6 +232,31 @@ Events from `/api/agent` are written one line at a time to a `ReadableStream`. T
 ```
 
 This is fine for live progress display; it would not be fine if the stream were carrying state changes the client *must* see. The cached-replay path (`/api/agent` with no `live=1`) handles re-visits by replaying the entire stored `AgentEvent[]` from disk — not by resuming, but by re-emitting from the start with the same `REPLAY_DELAY_MS` pacing.
+
+```
+  app/api/agent/route.ts  (lines 127-141)
+
+  const cached = insightId && !live ? getCachedInvestigation(insightId) : null;
+  if (cached) {
+    const events = step ? filterByStep(cached, step) : cached;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const e of events) {
+          controller.enqueue(encoder.encode(encodeEvent(e)));
+          await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));   ← paced replay
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, { headers: NDJSON_HEADERS });
+  }
+       │
+       └─ the "replay" path. Cached investigations are effectively
+          idempotent re-views — the cache key is insightId, the
+          payload is deterministic, every replay produces the same
+          stream. This is what makes the demo mode safe to refresh.
+```
 
 #### Part 4 — what NOT YET EXERCISED looks like
 
@@ -253,96 +337,6 @@ This is the right kind of NOT YET EXERCISED — explicitly named, scoped to a kn
   │                                                            │
   │   writes (update_*, create_*, start_*) — NOT YET EXERCISED │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- Re-visiting an investigation page in dev (React StrictMode): without `startedRef`, two fetches would issue; with it, only one runs.
-- The schema bootstrap (`bootstrapSchema`) is called by both `/api/agent` and `/api/briefing` within seconds of each other. The four underlying tool calls (`get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview`) are cached for 60s in `McpClient` *and* the parsed `WorkspaceSchema` is cached at the module level for the lifetime of the process. The combined dedup means the second route pays zero network cost.
-- The monitoring agent issues several `execute_analytics_eql` calls with different EQL bodies. Each unique EQL is a different cache key. If the agent happens to issue the *same* EQL twice (e.g. re-checking a baseline), the second one returns from cache instantly.
-
-**Code side by side.**
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 144-152, 178-187)
-
-  const cacheKey = `${name}:${JSON.stringify(args)}`;     ← key includes args
-  const ttl = options.cacheTtlMs ?? 60_000;                 deterministically
-
-  if (!options.skipCache) {
-    const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {        ← lazy TTL check;
-      return {                                                no background eviction
-        result: cached.result as T,
-        durationMs: 0,
-        fromCache: true,                                  ← caller can observe
-      };                                                     this for diagnostics
-    }
-  }
-
-  // ... after live call + retry ...
-
-  if ((result as any)?.isError === true) {
-    return { result: result as T, durationMs, fromCache: false };
-  }                                                       ← NEVER cache errors
-
-  const now = Date.now();
-  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-  return { result: result as T, durationMs, fromCache: false };
-       │
-       └─ the "don't cache errors" line is load-bearing. Without it,
-          a 429 that contained isError: true would be cached for 60s,
-          and the next call would return the rate-limit envelope from
-          cache without ever retrying. The error → cache miss → retry
-          path depends on this.
-```
-
-```
-  lib/hooks/useInvestigation.ts  (lines 43-48)
-
-  const startedRef = useRef(false);
-
-  useEffect(() => {
-    if (!id) return;
-    if (startedRef.current) return;     ← second StrictMode run bails
-    startedRef.current = true;           ← first run claims the slot
-
-    // ... hydrate from stash, then fetch /api/agent ...
-  }, [id, step]);
-       │
-       └─ this is the only client-side dedup. The fetch itself has
-          no AbortController on the cleanup path (deliberate, see
-          comment in file at lines 33-36) — so the in-flight request
-          completes even after unmount. That's at-most-once initiation
-          with at-least-once completion.
-```
-
-```
-  app/api/agent/route.ts  (lines 127-141)
-
-  const cached = insightId && !live ? getCachedInvestigation(insightId) : null;
-  if (cached) {
-    const events = step ? filterByStep(cached, step) : cached;
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        for (const e of events) {
-          controller.enqueue(encoder.encode(encodeEvent(e)));
-          await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));   ← paced replay
-        }
-        controller.close();
-      },
-    });
-    return new Response(stream, { headers: NDJSON_HEADERS });
-  }
-       │
-       └─ the "replay" path. Cached investigations are effectively
-          idempotent re-views — the cache key is insightId, the
-          payload is deterministic, every replay produces the same
-          stream. This is what makes the demo mode safe to refresh.
 ```
 
 ---

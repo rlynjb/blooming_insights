@@ -302,6 +302,75 @@ A red-flag audit isn't about finding every smell. It's about *ranking* them so t
 
 **A note on resolved-by-deletion.** The 2026-06-16 #1 (`price_brl`) is the cleanest case of "a finding goes away because the code does." It wasn't fixed; it was removed. That's still a legitimate audit outcome — the right action is to mark the finding as no-longer-applicable and rerank, not to keep a phantom item at the top of the list. The historical file (file 10) stays as a pattern artifact; the audit pretends it's not there because, for this repo today, it isn't.
 
+### Code in this codebase
+
+The repo anchors for the top-priority fix targets and the deferred substrate-graduation move.
+
+#### The top-3 fix locations
+
+```
+  the fix targets, in priority order (2026-06-19)
+
+  ┌─ #1: the wire-format leak ──────────────────────────────┐
+  │  lib/mcp/types.ts                  ← truth source        │
+  │  lib/state/insights.ts (colocated) ← both conversions    │
+  │  app/api/agent/route.ts            ← resolveAnomaly() –  │
+  │                                       wire branch is the │
+  │                                       remaining leak     │
+  │                                                            │
+  │  move: switch wire format to ?id=<insightId>; rely on the │
+  │        per-session anomalies Map for the lookup. retires  │
+  │        the lossy round-trip end-to-end.                   │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ #2: the dual-shape ────────────────────────────────────┐
+  │  lib/mcp/types.ts L95–L104   ← Diagnosis (rich)          │
+  │  lib/mcp/types.ts L132–L141  ← Investigation.diagnosis   │
+  │                                  (flat, embedded)         │
+  │                                                            │
+  │  move: rename the embedded one DiagnosisSummary and add   │
+  │        a summarizeDiagnosis() projection function.        │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ #7: the synthetic determinism contract ────────────────┐
+  │  lib/data-source/synthetic-data-source.ts L275–L307      │
+  │  test/data-source/synthetic-data-source.test.ts          │
+  │                                                            │
+  │  move: doc comment naming the "no PRNG, no Date.now()"   │
+  │        contract + a byte-equality test on two adjacent   │
+  │        callTool() invocations.                            │
+  └────────────────────────────────────────────────────────────┘
+```
+
+#### The honest-gap fix is one move: graduate the storage
+
+```
+  the deferred work — when the time comes
+
+  current:     in-memory Maps + JSON-file fallback + demo seed
+  buildable:   Postgres (Vercel Postgres / Supabase / Neon)
+               + Drizzle for schema + migrations
+               + one migration to seed from demo-insights.json
+
+  what this retires:
+    - the cross-Map invariant problem (FK + CASCADE)
+    - the transaction layer gap (BEGIN / COMMIT)
+    - the cold-start durability story (Postgres persists)
+    - the wire-format-as-bridge cost (no longer needed)
+    - the lossy insightToAnomaly conversion (no conversion needed)
+    - the migration story gap (Drizzle's migration files are first-class)
+
+  what it adds:
+    - one dependency (Drizzle + the DB driver)
+    - one schema file
+    - one managed-DB account (Vercel Postgres tier or Supabase)
+    - one ops surface (the DB itself)
+
+  prerequisite: a real need for durability. today the demo + portfolio
+  context doesn't have one. when the user expects briefings to persist,
+  this is the move.
+```
+
 ---
 
 ## Primary diagram
@@ -354,75 +423,6 @@ The capstone — every red flag, by severity and concreteness.
   9.  No migration tooling           (substrate-gap; no DB)
   10. No query / index layer         (substrate-gap; no SQL)
   11. No transaction layer           (substrate-gap; no DB)
-```
-
----
-
-## Implementation in codebase
-
-### The top-3 fix locations
-
-```
-  the fix targets, in priority order (2026-06-19)
-
-  ┌─ #1: the wire-format leak ──────────────────────────────┐
-  │  lib/mcp/types.ts                  ← truth source        │
-  │  lib/state/insights.ts (colocated) ← both conversions    │
-  │  app/api/agent/route.ts            ← resolveAnomaly() –  │
-  │                                       wire branch is the │
-  │                                       remaining leak     │
-  │                                                            │
-  │  move: switch wire format to ?id=<insightId>; rely on the │
-  │        per-session anomalies Map for the lookup. retires  │
-  │        the lossy round-trip end-to-end.                   │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ #2: the dual-shape ────────────────────────────────────┐
-  │  lib/mcp/types.ts L95–L104   ← Diagnosis (rich)          │
-  │  lib/mcp/types.ts L132–L141  ← Investigation.diagnosis   │
-  │                                  (flat, embedded)         │
-  │                                                            │
-  │  move: rename the embedded one DiagnosisSummary and add   │
-  │        a summarizeDiagnosis() projection function.        │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ #7: the synthetic determinism contract ────────────────┐
-  │  lib/data-source/synthetic-data-source.ts L275–L307      │
-  │  test/data-source/synthetic-data-source.test.ts          │
-  │                                                            │
-  │  move: doc comment naming the "no PRNG, no Date.now()"   │
-  │        contract + a byte-equality test on two adjacent   │
-  │        callTool() invocations.                            │
-  └────────────────────────────────────────────────────────────┘
-```
-
-### The honest-gap fix is one move: graduate the storage
-
-```
-  the deferred work — when the time comes
-
-  current:     in-memory Maps + JSON-file fallback + demo seed
-  buildable:   Postgres (Vercel Postgres / Supabase / Neon)
-               + Drizzle for schema + migrations
-               + one migration to seed from demo-insights.json
-
-  what this retires:
-    - the cross-Map invariant problem (FK + CASCADE)
-    - the transaction layer gap (BEGIN / COMMIT)
-    - the cold-start durability story (Postgres persists)
-    - the wire-format-as-bridge cost (no longer needed)
-    - the lossy insightToAnomaly conversion (no conversion needed)
-    - the migration story gap (Drizzle's migration files are first-class)
-
-  what it adds:
-    - one dependency (Drizzle + the DB driver)
-    - one schema file
-    - one managed-DB account (Vercel Postgres tier or Supabase)
-    - one ops surface (the DB itself)
-
-  prerequisite: a real need for durability. today the demo + portfolio
-  context doesn't have one. when the user expects briefings to persist,
-  this is the move.
 ```
 
 ---

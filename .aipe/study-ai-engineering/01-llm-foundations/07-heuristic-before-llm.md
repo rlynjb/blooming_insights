@@ -174,6 +174,21 @@ Order your routing checks cheapest-first and reserve the model for what only a m
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **The heuristic:** `parseIntent(raw)` — `lib/agents/intent.ts` L6–L12. Pure, lowercase + substring match, default `'diagnostic'`.
+- **The LLM fallback:** `classifyIntent(anthropic, query)` — `lib/agents/intent.ts` L17–L31. Haiku, `max_tokens: 16` (L20), output normalized via `parseIntent` (L30).
+- **The cheap model tier:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14 (vs sonnet `AGENT_MODEL`, `lib/agents/base.ts` L9).
+- **The route's structural heuristic:** parameter-presence branch — `app/api/agent/route.ts` L210 (`q && !insightId` → query flow), L221 (investigation flow body; anomaly resolved at L144), L121–L123 (neither → 400); `classifyIntent` invoked only inside the query branch at L211.
+
+#### Why two layers, not one
+
+`parseIntent` alone would mis-route every natural-language question, because real users do not type the word "diagnostic" — they type "why did sales drop?" `classifyIntent` alone would pay for a model call on every routing decision, including the unambiguous "show me monitoring." Layering them captures the cheap wins (literal keywords, parameter presence) for free and pays for the model only on the inputs that need understanding. The reuse of `parseIntent` to parse the model's output means there is one canonical mapping from string to `Intent`, whether the string came from a user or from haiku.
+
+---
+
 ## Heuristic before LLM — diagram
 
 This diagram spans the route (structural heuristic) and the intent layer (keyword heuristic → LLM fallback). The free checks gate the paid call; a reader who sees only this should grasp that the model is the last resort, not the first move.
@@ -206,21 +221,6 @@ This diagram spans the route (structural heuristic) and the intent layer (keywor
 ```
 
 The free heuristics gate the call; the model only runs for free-form queries with no literal keyword, and the free parser even interprets the model's answer.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **The heuristic:** `parseIntent(raw)` — `lib/agents/intent.ts` L6–L12. Pure, lowercase + substring match, default `'diagnostic'`.
-- **The LLM fallback:** `classifyIntent(anthropic, query)` — `lib/agents/intent.ts` L17–L31. Haiku, `max_tokens: 16` (L20), output normalized via `parseIntent` (L30).
-- **The cheap model tier:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14 (vs sonnet `AGENT_MODEL`, `lib/agents/base.ts` L9).
-- **The route's structural heuristic:** parameter-presence branch — `app/api/agent/route.ts` L210 (`q && !insightId` → query flow), L221 (investigation flow body; anomaly resolved at L144), L121–L123 (neither → 400); `classifyIntent` invoked only inside the query branch at L211.
-
-### Why two layers, not one
-
-`parseIntent` alone would mis-route every natural-language question, because real users do not type the word "diagnostic" — they type "why did sales drop?" `classifyIntent` alone would pay for a model call on every routing decision, including the unambiguous "show me monitoring." Layering them captures the cheap wins (literal keywords, parameter presence) for free and pays for the model only on the inputs that need understanding. The reuse of `parseIntent` to parse the model's output means there is one canonical mapping from string to `Intent`, whether the string came from a user or from haiku.
 
 ---
 

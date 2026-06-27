@@ -389,6 +389,70 @@ The `NODE_ENV` checks select the backend. In production the read/write helpers h
 
 The SDK implements a complex, multi-step protocol (register → authorize → exchange → refresh). Our code implements a **provider interface** — a set of callbacks the SDK invokes at defined points. This is the Strategy pattern: the framework drives the algorithm; the implementor supplies the storage and redirect behavior. The provider interface is the seam between protocol execution and application-specific concerns.
 
+### Code in this codebase
+
+Each callback the SDK invokes (Sub-sections A–F above) maps to a real method or helper in the repo. Open `lib/mcp/auth.ts` to read the provider, `lib/mcp/connect.ts` for the inner-connect path, and `app/api/mcp/callback/route.ts` for the IdP return.
+
+| File | Function / Export | Lines | Role |
+|---|---|---|---|
+| `lib/mcp/auth.ts` | `BloomreachAuthProvider` | L160–L218 | Implements `OAuthClientProvider`; all persistence via `patchState`/`readState` |
+| `lib/mcp/auth.ts` | `readAll` / `writeAll` | L113–L142 | Picks backend by `NODE_ENV`: ALS cookie store (prod), file (dev), `Map` (test) |
+| `lib/mcp/auth.ts` | `aesKey` | L51–L60 | Derives AES-256 key from `AUTH_SECRET` (SHA-256); throws if unset |
+| `lib/mcp/auth.ts` | `encryptStore` / `decryptStore` | L62–L79 | AES-256-GCM encode/decode the `Store` to/from the `bi_auth` cookie value |
+| `lib/mcp/auth.ts` | `withAuthCookies` | L86–L104 | Seeds an ALS-scoped store from `bi_auth` once, flushes it back once (prod only) |
+| `lib/mcp/auth.ts` | `AUTH_COOKIE` / `requestStore` | L47–L48 | `'bi_auth'` cookie name; `AsyncLocalStorage<RequestStore>` |
+| `lib/mcp/auth.ts` | `_authCookieCrypto` | L244–L247 | Test seam exposing `encrypt`/`decrypt` without a request context |
+| `lib/mcp/auth.ts` | `deleteAuthCookie` | L107–L111 | Clears `bi_auth` (reset route); no-op in dev/test |
+| `lib/mcp/auth.ts` | `hasTokens` | L220–L222 | Boolean check used by routes to skip auth |
+| `lib/mcp/auth.ts` | `clearAuth` | L237–L241 | Removes session from store (logout) |
+| `lib/mcp/auth.ts` | `consumeState` | L230–L235 | One-time CSRF state validator (not wired in callback) |
+| `lib/mcp/connect.ts` | `connectMcp` | L59–L64 | Wraps `connectMcpInner` in `withAuthCookies` (async) |
+| `lib/mcp/connect.ts` | `connectMcpInner` | L66–L107 | Builds transport + provider, calls `client.connect`, catches `UnauthorizedError` |
+| `lib/mcp/connect.ts` | `redirectUri` | L31–L52 | Async, host-based callback origin (`x-forwarded-host` in prod) |
+| `lib/mcp/connect.ts` | `completeAuth` | L114–L122 | Reconstructs provider for session, calls `transport.finishAuth` (in `withAuthCookies`) |
+| `lib/mcp/connect.ts` | `mcpUrl` | L25–L29 | Strips trailing slash from MCP URL to avoid 307 |
+| `app/api/mcp/callback/route.ts` | `GET` | L5–L35 | Reads `code`, resolves session, calls `completeAuth`, redirects to `/` |
+| `lib/mcp/session.ts` | `getOrCreateSessionId` | L16–L24 | Creates `bi_session` cookie on first request |
+| `lib/mcp/session.ts` | `readSessionId` | L26–L29 | Reads existing `bi_session` (returns null if absent) |
+| `lib/mcp/session.ts` | `sessionCookieOpts` | L10–L14 | `SameSite=None; Secure` in prod, `Lax` in dev |
+
+**connect → needsAuth → callback → finishAuth pseudocode:**
+
+```
+// Phase 1: connect (connect.ts L59 connectMcp → L63 withAuthCookies)
+sessionId = await getOrCreateSessionId()     // lib/mcp/session.ts L16
+withAuthCookies(() =>                         // prod: seed/flush bi_auth around this
+  connectMcpInner(sessionId):                 // connect.ts L66
+    provider  = new BloomreachAuthProvider(sessionId, await redirectUri())  // L67, host-based
+    transport = new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider })
+    try:
+      await client.connect(transport)         // SDK drives DCR + PKCE
+      return { ok: true, mcp: new McpClient(...) }
+    catch UnauthorizedError:                   // connect.ts L98
+      if provider.lastAuthorizeUrl:
+        return { ok: false, authUrl: provider.lastAuthorizeUrl.toString() }
+)
+
+// Phase 2: callback (connect.ts L114 completeAuth)
+sessionId = await readSessionId()            // lib/mcp/session.ts L26
+withAuthCookies(async () =>                    // prod: decrypt bi_auth → verifier + clientInfo
+  provider  = new BloomreachAuthProvider(sessionId, await redirectUri())
+  transport = new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider })
+  await transport.finishAuth(code)            // reads codeVerifier + clientInfo from store
+)
+// provider.saveTokens() called by SDK → flushed to bi_auth under sessionId
+redirect("/")
+```
+
+**GitHub links:**
+
+- `lib/mcp/auth.ts` L160–L218 (`BloomreachAuthProvider`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L160-L218
+- `lib/mcp/auth.ts` L51–L104 (`aesKey` → `withAuthCookies`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L51-L104
+- `lib/mcp/auth.ts` L113–L142 (`readAll`/`writeAll`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L113-L142
+- `lib/mcp/connect.ts` L31–L122 (`redirectUri` → `completeAuth`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L31-L122
+- `app/api/mcp/callback/route.ts` L5–L35: https://github.com/rlynjb/blooming_insights/blob/main/app/api/mcp/callback/route.ts#L5-L35
+- `lib/mcp/session.ts` L10–L29: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/session.ts#L10-L29
+
 ---
 
 ## OAuth boundary — diagram
@@ -462,70 +526,6 @@ Provider / Network layer
 ```
 
 After `saveTokens` completes, the next `connectMcp` call for the same session reads the tokens via `provider.tokens()`, `client.connect` succeeds, and `{ ok: true, mcp }` is returned — the MCP server is reachable.
-
----
-
-## Implementation in codebase
-
-| File | Function / Export | Lines | Role |
-|---|---|---|---|
-| `lib/mcp/auth.ts` | `BloomreachAuthProvider` | L160–L218 | Implements `OAuthClientProvider`; all persistence via `patchState`/`readState` |
-| `lib/mcp/auth.ts` | `readAll` / `writeAll` | L113–L142 | Picks backend by `NODE_ENV`: ALS cookie store (prod), file (dev), `Map` (test) |
-| `lib/mcp/auth.ts` | `aesKey` | L51–L60 | Derives AES-256 key from `AUTH_SECRET` (SHA-256); throws if unset |
-| `lib/mcp/auth.ts` | `encryptStore` / `decryptStore` | L62–L79 | AES-256-GCM encode/decode the `Store` to/from the `bi_auth` cookie value |
-| `lib/mcp/auth.ts` | `withAuthCookies` | L86–L104 | Seeds an ALS-scoped store from `bi_auth` once, flushes it back once (prod only) |
-| `lib/mcp/auth.ts` | `AUTH_COOKIE` / `requestStore` | L47–L48 | `'bi_auth'` cookie name; `AsyncLocalStorage<RequestStore>` |
-| `lib/mcp/auth.ts` | `_authCookieCrypto` | L244–L247 | Test seam exposing `encrypt`/`decrypt` without a request context |
-| `lib/mcp/auth.ts` | `deleteAuthCookie` | L107–L111 | Clears `bi_auth` (reset route); no-op in dev/test |
-| `lib/mcp/auth.ts` | `hasTokens` | L220–L222 | Boolean check used by routes to skip auth |
-| `lib/mcp/auth.ts` | `clearAuth` | L237–L241 | Removes session from store (logout) |
-| `lib/mcp/auth.ts` | `consumeState` | L230–L235 | One-time CSRF state validator (not wired in callback) |
-| `lib/mcp/connect.ts` | `connectMcp` | L59–L64 | Wraps `connectMcpInner` in `withAuthCookies` (async) |
-| `lib/mcp/connect.ts` | `connectMcpInner` | L66–L107 | Builds transport + provider, calls `client.connect`, catches `UnauthorizedError` |
-| `lib/mcp/connect.ts` | `redirectUri` | L31–L52 | Async, host-based callback origin (`x-forwarded-host` in prod) |
-| `lib/mcp/connect.ts` | `completeAuth` | L114–L122 | Reconstructs provider for session, calls `transport.finishAuth` (in `withAuthCookies`) |
-| `lib/mcp/connect.ts` | `mcpUrl` | L25–L29 | Strips trailing slash from MCP URL to avoid 307 |
-| `app/api/mcp/callback/route.ts` | `GET` | L5–L35 | Reads `code`, resolves session, calls `completeAuth`, redirects to `/` |
-| `lib/mcp/session.ts` | `getOrCreateSessionId` | L16–L24 | Creates `bi_session` cookie on first request |
-| `lib/mcp/session.ts` | `readSessionId` | L26–L29 | Reads existing `bi_session` (returns null if absent) |
-| `lib/mcp/session.ts` | `sessionCookieOpts` | L10–L14 | `SameSite=None; Secure` in prod, `Lax` in dev |
-
-**connect → needsAuth → callback → finishAuth pseudocode:**
-
-```
-// Phase 1: connect (connect.ts L59 connectMcp → L63 withAuthCookies)
-sessionId = await getOrCreateSessionId()     // lib/mcp/session.ts L16
-withAuthCookies(() =>                         // prod: seed/flush bi_auth around this
-  connectMcpInner(sessionId):                 // connect.ts L66
-    provider  = new BloomreachAuthProvider(sessionId, await redirectUri())  // L67, host-based
-    transport = new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider })
-    try:
-      await client.connect(transport)         // SDK drives DCR + PKCE
-      return { ok: true, mcp: new McpClient(...) }
-    catch UnauthorizedError:                   // connect.ts L98
-      if provider.lastAuthorizeUrl:
-        return { ok: false, authUrl: provider.lastAuthorizeUrl.toString() }
-)
-
-// Phase 2: callback (connect.ts L114 completeAuth)
-sessionId = await readSessionId()            // lib/mcp/session.ts L26
-withAuthCookies(async () =>                    // prod: decrypt bi_auth → verifier + clientInfo
-  provider  = new BloomreachAuthProvider(sessionId, await redirectUri())
-  transport = new StreamableHTTPClientTransport(mcpUrl(), { authProvider: provider })
-  await transport.finishAuth(code)            // reads codeVerifier + clientInfo from store
-)
-// provider.saveTokens() called by SDK → flushed to bi_auth under sessionId
-redirect("/")
-```
-
-**GitHub links:**
-
-- `lib/mcp/auth.ts` L160–L218 (`BloomreachAuthProvider`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L160-L218
-- `lib/mcp/auth.ts` L51–L104 (`aesKey` → `withAuthCookies`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L51-L104
-- `lib/mcp/auth.ts` L113–L142 (`readAll`/`writeAll`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/auth.ts#L113-L142
-- `lib/mcp/connect.ts` L31–L122 (`redirectUri` → `completeAuth`): https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L31-L122
-- `app/api/mcp/callback/route.ts` L5–L35: https://github.com/rlynjb/blooming_insights/blob/main/app/api/mcp/callback/route.ts#L5-L35
-- `lib/mcp/session.ts` L10–L29: https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/session.ts#L10-L29
 
 ---
 

@@ -152,6 +152,14 @@ Retrieval is only as good as the query handed to it, so transform the query to m
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (retrieval-query rewriting).** blooming insights retrieves live via exact EQL — where the query is translated, not rewritten-for-recall — and has no embedding retrieval whose query would need expansion or HyDE.
+
+The honest analog is real and present: blooming insights does *query understanding*, the sibling discipline. `classifyIntent` (`lib/agents/intent.ts` L17–L31) classifies the free-form `?q=` into an intent with a cheap haiku call (`max_tokens: 16`), preceded by the pure `parseIntent` substring heuristic (L6–L12). Then the agent translates the natural-language question into structured EQL and tool arguments — reshaping the user's words into the engine's consumable form. That translation is query-rewriting-adjacent: it transforms the question before retrieval. The difference is that EQL is *exact* (schema names are known), so there is no vocabulary-gap recall problem the expand/HyDE levers exist to solve. Those levers would live in a `lib/mcp/retrieval.ts` if fuzzy retrieval over past investigations is added. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Query rewriting & HyDE — diagram
 
 This diagram spans the Service layer (the rewrite step before retrieval). A reader who sees only this should grasp that the raw question is transformed into a better retrieval query before the index is touched.
@@ -175,14 +183,6 @@ This diagram spans the Service layer (the rewrite step before retrieval). A read
 ```
 
 The current path produces an exact EQL query; the proposed path reshapes a fuzzy question for embedding retrieval. Both are query understanding; only the second is retrieval-query rewriting.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (retrieval-query rewriting).** blooming insights retrieves live via exact EQL — where the query is translated, not rewritten-for-recall — and has no embedding retrieval whose query would need expansion or HyDE.
-
-The honest analog is real and present: blooming insights does *query understanding*, the sibling discipline. `classifyIntent` (`lib/agents/intent.ts` L17–L31) classifies the free-form `?q=` into an intent with a cheap haiku call (`max_tokens: 16`), preceded by the pure `parseIntent` substring heuristic (L6–L12). Then the agent translates the natural-language question into structured EQL and tool arguments — reshaping the user's words into the engine's consumable form. That translation is query-rewriting-adjacent: it transforms the question before retrieval. The difference is that EQL is *exact* (schema names are known), so there is no vocabulary-gap recall problem the expand/HyDE levers exist to solve. Those levers would live in a `lib/mcp/retrieval.ts` if fuzzy retrieval over past investigations is added. The `Project exercises` block below is the primary buildable target.
 
 ---
 

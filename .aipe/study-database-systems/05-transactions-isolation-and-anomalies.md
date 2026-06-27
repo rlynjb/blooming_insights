@@ -124,21 +124,11 @@ A transaction is a fence around a group of operations. Inside the fence, the dat
 
 Bridge: think of two browser tabs both editing the same Google Doc without operational transform. Without isolation, both write their changes and one wins silently — that's lost update.
 
-### Move 3 — the principle
-
-**Transactions are a contract that lets you write code as if you were alone.** Without them, every multi-write operation must be hand-coded to be re-entrant and conflict-aware — which is exactly the trap concurrent programming has always been. The whole reason relational databases beat hand-rolled storage layers is that ACID transactions are *correct by default*, where the alternative is correct-if-you-think-of-everything.
-
-## Primary diagram
-
-Skipped — no codebase instance.
-
-## Implementation in codebase
-
-### Use cases
+### Code in this codebase
 
 None at the database level. The closest transaction-shaped code in the repo is `withAuthCookies` — a read-once, mutate-in-memory, write-once wrapper. The closest "atomicity by accident" is any function body with no awaits inside `lib/state/insights.ts`, which Node's event loop guarantees runs to completion before any other handler can observe its mutations (see 06 for the full concurrency story).
 
-### The closest cousin — Node's single-threaded "isolation" (main app)
+The closest cousin — Node's single-threaded "isolation" (main app):
 
 ```
   lib/state/insights.ts  (lines 30–42)
@@ -198,6 +188,14 @@ None at the database level. The closest transaction-shaped code in the repo is `
           way (the cookie just doesn't get written, which is the right
           behavior here) — but the SHAPE is transactional.
 ```
+
+### Move 3 — the principle
+
+**Transactions are a contract that lets you write code as if you were alone.** Without them, every multi-write operation must be hand-coded to be re-entrant and conflict-aware — which is exactly the trap concurrent programming has always been. The whole reason relational databases beat hand-rolled storage layers is that ACID transactions are *correct by default*, where the alternative is correct-if-you-think-of-everything.
+
+## Primary diagram
+
+Skipped — no codebase instance.
 
 ## Elaborate
 

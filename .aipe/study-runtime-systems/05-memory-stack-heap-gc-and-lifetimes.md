@@ -291,65 +291,7 @@ When the route enqueues bytes (`controller.enqueue(encoder.encode(...))`), they 
   GC pressure: negligible.
 ```
 
-### Move 3 — the principle
-
-**In a process-resident runtime, "lifetime" beats "size" as the thing to reason about.** Most performance bugs in serverless aren't OOM — they're stale-state surprises ("why did my Map come back empty?") or cold-start latency ("why did this request take 5s?"). The right discipline is naming the lifetime of every heap object the way the comments in this repo do for the `cached` schema and for `insights`: who clears it, when, and what happens when the process dies underneath it.
-
----
-
-## Primary diagram
-
-The full memory + lifetime picture for one warm Node instance:
-
-```
-  Memory in one warm Vercel instance — lifetimes named
-
-  ┌─ Node process (V8 heap) ─────────────────────────────────────────────┐
-  │                                                                      │
-  │  ┌─ MODULE SCOPE (warm-instance lifetime) ─────────────────────────┐ │
-  │  │                                                                 │ │
-  │  │  insights        Map<string, Insight>     ≤10 entries           │ │
-  │  │                  cleared on each putInsights — bounded          │ │
-  │  │                                                                 │ │
-  │  │  anomalies       Map<string, Anomaly>     ≤10 entries           │ │
-  │  │                  cleared with insights                          │ │
-  │  │                                                                 │ │
-  │  │  investigations  Map<string, AgentEvent[]> MONOTONIC growth     │ │
-  │  │                  no eviction; only process restart shrinks      │ │
-  │  │                  practical ceiling: 1-5MB at current scale      │ │
-  │  │                                                                 │ │
-  │  │  cached schema   WorkspaceSchema           one object, ~tens KB │ │
-  │  │                  bootstrapped once per warm instance            │ │
-  │  │                                                                 │ │
-  │  │  (per-request McpClient.cache lives at this scope too, but the  │ │
-  │  │   McpClient itself is per-request — so the cache is too)         │ │
-  │  └─────────────────────────────────────────────────────────────────┘ │
-  │                                                                      │
-  │  ┌─ PER-REQUEST (≤300s lifetime, bounded by maxDuration) ──────────┐ │
-  │  │                                                                 │ │
-  │  │  ALS ctx { store, dirty }     ~few KB (decrypted auth state)    │ │
-  │  │  McpClient instance            with its own 60s TTL cache       │ │
-  │  │  ReadableStream buffer          NDJSON bytes, drains to client   │ │
-  │  │  collected[] (in route)         all events for saveInvestigation │ │
-  │  └─────────────────────────────────────────────────────────────────┘ │
-  │                                                                      │
-  │  ┌─ PER-CALL (function-frame lifetime) ────────────────────────────┐ │
-  │  │                                                                 │ │
-  │  │  runAgentLoop messages[]   linear growth per turn, bounded by   │ │
-  │  │                            16KB truncation per tool_result      │ │
-  │  │  toolCalls[]               linear growth per tool call            │ │
-  │  │  textBlocks[], toolUses[]   per-turn, GC'd between turns         │ │
-  │  └─────────────────────────────────────────────────────────────────┘ │
-  │                                                                      │
-  └────────────────────────────────│─────────────────────────────────────┘
-                                   │  Vercel evicts → ALL of the above
-                                   ▼  is gone. Cold start rebuilds.
-                                  💀
-```
-
----
-
-## Implementation in codebase
+#### 7) Code in this codebase
 
 **Use cases.**
 
@@ -439,6 +381,62 @@ The full memory + lifetime picture for one warm Node instance:
           (and into the saved AgentEvent[]). Bounds the size of the
           investigation cache entry — without it, one big EQL result
           could make a single cached investigation 100KB+.
+```
+
+### Move 3 — the principle
+
+**In a process-resident runtime, "lifetime" beats "size" as the thing to reason about.** Most performance bugs in serverless aren't OOM — they're stale-state surprises ("why did my Map come back empty?") or cold-start latency ("why did this request take 5s?"). The right discipline is naming the lifetime of every heap object the way the comments in this repo do for the `cached` schema and for `insights`: who clears it, when, and what happens when the process dies underneath it.
+
+---
+
+## Primary diagram
+
+The full memory + lifetime picture for one warm Node instance:
+
+```
+  Memory in one warm Vercel instance — lifetimes named
+
+  ┌─ Node process (V8 heap) ─────────────────────────────────────────────┐
+  │                                                                      │
+  │  ┌─ MODULE SCOPE (warm-instance lifetime) ─────────────────────────┐ │
+  │  │                                                                 │ │
+  │  │  insights        Map<string, Insight>     ≤10 entries           │ │
+  │  │                  cleared on each putInsights — bounded          │ │
+  │  │                                                                 │ │
+  │  │  anomalies       Map<string, Anomaly>     ≤10 entries           │ │
+  │  │                  cleared with insights                          │ │
+  │  │                                                                 │ │
+  │  │  investigations  Map<string, AgentEvent[]> MONOTONIC growth     │ │
+  │  │                  no eviction; only process restart shrinks      │ │
+  │  │                  practical ceiling: 1-5MB at current scale      │ │
+  │  │                                                                 │ │
+  │  │  cached schema   WorkspaceSchema           one object, ~tens KB │ │
+  │  │                  bootstrapped once per warm instance            │ │
+  │  │                                                                 │ │
+  │  │  (per-request McpClient.cache lives at this scope too, but the  │ │
+  │  │   McpClient itself is per-request — so the cache is too)         │ │
+  │  └─────────────────────────────────────────────────────────────────┘ │
+  │                                                                      │
+  │  ┌─ PER-REQUEST (≤300s lifetime, bounded by maxDuration) ──────────┐ │
+  │  │                                                                 │ │
+  │  │  ALS ctx { store, dirty }     ~few KB (decrypted auth state)    │ │
+  │  │  McpClient instance            with its own 60s TTL cache       │ │
+  │  │  ReadableStream buffer          NDJSON bytes, drains to client   │ │
+  │  │  collected[] (in route)         all events for saveInvestigation │ │
+  │  └─────────────────────────────────────────────────────────────────┘ │
+  │                                                                      │
+  │  ┌─ PER-CALL (function-frame lifetime) ────────────────────────────┐ │
+  │  │                                                                 │ │
+  │  │  runAgentLoop messages[]   linear growth per turn, bounded by   │ │
+  │  │                            16KB truncation per tool_result      │ │
+  │  │  toolCalls[]               linear growth per tool call            │ │
+  │  │  textBlocks[], toolUses[]   per-turn, GC'd between turns         │ │
+  │  └─────────────────────────────────────────────────────────────────┘ │
+  │                                                                      │
+  └────────────────────────────────│─────────────────────────────────────┘
+                                   │  Vercel evicts → ALL of the above
+                                   ▼  is gone. Cold start rebuilds.
+                                  💀
 ```
 
 ---

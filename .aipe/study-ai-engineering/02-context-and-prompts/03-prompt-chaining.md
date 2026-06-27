@@ -219,6 +219,19 @@ Decompose a multi-stage task into a fixed sequence of single-job model calls wir
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **The chain orchestration (two-step split):** `app/api/agent/route.ts` reads the `step` param (L117–L118), runs the diagnostic agent on `step !== 'recommend'` (`await diagAgent.investigate(...)` at L238, `send 'diagnosis'` at L239) and the recommendation agent on `step !== 'diagnose'` (`await recAgent.propose(inv, diagnosis!, ...)` at L247). On `step === 'recommend'` the diagnosis comes from the `?diagnosis=` param via `parseDiagnosis` (L227, parser L86–L97). The client (`lib/hooks/useInvestigation.ts`) drives the order: stash `bi:diag:<id>` after step 2 (L138–L139), read + forward it as `&diagnosis=` on step 3 (L72–L84, L162–L164). The combined-capture run (`step == null`) runs both `await`s in one request and caches via `saveInvestigation` (L254). `filterByStep` (L66–L84) keeps one step's events on cached replay. The whole stream body is wrapped in `try/catch` at L196–L263 (`finally { controller.close() }` at L261–L262).
+- **Link 1 (detect):** `MonitoringAgent.scan` — `lib/agents/monitoring.ts` L68–L103; prompt `lib/agents/prompts/monitoring.md`; tools `monitoringTools`; validator `isAnomalyArray`; `maxToolCalls: 6` (L84); degrades to `[]` (L95–L101). Runs in the briefing path `app/api/briefing/route.ts`.
+- **Link 2 (explain):** `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` L45–L83; prompt `prompts/diagnostic.md`; tools `diagnosticTools`; validator `isDiagnosis`; `maxToolCalls: 6` (L62); fallback chain `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L74–L75); confidence post-derived at L80–L82.
+- **Link 3 (act):** `RecommendationAgent.propose` — `lib/agents/recommendation.ts` L36–L77; prompt `prompts/recommendation.md`; tools `recommendationTools`; validator `isRecommendationArray`; `maxToolCalls: 4` (L57); fallback chain `tryParseRecommendations ?? synthesize ?? []` (L69–L73); ids assigned and capped at 3 (L76).
+- **The gather→synthesize micro-chain:** `synthesize()` at `lib/agents/diagnostic.ts` L87–L126 and `lib/agents/recommendation.ts` L82–L132 — separate tool-less `anthropic.messages.create` calls (`max_tokens: 2048`) chained after the gather loop in `runAgentLoop` (`lib/agents/base.ts` L48–L176).
+- **The un-taken model optimization:** every link reads `AGENT_MODEL = 'claude-sonnet-4-6'` from `lib/agents/base.ts` L9; the cheaper-model-on-early-steps optimization is not wired (haiku is used only for intent at `lib/agents/intent.ts` L14).
+
+---
+
 ## Prompt chaining — diagram
 
 This diagram spans the layers. The Route layer owns the chain order — across two `step`-gated HTTP requests for the live path (the `Diagnosis` handed over via the client's sessionStorage), or a single `await` sequence for the legacy combined-capture run; the Agent layer is the three single-job links, each running its own focused call (and a gather→synthesize micro-chain inside two of them); the Provider boundary is where each link's model call goes out.
@@ -258,19 +271,6 @@ This diagram spans the layers. The Route layer owns the chain order — across t
 ```
 
 The route owns the order — two `step`-gated requests live, one `await` sequence for capture; each agent is one focused link with its own prompt, tools, validator, and fallback; two links contain a gather→synthesize micro-chain. All links currently share one model — the seam for per-step model choice is open but unused.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **The chain orchestration (two-step split):** `app/api/agent/route.ts` reads the `step` param (L117–L118), runs the diagnostic agent on `step !== 'recommend'` (`await diagAgent.investigate(...)` at L238, `send 'diagnosis'` at L239) and the recommendation agent on `step !== 'diagnose'` (`await recAgent.propose(inv, diagnosis!, ...)` at L247). On `step === 'recommend'` the diagnosis comes from the `?diagnosis=` param via `parseDiagnosis` (L227, parser L86–L97). The client (`lib/hooks/useInvestigation.ts`) drives the order: stash `bi:diag:<id>` after step 2 (L138–L139), read + forward it as `&diagnosis=` on step 3 (L72–L84, L162–L164). The combined-capture run (`step == null`) runs both `await`s in one request and caches via `saveInvestigation` (L254). `filterByStep` (L66–L84) keeps one step's events on cached replay. The whole stream body is wrapped in `try/catch` at L196–L263 (`finally { controller.close() }` at L261–L262).
-- **Link 1 (detect):** `MonitoringAgent.scan` — `lib/agents/monitoring.ts` L68–L103; prompt `lib/agents/prompts/monitoring.md`; tools `monitoringTools`; validator `isAnomalyArray`; `maxToolCalls: 6` (L84); degrades to `[]` (L95–L101). Runs in the briefing path `app/api/briefing/route.ts`.
-- **Link 2 (explain):** `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` L45–L83; prompt `prompts/diagnostic.md`; tools `diagnosticTools`; validator `isDiagnosis`; `maxToolCalls: 6` (L62); fallback chain `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L74–L75); confidence post-derived at L80–L82.
-- **Link 3 (act):** `RecommendationAgent.propose` — `lib/agents/recommendation.ts` L36–L77; prompt `prompts/recommendation.md`; tools `recommendationTools`; validator `isRecommendationArray`; `maxToolCalls: 4` (L57); fallback chain `tryParseRecommendations ?? synthesize ?? []` (L69–L73); ids assigned and capped at 3 (L76).
-- **The gather→synthesize micro-chain:** `synthesize()` at `lib/agents/diagnostic.ts` L87–L126 and `lib/agents/recommendation.ts` L82–L132 — separate tool-less `anthropic.messages.create` calls (`max_tokens: 2048`) chained after the gather loop in `runAgentLoop` (`lib/agents/base.ts` L48–L176).
-- **The un-taken model optimization:** every link reads `AGENT_MODEL = 'claude-sonnet-4-6'` from `lib/agents/base.ts` L9; the cheaper-model-on-early-steps optimization is not wired (haiku is used only for intent at `lib/agents/intent.ts` L14).
 
 ---
 

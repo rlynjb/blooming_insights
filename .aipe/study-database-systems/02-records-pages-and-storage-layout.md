@@ -89,21 +89,11 @@ A database row isn't a row on disk. It's a small slice of a fixed-size **page** 
 
 **Move 2c — locality and the heap.** A Postgres heap is unordered — rows go wherever there's space. Clustered indexes (Postgres `CLUSTER`, MySQL InnoDB primary key) re-order the heap to match an access pattern. Without clustering, rows logically near each other can be physically scattered, so a "give me all insights from this week" scan touches more pages than it needs to.
 
-### Move 3 — the principle
+### Code in this codebase
 
-**Physical layout determines which queries are cheap.** A schema that's normalized into five tables looks elegant on paper, but if your access pattern always joins those five tables on the same key, you're paying for five separate page lookups every time. Picking row vs column store, picking a clustering key, picking a fill factor — these are all bets on which access pattern is hot.
+No codebase instance today. The closest analog is the `Map` in `lib/state/insights.ts` — a V8 hash table that doesn't expose pages or layout. If you're learning this concept for the first time, the right move is to mock up a small Postgres locally and read its EXPLAIN output; this codebase won't teach you record-and-page mechanics.
 
-## Primary diagram
-
-Skipped — no codebase instance to recap.
-
-## Implementation in codebase
-
-### Use cases
-
-None today. The closest analog is the `Map` in `lib/state/insights.ts` — a V8 hash table that doesn't expose pages or layout. If you're learning this concept for the first time, the right move is to mock up a small Postgres locally and read its EXPLAIN output; this codebase won't teach you record-and-page mechanics.
-
-### The closest cousin
+The closest cousin, side-by-side:
 
 ```
   lib/state/insights.ts  (lines 4–6)
@@ -117,6 +107,14 @@ None today. The closest analog is the `Map` in `lib/state/insights.ts` — a V8 
           engine — Postgres for saved/historical insights, or an external KV
           for ephemeral cross-instance state.
 ```
+
+### Move 3 — the principle
+
+**Physical layout determines which queries are cheap.** A schema that's normalized into five tables looks elegant on paper, but if your access pattern always joins those five tables on the same key, you're paying for five separate page lookups every time. Picking row vs column store, picking a clustering key, picking a fill factor — these are all bets on which access pattern is hot.
+
+## Primary diagram
+
+Skipped — no codebase instance to recap.
 
 ## Elaborate
 

@@ -82,6 +82,12 @@ The shape — what each piece of HTTP carries
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **Demo / live toggle.** The same `GET /api/briefing` route returns plain JSON for the demo replay (when the snapshot has no NDJSON format) or NDJSON for live. The client checks `Content-Type` and picks a path: stream reader vs `setState(body)`.
+  → **Auth challenge.** Any route call that finds no tokens returns `401 + { needsAuth, authUrl }` BEFORE committing to a stream. The client redirects the browser.
+  → **Token revocation mid-stream.** If Bloomreach revokes the token mid-investigation, the route emits `{type:"error", message:"invalid_token …"}` into the NDJSON (it can't change a 200 to a 401 after headers went). The client detects the message pattern and self-reconnects.
+
 **Methods — GET for streams, POST for mutations, no PUT/DELETE/PATCH.** Long-running streams are GETs because they're idempotent reads (running an agent over an anomaly should be cacheable / replayable; we even cache one). Debug tool calls, OAuth reset, demo capture are POSTs because they mutate (or have side effects we want POST's "non-idempotent by convention" semantics for — POST doesn't get cached, prefetched, or replayed by the browser). We don't use PUT or PATCH because we have no resources to update in a REST-ful sense; the only "state" is cookies (which `Set-Cookie` handles) and the in-process Map cache (which has no HTTP surface).
 
 ```
@@ -114,6 +120,40 @@ Status-code → client decision tree
 
 The boundary that catches people: 401 is *only* returned on auth failure to the user (no tokens, expired tokens). Tool-level failures (Bloomreach returned `isError: true`) go into the NDJSON `error` event with a 200 status, because we already started streaming. Mixing those would force a different client path.
 
+The 401 + `needsAuth` + `authUrl` contract, both sides:
+
+```
+app/api/agent/route.ts  (line 166)
+
+if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
+                                       │
+                                       └─ the structured 401 body is the
+                                          contract with the client: it
+                                          looks for needsAuth=true and
+                                          authUrl, then does a full-page
+                                          redirect. The status alone
+                                          isn't enough; the body carries
+                                          the IdP target.
+```
+
+```
+lib/hooks/useInvestigation.ts  (lines 171-177)
+
+if (res.status === 401) {
+  const b = await res.json().catch(() => ({}));
+  if (b?.needsAuth && b?.authUrl) {
+    window.location.href = b.authUrl as string;
+                       │
+                       └─ status code + body shape together drive a
+                          NAVIGATION, not a state update. This is the
+                          only place in the client where a non-200
+                          response triggers a side effect outside the
+                          fetch handler.
+    return;
+  }
+}
+```
+
 **Headers — the streaming contract.** Two headers make NDJSON streaming work:
 
 ```
@@ -138,6 +178,47 @@ Streaming response headers — load-bearing
                       nothing until the whole 60s run finishes.
 ```
 
+The two `NDJSON_HEADERS` blocks in the repo — load-bearing for streaming liveness:
+
+```
+app/api/agent/route.ts  (lines 107-110)
+
+const NDJSON_HEADERS = {
+  'Content-Type': 'application/x-ndjson; charset=utf-8',
+       │
+       └─ tells the consumer "treat me as line-delimited JSON, not
+          a single JSON document." The hook checks this exact string
+          to decide between the reader loop and a json fallback.
+  'Cache-Control': 'no-cache, no-transform',
+       │           │
+       │           └─ ★ load-bearing ★ — without no-transform, Vercel's
+       │              edge may buffer or gzip-rechunk the stream and
+       │              the UI sees no events until the full 60s run
+       │              finishes. The producer/consumer pipe breaks.
+       │
+       └─ no-cache: forbid caching the response (relevant for the
+          rare case where an intermediate proxy might try). The replay
+          path emits the same NDJSON shape but different bytes per call
+          (timestamps in the IDs), so caching would be wrong anyway.
+};
+```
+
+```
+app/api/briefing/route.ts  (lines 144-149 and 259-264)
+
+return new Response(stream, {
+  headers: {
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+                     │
+                     └─ briefing uses no-store (stronger than no-cache:
+                        also forbids caching in any form). Same intent:
+                        every briefing call returns the freshest live
+                        scan (or freshest replay).
+  },
+});
+```
+
 **Cookies — two cookies, two purposes, four attributes that matter.** `bi_session` is a UUID (server-generated, never re-used) that identifies "which session is this browser?" — keyed into the auth store. `bi_auth` is the encrypted store itself (in production). Both cookies use the same attribute set: `httpOnly` (JS cannot read them), `Secure` (production only; only ride on TLS), `SameSite=None` (production only; survive cross-site OAuth bounce) or `SameSite=Lax` (development; localhost is HTTP so `Secure` would drop the cookie entirely).
 
 ```
@@ -156,6 +237,25 @@ Cookie matrix — what each attribute prevents
 
 The cross-site OAuth round-trip is the single reason for `SameSite=None` in production. The user navigates to Bloomreach (different origin), authenticates, gets 302'd back to `/api/mcp/callback?code=…`. That return navigation is *cross-site* (initiated by Bloomreach's IdP, not our app). With `SameSite=Lax` the browser would refuse to send `bi_session`/`bi_auth` on the cross-site return in some browsers, and our callback would see "no session" / no PKCE verifier.
 
+The cookie attribute matrix in one place — both cookies share the same shape:
+
+```
+lib/mcp/session.ts  (lines 10-14)
+lib/mcp/auth.ts     (lines 91-101)
+
+production:                       development:
+  httpOnly: true                    httpOnly: true
+  secure: true                      sameSite: 'lax'
+  sameSite: 'none'                  path: '/'
+  path: '/'                         (no secure, no maxAge for session)
+  maxAge: 10 days (for bi_auth)
+       │
+       └─ matches the Bloomreach refresh-token lifetime; longer than
+          the session cookie because we want OAuth tokens to survive
+          a browser restart without re-auth. The session cookie has
+          no maxAge — it's a session cookie in the literal HTTP sense.
+```
+
 **CORS — absent on purpose.** Every browser → API call is same-origin (`/api/*` on the same host as the page). No CORS preflight, no `Access-Control-Allow-Origin` headers anywhere. We don't need them. If a future feature needed a different origin (a third-party widget calling our API), we'd add an explicit allowlist; today the absence is correct.
 
 ```
@@ -171,6 +271,8 @@ Same-origin policy in this app
   2) the preflight OPTIONS handler, 3) SameSite=None on relevant cookies
   (already true here).
 ```
+
+A grep for `Access-Control-` across `app/api/` returns no hits. The verdict is `not yet exercised`; if we needed a cross-origin client (a third-party widget, a separate frontend on a different domain), we'd add an allowlist + preflight handler. Today the same-origin assumption is correct and the absence is intentional.
 
 ### Principle
 
@@ -218,114 +320,6 @@ Service band ─────────────▼────────�
 │  No CORS surface (same-origin only).                            │
 └────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **Demo / live toggle.** The same `GET /api/briefing` route returns plain JSON for the demo replay (when the snapshot has no NDJSON format) or NDJSON for live. The client checks `Content-Type` and picks a path: stream reader vs `setState(body)`.
-  → **Auth challenge.** Any route call that finds no tokens returns `401 + { needsAuth, authUrl }` BEFORE committing to a stream. The client redirects the browser.
-  → **Token revocation mid-stream.** If Bloomreach revokes the token mid-investigation, the route emits `{type:"error", message:"invalid_token …"}` into the NDJSON (it can't change a 200 to a 401 after headers went). The client detects the message pattern and self-reconnects.
-
-### The two `NDJSON_HEADERS` blocks (load-bearing for streaming liveness)
-
-```
-app/api/agent/route.ts  (lines 107-110)
-
-const NDJSON_HEADERS = {
-  'Content-Type': 'application/x-ndjson; charset=utf-8',
-       │
-       └─ tells the consumer "treat me as line-delimited JSON, not
-          a single JSON document." The hook checks this exact string
-          to decide between the reader loop and a json fallback.
-  'Cache-Control': 'no-cache, no-transform',
-       │           │
-       │           └─ ★ load-bearing ★ — without no-transform, Vercel's
-       │              edge may buffer or gzip-rechunk the stream and
-       │              the UI sees no events until the full 60s run
-       │              finishes. The producer/consumer pipe breaks.
-       │
-       └─ no-cache: forbid caching the response (relevant for the
-          rare case where an intermediate proxy might try). The replay
-          path emits the same NDJSON shape but different bytes per call
-          (timestamps in the IDs), so caching would be wrong anyway.
-};
-```
-
-```
-app/api/briefing/route.ts  (lines 144-149 and 259-264)
-
-return new Response(stream, {
-  headers: {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store, no-transform',
-                     │
-                     └─ briefing uses no-store (stronger than no-cache:
-                        also forbids caching in any form). Same intent:
-                        every briefing call returns the freshest live
-                        scan (or freshest replay).
-  },
-});
-```
-
-### The auth challenge — 401 + `needsAuth` + `authUrl`
-
-```
-app/api/agent/route.ts  (line 166)
-
-if (!conn.ok) return NextResponse.json({ needsAuth: true, authUrl: conn.authUrl }, { status: 401 });
-                                       │
-                                       └─ the structured 401 body is the
-                                          contract with the client: it
-                                          looks for needsAuth=true and
-                                          authUrl, then does a full-page
-                                          redirect. The status alone
-                                          isn't enough; the body carries
-                                          the IdP target.
-```
-
-```
-lib/hooks/useInvestigation.ts  (lines 171-177)
-
-if (res.status === 401) {
-  const b = await res.json().catch(() => ({}));
-  if (b?.needsAuth && b?.authUrl) {
-    window.location.href = b.authUrl as string;
-                       │
-                       └─ status code + body shape together drive a
-                          NAVIGATION, not a state update. This is the
-                          only place in the client where a non-200
-                          response triggers a side effect outside the
-                          fetch handler.
-    return;
-  }
-}
-```
-
-### The cookie attribute matrix in one place
-
-```
-lib/mcp/session.ts  (lines 10-14)
-lib/mcp/auth.ts     (lines 91-101)
-
-production:                       development:
-  httpOnly: true                    httpOnly: true
-  secure: true                      sameSite: 'lax'
-  sameSite: 'none'                  path: '/'
-  path: '/'                         (no secure, no maxAge for session)
-  maxAge: 10 days (for bi_auth)
-       │
-       └─ matches the Bloomreach refresh-token lifetime; longer than
-          the session cookie because we want OAuth tokens to survive
-          a browser restart without re-auth. The session cookie has
-          no maxAge — it's a session cookie in the literal HTTP sense.
-```
-
-### No CORS headers anywhere
-
-A grep for `Access-Control-` across `app/api/` returns no hits. The verdict is `not yet exercised`; if we needed a cross-origin client (a third-party widget, a separate frontend on a different domain), we'd add an allowlist + preflight handler. Today the same-origin assumption is correct and the absence is intentional.
 
 ---
 

@@ -295,88 +295,9 @@ The principle: **the `no-transform` directive is what makes streaming actually s
 
 ---
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Perceived performance is a UX strategy, not a measurement.** The four moves in this file all *work* — they convert the 100s of actual latency into ~1-2s of time-to-feedback. But "they work" today is a *belief*, not a *fact*, because no measurement validates it. There are no Web Vitals (no LCP/INP/CLS), no time-to-first-event metric, no React Profiler integration. The right discipline is: ship the UX moves first (the cheap part), then add Web Vitals + per-event timing (the cheaper part) so a regression doesn't land silently. blooming insights has done the first half; the second half is still pending. The general lesson: **perceived perf without measurement is engineering on hope — it works until it doesn't, and you find out from a user complaint, not from a metric.**
-
----
-
-## Primary diagram
-
-The full picture — the streaming kernel, the four UX moves, the buffering risk, the missing measurements.
-
-```
-  blooming insights — progressive streaming at a glance
-
-  ┌─ Server route ─────────────────────────────────────────────────────┐
-  │                                                                     │
-  │  ReadableStream<Uint8Array>                                        │
-  │    controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'))    │
-  │    one NDJSON line per event                                        │
-  │                                                                     │
-  │  Cache-Control: no-cache, no-transform   ★ LOAD-BEARING ★          │
-  │  Content-Type: application/x-ndjson; charset=utf-8                 │
-  │                                                                     │
-  │  app/api/agent/route.ts:167-264                                    │
-  │  app/api/briefing/route.ts:178-258                                 │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │ HTTP/1.1 chunked transfer
-                                   ▼
-  ┌─ Browser (React 19, useInvestigation hook) ────────────────────────┐
-  │                                                                     │
-  │  ┌─ Read pipeline ──────────────────────────────────────────────┐  │
-  │  │  fetch → response.body.getReader() → TextDecoder               │  │
-  │  │  per chunk: split('\n') → JSON.parse → handle(event)          │  │
-  │  │  partial-line handling: buf = lines.pop() ?? ''               │  │
-  │  │  ★ ~100-200 setState calls per investigation, no batching ★    │  │
-  │  │  lib/hooks/useInvestigation.ts:184-208                        │  │
-  │  └──────────────────────────────────────────────────────────────┘  │
-  │                                                                     │
-  │  ┌─ Four UX moves ──────────────────────────────────────────────┐  │
-  │  │                                                                │  │
-  │  │  1. NDJSON streaming                                          │  │
-  │  │     time-to-first-event: ~1-2s                                │  │
-  │  │     ★ converts 100s actual → 1-2s perceived ★                 │  │
-  │  │                                                                │  │
-  │  │  2. Skeleton placeholders                                     │  │
-  │  │     components/shared/Skeleton.tsx                            │  │
-  │  │     RecommendationCardSkeleton, CoverageGrid loading state    │  │
-  │  │     prevents layout shift (Web Vital: CLS)                    │  │
-  │  │                                                                │  │
-  │  │  3. ProcessStepper                                            │  │
-  │  │     components/shared/ProcessStepper.tsx                      │  │
-  │  │     pending / active / complete / error per step              │  │
-  │  │     active step has animate-pulse                             │  │
-  │  │                                                                │  │
-  │  │  4. StatusLog                                                 │  │
-  │  │     components/shared/StatusLog.tsx                           │  │
-  │  │     live thoughts + tool calls + durations                    │  │
-  │  │     replaceRunningTool for in-place duration update           │  │
-  │  └──────────────────────────────────────────────────────────────┘  │
-  │                                                                     │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  ┌─ NOT MEASURED (the validation gap) ────────────────────────────────┐
-  │                                                                     │
-  │  Web Vitals (LCP / INP / CLS)            ← no useReportWebVitals   │
-  │  Vercel Speed Insights                    ← not enabled             │
-  │  React Profiler integration               ← not used                │
-  │  Bundle analyzer                          ← no @next/bundle-analyzer │
-  │  Time-to-first-event                      ← no performance.mark    │
-  │  Time-to-diagnosis                        ← no performance.mark    │
-  │  Per-event render cost                    ← no profiling            │
-  │  setState frequency under high event rate ← no observation          │
-  │                                                                     │
-  │  ★ same gap as R2 (server-side res.usage logging) ★                │
-  │  ★ same finding: applied without validation ★                      │
-  └─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases — where each UX move appears
+##### Use cases — where each UX move appears
 
 - **NDJSON streaming** — both `/api/agent` (investigation runs) and `/api/briefing` (monitoring scan) return `ReadableStream<Uint8Array>` responses. The browser-side reader lives in `useInvestigation` (for investigations) and inline in `app/page.tsx` (for the feed briefing).
 - **Skeleton placeholders** — `EvidencePanel` shows skeletons while the diagnosis loads; `RecommendationCardSkeleton` shows three placeholder cards while recommendations stream in; `CoverageGrid` renders pending tiles while categories resolve.
@@ -384,7 +305,7 @@ The full picture — the streaming kernel, the four UX moves, the buffering risk
 - **StatusLog** — the investigation page's right column shows live agent activity; the feed shows it for the monitoring scan. Each event triggers an in-place update.
 - **Streaming reveal (CoverageGrid)** — commit `7b5707b` (per the audit) made the coverage grid fill tile-by-tile in step with the checklist log lines, instead of all-at-once. Pure perceived-perf win: zero actual speedup, significant UX improvement.
 
-### Code side by side
+##### Code side by side
 
 **The browser-side NDJSON read loop — chunk handling done right.**
 
@@ -569,6 +490,85 @@ The full picture — the streaming kernel, the four UX moves, the buffering risk
            clock time, dramatically different felt experience. This is
            perceived-perf in COMMIT shape: zero actual speedup,
            significant UX win.
+```
+
+---
+
+### Move 3 — the principle
+
+**Perceived performance is a UX strategy, not a measurement.** The four moves in this file all *work* — they convert the 100s of actual latency into ~1-2s of time-to-feedback. But "they work" today is a *belief*, not a *fact*, because no measurement validates it. There are no Web Vitals (no LCP/INP/CLS), no time-to-first-event metric, no React Profiler integration. The right discipline is: ship the UX moves first (the cheap part), then add Web Vitals + per-event timing (the cheaper part) so a regression doesn't land silently. blooming insights has done the first half; the second half is still pending. The general lesson: **perceived perf without measurement is engineering on hope — it works until it doesn't, and you find out from a user complaint, not from a metric.**
+
+---
+
+## Primary diagram
+
+The full picture — the streaming kernel, the four UX moves, the buffering risk, the missing measurements.
+
+```
+  blooming insights — progressive streaming at a glance
+
+  ┌─ Server route ─────────────────────────────────────────────────────┐
+  │                                                                     │
+  │  ReadableStream<Uint8Array>                                        │
+  │    controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'))    │
+  │    one NDJSON line per event                                        │
+  │                                                                     │
+  │  Cache-Control: no-cache, no-transform   ★ LOAD-BEARING ★          │
+  │  Content-Type: application/x-ndjson; charset=utf-8                 │
+  │                                                                     │
+  │  app/api/agent/route.ts:167-264                                    │
+  │  app/api/briefing/route.ts:178-258                                 │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │ HTTP/1.1 chunked transfer
+                                   ▼
+  ┌─ Browser (React 19, useInvestigation hook) ────────────────────────┐
+  │                                                                     │
+  │  ┌─ Read pipeline ──────────────────────────────────────────────┐  │
+  │  │  fetch → response.body.getReader() → TextDecoder               │  │
+  │  │  per chunk: split('\n') → JSON.parse → handle(event)          │  │
+  │  │  partial-line handling: buf = lines.pop() ?? ''               │  │
+  │  │  ★ ~100-200 setState calls per investigation, no batching ★    │  │
+  │  │  lib/hooks/useInvestigation.ts:184-208                        │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                     │
+  │  ┌─ Four UX moves ──────────────────────────────────────────────┐  │
+  │  │                                                                │  │
+  │  │  1. NDJSON streaming                                          │  │
+  │  │     time-to-first-event: ~1-2s                                │  │
+  │  │     ★ converts 100s actual → 1-2s perceived ★                 │  │
+  │  │                                                                │  │
+  │  │  2. Skeleton placeholders                                     │  │
+  │  │     components/shared/Skeleton.tsx                            │  │
+  │  │     RecommendationCardSkeleton, CoverageGrid loading state    │  │
+  │  │     prevents layout shift (Web Vital: CLS)                    │  │
+  │  │                                                                │  │
+  │  │  3. ProcessStepper                                            │  │
+  │  │     components/shared/ProcessStepper.tsx                      │  │
+  │  │     pending / active / complete / error per step              │  │
+  │  │     active step has animate-pulse                             │  │
+  │  │                                                                │  │
+  │  │  4. StatusLog                                                 │  │
+  │  │     components/shared/StatusLog.tsx                           │  │
+  │  │     live thoughts + tool calls + durations                    │  │
+  │  │     replaceRunningTool for in-place duration update           │  │
+  │  └──────────────────────────────────────────────────────────────┘  │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─ NOT MEASURED (the validation gap) ────────────────────────────────┐
+  │                                                                     │
+  │  Web Vitals (LCP / INP / CLS)            ← no useReportWebVitals   │
+  │  Vercel Speed Insights                    ← not enabled             │
+  │  React Profiler integration               ← not used                │
+  │  Bundle analyzer                          ← no @next/bundle-analyzer │
+  │  Time-to-first-event                      ← no performance.mark    │
+  │  Time-to-diagnosis                        ← no performance.mark    │
+  │  Per-event render cost                    ← no profiling            │
+  │  setState frequency under high event rate ← no observation          │
+  │                                                                     │
+  │  ★ same gap as R2 (server-side res.usage logging) ★                │
+  │  ★ same finding: applied without validation ★                      │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

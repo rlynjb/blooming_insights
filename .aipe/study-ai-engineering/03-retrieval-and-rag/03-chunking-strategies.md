@@ -161,6 +161,14 @@ The chunk is the atomic unit you can retrieve, so the boundary *is* the search r
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings over chunked documents — there is no document corpus and no retrieval-time chunking.
+
+The honest analog is `schemaSummary` (`lib/agents/monitoring.ts` L15–L48): it is a crude truncate-the-schema "chunking." Faced with a schema too large for the prompt, it sorts events by `eventCount` (`lib/mcp/schema.ts` L99) and keeps a fixed slice — `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10`, `MAX_CPROPS = 30` — discarding the rest. That is a chunking decision (which slice survives the budget) made by rank-truncation, with the same failure mode as any chunker: the relevant item below the cut is silently lost. A second, even cruder analog is `truncate` (`lib/agents/base.ts` L31–L34), which keeps the first 16k characters of a tool result and appends `…[truncated]`. Real retrieval chunking would live where past investigations are stored (`lib/state/investigations.ts`) when the "search past investigations" feature is built. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Chunking strategies — diagram
 
 This diagram spans the Service layer (where a document is split) and the State layer (where chunks become indexed vectors). A reader who sees only this should grasp that splitting decides the unit of retrieval, and that the current `schemaSummary` is a rank-truncation special case.
@@ -189,14 +197,6 @@ This diagram spans the Service layer (where a document is split) and the State l
 ```
 
 The split decided in the Service layer fixes, permanently, the smallest piece any query can ever retrieve.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings over chunked documents — there is no document corpus and no retrieval-time chunking.
-
-The honest analog is `schemaSummary` (`lib/agents/monitoring.ts` L15–L48): it is a crude truncate-the-schema "chunking." Faced with a schema too large for the prompt, it sorts events by `eventCount` (`lib/mcp/schema.ts` L99) and keeps a fixed slice — `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10`, `MAX_CPROPS = 30` — discarding the rest. That is a chunking decision (which slice survives the budget) made by rank-truncation, with the same failure mode as any chunker: the relevant item below the cut is silently lost. A second, even cruder analog is `truncate` (`lib/agents/base.ts` L31–L34), which keeps the first 16k characters of a tool result and appends `…[truncated]`. Real retrieval chunking would live where past investigations are stored (`lib/state/investigations.ts`) when the "search past investigations" feature is built. The `Project exercises` block below is the primary buildable target.
 
 ---
 

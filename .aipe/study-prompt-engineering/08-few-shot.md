@@ -138,6 +138,8 @@ six correct shapes shown  →  model emits queries matching them
 one forbidden shape shown →  model avoids `customers matching`
 ```
 
+**Code in this codebase — format exemplars (EQL reminders).** `lib/agents/prompts/monitoring.md`, `lib/agents/prompts/diagnostic.md` — the `## EQL reminders` blocks (prompt text) at `monitoring.md` L49–L54; `diagnostic.md` L27–L37 (negative example at L35). Worked query one-liners that demonstrate supported EQL syntax (and one forbidden clause), so the model copies the shapes instead of inventing grammar.
+
 ---
 
 ### A worked end-to-end exemplar — the monitoring query plan
@@ -156,6 +158,8 @@ monitoring prompt — Suggested query plan
 ```
 
 This is the strongest exemplar in the codebase — a full worked example of *which queries to run in what order to produce a briefing*. It shapes the agent's whole exploration trajectory, not just one query's syntax. It is still format/process-shaping, not a labeled "input anomaly → output anomaly-array" pair, but it is the closest the prompts get to demonstrating the task end to end.
+
+**Code in this codebase — the worked query plan (end-to-end process exemplar).** `lib/agents/prompts/monitoring.md`, the `## Suggested query plan` section at L39–L47. A five-step worked sequence that shapes the agent's whole exploration trajectory — the closest the prompts get to demonstrating the task end to end.
 
 ---
 
@@ -184,6 +188,8 @@ output exemplar (the request)  →  model emits matching shape
 parser + type guard (the guarantee)  →  shape enforced
 the example and the validator describe the SAME shape from two sides
 ```
+
+**Code in this codebase — output exemplars (few-shot of the output form).** The three JSON prompts — the `## Output` example blocks at `monitoring.md` L73–L85; `diagnostic.md` L63–L85; `recommendation.md` L49–L74 (id-less; reinforced by L82 "Do NOT include an `id` field"). A filled instance of the exact return shape — the request side of the structured-output contract (`parseAgentJson` + type guards in `validate.ts` are the guarantee side).
 
 ---
 
@@ -215,6 +221,10 @@ classifier today:   [label definitions] + query  →  one word   (ZERO-shot)
 classifier could:   [label defs] + [3 query→label examples] + query  (FEW-shot)
                     ← measurable: does accuracy improve enough to pay the tokens?
 ```
+
+**Code in this codebase — the classifier (zero-shot, the absence).** `lib/agents/intent.ts` + `lib/agents/prompts/query.md`, `classifyIntent` (label definitions, no examples) at `intent.ts` L17–L31 (system at L21–L23); query.md Framing L15–L21. Classifies via label *definitions*, not labeled query→label pairs — the one true classification decision is demonstrated nowhere.
+
+**Why this split is defensible.** Format wants demonstration: showing a JSON block or an EQL line pins a shape that prose cannot. The classifier wants cheap, decisive output: three distinct categories, `max_tokens: 16`, a capable model — definitions suffice without paying for examples on every call. The codebase put examples exactly where shape-imitation is the goal and withheld them where definitions plausibly suffice. Whether the classifier would be *more accurate* with examples is left open and measurable.
 
 ---
 
@@ -260,44 +270,6 @@ This diagram spans the prompt's example use. The Format-exemplar layer shows sha
 ```
 
 The codebase demonstrates shapes pervasively and the actual classification decision not at all — an honest, measurable split.
-
----
-
-## Implementation in codebase
-
-**Case A — partial.** Format-shaping few-shot is present; classifier few-shot is absent.
-
-### Format exemplars — EQL reminders
-
-- **File:** `lib/agents/prompts/monitoring.md`, `lib/agents/prompts/diagnostic.md`
-- **Function / class:** the `## EQL reminders` blocks (prompt text)
-- **Line range:** `monitoring.md` L49–L54; `diagnostic.md` L27–L37 (negative example at L35)
-- **Role:** worked query one-liners that demonstrate supported EQL syntax (and one forbidden clause), so the model copies the shapes instead of inventing grammar.
-
-### The worked query plan (end-to-end process exemplar)
-
-- **File:** `lib/agents/prompts/monitoring.md`
-- **Function / class:** the `## Suggested query plan` section
-- **Line range:** L39–L47
-- **Role:** a five-step worked sequence that shapes the agent's whole exploration trajectory — the closest the prompts get to demonstrating the task end to end.
-
-### Output exemplars (few-shot of the output form)
-
-- **File:** the three JSON prompts
-- **Function / class:** the `## Output` example blocks
-- **Line range:** `monitoring.md` L73–L85; `diagnostic.md` L63–L85; `recommendation.md` L49–L74 (id-less; reinforced by L82 "Do NOT include an `id` field")
-- **Role:** a filled instance of the exact return shape — the request side of the structured-output contract (`parseAgentJson` + type guards in `validate.ts` are the guarantee side).
-
-### The classifier — zero-shot (the absence)
-
-- **File:** `lib/agents/intent.ts` + `lib/agents/prompts/query.md`
-- **Function / class:** `classifyIntent` (label definitions, no examples)
-- **Line range:** `intent.ts` L17–L31 (system at L21–L23); query.md Framing L15–L21
-- **Role:** classifies via label *definitions*, not labeled query→label pairs — the one true classification decision is demonstrated nowhere.
-
-### Why this split is defensible
-
-Format wants demonstration: showing a JSON block or an EQL line pins a shape that prose cannot. The classifier wants cheap, decisive output: three distinct categories, `max_tokens: 16`, a capable model — definitions suffice without paying for examples on every call. The codebase put examples exactly where shape-imitation is the goal and withheld them where definitions plausibly suffice. Whether the classifier would be *more accurate* with examples is left open and measurable.
 
 ---
 

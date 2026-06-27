@@ -188,6 +188,57 @@ Today the chain is exactly two business steps (`investigate → propose`), run a
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.** Both topologies coexist; this is the defining architectural choice of the codebase.
+
+#### The chain (top-level orchestration)
+
+- **File:** `app/api/agent/route.ts`
+- **Function / class:** `GET` → the `ReadableStream` `start(controller)` body, gated by the `step` param
+- **Line range:** L231–L240 (`step=diagnose` node 1); L244–L249 (`step=recommend` node 2); L210–L218 (single-agent query branch); `saveInvestigation` gated on `step == null` at L254
+- **Role:** Runs `DiagnosticAgent.investigate` on `step=diagnose` and `RecommendationAgent.propose` on `step=recommend`, each with plain `await`; `diagnosis` is passed into `propose` as an argument (L247) and crosses the HTTP boundary via `parseDiagnosis(diagnosisParam)` (L227). No graph, no framework — `step`-gated `if/await`.
+
+#### The agent (per-node loop)
+
+- **File:** `lib/agents/base.ts`
+- **Function / class:** `runAgentLoop`
+- **Line range:** L48–L176; termination on model choice at L121 (`if (toolUses.length === 0) return`); turn loop L85–L172
+- **Role:** The model decides which tools to call (L116) and when to stop (L121). Bounded by `maxTurns = 8` (L73) and per-agent `maxToolCalls`.
+
+#### The micro-chain (loop → synthesize, inside one agent)
+
+- **File:** `lib/agents/diagnostic.ts`
+- **Function / class:** `DiagnosticAgent.investigate` (agent step) → `synthesize` (chain step) → `diagnosisConfidence` (derive step)
+- **Line range:** L51 (`runAgentLoop`) → L74–L75 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`) → L80–L82 (confidence derive); `synthesize` body L87–L126
+- **Role:** A bounded agent loop followed by a fixed, tool-less synthesis call, then a deterministic confidence derivation. Same shape in `recommendation.ts` L69–L73 / L82–L133 (minus the confidence step).
+
+#### Shared constants
+
+- **File:** `lib/agents/base.ts` L9 — `AGENT_MODEL = 'claude-sonnet-4-6'` (every node + every synthesize call).
+- **File:** `lib/agents/intent.ts` L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (the query branch's routing step).
+
+**Pseudocode — chain of bounded agents** (route.ts L231–L249 + diagnostic.ts L74–L75):
+
+```typescript
+// CHAIN (route.ts): fixed order, typed handoff — split across two ?step calls
+// step=diagnose:
+const diagnosis = await diag.investigate(inv);        // node 1 (an agent)
+send({ type: 'diagnosis', diagnosis });               // → client stashes bi:diag:<id>
+// step=recommend (separate request):
+const diagnosis = parseDiagnosis(diagnosisParam);     // handed over from step 2
+const recs      = await rec.propose(inv, diagnosis);  // node 2 (an agent), reads node 1
+
+// AGENT + MICRO-CHAIN (diagnostic.ts): variable loop, then fixed fallback
+const { finalText, toolCalls } = await runAgentLoop({ ... });  // model owns the path
+const diag = tryParseDiagnosis(finalText)   // micro-chain step 1
+    ?? (await this.synthesize(anomaly, toolCalls))  // micro-chain step 2
+    ?? FALLBACK;                            // micro-chain step 3
+return { ...diag, confidence: diagnosisConfidence(diag) };  // derive step
+```
+
+---
+
 ## Agents vs chains — diagram
 
 The diagram spans three layers. The Route layer is a chain (fixed order). The Agent layer is where each node runs an agent loop (model-chosen order). The micro-chain (loop → synthesize) lives inside the Agent layer. The Provider boundary is where the model's decisions become real API calls.
@@ -228,57 +279,6 @@ The diagram spans three layers. The Route layer is a chain (fixed order). The Ag
 ```
 
 A reader who sees only this diagram should grasp: the route is fixed, the nodes adapt, and the adaptation is bounded.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.** Both topologies coexist; this is the defining architectural choice of the codebase.
-
-### The chain (top-level orchestration)
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `GET` → the `ReadableStream` `start(controller)` body, gated by the `step` param
-- **Line range:** L231–L240 (`step=diagnose` node 1); L244–L249 (`step=recommend` node 2); L210–L218 (single-agent query branch); `saveInvestigation` gated on `step == null` at L254
-- **Role:** Runs `DiagnosticAgent.investigate` on `step=diagnose` and `RecommendationAgent.propose` on `step=recommend`, each with plain `await`; `diagnosis` is passed into `propose` as an argument (L247) and crosses the HTTP boundary via `parseDiagnosis(diagnosisParam)` (L227). No graph, no framework — `step`-gated `if/await`.
-
-### The agent (per-node loop)
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop`
-- **Line range:** L48–L176; termination on model choice at L121 (`if (toolUses.length === 0) return`); turn loop L85–L172
-- **Role:** The model decides which tools to call (L116) and when to stop (L121). Bounded by `maxTurns = 8` (L73) and per-agent `maxToolCalls`.
-
-### The micro-chain (loop → synthesize, inside one agent)
-
-- **File:** `lib/agents/diagnostic.ts`
-- **Function / class:** `DiagnosticAgent.investigate` (agent step) → `synthesize` (chain step) → `diagnosisConfidence` (derive step)
-- **Line range:** L51 (`runAgentLoop`) → L74–L75 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`) → L80–L82 (confidence derive); `synthesize` body L87–L126
-- **Role:** A bounded agent loop followed by a fixed, tool-less synthesis call, then a deterministic confidence derivation. Same shape in `recommendation.ts` L69–L73 / L82–L133 (minus the confidence step).
-
-### Shared constants
-
-- **File:** `lib/agents/base.ts` L9 — `AGENT_MODEL = 'claude-sonnet-4-6'` (every node + every synthesize call).
-- **File:** `lib/agents/intent.ts` L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (the query branch's routing step).
-
-**Pseudocode — chain of bounded agents** (route.ts L231–L249 + diagnostic.ts L74–L75):
-
-```typescript
-// CHAIN (route.ts): fixed order, typed handoff — split across two ?step calls
-// step=diagnose:
-const diagnosis = await diag.investigate(inv);        // node 1 (an agent)
-send({ type: 'diagnosis', diagnosis });               // → client stashes bi:diag:<id>
-// step=recommend (separate request):
-const diagnosis = parseDiagnosis(diagnosisParam);     // handed over from step 2
-const recs      = await rec.propose(inv, diagnosis);  // node 2 (an agent), reads node 1
-
-// AGENT + MICRO-CHAIN (diagnostic.ts): variable loop, then fixed fallback
-const { finalText, toolCalls } = await runAgentLoop({ ... });  // model owns the path
-const diag = tryParseDiagnosis(finalText)   // micro-chain step 1
-    ?? (await this.synthesize(anomaly, toolCalls))  // micro-chain step 2
-    ?? FALLBACK;                            // micro-chain step 3
-return { ...diag, confidence: diagnosisConfidence(diag) };  // derive step
-```
 
 ---
 

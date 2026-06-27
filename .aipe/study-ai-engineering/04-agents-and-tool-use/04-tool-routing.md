@@ -182,6 +182,68 @@ both routers, in the route handler
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.**
+
+#### Per-agent tool subsets (Router 1)
+
+- **File:** `lib/mcp/tools.ts`
+- **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
+- **Line range:** L5–L13, L15–L25, L27–L34, L38–L40 (`queryTools` = de-duplicated union of all three)
+- **Role:** The allow-list of tool names each agent may use; `bootstrapTools` (L50–L54) is the separate session-start discovery set.
+
+#### The filter that applies the subset
+
+- **File:** `lib/agents/tool-schemas.ts`
+- **Function / class:** `filterToolSchemas`
+- **Line range:** L9–L21; the filter at L15 (`set.has(t.name)`)
+- **Role:** Keeps only allowed tools and maps them to `Anthropic.Messages.Tool[]`; the result becomes `params.tools` at `base.ts` L101.
+
+#### Subset selection per agent
+
+- **File:** `lib/agents/diagnostic.ts` L57 · `recommendation.ts` L52 · `monitoring.ts` L79 · `query.ts` L36
+- **Function / class:** the `toolSchemas: filterToolSchemas(this.allTools, <subset>)` argument to `runAgentLoop`
+- **Line range:** one line per agent
+- **Role:** Binds each agent to its subset at the call site.
+
+#### Intent classification (Router 2)
+
+- **File:** `lib/agents/intent.ts`
+- **Function / class:** `parseIntent` (heuristic) + `classifyIntent` (LLM)
+- **Line range:** `parseIntent` L6–L12; `CLASSIFIER_MODEL` L14; `classifyIntent` L17–L31 (`max_tokens: 16` at L20; coerced through `parseIntent` at L30)
+- **Role:** Maps a free-form query to one of `monitoring | diagnostic | recommendation`; heuristic first, haiku fallback, heuristic-as-normalizer at the end.
+
+#### Where intent is consumed
+
+- **File:** `app/api/agent/route.ts`
+- **Function / class:** `GET` → query branch
+- **Line range:** L210–L218 (`classifyIntent` at L211; `QueryAgent.answer(q, intent, ...)` at L214)
+- **Role:** Calls the classifier, then runs the query agent with the chosen intent as prompt framing (intent injected at `query.ts` L28).
+
+**Pseudocode — both routers** (`tools.ts` + `intent.ts` + `route.ts`):
+
+```typescript
+// ROUTER 1 — subset by construction (diagnostic.ts L57)
+toolSchemas: filterToolSchemas(this.allTools, diagnosticTools)  // model sees only these
+
+// ROUTER 2 — intent, heuristic-first (intent.ts)
+function parseIntent(raw) {                                     // L6 — free heuristic
+  const t = raw.trim().toLowerCase();
+  if (t.includes('monitoring'))     return 'monitoring';
+  if (t.includes('recommendation')) return 'recommendation';
+  return 'diagnostic';                                          // default
+}
+async function classifyIntent(anthropic, query) {              // L17 — haiku fallback
+  const res = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-...', max_tokens: 16, system: '...one word...' });
+  return parseIntent(textOf(res));                             // L30 — heuristic normalizes
+}
+// route.ts L211: const intent = await classifyIntent(anthropic, q);
+```
+
+---
+
 ## Tool routing — diagram
 
 The diagram spans three layers. The Route layer holds the intent classifier (Router 2). The Agent layer holds the subset selection (Router 1) per agent. The Provider boundary is where the curated tool array reaches the model. Both routers narrow the space before the model acts.
@@ -217,68 +279,6 @@ The diagram spans three layers. The Route layer holds the intent classifier (Rou
 ```
 
 A reader who sees only this diagram should grasp: intent routing picks the surface, subset-scoping bounds what each surface can do, and the model never sees a tool outside its subset.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### Per-agent tool subsets (Router 1)
-
-- **File:** `lib/mcp/tools.ts`
-- **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
-- **Line range:** L5–L13, L15–L25, L27–L34, L38–L40 (`queryTools` = de-duplicated union of all three)
-- **Role:** The allow-list of tool names each agent may use; `bootstrapTools` (L50–L54) is the separate session-start discovery set.
-
-### The filter that applies the subset
-
-- **File:** `lib/agents/tool-schemas.ts`
-- **Function / class:** `filterToolSchemas`
-- **Line range:** L9–L21; the filter at L15 (`set.has(t.name)`)
-- **Role:** Keeps only allowed tools and maps them to `Anthropic.Messages.Tool[]`; the result becomes `params.tools` at `base.ts` L101.
-
-### Subset selection per agent
-
-- **File:** `lib/agents/diagnostic.ts` L57 · `recommendation.ts` L52 · `monitoring.ts` L79 · `query.ts` L36
-- **Function / class:** the `toolSchemas: filterToolSchemas(this.allTools, <subset>)` argument to `runAgentLoop`
-- **Line range:** one line per agent
-- **Role:** Binds each agent to its subset at the call site.
-
-### Intent classification (Router 2)
-
-- **File:** `lib/agents/intent.ts`
-- **Function / class:** `parseIntent` (heuristic) + `classifyIntent` (LLM)
-- **Line range:** `parseIntent` L6–L12; `CLASSIFIER_MODEL` L14; `classifyIntent` L17–L31 (`max_tokens: 16` at L20; coerced through `parseIntent` at L30)
-- **Role:** Maps a free-form query to one of `monitoring | diagnostic | recommendation`; heuristic first, haiku fallback, heuristic-as-normalizer at the end.
-
-### Where intent is consumed
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `GET` → query branch
-- **Line range:** L210–L218 (`classifyIntent` at L211; `QueryAgent.answer(q, intent, ...)` at L214)
-- **Role:** Calls the classifier, then runs the query agent with the chosen intent as prompt framing (intent injected at `query.ts` L28).
-
-**Pseudocode — both routers** (`tools.ts` + `intent.ts` + `route.ts`):
-
-```typescript
-// ROUTER 1 — subset by construction (diagnostic.ts L57)
-toolSchemas: filterToolSchemas(this.allTools, diagnosticTools)  // model sees only these
-
-// ROUTER 2 — intent, heuristic-first (intent.ts)
-function parseIntent(raw) {                                     // L6 — free heuristic
-  const t = raw.trim().toLowerCase();
-  if (t.includes('monitoring'))     return 'monitoring';
-  if (t.includes('recommendation')) return 'recommendation';
-  return 'diagnostic';                                          // default
-}
-async function classifyIntent(anthropic, query) {              // L17 — haiku fallback
-  const res = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-...', max_tokens: 16, system: '...one word...' });
-  return parseIntent(textOf(res));                             // L30 — heuristic normalizes
-}
-// route.ts L211: const intent = await classifyIntent(anthropic, q);
-```
 
 ---
 

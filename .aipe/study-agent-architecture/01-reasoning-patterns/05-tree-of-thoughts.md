@@ -232,24 +232,16 @@ The three positions you can take
   rate-limited MCP + 300s ceiling. B and C are non-starters.
 ```
 
----
+### Code in this codebase
 
-## Implementation in codebase
+ToT is not implemented (Case B — and correctly so). No agent branches over candidate thoughts. All four run linear ReAct trajectories via `runAgentLoop` (`lib/agents/base.ts` L48–L176). The constraints that rule it out are pinned to specific lines in the repo:
 
-**Not yet implemented (Case B — and correctly so).** No agent branches over candidate thoughts. All four run linear ReAct trajectories via `runAgentLoop` (`lib/agents/base.ts` L48–L176).
-
-**The constraints that rule it out**
-
-- MCP rate: ~1 req/s spacing (referenced in `app/api/agent/route.ts` L18–L19 comment and across the codebase as a known floor).
-- Per-investigation ceiling: 300s (`app/api/agent/route.ts` L20 — `export const maxDuration = 300`).
-- Current investigation depth: ~100–115s for the diagnostic → recommendation chain (per the route file's comment).
-- Per-agent tool budget: `maxToolCalls: 6` (monitoring/diagnostic/query) or `4` (recommendation) — `lib/agents/monitoring.ts` L101, `lib/agents/diagnostic.ts` L62, `lib/agents/recommendation.ts` L57, `lib/agents/query.ts` L41.
+- **MCP rate:** ~1 req/s spacing — referenced in `app/api/agent/route.ts` L18–L19 comment and across the codebase as a known floor.
+- **Per-investigation ceiling:** 300s — `app/api/agent/route.ts` L20 (`export const maxDuration = 300`).
+- **Current investigation depth:** ~100–115s for the diagnostic → recommendation chain (per the route file's comment).
+- **Per-agent tool budget:** `maxToolCalls: 6` (monitoring/diagnostic/query) or `4` (recommendation) — `lib/agents/monitoring.ts` L101, `lib/agents/diagnostic.ts` L62, `lib/agents/recommendation.ts` L57, `lib/agents/query.ts` L41.
 
 The arithmetic at the smallest viable ToT (b=2, d=2): 4 partial trajectories × ~6 tool calls × ~1s/call = ~24s of MCP work *for one node depth*, then × multiple depths. The headroom between current ~100s and the 300s ceiling is roughly 2x — only enough for a minimal ToT, and the minimal shape doesn't measurably improve answer quality on tasks with smooth answer surfaces. So the cost-vs-quality math doesn't pencil out.
-
-**Why this is the correct decision, not a missed opportunity**
-
-Diagnostic investigations have a smooth answer surface: the underlying data is the same regardless of which query you start with, and a wrong early query just costs ~1s before the loop re-decides. The cliff scenarios ToT is designed for — where step 1's choice locks you out of recoverable end-states — don't show up here. Adding ToT would multiply cost by the branch factor for a task whose structure doesn't reward branching.
 
 ```
 shape (what ToT would look like — illustrative, NOT in repo):

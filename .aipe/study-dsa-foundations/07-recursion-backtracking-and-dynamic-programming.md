@@ -165,6 +165,15 @@ the call stack during factorial(4):
 
 **In this codebase: not yet exercised.** Every loop is a `for` or a higher-order array method. The deepest "recursive structure" is the 2-level schema, which is read with two flat loops. The user's portfolio (`reincodes/Tree.ts`, `BinarySearchTree.ts`, sorting visualizers) has recursive implementations — the codebase doesn't reach for that style.
 
+**Code in this codebase — the only "recursive" thing is a stdlib parameter (`app/api/mcp/capture/route.ts`).**
+
+```ts
+// app/api/mcp/capture/route.ts (paraphrased — the only occurrence of "recursive" in the repo)
+await mkdir(dir, { recursive: true });
+```
+
+This isn't *our* recursion — it's a parameter to Node's `fs.promises.mkdir` telling the stdlib to create intermediate directories. The recursion happens inside Node, not in the codebase's code. From the codebase's perspective, this is just a flag. It belongs here only as a footnote: a beginner sometimes counts "I use `{recursive: true}`" as "my codebase exercises recursion." It doesn't. Confirmed by grep across `lib/` and `app/`: no function calls itself. The deepest function-call nesting is `agent.scan() → runAgentLoop() → mcp.callTool() → liveCall() → transport.callTool()` — five levels, all distinct functions, no self-call. The plausible trigger: schema grows deeper than 3-4 levels and a recursive walker becomes the cleanest expression; OR a grammar appears in the agent intent classifier and recursive-descent parsing is natural.
+
 ### Move 2 — backtracking (state-space search with undo)
 
 Backtracking is recursion plus **explicit undo**. You try a choice, recurse, and if the recursion fails (no solution found), you undo the choice and try the next one. The classic kernel:
@@ -222,6 +231,22 @@ The "undo" is what makes it *backtracking* and not *enumerate all*. Without expl
 **In this codebase: not yet exercised.** No constraint satisfaction problem. No combinatorial generation. No state-space search.
 
 **What would trigger reaching for backtracking?** If an agent had to generate a *valid combination of tool calls* satisfying multiple constraints (call this before that; if A is called, can't call B; total token budget ≤ X), backtracking would be the natural search strategy. Today the tool calls are linear (the LLM decides what to call next; no constraint solver runs).
+
+**Code in this codebase — `not yet exercised`.** No state-space search anywhere. The closest abstraction is the JSON extraction fallback ladder in `lib/mcp/validate.ts` L3–L13 — three attempts in order, each falls through to the next on failure. But it's *not* backtracking: there's no *undo*, no shared state being modified-and-restored, no recursive descent into branches. It's a flat sequential fallback.
+
+```
+parseAgentJson (validate.ts L3–L13):
+
+  try fenced-block regex  ──► success: return
+                              fail: continue
+  try bare JSON.parse     ──► success: return
+                              fail: continue
+  try substring scan      ──► success: return
+                              fail: throw
+
+  NOT backtracking — no undo, no state modification, no recursion.
+  Just three attempts in a linear ladder.
+```
 
 ### Move 3 — dynamic programming (recursion + memoization)
 
@@ -299,6 +324,8 @@ fib(n):
 **In this codebase: not yet exercised.** No problem here has overlapping subproblems. The agent pipeline is a fixed sequence. The derivation functions are pure projections. The sort is one-shot. No optimization-under-constraints problem with subproblem structure.
 
 **What would trigger reaching for DP?** If the recommendation agent had to *choose the optimal subset of recommendations to present* under a constraint (e.g., "fit 3 recommendations that together exceed K total expected impact and don't conflict"), that's a 0/1 knapsack variant — DP territory. Today recommendations are presented as-is, no optimization.
+
+**Code in this codebase — `not yet exercised`.** No memoization table, no tabulation, no recurrence. The TTL cache (`lib/mcp/client.ts` L80) is a *cache* of tool-call results, not a memoization table for subproblems — there's no recursive structure being cached. The derivation functions (`lib/insights/derive.ts`) recompute on every call; there's no overlapping subproblem to memoize. The plausible trigger: an optimization problem appears — "pick K recommendations totaling impact ≥ T without conflicting" — that's a 0/1 knapsack and classical DP.
 
 ### Move 2 variant — the irreducible kernel of each technique
 
@@ -414,74 +441,6 @@ The three techniques, their kernel, when each applies, and the codebase's gap.
   • backtracking: need to generate valid configurations under constraints
   • DP: optimization problem with overlapping subproblems shows up
 ```
-
----
-
-## Implementation in codebase
-
-The honest report: no recursion, no backtracking, no DP in `lib/` or `app/`. One use of `recursive: true` as a parameter to a stdlib function. Three plausible triggers.
-
-### **The only "recursive" thing — `mkdir({recursive: true})` (`app/api/mcp/capture/route.ts`)**
-
-```ts
-// app/api/mcp/capture/route.ts (paraphrased — the only occurrence of "recursive" in the repo)
-await mkdir(dir, { recursive: true });
-```
-
-This isn't *our* recursion — it's a parameter to Node's `fs.promises.mkdir` telling the stdlib to create intermediate directories. The recursion happens inside Node, not in the codebase's code. From the codebase's perspective, this is just a flag.
-
-It belongs in this chapter only as a footnote: a beginner sometimes counts "I use `{recursive: true}`" as "my codebase exercises recursion." It doesn't.
-
-### **No recursive function definitions**
-
-Confirmed by grep across `lib/` and `app/`: no function calls itself. The deepest function-call nesting is `agent.scan() → runAgentLoop() → mcp.callTool() → liveCall() → transport.callTool()` — five levels, all distinct functions, no self-call.
-
-### **No backtracking**
-
-No state-space search anywhere. The closest abstraction is the JSON extraction fallback ladder in `lib/mcp/validate.ts` L3–L13 — three attempts in order, each falls through to the next on failure. But it's not backtracking: there's no *undo*, no shared state being modified-and-restored, no recursive descent into branches. It's a flat sequential fallback.
-
-```
-parseAgentJson (validate.ts L3–L13):
-
-  try fenced-block regex  ──► success: return
-                              fail: continue
-  try bare JSON.parse     ──► success: return
-                              fail: continue
-  try substring scan      ──► success: return
-                              fail: throw
-
-  NOT backtracking — no undo, no state modification, no recursion.
-  Just three attempts in a linear ladder.
-```
-
-### **No dynamic programming**
-
-No memoization table, no tabulation, no recurrence. The TTL cache (`lib/mcp/client.ts` L80) is a *cache* of tool-call results, not a memoization table for subproblems — there's no recursive structure being cached. The derivation functions (`lib/insights/derive.ts`) recompute on every call; there's no overlapping subproblem to memoize.
-
-### **What would trigger reaching for each?**
-
-```
-  technique          plausible trigger in this codebase
-  ─────────────      ────────────────────────────────────────────────────
-  recursion          schema grows deeper than 3-4 levels; recursive walker
-                     becomes the cleanest expression. OR: a grammar appears
-                     in the agent intent classifier and recursive-descent
-                     parser is the natural form.
-
-  backtracking       agent has to generate a valid *combination* of tool
-                     calls under constraints (call order, conflicts, budget).
-                     Today the LLM picks one call at a time linearly, but
-                     constrained generation could become a backtracking
-                     search.
-
-  dynamic            optimization-under-constraints problem appears:
-  programming        "pick K recommendations totaling impact ≥ T without
-                     conflicting." That's a 0/1 knapsack — classical DP.
-                     Today recommendations are independent; no selection
-                     optimization runs.
-```
-
-None of these triggers has fired. The chapter is here so you recognize them when they arrive.
 
 ---
 

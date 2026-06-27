@@ -293,55 +293,7 @@ This is a subtle one worth knowing because it's documented inline at `lib/mcp/au
 
 This is the *only* place in the repo where the event-loop concurrency model would have caused a real bug without an explicit fix. Everywhere else, run-to-completion happens to give the right answer.
 
-### Move 3 — the principle
-
-**Async/await isn't free concurrency — it's cooperative concurrency.** You get a turn of the loop at every `await` and nowhere else. Your code is safe from interleaving inside a synchronous block; it's exposed to interleaving across `await`s. Most of the time the exposure doesn't matter, because the shared state isn't actually shared (each request has its own locals). When it does matter — like the cookie store — you reach for `AsyncLocalStorage` to scope the shared state per task. That's the kernel: the loop runs cooperatively, you fence shared state with ALS when the cooperation needs help.
-
----
-
-## Primary diagram
-
-The full event-loop picture for one agent run, with the yields and the queues:
-
-```
-  One agent run, one event loop — the full picture
-
-  ┌─ event loop ───────────────────────────────────────────────────────────┐
-  │                                                                        │
-  │   ┌─ macrotask: GET(req) ─────────────────────────────────────────┐    │
-  │   │  build response, return ReadableStream                        │    │
-  │   └────────────────────────────┬─────────────────────────────────┘    │
-  │                                │ (Node calls start later)              │
-  │                                ▼                                       │
-  │   ┌─ macrotask: ReadableStream.start(controller) ──────────────────┐   │
-  │   │                                                                 │   │
-  │   │   send({type:'reasoning_step', ...}) ← controller.enqueue (sync)│   │
-  │   │   await bootstrapSchema(mcp)                                    │   │
-  │   │       │                                                         │   │
-  │   │       ▼  yields N times (4 sequential MCP calls × 1.1s gate)    │   │
-  │   │   await runAgentLoop({ ... })                                   │   │
-  │   │       │                                                         │   │
-  │   │       ▼  yields per turn:                                       │   │
-  │   │         await anthropic.messages.create()  ← yield ①            │   │
-  │   │         for tool of toolUses:                                   │   │
-  │   │           await mcp.callTool(...)          ← yield ②            │   │
-  │   │             → await setTimeout(1100-el)    ← yield (timer)      │   │
-  │   │             → await transport.callTool(...)← yield (HTTP)       │   │
-  │   │         (push results, next turn)                               │   │
-  │   │                                                                 │   │
-  │   │   send({type:'done'})                                            │   │
-  │   │   controller.close()  in finally                                 │   │
-  │   └─────────────────────────────────────────────────────────────────┘   │
-  │                                                                        │
-  │   between EVERY yield: microtask drain, then next macrotask.            │
-  │   while we wait on I/O: another request's GET can run.                  │
-  │                                                                        │
-  └────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 6) Code in this codebase
 
 **Use cases.** Every `await` in the agent stack is a yield point; the highest-leverage ones:
 
@@ -421,6 +373,52 @@ The full event-loop picture for one agent run, with the yields and the queues:
     }
     return result;
   }
+```
+
+### Move 3 — the principle
+
+**Async/await isn't free concurrency — it's cooperative concurrency.** You get a turn of the loop at every `await` and nowhere else. Your code is safe from interleaving inside a synchronous block; it's exposed to interleaving across `await`s. Most of the time the exposure doesn't matter, because the shared state isn't actually shared (each request has its own locals). When it does matter — like the cookie store — you reach for `AsyncLocalStorage` to scope the shared state per task. That's the kernel: the loop runs cooperatively, you fence shared state with ALS when the cooperation needs help.
+
+---
+
+## Primary diagram
+
+The full event-loop picture for one agent run, with the yields and the queues:
+
+```
+  One agent run, one event loop — the full picture
+
+  ┌─ event loop ───────────────────────────────────────────────────────────┐
+  │                                                                        │
+  │   ┌─ macrotask: GET(req) ─────────────────────────────────────────┐    │
+  │   │  build response, return ReadableStream                        │    │
+  │   └────────────────────────────┬─────────────────────────────────┘    │
+  │                                │ (Node calls start later)              │
+  │                                ▼                                       │
+  │   ┌─ macrotask: ReadableStream.start(controller) ──────────────────┐   │
+  │   │                                                                 │   │
+  │   │   send({type:'reasoning_step', ...}) ← controller.enqueue (sync)│   │
+  │   │   await bootstrapSchema(mcp)                                    │   │
+  │   │       │                                                         │   │
+  │   │       ▼  yields N times (4 sequential MCP calls × 1.1s gate)    │   │
+  │   │   await runAgentLoop({ ... })                                   │   │
+  │   │       │                                                         │   │
+  │   │       ▼  yields per turn:                                       │   │
+  │   │         await anthropic.messages.create()  ← yield ①            │   │
+  │   │         for tool of toolUses:                                   │   │
+  │   │           await mcp.callTool(...)          ← yield ②            │   │
+  │   │             → await setTimeout(1100-el)    ← yield (timer)      │   │
+  │   │             → await transport.callTool(...)← yield (HTTP)       │   │
+  │   │         (push results, next turn)                               │   │
+  │   │                                                                 │   │
+  │   │   send({type:'done'})                                            │   │
+  │   │   controller.close()  in finally                                 │   │
+  │   └─────────────────────────────────────────────────────────────────┘   │
+  │                                                                        │
+  │   between EVERY yield: microtask drain, then next macrotask.            │
+  │   while we wait on I/O: another request's GET can run.                  │
+  │                                                                        │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

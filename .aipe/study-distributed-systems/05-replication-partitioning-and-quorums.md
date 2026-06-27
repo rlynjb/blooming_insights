@@ -94,6 +94,12 @@ Partitioning is orthogonal: *what subset of the data does this machine hold?* Pa
 
 ### Move 2 — the moving parts (named, then marked NOT YET EXERCISED)
 
+**Use cases.**
+
+In the Vercel app: none today. Every file path that would normally appear here — connection pools to a primary, read-replica routing, quorum-write configuration, failover handlers — does not exist. The closest thing to "instance-aware logic" is the comment in `lib/mcp/auth.ts:38-104` explaining that the encrypted cookie backend exists precisely *because* there's no cross-instance store, and the auth flow has to survive Vercel routing the connect and callback requests to different instances.
+
+In the eval scripts: the `EVAL_RUN_TAG` env var IS the codebase's only existing answer to a shared-mutable-state-across-processes hazard. Four scripts honor it (`eval/scripts/run-detection.ts`, `run-diagnosis.ts`, `run-recommendation.ts`, `run-regression.ts`); each computes its results-dir as `${date}-${tag}` if the tag is set, plain `${date}` otherwise. The fix is one-shape, repeated.
+
 #### Part 1 — primary-replica
 
 A primary accepts writes; one or more read replicas pull from a replication stream. Replication lag is the staleness window between a write committing on the primary and being visible on the replica. Failover means promoting a replica to primary when the primary dies.
@@ -174,6 +180,29 @@ A failover protocol picks a new primary when the current one dies. It requires c
 
 **Status in blooming insights: NOT YET EXERCISED.** There IS no leader to elect. No node has a special role. Every Vercel instance is interchangeable; the system simply has no notion of "the instance that owns X." If a feature needed one — for example, a "global lock so two briefings for one user don't run concurrently" — that would force consensus (probably Vercel KV's `SET NX` as a poor-man's lock with TTL, not a real consensus protocol). Not built; not needed.
 
+The only place the codebase acknowledges horizontal scaling is in the auth backend selection. Here's the seam between "single-process dev" and "multi-instance production" — and the choice the code makes about it:
+
+```
+  lib/mcp/auth.ts  (lines 22-36, 38-104)
+
+  // Storage backend, keyed by our app session id. Three backends, selected by env:
+  //   • development → a gitignored file (.auth-cache.json).
+  //   • test → in-memory Map (isolated per run).
+  //   • production (Vercel) → an encrypted httpOnly cookie, via `withAuthCookies`.
+  //     The `connect` and `callback` requests run on different ephemeral
+  //     instances, so the browser cookie is the only state both can see.
+  const PERSIST = process.env.NODE_ENV === 'development';
+  const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
+  const memStore = new Map<string, SessionAuthState>();
+       │
+       └─ this comment IS the codebase's only explicit acknowledgment
+          that production is multi-instance. The "shared store" for
+          the auth flow is the browser cookie — i.e. the client carries
+          the state. Same pattern as bi:diag:<id> in useInvestigation.
+          NEITHER is replication; both are "push state to where you can
+          see it across instances."
+```
+
 #### Part 5 — what IS replicated that we can name
 
 Two things in the dependency graph are almost certainly replicated, but invisible to our code.
@@ -182,6 +211,19 @@ Two things in the dependency graph are almost certainly replicated, but invisibl
 - **Anthropic API.** Same story. Multi-region, multi-tenant, opaque to us. Their availability is their problem.
 
 There's nothing we can do at the codebase to participate in their replication — we're a client, not a peer. The right response to their failure is the partial-failure handling in file 02.
+
+```
+  lib/state/insights.ts  (lines 4-6)
+
+  const insights = new Map<string, Insight>();             ← per-process;
+  const investigations = new Map<string, Investigation>();    no replica
+  const anomalies = new Map<string, Anomaly>();              no failover
+       │
+       └─ this is the gap that file 09 (red-flags audit) ranks as the
+          #1 distributed-systems risk. It's not "the wrong design"; it's
+          "the right design at hackathon scale, with the cost honestly
+          named." Adding replication here means adding a database first.
+```
 
 #### Part 6 — the parallel-eval K=10 race (real war story, single host, multiple processes)
 
@@ -233,6 +275,32 @@ The distributed-systems lessons here are real even though it's a single host:
 
 The right next move when a real cross-instance hazard arises in the Vercel app (not just the eval scripts): the same pattern applies. Namespace-separate by `bi_session` (one user, one namespace) or `sessionId` (one route invocation, one namespace), and the cross-instance hazard converts into a non-race.
 
+```
+  eval/scripts/run-detection.ts  (lines 87-100)
+
+  function makeResultsDir(): { dir: string; date: string } {
+    const today = new Date();
+    const date = today.toISOString().slice(0, 10);
+    // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
+    // `2026-06-15-after-fix/`) instead of overwriting the prior run's
+    // summary.md and raw audit trail.
+    const tag = process.env.EVAL_RUN_TAG;
+    const dirName = tag ? `${date}-${tag}` : date;
+    const dir = resolve(REPO_ROOT, 'eval/results', dirName);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    return { dir, date };
+  }
+       │
+       └─ namespace-separation as a coordination primitive. Without the
+          tag suffix, two parallel K=10 runs collide; with it, they
+          partition their writes by tag. Same pattern lives in
+          run-diagnosis.ts:118-127, run-recommendation.ts:136-145,
+          run-regression.ts:178-187 — four copies, deliberately
+          duplicated because each script is a standalone process and
+          the cost of factoring this out is higher than the cost of
+          one extra `const tag = process.env.EVAL_RUN_TAG`.
+```
+
 ### Move 3 — the principle
 
 **Replication is the answer to "what happens when this dies?" — but only when there's something durable to keep alive.** blooming insights has no durable state outside Bloomreach itself; if the Vercel instance dies, the user retries from scratch and nothing is lost (the briefing was re-derivable; the investigation was re-runnable). Replication is the right tool the moment that stops being true — when there's a feature where "the user wouldn't be able to redo the work." Until then, the right answer to "why no replication?" is "because nothing here would benefit from it" — and saying that plainly is honest distributed-systems thinking, not a confession.
@@ -276,80 +344,6 @@ The right next move when a real cross-instance hazard arises in the Vercel app (
     → add Postgres or Vercel KV
     → that database has replicas
     → THEN this file becomes load-bearing
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-
-In the Vercel app: none today. Every file path that would normally appear here — connection pools to a primary, read-replica routing, quorum-write configuration, failover handlers — does not exist. The closest thing to "instance-aware logic" is the comment in `lib/mcp/auth.ts:38-104` explaining that the encrypted cookie backend exists precisely *because* there's no cross-instance store, and the auth flow has to survive Vercel routing the connect and callback requests to different instances.
-
-In the eval scripts: the `EVAL_RUN_TAG` env var IS the codebase's only existing answer to a shared-mutable-state-across-processes hazard. Four scripts honor it (`eval/scripts/run-detection.ts`, `run-diagnosis.ts`, `run-recommendation.ts`, `run-regression.ts`); each computes its results-dir as `${date}-${tag}` if the tag is set, plain `${date}` otherwise. The fix is one-shape, repeated.
-
-**Code side by side.**
-
-The only place the codebase acknowledges horizontal scaling is in the auth backend selection. Here's the seam between "single-process dev" and "multi-instance production" — and the choice the code makes about it:
-
-```
-  lib/mcp/auth.ts  (lines 22-36, 38-104)
-
-  // Storage backend, keyed by our app session id. Three backends, selected by env:
-  //   • development → a gitignored file (.auth-cache.json).
-  //   • test → in-memory Map (isolated per run).
-  //   • production (Vercel) → an encrypted httpOnly cookie, via `withAuthCookies`.
-  //     The `connect` and `callback` requests run on different ephemeral
-  //     instances, so the browser cookie is the only state both can see.
-  const PERSIST = process.env.NODE_ENV === 'development';
-  const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
-  const memStore = new Map<string, SessionAuthState>();
-       │
-       └─ this comment IS the codebase's only explicit acknowledgment
-          that production is multi-instance. The "shared store" for
-          the auth flow is the browser cookie — i.e. the client carries
-          the state. Same pattern as bi:diag:<id> in useInvestigation.
-          NEITHER is replication; both are "push state to where you can
-          see it across instances."
-```
-
-```
-  lib/state/insights.ts  (lines 4-6)
-
-  const insights = new Map<string, Insight>();             ← per-process;
-  const investigations = new Map<string, Investigation>();    no replica
-  const anomalies = new Map<string, Anomaly>();              no failover
-       │
-       └─ this is the gap that file 09 (red-flags audit) ranks as the
-          #1 distributed-systems risk. It's not "the wrong design"; it's
-          "the right design at hackathon scale, with the cost honestly
-          named." Adding replication here means adding a database first.
-```
-
-```
-  eval/scripts/run-detection.ts  (lines 87-100)
-
-  function makeResultsDir(): { dir: string; date: string } {
-    const today = new Date();
-    const date = today.toISOString().slice(0, 10);
-    // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
-    // `2026-06-15-after-fix/`) instead of overwriting the prior run's
-    // summary.md and raw audit trail.
-    const tag = process.env.EVAL_RUN_TAG;
-    const dirName = tag ? `${date}-${tag}` : date;
-    const dir = resolve(REPO_ROOT, 'eval/results', dirName);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    return { dir, date };
-  }
-       │
-       └─ namespace-separation as a coordination primitive. Without the
-          tag suffix, two parallel K=10 runs collide; with it, they
-          partition their writes by tag. Same pattern lives in
-          run-diagnosis.ts:118-127, run-recommendation.ts:136-145,
-          run-regression.ts:178-187 — four copies, deliberately
-          duplicated because each script is a standalone process and
-          the cost of factoring this out is higher than the cost of
-          one extra `const tag = process.env.EVAL_RUN_TAG`.
 ```
 
 ---

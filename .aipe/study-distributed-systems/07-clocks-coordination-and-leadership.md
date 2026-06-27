@@ -112,6 +112,13 @@ Three classical responses to this:
 
 ### Move 2 — the four `Date.now()` callsites, walked
 
+**Use cases.**
+
+Every existing use case is within-process and safe. The interesting *non*-use cases are the features that would force this to become a real concern:
+- Scheduled briefings (would need cron + leader election; Vercel Cron Jobs handles it).
+- "Don't run two briefings in parallel for the same user" (would need a distributed lock; Vercel KV `SET NX` with TTL is the easy solution).
+- Merging insights from two parallel briefings into one feed (would need ordering; HLC or per-event UUID with tiebreak).
+
 #### Callsite 1 — BloomreachDataSource cache TTL (`lib/data-source/bloomreach-data-source.ts:149, 186`)
 
 ```
@@ -131,6 +138,22 @@ Three classical responses to this:
 
 Safe. No distributed clock issue.
 
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 149-150, 185-186)
+
+  if (cached && cached.expiresAt > Date.now()) {        ← read-time comparison
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
+  }
+  // ...
+  const now = Date.now();                                ← write-time stamp
+  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+       │
+       └─ both Date.now() calls happen in the same Node process.
+          Comparison is monotonic-ish — safe even across NTP corrections
+          (worst case: one extra cache miss or one extra hit, no
+          correctness impact).
+```
+
 #### Callsite 2 — BloomreachDataSource spacing (`lib/data-source/bloomreach-data-source.ts:191, 197, 200`)
 
 ```
@@ -149,6 +172,29 @@ Safe. No distributed clock issue.
 ```
 
 Safe. No distributed clock issue.
+
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
+
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  try {
+    const result = await this.transport.callTool(name, args);
+    this.lastCallAt = Date.now();                        ← record after success
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();                        ← also record on fail
+    // ...
+  }
+       │
+       └─ rate-limit spacing tracker. Same-process clock comparison;
+          no skew issue. Cross-instance leak: two Vercel instances each
+          have their own lastCallAt, so concurrent calls from different
+          instances can both fire within Bloomreach's window. That's a
+          coordination issue (file 05), not a clock issue.
+```
 
 #### Callsite 2b — OlistDataSource durationMs (`lib/data-source/olist-data-source.ts:152, 159`)
 
@@ -207,6 +253,24 @@ Safe. No distributed clock issue.
 ```
 
 Mostly safe. The cross-clock comparison server→browser is the only one in the codebase, and the consequence of skew is a display glitch ("3 minutes ago" off by 30 seconds for a user whose machine clock is 30s slow). No data corruption.
+
+```
+  lib/state/insights.ts  (lines 8-28, specifically line 14)
+
+  export function anomalyToInsight(a: Anomaly): Insight {
+    const id = crypto.randomUUID();
+    // ...
+    return {
+      id,
+      timestamp: new Date().toISOString(),               ← server's clock,
+      // ...                                                ISO string format
+    };
+  }
+       │
+       └─ the only "produced here, displayed there" timestamp. UI
+          compares to browser Date.now() for "X minutes ago" rendering.
+          Skew effect is cosmetic; no data path depends on the value.
+```
 
 ### Move 3 — what NOT YET EXERCISED looks like (and what would force it)
 
@@ -296,76 +360,6 @@ Mostly safe. The cross-clock comparison server→browser is the only one in the 
   │   all NOT YET EXERCISED                                         │
   │                                                                │
   └────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-
-Every existing use case is within-process and safe. The interesting *non*-use cases are the features that would force this to become a real concern:
-- Scheduled briefings (would need cron + leader election; Vercel Cron Jobs handles it).
-- "Don't run two briefings in parallel for the same user" (would need a distributed lock; Vercel KV `SET NX` with TTL is the easy solution).
-- Merging insights from two parallel briefings into one feed (would need ordering; HLC or per-event UUID with tiebreak).
-
-**Code side by side.**
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 149-150, 185-186)
-
-  if (cached && cached.expiresAt > Date.now()) {        ← read-time comparison
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-  // ...
-  const now = Date.now();                                ← write-time stamp
-  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-       │
-       └─ both Date.now() calls happen in the same Node process.
-          Comparison is monotonic-ish — safe even across NTP corrections
-          (worst case: one extra cache miss or one extra hit, no
-          correctness impact).
-```
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
-
-  const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-  }
-  try {
-    const result = await this.transport.callTool(name, args);
-    this.lastCallAt = Date.now();                        ← record after success
-    return result;
-  } catch (err) {
-    this.lastCallAt = Date.now();                        ← also record on fail
-    // ...
-  }
-       │
-       └─ rate-limit spacing tracker. Same-process clock comparison;
-          no skew issue. Cross-instance leak: two Vercel instances each
-          have their own lastCallAt, so concurrent calls from different
-          instances can both fire within Bloomreach's window. That's a
-          coordination issue (file 05), not a clock issue.
-```
-
-```
-  lib/state/insights.ts  (lines 8-28, specifically line 14)
-
-  export function anomalyToInsight(a: Anomaly): Insight {
-    const id = crypto.randomUUID();
-    // ...
-    return {
-      id,
-      timestamp: new Date().toISOString(),               ← server's clock,
-      // ...                                                ISO string format
-    };
-  }
-       │
-       └─ the only "produced here, displayed there" timestamp. UI
-          compares to browser Date.now() for "X minutes ago" rendering.
-          Skew effect is cosmetic; no data path depends on the value.
 ```
 
 ---

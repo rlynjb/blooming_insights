@@ -126,6 +126,8 @@ The practical consequence: a workspace with 500 events doesn't blow the prompt �
 
 The condition under which it works (and doesn't): it works because the agent doesn't *need* the long tail to do its job. If a future agent had to reason about rare events, the cap would have to grow or the summary would have to become retrievable on demand (the agentic-RAG shape from section 02). Right now the agent's job is bounded; the summary's shape matches the job.
 
+**Where this lives in the repo.** `schemaSummary()` in `lib/agents/monitoring.ts` L16–L49 — caps at L21 (`MAX_EVENTS = 20`), L22 (`MAX_PROPS_PER_EVENT = 10`), L33 (`MAX_CPROPS = 30`).
+
 ### Move 2 — Inject the right slice by replacement, per run
 
 The technical thing: **prompt templating with replacement, where the replacement value is computed against runtime state.** The prompt file holds slots (`{categories}`, `{schema}`, `{project_id}`); the agent code computes each slot's value and runs `.replace()` to splice them in before the call.
@@ -152,6 +154,8 @@ prompt injection at run time
 The practical consequence: the route runs the *capability gate* (the runnable-categories filter, covered in the guardrails note) before the monitoring agent starts, and only the categories whose required events exist in the schema land in `{categories}`. The model is never shown a category like `fraud_detection` if the workspace doesn't emit `payment_failure` — because the category isn't *in the window*. There's nothing to ignore, nothing to misclick.
 
 The condition under which it works: the gate has to be correct. If the runnable-categories filter returns a category the schema can't actually support, the model will dutifully try and spend a tool call on a query that fails. The substitution is honest because the gate upstream is honest.
+
+**Where this lives in the repo.** `MonitoringAgent.scan()` in `lib/agents/monitoring.ts` L83–L86 — three `.replace()` calls splicing values into `prompts/monitoring.md` slots at L7–L11 and L99–L101.
 
 ### Move 3 — Cap every tool result before it goes back in
 
@@ -181,6 +185,8 @@ The practical consequence: a customer-events tool result with 5,000 events doesn
 
 The condition under which it works: 16KB has to be enough for the *first* turn's decision. If the model needs more, it can call a more specific tool with narrower args — and the next result will also be capped. If 16KB is *never* enough for a particular tool, that tool's contract is wrong and should return summaries, not blobs.
 
+**Where this lives in the repo.** `runAgentLoop()` in `lib/agents/base.ts` — `truncate()` helper at L29–L34, applied at L150 and pushed at L171 (`MAX_TOOL_RESULT_CHARS = 16_000`). The stream-payload cap (the wire-to-client slice) is `trunc()` in `app/api/agent/route.ts` L99–L103, applied at L192.
+
 ### Move 4 — In a multi-agent run, decide who sees what
 
 The technical thing: **per-agent context routing.** With four agents sharing one MCP server, deciding which tools each agent sees is itself a context-engineering decision — the smaller the surface, the cleaner the reasoning.
@@ -203,6 +209,24 @@ who sees what (per-agent context routing)
 The practical consequence: the recommendation agent doesn't have analytics tools in its window — so it can't burn its 4-call budget re-running monitoring queries when its job is to propose actions. The mechanism is a per-agent tool-schema filter, but the *discipline* is context engineering: the surface each agent sees is curated to its job. This is covered as a mechanism in the tool-calling-and-mcp note; here it's the per-agent-context-routing pattern from the multi-agent-orchestration sub-section.
 
 The condition under which it works: the per-agent tool list has to match the per-agent prompt. If you give the recommendation agent the diagnostic tool subset but a recommendation prompt, the model gets confused by mismatched affordances. The two slots — tools and prompt — are curated together.
+
+**Where this lives in the repo.** `filterToolSchemas()` in `lib/agents/tool-schemas.ts` L15; the per-agent subsets are defined in `lib/mcp/tools.ts` L5–L40.
+
+```
+shape (not full impl):
+  // monitoring.ts L83
+  const system = PROMPT
+    .replace('{schema}', schemaSummary(this.schema))   // bounded
+    .replace(/\{project_id\}/g, this.schema.projectId)
+    .replace('{categories}', checklist);                // gated
+
+  // base.ts L29 + L150
+  const MAX_TOOL_RESULT_CHARS = 16_000;
+  resultContent = truncate(JSON.stringify(result));    // capped
+
+  // monitoring.ts L96
+  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // sliced
+```
 
 ### The principle
 
@@ -242,51 +266,6 @@ The window for ONE monitoring turn (blooming insights)
 
   CURATION points: schema cap · {categories} gate · per-agent
   tool subset · 16KB tool-result cap · 4KB stream cap
-```
-
----
-
-## Implementation in codebase
-
-**Schema cap (the structured-input slice):**
-**File:** `lib/agents/monitoring.ts`
-**Function:** `schemaSummary()`
-**Line range:** L16–L49 (caps at L21, L22, L33)
-
-**Prompt injection (the per-run slot fill):**
-**File:** `lib/agents/monitoring.ts`
-**Function:** `MonitoringAgent.scan()`
-**Line range:** L83–L86 (three `.replace()` calls into `prompts/monitoring.md` L7–L11, L99–L101)
-
-**Tool-result truncation (the loop-boundary cap):**
-**File:** `lib/agents/base.ts`
-**Function:** `runAgentLoop()` (the `truncate()` helper at L29–L34, applied at L150 and pushed at L171)
-**Line range:** L29, L150, L171
-
-**Per-agent tool subset (the cross-agent slice):**
-**File:** `lib/agents/tool-schemas.ts`
-**Function:** `filterToolSchemas()`
-**Line range:** L15 (subsets defined in `lib/mcp/tools.ts` L5–L40)
-
-**Stream-payload cap (the wire-to-client slice):**
-**File:** `app/api/agent/route.ts`
-**Function:** `trunc()`
-**Line range:** L99–L103 (applied at L192)
-
-```
-shape (not full impl):
-  // monitoring.ts L83
-  const system = PROMPT
-    .replace('{schema}', schemaSummary(this.schema))   // bounded
-    .replace(/\{project_id\}/g, this.schema.projectId)
-    .replace('{categories}', checklist);                // gated
-
-  // base.ts L29 + L150
-  const MAX_TOOL_RESULT_CHARS = 16_000;
-  resultContent = truncate(JSON.stringify(result));    // capped
-
-  // monitoring.ts L96
-  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // sliced
 ```
 
 ---

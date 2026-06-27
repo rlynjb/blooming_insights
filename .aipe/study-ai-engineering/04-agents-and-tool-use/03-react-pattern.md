@@ -218,6 +218,58 @@ The shared agent loop ships the six-piece kernel plus six pieces of hardening th
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.**
+
+#### Thought (text reasoning → reasoning_step)
+
+- **File:** `lib/agents/base.ts` (extraction) + `app/api/agent/route.ts` (event)
+- **Function / class:** `runAgentLoop` text-block extraction → `hooksFor(agent).onText`
+- **Line range:** `base.ts` L108–L113; `route.ts` L182–L184 (`stepFor(agent, 'thought', t)`; `stepFor` L176–L180)
+- **Role:** The model's text blocks become `reasoning_step` events of kind `'thought'`.
+
+#### Action (tool_use → tool_call_start)
+
+- **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
+- **Function / class:** `runAgentLoop` per-tool loop → `onToolCall` → `tool_call_start`
+- **Line range:** `base.ts` L138 (hook fired before the call); `events.ts` L6; `route.ts` L185
+- **Role:** Emitted *before* execution so the UI shows the in-flight action.
+
+#### Observation (result → tool_call_end + fed back)
+
+- **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
+- **Function / class:** `runAgentLoop` → `onToolResult` → `tool_call_end`; result pushed as user turn
+- **Line range:** `base.ts` L144 (run), L159 (hook), L171 (fed back); `events.ts` L7; `route.ts` L186–L194
+- **Role:** `tool_call_end` carries `durationMs`/`result`/`error` for the UI; L171 re-enters the result into the conversation so the next Thought is conditioned on it.
+
+#### The streamed trace (product surface)
+
+- **File:** `lib/mcp/events.ts` + `app/api/agent/route.ts` + `lib/hooks/useInvestigation.ts`
+- **Function / class:** `encodeEvent` (NDJSON); route `ReadableStream` `start()`; the `useInvestigation` reader loop + `handle`
+- **Line range:** `events.ts` L15 (`JSON.stringify(e)+'\n'`); `route.ts` L169–L265; `useInvestigation.ts` L184–L201 (reader, behind the `startedRef` StrictMode guard L43/L47), L97–L151 (`handle`)
+- **Role:** Each phase becomes an NDJSON line streamed over `fetch` (no `EventSource`) and rendered live. The consumer moved out of `app/investigate/[id]/page.tsx` into the hook so both step pages (`useInvestigation(id,'diagnose')` and `(id,'recommend')`) share one reader.
+
+**Pseudocode — one ReAct cycle, tapped** (`base.ts` L108–L171):
+
+```typescript
+// THOUGHT
+const textBlocks = res.content.filter(b => b.type === 'text');     // L108
+if (textBlocks.length && onText) onText(textBlocks.join(''));      // L112  → reasoning_step
+
+const toolUses = res.content.filter(b => b.type === 'tool_use');   // L116
+if (toolUses.length === 0) return { finalText, toolCalls };        // natural end
+
+for (const tu of toolUses) {
+  onToolCall?.(tc);                                                // L138  ACTION → tool_call_start
+  const { result, durationMs } = await mcp.callTool(tu.name, tu.input);  // L144
+  onToolResult?.(tc);                                              // L159  OBSERVATION → tool_call_end
+}
+messages.push({ role: 'user', content: toolResults });            // L171  observation → next THOUGHT
+```
+
+---
+
 ## The ReAct pattern — diagram
 
 The diagram spans three layers. The Model layer produces Thoughts and Actions. The Loop layer runs the Action and produces the Observation, tapping each phase with a hook. The Stream/UI boundary turns each tap into a rendered event. The feedback edge (Observation → next Thought) is the loop's spine.
@@ -249,58 +301,6 @@ The diagram spans three layers. The Model layer produces Thoughts and Actions. T
 ```
 
 A reader who sees only this diagram should grasp: three phases, each tapped by a hook, each streamed as an event — and the Observation loops back to feed the next Thought.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### Thought (text reasoning → reasoning_step)
-
-- **File:** `lib/agents/base.ts` (extraction) + `app/api/agent/route.ts` (event)
-- **Function / class:** `runAgentLoop` text-block extraction → `hooksFor(agent).onText`
-- **Line range:** `base.ts` L108–L113; `route.ts` L182–L184 (`stepFor(agent, 'thought', t)`; `stepFor` L176–L180)
-- **Role:** The model's text blocks become `reasoning_step` events of kind `'thought'`.
-
-### Action (tool_use → tool_call_start)
-
-- **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
-- **Function / class:** `runAgentLoop` per-tool loop → `onToolCall` → `tool_call_start`
-- **Line range:** `base.ts` L138 (hook fired before the call); `events.ts` L6; `route.ts` L185
-- **Role:** Emitted *before* execution so the UI shows the in-flight action.
-
-### Observation (result → tool_call_end + fed back)
-
-- **File:** `lib/agents/base.ts` + `lib/mcp/events.ts` + `app/api/agent/route.ts`
-- **Function / class:** `runAgentLoop` → `onToolResult` → `tool_call_end`; result pushed as user turn
-- **Line range:** `base.ts` L144 (run), L159 (hook), L171 (fed back); `events.ts` L7; `route.ts` L186–L194
-- **Role:** `tool_call_end` carries `durationMs`/`result`/`error` for the UI; L171 re-enters the result into the conversation so the next Thought is conditioned on it.
-
-### The streamed trace (product surface)
-
-- **File:** `lib/mcp/events.ts` + `app/api/agent/route.ts` + `lib/hooks/useInvestigation.ts`
-- **Function / class:** `encodeEvent` (NDJSON); route `ReadableStream` `start()`; the `useInvestigation` reader loop + `handle`
-- **Line range:** `events.ts` L15 (`JSON.stringify(e)+'\n'`); `route.ts` L169–L265; `useInvestigation.ts` L184–L201 (reader, behind the `startedRef` StrictMode guard L43/L47), L97–L151 (`handle`)
-- **Role:** Each phase becomes an NDJSON line streamed over `fetch` (no `EventSource`) and rendered live. The consumer moved out of `app/investigate/[id]/page.tsx` into the hook so both step pages (`useInvestigation(id,'diagnose')` and `(id,'recommend')`) share one reader.
-
-**Pseudocode — one ReAct cycle, tapped** (`base.ts` L108–L171):
-
-```typescript
-// THOUGHT
-const textBlocks = res.content.filter(b => b.type === 'text');     // L108
-if (textBlocks.length && onText) onText(textBlocks.join(''));      // L112  → reasoning_step
-
-const toolUses = res.content.filter(b => b.type === 'tool_use');   // L116
-if (toolUses.length === 0) return { finalText, toolCalls };        // natural end
-
-for (const tu of toolUses) {
-  onToolCall?.(tc);                                                // L138  ACTION → tool_call_start
-  const { result, durationMs } = await mcp.callTool(tu.name, tu.input);  // L144
-  onToolResult?.(tc);                                              // L159  OBSERVATION → tool_call_end
-}
-messages.push({ role: 'user', content: toolResults });            // L171  observation → next THOUGHT
-```
 
 ---
 

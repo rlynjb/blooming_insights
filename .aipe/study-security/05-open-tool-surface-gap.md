@@ -287,83 +287,9 @@ This finding has a real Phase A → Phase B comparison worth drawing because the
 
 The fix takes the same shape in both phases: add the allowlist. The difference is *when the missing fix becomes catastrophic* — today it's a posture problem; the moment Bloomreach ships a write tool, it's an active exploit.
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Defenses that rely on an upstream's posture are conditional defenses.** They're correct as long as the upstream doesn't change. They become wrong silently the moment the upstream changes — because the change happens outside your codebase, outside your review, outside your CI. Structural defenses in your own code don't have that property: an allowlist in your route stays correct regardless of what Bloomreach ships. Prefer in-app structural defenses over "upstream won't expose anything dangerous" assumptions.
-
----
-
-## Primary diagram
-
-The full picture of the gap and the fix, side by side.
-
-```
-  POST /api/mcp/call — current vs hardened
-
-  ┌─ TODAY ────────────────────────────────────────────────────────┐
-  │                                                                  │
-  │  POST(req):                                                      │
-  │    body = await req.json()           ← any shape                 │
-  │    sid  = await getOrCreateSessionId()                           │
-  │    conn = await connectMcp(sid)                                  │
-  │    if not conn.ok: return 401                                    │
-  │    r = await conn.mcp.callTool(                                  │
-  │           body.name,                  ← ★ ANY name forwards ★    │
-  │           body.args ?? {},                                       │
-  │           { skipCache: true }                                    │
-  │         )                                                        │
-  │    return { result: r.result }                                   │
-  │                                                                  │
-  │  enforcement points:                                             │
-  │   ★ authn (session)        ✓                                     │
-  │     body schema            ✗                                     │
-  │     tool-name allowlist    ✗ ← this is the audit's H1 finding    │
-  │     production gate        ✗                                     │
-  │     CSRF token             ✗                                     │
-  │                                                                  │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ HARDENED (one-line fix) ──────────────────────────────────────┐
-  │                                                                  │
-  │  const ALL_KNOWN = new Set([                                     │
-  │    ...monitoringTools, ...diagnosticTools,                       │
-  │    ...recommendationTools, ...bootstrapTools,                    │
-  │  ])                                                              │
-  │                                                                  │
-  │  POST(req):                                                      │
-  │    body = await req.json()                                       │
-  │    if (!ALL_KNOWN.has(body.name)) {           ← ★ ALLOWLIST ★    │
-  │      return NextResponse.json(                                   │
-  │        { error: 'tool not permitted' },                          │
-  │        { status: 403 }                                           │
-  │      )                                                           │
-  │    }                                                             │
-  │    sid  = await getOrCreateSessionId()                           │
-  │    // ... rest unchanged ...                                     │
-  │                                                                  │
-  │  enforcement points:                                             │
-  │   ★ authn (session)        ✓                                     │
-  │     tool-name allowlist    ✓ ← H1 closed                         │
-  │     body schema            (optional next-mile)                  │
-  │     production gate        (optional, would also work)           │
-  │     CSRF token             (separate B4 fix)                     │
-  │                                                                  │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-The structural property worth memorizing: **the fix is the same code shape that protects the agent flow — an allowlist on the tool name — just applied at a different entry point.**
-
----
-
-## Implementation in codebase
-
-**Use case 1 — legitimate /debug introspection (today).** Developer opens `/debug`. The page calls `GET /api/mcp/tools` to discover available tools. Developer picks `list_funnels` from the dropdown, clicks Run. Browser POSTs to `/api/mcp/call` with `{name: 'list_funnels', args: {}}`. Route forwards to MCP. Result comes back. Page renders the JSON. Works fine — no allowlist needed because the tool was a legitimate read.
-
-**Use case 2 — hostile authenticated user (today).** Logged-in user (or an attacker who has compromised someone's session) opens DevTools, fires `fetch('/api/mcp/call', {method: 'POST', body: JSON.stringify({name: 'create_scenario', args: {...}})})`. Route forwards. Bloomreach returns "unknown tool" (assuming `create_scenario` doesn't exist today). 500 with the upstream error. No damage. But the round trip happened; an attacker is enumerating Bloomreach's tool surface for free.
-
-**Use case 3 — CSRF + future write tool (hypothetical).** Bloomreach has shipped `create_scenario`. Victim with active session visits `attacker.example`. Attacker page contains `<form action="https://blooming-insights.app/api/mcp/call" method="POST">` with hidden inputs and an auto-submit script. Browser POSTs cross-origin with victim's cookies (`SameSite=None`). Route forwards. Bloomreach creates a scenario on the victim's workspace. Victim's Bloomreach is now mutated. The victim never intended the request.
-
-**Use case 4 — what the hardened route does in scenarios 2-3.** Route reads body. `ALL_KNOWN.has('create_scenario')` → false (it's not in any agent whitelist). Returns 403 immediately. No call to MCP. No round trip. No upstream load. Both scenarios end at the route.
+Two blocks: the current 22-line route in `app/api/mcp/call/route.ts` with both findings annotated, and the hardened version that closes them. Read with the annotation, then the four use-cases below show the legitimate debug path, two attack scenarios, and what the hardened route does to them.
 
 ```
   app/api/mcp/call/route.ts  (current, lines 1–22)
@@ -449,6 +375,80 @@ The structural property worth memorizing: **the fix is the same code shape that 
           behavior unchanged for /debug's actual usage
           (it only calls tools in the whitelisted set).
 ```
+
+**Use case 1 — legitimate /debug introspection (today).** Developer opens `/debug`. The page calls `GET /api/mcp/tools` to discover available tools. Developer picks `list_funnels` from the dropdown, clicks Run. Browser POSTs to `/api/mcp/call` with `{name: 'list_funnels', args: {}}`. Route forwards to MCP. Result comes back. Page renders the JSON. Works fine — no allowlist needed because the tool was a legitimate read.
+
+**Use case 2 — hostile authenticated user (today).** Logged-in user (or an attacker who has compromised someone's session) opens DevTools, fires `fetch('/api/mcp/call', {method: 'POST', body: JSON.stringify({name: 'create_scenario', args: {...}})})`. Route forwards. Bloomreach returns "unknown tool" (assuming `create_scenario` doesn't exist today). 500 with the upstream error. No damage. But the round trip happened; an attacker is enumerating Bloomreach's tool surface for free.
+
+**Use case 3 — CSRF + future write tool (hypothetical).** Bloomreach has shipped `create_scenario`. Victim with active session visits `attacker.example`. Attacker page contains `<form action="https://blooming-insights.app/api/mcp/call" method="POST">` with hidden inputs and an auto-submit script. Browser POSTs cross-origin with victim's cookies (`SameSite=None`). Route forwards. Bloomreach creates a scenario on the victim's workspace. Victim's Bloomreach is now mutated. The victim never intended the request.
+
+**Use case 4 — what the hardened route does in scenarios 2-3.** Route reads body. `ALL_KNOWN.has('create_scenario')` → false (it's not in any agent whitelist). Returns 403 immediately. No call to MCP. No round trip. No upstream load. Both scenarios end at the route.
+
+### Move 3 — the principle
+
+**Defenses that rely on an upstream's posture are conditional defenses.** They're correct as long as the upstream doesn't change. They become wrong silently the moment the upstream changes — because the change happens outside your codebase, outside your review, outside your CI. Structural defenses in your own code don't have that property: an allowlist in your route stays correct regardless of what Bloomreach ships. Prefer in-app structural defenses over "upstream won't expose anything dangerous" assumptions.
+
+---
+
+## Primary diagram
+
+The full picture of the gap and the fix, side by side.
+
+```
+  POST /api/mcp/call — current vs hardened
+
+  ┌─ TODAY ────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  POST(req):                                                      │
+  │    body = await req.json()           ← any shape                 │
+  │    sid  = await getOrCreateSessionId()                           │
+  │    conn = await connectMcp(sid)                                  │
+  │    if not conn.ok: return 401                                    │
+  │    r = await conn.mcp.callTool(                                  │
+  │           body.name,                  ← ★ ANY name forwards ★    │
+  │           body.args ?? {},                                       │
+  │           { skipCache: true }                                    │
+  │         )                                                        │
+  │    return { result: r.result }                                   │
+  │                                                                  │
+  │  enforcement points:                                             │
+  │   ★ authn (session)        ✓                                     │
+  │     body schema            ✗                                     │
+  │     tool-name allowlist    ✗ ← this is the audit's H1 finding    │
+  │     production gate        ✗                                     │
+  │     CSRF token             ✗                                     │
+  │                                                                  │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ HARDENED (one-line fix) ──────────────────────────────────────┐
+  │                                                                  │
+  │  const ALL_KNOWN = new Set([                                     │
+  │    ...monitoringTools, ...diagnosticTools,                       │
+  │    ...recommendationTools, ...bootstrapTools,                    │
+  │  ])                                                              │
+  │                                                                  │
+  │  POST(req):                                                      │
+  │    body = await req.json()                                       │
+  │    if (!ALL_KNOWN.has(body.name)) {           ← ★ ALLOWLIST ★    │
+  │      return NextResponse.json(                                   │
+  │        { error: 'tool not permitted' },                          │
+  │        { status: 403 }                                           │
+  │      )                                                           │
+  │    }                                                             │
+  │    sid  = await getOrCreateSessionId()                           │
+  │    // ... rest unchanged ...                                     │
+  │                                                                  │
+  │  enforcement points:                                             │
+  │   ★ authn (session)        ✓                                     │
+  │     tool-name allowlist    ✓ ← H1 closed                         │
+  │     body schema            (optional next-mile)                  │
+  │     production gate        (optional, would also work)           │
+  │     CSRF token             (separate B4 fix)                     │
+  │                                                                  │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+The structural property worth memorizing: **the fix is the same code shape that protects the agent flow — an allowlist on the tool name — just applied at a different entry point.**
 
 ---
 

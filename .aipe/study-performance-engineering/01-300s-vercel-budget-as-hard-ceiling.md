@@ -241,71 +241,15 @@ The principle that pops out: **the ceiling is a constraint, not a goal**. Today,
 
 ---
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Hard budgets are enforced by the layer above; soft budgets need a meter.** The 300s ceiling works because Vercel enforces it for free — we don't have to count milliseconds. The cost of pinning at the ceiling is that we get *no early warning* — there's no "you spent 250s, time to wind down" signal. A soft budget at, say, 270s (Move B above) would give us that signal at the price of writing a watchdog. The general lesson: **every hard budget should be paired with a soft budget below it, so the user sees a graceful error before the platform pulls the plug.** blooming insights has the hard budget; the soft one isn't built yet.
-
----
-
-## Primary diagram
-
-The full picture — the platform ceiling, the configured budget, the agent run underneath, the failure mode.
-
-```
-  blooming insights — the 300s budget at a glance
-
-  ┌─ Vercel platform ─────────────────────────────────────────────────┐
-  │                                                                    │
-  │  Pro plan: maxDuration cap = 300s                                  │
-  │  Hobby plan: maxDuration cap = 60s                                 │
-  │  enforcement: wall-clock kill at the configured maxDuration       │
-  │  ★ no graceful signal — the function just stops ★                  │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │
-  ┌─ Route handler (configured) ───▼───────────────────────────────────┐
-  │                                                                    │
-  │  app/api/agent/route.ts:20:    export const maxDuration = 300;     │
-  │  app/api/briefing/route.ts:17: export const maxDuration = 300;     │
-  │  // comment names the rationale: ~100-115s typical, 60s won't fit  │
-  │                                                                    │
-  │  ★ pinned AT the platform ceiling — zero engineering headroom      │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │
-  ┌─ Agent run (must fit under) ───▼───────────────────────────────────┐
-  │                                                                    │
-  │  bootstrap            ~5-10s     (4-6 MCP calls, serial)           │
-  │  diagnostic agent    ~30-50s     (6 tool calls × ~1.5-3s + Anth)  │
-  │  recommendation     ~20-35s     (4 tool calls × ~1.5-3s + Anth)  │
-  │  ─────────────────────────────                                      │
-  │  TYPICAL TOTAL       ~55-95s     (~205-245s headroom)              │
-  │                                                                    │
-  │  bad-day adders:                                                   │
-  │   1 retry storm:     +20-60s     (~280s — TIGHT)                   │
-  │   2 retry storms:    +60-120s    (~215-275s — DANGEROUS)           │
-  │   3 retry storms:    +120-180s   (~275-300s — HITS CEILING)        │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │
-  ┌─ Failure mode (when ceiling hit) ─▼────────────────────────────────┐
-  │                                                                    │
-  │  Vercel: function killed (no graceful close)                       │
-  │  Client: ReadableStream ends without `{ type: 'done' }`            │
-  │  UI: ProcessStepper stuck in 'active'; recommendation never shows  │
-  │  Logs: timeout error in Vercel function logs; no app-side log      │
-  │  ★ NO measurement today of how often this fires ★                  │
-  └────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases — where the 300s budget is reached for
+##### Use cases — where the 300s budget is reached for
 
 - **Both NDJSON-streaming routes.** `app/api/agent/route.ts` runs the diagnostic + recommendation chain; `app/api/briefing/route.ts` runs the monitoring scan. Both can take 100+ seconds in live mode, both are pinned at 300s.
 - **The briefing route's `?demo=cached` path** — bypasses the agents entirely and replays committed JSON paced by `REPLAY_DELAY_MS = 140`. The 300s budget isn't even close to being a constraint here (~30-50s for a full replay), but the budget stays the same for code-uniformity reasons.
 - **Failure mode in production** — when the budget is hit, only Vercel's function logs show the timeout. The application-side code emits nothing (no `console.error`, no event) because the kill happens during an `await` with no rescue path.
 
-### Code side by side
+##### Code side by side
 
 **The budget itself, with the rationale comment that names the constraint.**
 
@@ -388,6 +332,62 @@ The full picture — the platform ceiling, the configured budget, the agent run 
   //   try { ... agent run ... } finally { clearTimeout(watchdog); }
   //
   // ~10 lines per route. Transforms the failure from silent to visible.
+```
+
+---
+
+### Move 3 — the principle
+
+**Hard budgets are enforced by the layer above; soft budgets need a meter.** The 300s ceiling works because Vercel enforces it for free — we don't have to count milliseconds. The cost of pinning at the ceiling is that we get *no early warning* — there's no "you spent 250s, time to wind down" signal. A soft budget at, say, 270s (Move B above) would give us that signal at the price of writing a watchdog. The general lesson: **every hard budget should be paired with a soft budget below it, so the user sees a graceful error before the platform pulls the plug.** blooming insights has the hard budget; the soft one isn't built yet.
+
+---
+
+## Primary diagram
+
+The full picture — the platform ceiling, the configured budget, the agent run underneath, the failure mode.
+
+```
+  blooming insights — the 300s budget at a glance
+
+  ┌─ Vercel platform ─────────────────────────────────────────────────┐
+  │                                                                    │
+  │  Pro plan: maxDuration cap = 300s                                  │
+  │  Hobby plan: maxDuration cap = 60s                                 │
+  │  enforcement: wall-clock kill at the configured maxDuration       │
+  │  ★ no graceful signal — the function just stops ★                  │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │
+  ┌─ Route handler (configured) ───▼───────────────────────────────────┐
+  │                                                                    │
+  │  app/api/agent/route.ts:20:    export const maxDuration = 300;     │
+  │  app/api/briefing/route.ts:17: export const maxDuration = 300;     │
+  │  // comment names the rationale: ~100-115s typical, 60s won't fit  │
+  │                                                                    │
+  │  ★ pinned AT the platform ceiling — zero engineering headroom      │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │
+  ┌─ Agent run (must fit under) ───▼───────────────────────────────────┐
+  │                                                                    │
+  │  bootstrap            ~5-10s     (4-6 MCP calls, serial)           │
+  │  diagnostic agent    ~30-50s     (6 tool calls × ~1.5-3s + Anth)  │
+  │  recommendation     ~20-35s     (4 tool calls × ~1.5-3s + Anth)  │
+  │  ─────────────────────────────                                      │
+  │  TYPICAL TOTAL       ~55-95s     (~205-245s headroom)              │
+  │                                                                    │
+  │  bad-day adders:                                                   │
+  │   1 retry storm:     +20-60s     (~280s — TIGHT)                   │
+  │   2 retry storms:    +60-120s    (~215-275s — DANGEROUS)           │
+  │   3 retry storms:    +120-180s   (~275-300s — HITS CEILING)        │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │
+  ┌─ Failure mode (when ceiling hit) ─▼────────────────────────────────┐
+  │                                                                    │
+  │  Vercel: function killed (no graceful close)                       │
+  │  Client: ReadableStream ends without `{ type: 'done' }`            │
+  │  UI: ProcessStepper stuck in 'active'; recommendation never shows  │
+  │  Logs: timeout error in Vercel function logs; no app-side log      │
+  │  ★ NO measurement today of how often this fires ★                  │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

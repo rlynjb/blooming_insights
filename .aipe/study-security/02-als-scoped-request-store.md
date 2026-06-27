@@ -235,74 +235,9 @@ What breaks if you put the dirty-check inside the `.run()` callback: nothing. It
 
 Two requests can interleave their awaits arbitrarily. Each `getStore()` call returns the value bound at the *enclosing* `.run()`. The V8 async-context subsystem is what enforces this — it's not a library-level convention.
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Context propagation without explicit threading is what makes "stateful work inside library calls you don't own" feasible.** You can't fork the MCP SDK to thread a context object through every `OAuthClientProvider` method. You can wrap the SDK's call site in `.run()` and have the provider methods read the active context. That's the load-bearing trick: ALS turns "context I need everywhere" from "thread it through every function" into "set it once at the top."
-
----
-
-## Primary diagram
-
-The full ALS pattern in one frame.
-
-```
-  ALS-scoped request store — full mechanics
-
-  ┌─ Module load (once per process) ───────────────────────────────┐
-  │                                                                  │
-  │   const requestStore = new AsyncLocalStorage<RequestStore>()    │
-  │                       (shared across all requests on instance)   │
-  │                                                                  │
-  └─────────────────────────────────┬──────────────────────────────┘
-                                    │
-                                    ▼  per request
-  ┌─ Request A ───────────────────────────────────────────────────┐
-  │                                                                 │
-  │  withAuthCookies(fnA):                                          │
-  │    raw = cookies.get('bi_auth')                                 │
-  │    ctxA = { store: decryptStore(raw), dirty: false }            │
-  │                                                                 │
-  │    requestStore.run(ctxA, async () => {                          │
-  │      // fnA's code runs here                                    │
-  │      // any awaited code preserves ctxA as active               │
-  │                                                                 │
-  │      readState(sid):                                            │
-  │        return requestStore.getStore().store[sid]  → ctxA.store  │
-  │                                                                 │
-  │      patchState(sid, patch):                                    │
-  │        ctx = requestStore.getStore()                            │
-  │        ctx.store[sid] = { ...ctx.store[sid], ...patch }         │
-  │        ctx.dirty = true   ← signals flush needed                │
-  │                                                                 │
-  │      provider.saveTokens(t)  ← MCP SDK call                     │
-  │        → patchState(sid, { tokens: t })  → ctxA.dirty = true    │
-  │                                                                 │
-  │      ... many more SDK calls ...                                │
-  │    })                                                            │
-  │                                                                 │
-  │    if (ctxA.dirty) {                                             │
-  │      cookies.set('bi_auth', encryptStore(ctxA.store), opts)     │
-  │    }                                                             │
-  │                                                                 │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ Concurrent Request B (same instance, separate ctxB) ──────────┐
-  │  requestStore.run(ctxB, fnB) — never sees ctxA                 │
-  │  V8 async-context tracking keeps them isolated                 │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-The structural property worth memorizing: **one module-level `AsyncLocalStorage` instance, one `.run()` per request, every awaited call inside `.run()` sees the same `ctx`, concurrent `.run()`s are isolated.**
-
----
-
-## Implementation in codebase
-
-**Use case 1 — MCP SDK calls the provider many times within one request.** Route enters `withAuthCookies(async () => { ... connectMcp(sid) ... })`. Inside, `connectMcp` constructs `new BloomreachAuthProvider(sid, redirectUri)` and hands it to the SDK. The SDK calls `provider.clientInformation()` — that calls `readState(sid)` → `requestStore.getStore()` → returns `ctx.store[sid]`. Empty → SDK triggers DCR. SDK calls `provider.saveClientInformation(info)` → `patchState(sid, {clientInformation: info})` → `ctx.store[sid].clientInformation = info; ctx.dirty = true`. SDK calls `provider.state()` → generates UUID, calls `patchState(sid, {state: v})`. SDK calls `provider.saveCodeVerifier(v)`. SDK calls `provider.redirectToAuthorization(url)` — captured into `provider.lastAuthorizeUrl`. SDK throws `UnauthorizedError`. The route catches, returns `{ needsAuth: true, authUrl: provider.lastAuthorizeUrl }`. **`withAuthCookies` sees `ctx.dirty === true` and flushes the now-populated store to the cookie.** Net result: one decrypt, one encrypt, and inside dozens of synchronous provider-method calls that all saw a consistent in-memory store.
-
-**Use case 2 — two requests arrive on the same warm Vercel instance simultaneously.** Request A enters `withAuthCookies` with `sessionId=alpha`, ctxA gets `store: {alpha: {...}}`. Before A's handler completes, Request B enters `withAuthCookies` with `sessionId=beta`, ctxB gets `store: {beta: {...}}`. Both run their async work — A awaits a network call, B starts its DCR registration. When A's `await` resolves, V8 re-enters ctxA for the continuation; A's `readState('alpha')` returns A's data, not B's. They flush independently. No state bleed despite shared process.
-
-**Use case 3 — dev mode, no cookie.** `withAuthCookies` sees `NODE_ENV !== 'production'` and short-circuits: `return fn()`. No `.run()` call. Inside `fn`, `requestStore.getStore()` returns `undefined`. The `readAll` function handles this: `if (ctx) return ctx.store` — falsey → falls through to the file-backed branch (`.auth-cache.json`). Dev path doesn't use ALS at all; it uses the filesystem because Next's dev server hot-reloads, which would wipe an in-memory Map mid-OAuth-flow.
+Three blocks tell the whole story in `lib/mcp/auth.ts`: the module-level singleton declaration, the wrapper that owns the lifecycle, and the read/write helpers the provider methods call. Read them with the annotation, then the three use-cases below show how they compose across one request, two concurrent requests, and dev mode.
 
 ```
   lib/mcp/auth.ts  (lines 3, 41–47)
@@ -368,6 +303,71 @@ The structural property worth memorizing: **one module-level `AsyncLocalStorage`
        └─ the three-backend dispatch is itself elegant: ALS for prod, file for dev,
           Map for test. each is selected by side-conditions, never by config flag.
 ```
+
+**Use case 1 — MCP SDK calls the provider many times within one request.** Route enters `withAuthCookies(async () => { ... connectMcp(sid) ... })`. Inside, `connectMcp` constructs `new BloomreachAuthProvider(sid, redirectUri)` and hands it to the SDK. The SDK calls `provider.clientInformation()` — that calls `readState(sid)` → `requestStore.getStore()` → returns `ctx.store[sid]`. Empty → SDK triggers DCR. SDK calls `provider.saveClientInformation(info)` → `patchState(sid, {clientInformation: info})` → `ctx.store[sid].clientInformation = info; ctx.dirty = true`. SDK calls `provider.state()` → generates UUID, calls `patchState(sid, {state: v})`. SDK calls `provider.saveCodeVerifier(v)`. SDK calls `provider.redirectToAuthorization(url)` — captured into `provider.lastAuthorizeUrl`. SDK throws `UnauthorizedError`. The route catches, returns `{ needsAuth: true, authUrl: provider.lastAuthorizeUrl }`. **`withAuthCookies` sees `ctx.dirty === true` and flushes the now-populated store to the cookie.** Net result: one decrypt, one encrypt, and inside dozens of synchronous provider-method calls that all saw a consistent in-memory store.
+
+**Use case 2 — two requests arrive on the same warm Vercel instance simultaneously.** Request A enters `withAuthCookies` with `sessionId=alpha`, ctxA gets `store: {alpha: {...}}`. Before A's handler completes, Request B enters `withAuthCookies` with `sessionId=beta`, ctxB gets `store: {beta: {...}}`. Both run their async work — A awaits a network call, B starts its DCR registration. When A's `await` resolves, V8 re-enters ctxA for the continuation; A's `readState('alpha')` returns A's data, not B's. They flush independently. No state bleed despite shared process.
+
+**Use case 3 — dev mode, no cookie.** `withAuthCookies` sees `NODE_ENV !== 'production'` and short-circuits: `return fn()`. No `.run()` call. Inside `fn`, `requestStore.getStore()` returns `undefined`. The `readAll` function handles this: `if (ctx) return ctx.store` — falsey → falls through to the file-backed branch (`.auth-cache.json`). Dev path doesn't use ALS at all; it uses the filesystem because Next's dev server hot-reloads, which would wipe an in-memory Map mid-OAuth-flow.
+
+### Move 3 — the principle
+
+**Context propagation without explicit threading is what makes "stateful work inside library calls you don't own" feasible.** You can't fork the MCP SDK to thread a context object through every `OAuthClientProvider` method. You can wrap the SDK's call site in `.run()` and have the provider methods read the active context. That's the load-bearing trick: ALS turns "context I need everywhere" from "thread it through every function" into "set it once at the top."
+
+---
+
+## Primary diagram
+
+The full ALS pattern in one frame.
+
+```
+  ALS-scoped request store — full mechanics
+
+  ┌─ Module load (once per process) ───────────────────────────────┐
+  │                                                                  │
+  │   const requestStore = new AsyncLocalStorage<RequestStore>()    │
+  │                       (shared across all requests on instance)   │
+  │                                                                  │
+  └─────────────────────────────────┬──────────────────────────────┘
+                                    │
+                                    ▼  per request
+  ┌─ Request A ───────────────────────────────────────────────────┐
+  │                                                                 │
+  │  withAuthCookies(fnA):                                          │
+  │    raw = cookies.get('bi_auth')                                 │
+  │    ctxA = { store: decryptStore(raw), dirty: false }            │
+  │                                                                 │
+  │    requestStore.run(ctxA, async () => {                          │
+  │      // fnA's code runs here                                    │
+  │      // any awaited code preserves ctxA as active               │
+  │                                                                 │
+  │      readState(sid):                                            │
+  │        return requestStore.getStore().store[sid]  → ctxA.store  │
+  │                                                                 │
+  │      patchState(sid, patch):                                    │
+  │        ctx = requestStore.getStore()                            │
+  │        ctx.store[sid] = { ...ctx.store[sid], ...patch }         │
+  │        ctx.dirty = true   ← signals flush needed                │
+  │                                                                 │
+  │      provider.saveTokens(t)  ← MCP SDK call                     │
+  │        → patchState(sid, { tokens: t })  → ctxA.dirty = true    │
+  │                                                                 │
+  │      ... many more SDK calls ...                                │
+  │    })                                                            │
+  │                                                                 │
+  │    if (ctxA.dirty) {                                             │
+  │      cookies.set('bi_auth', encryptStore(ctxA.store), opts)     │
+  │    }                                                             │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ Concurrent Request B (same instance, separate ctxB) ──────────┐
+  │  requestStore.run(ctxB, fnB) — never sees ctxA                 │
+  │  V8 async-context tracking keeps them isolated                 │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+The structural property worth memorizing: **one module-level `AsyncLocalStorage` instance, one `.run()` per request, every awaited call inside `.run()` sees the same `ctx`, concurrent `.run()`s are isolated.**
 
 ---
 

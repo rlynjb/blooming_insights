@@ -210,6 +210,31 @@ Match the scoring method to the variability of the output, not to your enthusias
 
 ---
 
+### Code in this codebase
+
+**Case B — no scorer wired today.** PR #8 (commit 62c24d7) removed the entire `eval/` tree along with the Olist MCP server. The 221 Vitest tests under `test/` still assert *shape* and control flow against fakes; there is no parallel scoring layer running against the live model. What was there briefly, and what would be the right rung per surface if it were rebuilt:
+
+#### What used to be wired (now gone)
+
+- **Set overlap for detection (Rung 2)** — `eval/scripts/lib/scorer.ts` + `eval/scripts/run-detection.ts` scored `Anomaly[]` output against 3 seeded anomalies under loose/strict matchers. Removed in PR #8.
+- **Rubric + LLM-as-judge for diagnosis (Rungs 3 + 4)** — `eval/scripts/lib/judge.ts` + `eval/scripts/run-diagnosis.ts` + `eval/judges/diagnosis-judge.md` ran a 5-criterion rubric (hypothesis / evidence / sizing / calibration / fabrication). Removed in PR #8.
+- **Rubric + LLM-as-judge for recommendation (Rungs 3 + 4)** — `eval/scripts/lib/judge-rec.ts` + `eval/scripts/run-recommendation.ts` + `eval/judges/recommendation-judge.md` ran a 3-criterion rubric (plausible / specific / impact_sized). Removed in PR #8.
+- **Structural diff + similarity judge for regression (Rung 1 + custom)** — `eval/scripts/run-regression.ts` + `eval/judges/similarity-judge.md` did capture-then-score with a two-mode comparator. Removed in PR #8.
+
+#### The right rung per surface — if rebuilt over `SyntheticDataSource`
+
+- **Intent classifier** → exact-match (`===`). `classifyIntent` (`lib/agents/intent.ts:17–31`) returns one of three enum words capped at `max_tokens: 16`. Pure Rung 1; no tolerance needed.
+- **Monitoring scan** → fuzzy / F1. `MonitoringAgent.scan` (`lib/agents/monitoring.ts:73–93` in the AptKit-wired wrapper) returns an `Anomaly[]`. Set overlap precision/recall, weighted by severity, is the right rung.
+- **Diagnostic agent** → per-criterion rubric (Rung 3). A `Diagnosis` decomposes naturally into checkable points; the previous 5-criterion rubric is the right starting shape.
+- **Recommendation agent** → per-criterion rubric (Rung 3). Same shape, smaller rubric.
+- **Prompt-edit / model A/B** → pairwise (Rung 5). Always the right tool for "did this change help?"; never wired in this codebase.
+
+#### What's deliberately NOT here
+
+Without a scorer wired, the 221 Vitest tests are the only assertions in the repo. They guard plumbing only; the model boundary is faked. The cheapest re-entry to Case A is the golden-set exercise in `01-eval-set-types.md` (one fixture file, one runner, one rung — no LLM-as-judge yet).
+
+---
+
 ## Eval methods — diagram
 
 This diagram spans the State layer (the eval set), the Eval-harness layer (which selects a scoring method per surface), and the Provider boundary (the LLM-judge, only for the upper rungs). A reader who sees only this should grasp that one harness routes each surface's output to the cheapest method that fits it.
@@ -241,31 +266,6 @@ This diagram spans the State layer (the eval set), the Eval-harness layer (which
 ```
 
 One harness, many methods. The cheap rungs stay local and free; only diagnosis/recommendation nuance and A/B comparisons reach the Provider boundary for a judge.
-
----
-
-## Implementation in codebase
-
-**Case B — no scorer wired today.** PR #8 (commit 62c24d7) removed the entire `eval/` tree along with the Olist MCP server. The 221 Vitest tests under `test/` still assert *shape* and control flow against fakes; there is no parallel scoring layer running against the live model. What was there briefly, and what would be the right rung per surface if it were rebuilt:
-
-### What used to be wired (now gone)
-
-- **Set overlap for detection (Rung 2)** — `eval/scripts/lib/scorer.ts` + `eval/scripts/run-detection.ts` scored `Anomaly[]` output against 3 seeded anomalies under loose/strict matchers. Removed in PR #8.
-- **Rubric + LLM-as-judge for diagnosis (Rungs 3 + 4)** — `eval/scripts/lib/judge.ts` + `eval/scripts/run-diagnosis.ts` + `eval/judges/diagnosis-judge.md` ran a 5-criterion rubric (hypothesis / evidence / sizing / calibration / fabrication). Removed in PR #8.
-- **Rubric + LLM-as-judge for recommendation (Rungs 3 + 4)** — `eval/scripts/lib/judge-rec.ts` + `eval/scripts/run-recommendation.ts` + `eval/judges/recommendation-judge.md` ran a 3-criterion rubric (plausible / specific / impact_sized). Removed in PR #8.
-- **Structural diff + similarity judge for regression (Rung 1 + custom)** — `eval/scripts/run-regression.ts` + `eval/judges/similarity-judge.md` did capture-then-score with a two-mode comparator. Removed in PR #8.
-
-### The right rung per surface — if rebuilt over `SyntheticDataSource`
-
-- **Intent classifier** → exact-match (`===`). `classifyIntent` (`lib/agents/intent.ts:17–31`) returns one of three enum words capped at `max_tokens: 16`. Pure Rung 1; no tolerance needed.
-- **Monitoring scan** → fuzzy / F1. `MonitoringAgent.scan` (`lib/agents/monitoring.ts:73–93` in the AptKit-wired wrapper) returns an `Anomaly[]`. Set overlap precision/recall, weighted by severity, is the right rung.
-- **Diagnostic agent** → per-criterion rubric (Rung 3). A `Diagnosis` decomposes naturally into checkable points; the previous 5-criterion rubric is the right starting shape.
-- **Recommendation agent** → per-criterion rubric (Rung 3). Same shape, smaller rubric.
-- **Prompt-edit / model A/B** → pairwise (Rung 5). Always the right tool for "did this change help?"; never wired in this codebase.
-
-### What's deliberately NOT here
-
-Without a scorer wired, the 221 Vitest tests are the only assertions in the repo. They guard plumbing only; the model boundary is faked. The cheapest re-entry to Case A is the golden-set exercise in `01-eval-set-types.md` (one fixture file, one runner, one rung — no LLM-as-judge yet).
 
 ---
 

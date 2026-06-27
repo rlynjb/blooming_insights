@@ -246,9 +246,7 @@ This diagram spans the request. Untrusted input enters at the Network boundary; 
 
 A reader who sees only this should grasp: the prompt-side layer is missing on `?q=`, the output-side and action-side layers are present, and together they bound the damage to a crafted answer.
 
----
-
-## Implementation in codebase
+### Code in this codebase
 
 **Not yet implemented (prompt-side); partially mitigated (runtime-side).** There is no prompt-side injection defense on the open-input path: `?q=` is `.trim()`-only (`app/api/agent/route.ts` L54) and passed verbatim as `userPrompt: query` (`lib/agents/query.ts` L35), and `query.md` contains no delimiters around the user's question, no instruction hierarchy, and no "treat this as data, not instructions" framing.
 

@@ -169,6 +169,30 @@ A string is an immutable sequence of characters (UTF-16 code units in JavaScript
 - `text.match(/```(?:json)?\s*([\s\S]*?)```/i)` — fenced-block regex extraction in `lib/mcp/validate.ts` L4.
 - `candidate.search(/[[{]/)` and `candidate.lastIndexOf(']')` — substring scan for JSON extraction in `lib/mcp/validate.ts` L7–L8.
 
+**Code in this codebase — String + Array compose in the NDJSON line buffer (`lib/hooks/useInvestigation.ts` L184–L208).**
+
+```ts
+// lib/hooks/useInvestigation.ts L184–L208 (excerpt)
+const reader = res.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });
+  const lines = buf.split('\n');
+  buf = lines.pop() ?? '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      handle(JSON.parse(line) as AgentEvent);
+    } catch { /* ignore malformed line */ }
+  }
+}
+```
+
+Two primitives composing: a String (`buf`) that accumulates partial bytes across chunks, and an Array (`lines`) that splits the buffer at the delimiter. The Array's `.pop()` is what holds the invariant — the last element is either an incomplete record (saved back to `buf`) or empty (when the chunk ended on `\n`).
+
 ### Move 3 — Map: hash table for keyed lookup
 
 A Map is a hash table — `get(key)` and `set(key, value)` are O(1) average. The "average" matters: hash collisions degrade to O(N) in pathological cases, but for normal data the average bound is operational.
@@ -193,6 +217,77 @@ A Map is a hash table — `get(key)` and `set(key, value)` are O(1) average. The
 - `new Map<string, {result, expiresAt}>()` — the TTL cache (`lib/mcp/client.ts` L80). One `Map.get` per `callTool`; the entire caching strategy depends on its O(1) lookup.
 - `new Set<string>()` + `set.add` — the capability set built by `schemaCapabilities` (`lib/agents/categories.ts` L116–L127). Flatten the schema once, then every `has` is O(1).
 - `new Set([...a, ...b, ...c])` — the queryTools dedup (`lib/mcp/tools.ts` L38–L40). Set's identity rule does the dedup for free.
+
+**Code in this codebase — Map: the TTL cache (`lib/mcp/client.ts` L80, L102–L108).**
+
+```ts
+// lib/mcp/client.ts L80
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+```
+
+```ts
+// lib/mcp/client.ts L102–L108
+const cacheKey = `${name}:${JSON.stringify(args)}`;
+const ttl = options.cacheTtlMs ?? 60_000;
+
+if (!options.skipCache) {
+  const cached = this.cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
+  }
+}
+```
+
+The Map's whole job is O(1) keyed lookup. `cache.get(cacheKey)` is the load-bearing op — it runs on every `callTool` invocation, and its O(1) cost is what makes the cache cheaper than the live call (which would otherwise dominate). Why not an array of `{key, value, expiresAt}` records? Because lookup on that would be `arr.find(e => e.key === cacheKey)` — O(N). At the small N this codebase has, both would be fast; the Map version stays correct as N grows.
+
+**Code in this codebase — Set: the capability gate (`lib/agents/categories.ts` L116–L127).**
+
+```ts
+// lib/agents/categories.ts L116–L127
+export function schemaCapabilities(schema): Set<string> {
+  const set = new Set<string>();
+  for (const e of schema.events ?? []) {
+    set.add(e.name);
+    for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
+  }
+  for (const c of schema.catalogs ?? []) set.add(`catalog:${c.name}`);
+  return set;
+}
+```
+
+```ts
+// lib/agents/categories.ts L131–L136
+export function coverageFor(cat, available): CategoryCoverage {
+  const has = (dep: string) => available.has(dep);
+  if (!cat.requires.every(has)) return 'unavailable';
+  if (cat.enriches && cat.enriches.length > 0 && !cat.enriches.every(has)) return 'limited';
+  return 'full';
+}
+```
+
+The Set turns a nested-schema-walk-per-dep into a one-time flatten plus O(1) `has` per dep. The kernel insight: **Set membership for any string token, regardless of which kind of thing it represents** — event name, `event.property`, or `catalog:name`. The string-shape contract is what unifies three different ontologies into one membership-testable structure.
+
+**Code in this codebase — Set-union: the `queryTools` dedup (`lib/mcp/tools.ts` L38–L40).**
+
+```ts
+// lib/mcp/tools.ts L38–L40
+export const queryTools = [
+  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
+] as const;
+```
+
+Three overlapping arrays collapsed into one ordered, deduplicated array — in one expression. The Set does the dedup (insert ignores duplicates by `===`); the spread converts back to an array, preserving insertion order. Insertion order is the load-bearer: it's what makes the result deterministic across reloads.
+
+**Code in this codebase — where the codebase deliberately *stays* in array world (`lib/agents/categories.ts` L139–L141).**
+
+```ts
+// lib/agents/categories.ts L139–L141
+export function missingFor(cat, available): string[] {
+  return [...cat.requires, ...(cat.enriches ?? [])].filter((d) => !available.has(d));
+}
+```
+
+`missingFor` uses `.filter` (array operation) instead of `.every` (which `coverageFor` uses for the gate). Why? Because here we need *the list of missing deps*, not a boolean. `.filter` produces the array; `.every` produces the boolean. Same iteration, different result type. The distinction matters for the UI's "missing X, Y, Z" copy. This is the array-vs-set distinction in miniature: when you need the *value* of what's missing, you stay in array world; when you need the *boolean* answer, you call `.has` against the Set.
 
 ### Move 2 variant — the irreducible kernel of each primitive
 
@@ -316,107 +411,6 @@ The three primitives, their kernel ops, their cost, and where each lives in this
   │   InsightCard L159         │   validate.ts L7–L8       │                            │
   └───────────────────────────┴───────────────────────────┴────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-Four sites where each primitive carries its weight.
-
-### **Map — the TTL cache (`lib/mcp/client.ts` L80)**
-
-```ts
-// lib/mcp/client.ts L80
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-```
-
-```ts
-// lib/mcp/client.ts L102–L108
-const cacheKey = `${name}:${JSON.stringify(args)}`;
-const ttl = options.cacheTtlMs ?? 60_000;
-
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-}
-```
-
-The Map's whole job is O(1) keyed lookup. `cache.get(cacheKey)` is the load-bearing op — it runs on every `callTool` invocation, and its O(1) cost is what makes the cache cheaper than the live call (which would otherwise dominate). Why not an array of `{key, value, expiresAt}` records? Because lookup on that would be `arr.find(e => e.key === cacheKey)` — O(N). At the small N this codebase has, both would be fast; the Map version stays correct as N grows. See the full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
-
-### **Set — the capability gate (`lib/agents/categories.ts` L116–L127)**
-
-```ts
-// lib/agents/categories.ts L116–L127
-export function schemaCapabilities(schema): Set<string> {
-  const set = new Set<string>();
-  for (const e of schema.events ?? []) {
-    set.add(e.name);
-    for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
-  }
-  for (const c of schema.catalogs ?? []) set.add(`catalog:${c.name}`);
-  return set;
-}
-```
-
-```ts
-// lib/agents/categories.ts L131–L136
-export function coverageFor(cat, available): CategoryCoverage {
-  const has = (dep: string) => available.has(dep);
-  if (!cat.requires.every(has)) return 'unavailable';
-  if (cat.enriches && cat.enriches.length > 0 && !cat.enriches.every(has)) return 'limited';
-  return 'full';
-}
-```
-
-The Set turns a nested-schema-walk-per-dep into a one-time flatten plus O(1) `has` per dep. The kernel insight: **Set membership for any string token, regardless of which kind of thing it represents** — event name, `event.property`, or `catalog:name`. The string-shape contract is what unifies three different ontologies into one membership-testable structure. Full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
-
-### **Set-union — the queryTools dedup (`lib/mcp/tools.ts` L38–L40)**
-
-```ts
-// lib/mcp/tools.ts L38–L40
-export const queryTools = [
-  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
-] as const;
-```
-
-Three overlapping arrays collapsed into one ordered, deduplicated array — in one expression. The Set does the dedup (insert ignores duplicates by `===`); the spread converts back to an array, preserving insertion order. Insertion order is the load-bearer: it's what makes the result deterministic across reloads. See the full case study (and the rank-mapped sort it sits next to) in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-### **String + Array — the NDJSON line buffer (`lib/hooks/useInvestigation.ts` L184–L208)**
-
-```ts
-// lib/hooks/useInvestigation.ts L184–L208 (excerpt)
-const reader = res.body.getReader();
-const dec = new TextDecoder();
-let buf = '';
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += dec.decode(value, { stream: true });
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      handle(JSON.parse(line) as AgentEvent);
-    } catch { /* ignore malformed line */ }
-  }
-}
-```
-
-Two primitives composing: a String (`buf`) that accumulates partial bytes across chunks, and an Array (`lines`) that splits the buffer at the delimiter. The Array's `.pop()` is what holds the invariant — the last element is either an incomplete record (saved back to `buf`) or empty (when the chunk ended on `\n`). Full case study in `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
-
-### **Where the codebase deliberately *avoids* this primitive level — `lib/agents/categories.ts` L139–L141**
-
-```ts
-// lib/agents/categories.ts L139–L141
-export function missingFor(cat, available): string[] {
-  return [...cat.requires, ...(cat.enriches ?? [])].filter((d) => !available.has(d));
-}
-```
-
-`missingFor` uses `.filter` (array operation) instead of `.every` (which `coverageFor` uses for the gate). Why? Because here we need *the list of missing deps*, not a boolean. `.filter` produces the array; `.every` produces the boolean. Same iteration, different result type. The distinction matters for the UI's "missing X, Y, Z" copy. This is the array-vs-set distinction in miniature: when you need the *value* of what's missing, you stay in array world; when you need the *boolean* answer, you call `.has` against the Set.
 
 ---
 

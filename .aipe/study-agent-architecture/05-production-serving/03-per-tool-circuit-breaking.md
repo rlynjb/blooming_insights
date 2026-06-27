@@ -246,6 +246,10 @@ The practical consequence: a transient rate-limit blip clears on retry (typicall
 
 The condition under which this is enough: the failure mode is transient, not sustained. Bloomreach's rate limit is a real failure mode the retry handles correctly (the parsed `Retry-After` is honored, so the retry lands after the penalty clears). The breaker pattern would add value when (a) the failure is sustained (a Bloomreach outage, not a rate limit) or (b) the topology has multiple tools the agent could route between.
 
+**Where the bounded retry lives in the repo.** `McpClient.callTool` in `lib/mcp/client.ts` — the retry while-loop at L122–L132 (retry guard at L122; retry counter at L123; wait calculation at L124–L129; sleep at L130; retry call at L131). `isRateLimited(result)` (L18–L22) decides whether to retry — the test is "is this an `isError: true` result whose text matches `/rate limit|too many requests/i`." `parseRetryAfterMs(result)` (L31–L38) pulls a stated window out of Bloomreach's error text; when present, the retry waits `hintMs + RETRY_BUFFER_MS` (500 ms cushion, L16). Configuration: `connectMcp`'s `McpClient` constructor call in `lib/mcp/connect.ts` L89–L96 — `minIntervalMs: 1100`, `retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`. The 10s base matches Bloomreach's observed `1 per 10 second` window — a sub-second retry would burn the attempt inside the same window. The 20s ceiling caps a single retry's wait so one retry can't blow the route's 60s investigation budget. `maxRetries: 3` × ~10s each gives a worst case of ~30s on a single call (comment in `client.ts` L118–L120).
+
+There is no breaker state in `McpClient`. The fields tracking call state (`cache` L80, `lastCallAt` L81) cover memoization and spacing, not failure-counting per tool. There is no `failureCount`, no `openUntil`, no per-tool state machine. And `runAgentLoop` (`lib/agents/base.ts` L48–L176) feeds the tool result back to the model unmodified (L161–L171) — on a final retry-exhausted error, the model sees an `is_error: true` tool result the same shape as any other failure; nothing tells the model "this tool has been failing for a while — try a different one."
+
 ### Why the gap matters — what "feed it back to the agent" would unlock
 
 The technical principle: the retry handles "this call failed; try again." The breaker handles "this *tool* is dead; stop trying." The agent-observation extension handles "the agent should *know* this tool is dead so it picks a different one." Each layer covers a failure mode the lower layer doesn't.
@@ -370,65 +374,6 @@ The canonical per-tool circuit breaker — with the agent-observation extension
    ─ today: every call pays full retry tax (~50s × 6 calls = budget gone)
    ─ with breaker + observation: first failures trip the breaker, rest
      return synthetic observations the agent reasons on, budget preserved
-```
-
----
-
-## Implementation in codebase
-
-**Case B (partial) — bounded exponential-backoff retry exists; per-tool circuit breaker does not.** The honest sentence: the retry layer covers transient blips correctly (Retry-After-honoring, exponential backoff, bounded to 3 retries), but there's no breaker state and no path that feeds an open-state observation back to the agent for routing.
-
-**Bounded retry (built)**
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool` — the retry while-loop
-**Line range:** L122–L132 (the retry guard at L122; retry counter at L123; wait calculation at L124–L129; sleep at L130; retry call at L131)
-
-The retry loop. `isRateLimited(result)` (L18–L22) decides whether to retry — the test is "is this an `isError: true` result whose text matches `/rate limit|too many requests/i`." `parseRetryAfterMs(result)` (L31–L38) pulls a stated window out of Bloomreach's error text; when present, the retry waits `hintMs + RETRY_BUFFER_MS` (500 ms cushion, L16). When no hint parses, the fallback is exponential backoff `retryDelayMs × 2^(retries-1)` off a 10s base. Every wait is capped at `retryCeilingMs = 20_000`.
-
-**Retry configuration**
-**File:** `lib/mcp/connect.ts`
-**Function / class:** the `McpClient` constructor call
-**Line range:** L89–L96 (the options: `minIntervalMs: 1100`, `retryDelayMs: 10_000`, `retryCeilingMs: 20_000`, `maxRetries: 3`)
-
-Where the retry numbers are tuned. The 10s base matches Bloomreach's observed `1 per 10 second` window — a sub-second retry would burn the attempt inside the same window. The 20s ceiling caps a single retry's wait so one retry can't blow the route's 60s investigation budget. `maxRetries: 3` × ~10s each gives a worst case of ~30s on a single call (comment in `client.ts` L118–L120).
-
-**Per-tool circuit breaker (not built)**
-**Honest sentence:** there is no breaker state in `McpClient`. The fields tracking call state (`cache` L80, `lastCallAt` L81) cover memoization and spacing, not failure-counting per tool. There is no `failureCount`, no `openUntil`, no per-tool state machine. Every retry sequence runs to completion regardless of how many recent calls to the same tool have failed.
-
-**Agent observation feedback (not built)**
-**Honest sentence:** `runAgentLoop` (`lib/agents/base.ts` L48–L176) feeds the tool result back to the model unmodified (L161–L171). On a final retry-exhausted error, the model sees an `is_error: true` tool result the same shape as any other failure; nothing tells the model "this tool has been failing for a while — try a different one."
-
-```
-shape (not full impl):
-  // TODAY — bounded retry only (client.ts L122–L132)
-  let retries = 0;
-  while (isRateLimited(result) && retries < this.maxRetries) {
-    retries++;
-    const hintMs = parseRetryAfterMs(result);
-    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
-    const waitMs = Math.min(
-      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
-      this.retryCeilingMs,
-    );
-    await sleep(waitMs);
-    result = await this.liveCall(name, args);
-  }
-  // result returned to agent; no breaker state, no observation
-
-  // PHASE B — breaker + observation (not here):
-  // class McpClient {
-  //   private breakers = new Map<string, { state, failures, openUntil }>();
-  //   async callTool(name, args) {
-  //     const b = this.breakers.get(name);
-  //     if (b?.state === 'OPEN' && b.openUntil > Date.now()) {
-  //       return { result: syntheticUnavailable(name, b.openUntil), ... };
-  //     }
-  //     // ... existing flow, plus record failure/success on breaker
-  //   }
-  // }
-  // // agent prompt addition:
-  // "if a tool returns 'currently unavailable', do not retry it —
-  //  choose a different tool or report what you have."
 ```
 
 ---

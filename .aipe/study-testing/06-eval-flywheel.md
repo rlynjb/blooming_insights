@@ -260,6 +260,51 @@ Drop any one of these four and the flywheel collapses into vibes-based developme
 
 Skeleton = committed receipts + tagged result dirs + PR-per-loop + calibration receipts. Optional hardening: a lockfile guard (audit's red-flag 12) and an enforcing CI hook that refuses to merge a PR that touches eval scripts without a new score-baseline dir.
 
+### Code in this codebase
+
+**Use case A — the result-dir paper trail.** The whole flywheel is committed under `eval/results/`. Every loop's receipt is a directory with a `summary.md` and per-eval JSON files. A reviewer auditing PR D → PR E can `ls eval/results/` and see the dates lined up.
+
+```
+eval/results/                             what each dir represents
+────────────                              ────────────────────────
+2026-06-15/                               PR D baseline detection K=10
+2026-06-15-after-fix/                     Phase 2.5 fix re-measure (5× lift proof)
+2026-06-15-capture/                       PR G capture mode (10 fixtures, K=1)
+2026-06-15-score-baseline/                PR G score mode + calibration receipts
+       │
+       └─ name pattern: <date>-<EVAL_RUN_TAG> — the tag IS the audit trail.
+          Without it, all four runs would land in 2026-06-15/ and clobber
+          each other; with it, each is a distinct commit-ready receipt.
+```
+
+**Use case B — `EVAL_RUN_TAG` honored at every entry point.** All four eval scripts respect the env var the same way, so the discipline is uniform.
+
+```
+eval/scripts/run-detection.ts  (lines 92–97)
+
+  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
+  // 2026-06-15-after-fix), so a fix can be measured without clobbering
+  // the prior baseline.
+  const tag = process.env.EVAL_RUN_TAG;
+  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
+       │
+       └─ same six lines repeat in run-diagnosis.ts, run-recommendation.ts,
+          and run-regression.ts. Uniform discipline = the operator doesn't
+          have to remember which script handles tags differently.
+
+eval/scripts/run-regression.ts  (lines 178–183)
+
+  // Results dir — EVAL_RUN_TAG honored (matches PRs D/E/F).
+  const tag = process.env.EVAL_RUN_TAG;
+  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
+       │
+       └─ identical pattern. Cf. the comment block in file 03 ("the comment
+          IS the post-mortem"): naming WHY the pattern exists is part of
+          keeping it alive across refactors.
+```
+
+**Use case C — the calibration receipt as a fork in the flywheel.** When a loop's eval result is suspicious, the next step isn't always "fix the code." Sometimes it's "spot-check the judge." Loop 3's BRL bug was confirmed via the calibration receipt at `eval/results/<date>-score-baseline/`. Without that fork, "the judge says there's a bug" and "there actually is a bug" are indistinguishable.
+
 ### Move 3 — the principle
 
 **Testing-driven development at the model-behavior layer is the same shape as TDD at the function layer — write the assertion first, then write the code, then watch the assertion go green.** What changes is the vocabulary: the assertion is a rubric, the code might be a prompt edit, the "green" is a pass-rate. The discipline that distinguishes useful eval work from theatre is the receipt at every step. Vibes are not committed; numbers are. The whole flywheel is built on that one rule.
@@ -335,51 +380,6 @@ The Phase 3 eval flywheel — PR D through PR G, with receipts
   │                                                                  │
   └──────────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use case A — the result-dir paper trail.** The whole flywheel is committed under `eval/results/`. Every loop's receipt is a directory with a `summary.md` and per-eval JSON files. A reviewer auditing PR D → PR E can `ls eval/results/` and see the dates lined up.
-
-```
-eval/results/                             what each dir represents
-────────────                              ────────────────────────
-2026-06-15/                               PR D baseline detection K=10
-2026-06-15-after-fix/                     Phase 2.5 fix re-measure (5× lift proof)
-2026-06-15-capture/                       PR G capture mode (10 fixtures, K=1)
-2026-06-15-score-baseline/                PR G score mode + calibration receipts
-       │
-       └─ name pattern: <date>-<EVAL_RUN_TAG> — the tag IS the audit trail.
-          Without it, all four runs would land in 2026-06-15/ and clobber
-          each other; with it, each is a distinct commit-ready receipt.
-```
-
-**Use case B — `EVAL_RUN_TAG` honored at every entry point.** All four eval scripts respect the env var the same way, so the discipline is uniform.
-
-```
-eval/scripts/run-detection.ts  (lines 92–97)
-
-  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
-  // 2026-06-15-after-fix), so a fix can be measured without clobbering
-  // the prior baseline.
-  const tag = process.env.EVAL_RUN_TAG;
-  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
-       │
-       └─ same six lines repeat in run-diagnosis.ts, run-recommendation.ts,
-          and run-regression.ts. Uniform discipline = the operator doesn't
-          have to remember which script handles tags differently.
-
-eval/scripts/run-regression.ts  (lines 178–183)
-
-  // Results dir — EVAL_RUN_TAG honored (matches PRs D/E/F).
-  const tag = process.env.EVAL_RUN_TAG;
-  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
-       │
-       └─ identical pattern. Cf. the comment block in file 03 ("the comment
-          IS the post-mortem"): naming WHY the pattern exists is part of
-          keeping it alive across refactors.
-```
-
-**Use case C — the calibration receipt as a fork in the flywheel.** When a loop's eval result is suspicious, the next step isn't always "fix the code." Sometimes it's "spot-check the judge." Loop 3's BRL bug was confirmed via the calibration receipt at `eval/results/<date>-score-baseline/`. Without that fork, "the judge says there's a bug" and "there actually is a bug" are indistinguishable.
 
 ## Elaborate
 

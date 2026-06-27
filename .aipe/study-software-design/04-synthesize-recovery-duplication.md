@@ -212,67 +212,7 @@ Pseudocode — DiagnosticAgent after the lift
 
 Ousterhout names four error strategies, ranked: **define out > mask low > transform > propagate**. The duplicated `synthesize()` is at the "mask low" level — each agent masks the parse failure inside its own method. Lifting the recovery into `runAgentLoop` *defines the case out* of the agent's surface entirely — the agent no longer has to know that "sometimes the model doesn't emit JSON" is a thing that happens. It passes a parser; if the loop returns `parsed`, great; if not, the loop already tried recovery. The agent's mental model gets simpler. That's the difference between "we handle this case in two files" (mask) and "the loop owns this case, agents don't see it" (define out).
 
-### Move 3 — the principle
-
-When the same recovery shape appears in two callers, the recovery isn't a one-off — it's a strategy. Strategies belong in the module that has enough context to decide *whether* to run them, not in every caller that *might* need them. The loop has the context: it knows when the final tool-less turn completed, what the caller's parser is, what the recovery prompt would be. The agents don't have that context — they only know *after the fact* that the parse failed. Push the strategy down to the module with the timing, parameterize what differs (the prompt, the parser), and delete the duplication. That's the move.
-
----
-
-## Primary diagram
-
-The fix in one frame — before and after the lift.
-
-```
-The synthesize() collapse — recap
-
-  BEFORE
-  ┌─ runAgentLoop ──────────────────────────────────────┐
-  │  returns: finalText (string)                         │
-  └─────────────────────────┬───────────────────────────┘
-                            │
-            ┌───────────────┴───────────────┐
-            ▼                                 ▼
-  ┌─ DiagnosticAgent ─────────┐    ┌─ RecommendationAgent ──────┐
-  │  tryParseDiagnosis(text)  │    │  tryParseRecommendations(t)│
-  │  ?? this.synthesize(...)  │    │  ?? this.synthesize(...)   │
-  │  ?? FALLBACK              │    │                             │
-  │                           │    │                             │
-  │  private synthesize(...) {│    │  private synthesize(...) {  │
-  │    serialize history       │    │    serialize history        │
-  │    anthropic.messages.    │    │    anthropic.messages.      │  ← same shape
-  │    create(...)             │    │    create(...)              │
-  │    parseDiagnosis           │    │    parseRecommendations    │
-  │  }                          │    │  }                           │
-  │  (40 LOC)                   │    │  (50 LOC)                    │
-  └────────────────────────────┘    └─────────────────────────────┘
-       ~90 LOC of duplicated recovery logic
-
-  AFTER
-  ┌─ runAgentLoop ──────────────────────────────────────┐
-  │  accepts: parseResult, recoveryPrompt                │
-  │  returns: { parsed: T | null, finalText, toolCalls } │
-  │                                                       │
-  │  internal:                                            │
-  │    parsed = parseResult(finalText)                    │
-  │    if (parsed == null && recoveryPrompt) {            │  ← strategy
-  │      recoveryText = oneToolLessTurn(recoveryPrompt)   │     lives here
-  │      parsed = parseResult(recoveryText)                │
-  │    }                                                   │
-  │    return { parsed, finalText, toolCalls }            │
-  └─────────────────────────┬───────────────────────────┘
-                            │
-            ┌───────────────┴───────────────┐
-            ▼                                 ▼
-  ┌─ DiagnosticAgent ─────────┐    ┌─ RecommendationAgent ──────┐
-  │  const { parsed } = ...   │    │  const { parsed } = ...    │
-  │  return parsed ?? FALLBACK│    │  return parsed ?? []       │
-  └────────────────────────────┘    └─────────────────────────────┘
-       ~90 LOC removed. one strategy. one owner.
-```
-
----
-
-## Implementation in codebase
+### Move 2 — code in this codebase
 
 **Use cases.** Three places this duplication bites today.
 
@@ -282,7 +222,7 @@ The synthesize() collapse — recap
 
 - **Tuning the serialization budget.** Both methods use `JSON.stringify(args).slice(0, 200)` and `JSON.stringify(payload).slice(0, 900)`. If the model needs more context to recover well, those numbers have to change in two places, in sync.
 
-### The two copies, side by side
+**The two copies, side by side.** The shared shape (serialize, Anthropic call, parse) is identical; the only divergence is the prompt text and the parser.
 
 ```
 lib/agents/diagnostic.ts  (lines 86–126)
@@ -342,7 +282,7 @@ lib/agents/recommendation.ts  (lines 82–132)
           only the prompt strings and the parser differ.
 ```
 
-### How they're invoked
+**How they're invoked.** Same special-case path in both agents.
 
 ```
 lib/agents/diagnostic.ts  (lines 73–75)
@@ -361,7 +301,7 @@ lib/agents/recommendation.ts  (lines 69–72)
                                      same special-case path
 ```
 
-### The runAgentLoop seam the fix changes
+**The runAgentLoop seam the fix changes.** The lift adds two optional params to the loop and changes the return shape.
 
 ```
 lib/agents/base.ts  (lines 48–176, current signature)
@@ -385,6 +325,64 @@ lib/agents/base.ts  (lines 48–176, current signature)
        │
        └─ new contract: loop owns parse-and-retry; agent passes its parser
           and prompt builder. both synthesize() methods delete.
+```
+
+### Move 3 — the principle
+
+When the same recovery shape appears in two callers, the recovery isn't a one-off — it's a strategy. Strategies belong in the module that has enough context to decide *whether* to run them, not in every caller that *might* need them. The loop has the context: it knows when the final tool-less turn completed, what the caller's parser is, what the recovery prompt would be. The agents don't have that context — they only know *after the fact* that the parse failed. Push the strategy down to the module with the timing, parameterize what differs (the prompt, the parser), and delete the duplication. That's the move.
+
+---
+
+## Primary diagram
+
+The fix in one frame — before and after the lift.
+
+```
+The synthesize() collapse — recap
+
+  BEFORE
+  ┌─ runAgentLoop ──────────────────────────────────────┐
+  │  returns: finalText (string)                         │
+  └─────────────────────────┬───────────────────────────┘
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                                 ▼
+  ┌─ DiagnosticAgent ─────────┐    ┌─ RecommendationAgent ──────┐
+  │  tryParseDiagnosis(text)  │    │  tryParseRecommendations(t)│
+  │  ?? this.synthesize(...)  │    │  ?? this.synthesize(...)   │
+  │  ?? FALLBACK              │    │                             │
+  │                           │    │                             │
+  │  private synthesize(...) {│    │  private synthesize(...) {  │
+  │    serialize history       │    │    serialize history        │
+  │    anthropic.messages.    │    │    anthropic.messages.      │  ← same shape
+  │    create(...)             │    │    create(...)              │
+  │    parseDiagnosis           │    │    parseRecommendations    │
+  │  }                          │    │  }                           │
+  │  (40 LOC)                   │    │  (50 LOC)                    │
+  └────────────────────────────┘    └─────────────────────────────┘
+       ~90 LOC of duplicated recovery logic
+
+  AFTER
+  ┌─ runAgentLoop ──────────────────────────────────────┐
+  │  accepts: parseResult, recoveryPrompt                │
+  │  returns: { parsed: T | null, finalText, toolCalls } │
+  │                                                       │
+  │  internal:                                            │
+  │    parsed = parseResult(finalText)                    │
+  │    if (parsed == null && recoveryPrompt) {            │  ← strategy
+  │      recoveryText = oneToolLessTurn(recoveryPrompt)   │     lives here
+  │      parsed = parseResult(recoveryText)                │
+  │    }                                                   │
+  │    return { parsed, finalText, toolCalls }            │
+  └─────────────────────────┬───────────────────────────┘
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                                 ▼
+  ┌─ DiagnosticAgent ─────────┐    ┌─ RecommendationAgent ──────┐
+  │  const { parsed } = ...   │    │  const { parsed } = ...    │
+  │  return parsed ?? FALLBACK│    │  return parsed ?? []       │
+  └────────────────────────────┘    └─────────────────────────────┘
+       ~90 LOC removed. one strategy. one owner.
 ```
 
 ---

@@ -208,65 +208,7 @@ What is the minimum that makes per-gate rejection coverage useful?
 
 Skeleton = positive control + isolated per-gate rejection + specific failure shape. Drop any one and the rejection coverage becomes decoration.
 
-### Move 3 — the principle
-
-**A function is defined by what it accepts AND what it rejects; testing only the accept side documents half the contract.** The pattern that works: for every gate, write a test that fails *only* because of that gate. The discipline scales — apply it to the type guards (done well here), then to the agent error paths (gap here: no test scripts a throw from `anthropic.messages.create`), then to the route handlers (gap here too: no `test/api/` directory). The same kernel — isolated per-gate rejection — works at every level.
-
-## Primary diagram
-
-The full pattern, applied across every type guard in the file:
-
-```
-Acceptance + per-gate rejection — full map of validate.ts coverage
-
-  ┌─ isAnomalyArray (6 gates) ─────────────────────────────────────┐
-  │                                                                 │
-  │  acceptance:    [good]                              → true      │
-  │  degenerate:    []                                   → true      │
-  │  rejection A:   {}                                   → false ← not array
-  │  rejection B/D: [{metric:'x'}]                       → false ← missing
-  │  rejection E:   [{...good, change:{direction:'…'}}] → false ← direction
-  │  rejection G:   [{...good, severity:'huge'}]        → false ← severity
-  │                                                                 │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ isDiagnosis (5 gates) ────────────────────────────────────────┐
-  │                                                                 │
-  │  acceptance:    valid diagnosis object               → true      │
-  │  degenerate:    arrays of evidence may be empty      → true      │
-  │  rejection 1:   null                                  → false    │
-  │  rejection 2:   'some string'                        → false    │
-  │  rejection 3:   {valid except missing conclusion}    → false    │
-  │  rejection 4:   {valid except evidence: 'not array'} → false    │
-  │                                                                 │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ isRecommendationArray (8 gates incl. dual-shape impact) ─────┐
-  │                                                                 │
-  │  acceptance:    [valid with legacy string impact]    → true     │
-  │  acceptance':   [valid with rich object impact]      → true     │
-  │  degenerate:    []                                   → true     │
-  │  rejection A:   {} (not array)                       → false    │
-  │  rejection B:   [bad feature (not in enum)]          → false    │
-  │  rejection C:   [bad confidence (not in enum)]       → false    │
-  │  rejection D:   [missing steps]                      → false    │
-  │  rejection E:   [object impact missing range]        → false ★  │
-  │                                                                 │
-  │  ★ this is the migration-trap test: if a refactor               │
-  │    drops the range check, this is the test that fires.          │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ parseAgentJson (3 strategies + 1 throw) ─────────────────────┐
-  │                                                                 │
-  │  acceptance A:  fenced ```json block                 → parsed   │
-  │  acceptance B:  plain JSON                           → parsed   │
-  │  acceptance C:  embedded JSON in prose                → parsed   │
-  │  rejection:     no JSON anywhere                     → throws   │
-  │                                                                 │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
+### Code in this codebase
 
 **Use case A — isAnomalyArray, the canonical pattern.** Six gates in the guard, six paired tests. The `good` fixture at the top of the `describe` is reused across every test via spread.
 
@@ -366,6 +308,64 @@ test/mcp/validate.test.ts  (lines 84–98 — the two acceptances + the migratio
           drops the range check from the gate — every other test still
           passes; only this one fires.
   });
+```
+
+### Move 3 — the principle
+
+**A function is defined by what it accepts AND what it rejects; testing only the accept side documents half the contract.** The pattern that works: for every gate, write a test that fails *only* because of that gate. The discipline scales — apply it to the type guards (done well here), then to the agent error paths (gap here: no test scripts a throw from `anthropic.messages.create`), then to the route handlers (gap here too: no `test/api/` directory). The same kernel — isolated per-gate rejection — works at every level.
+
+## Primary diagram
+
+The full pattern, applied across every type guard in the file:
+
+```
+Acceptance + per-gate rejection — full map of validate.ts coverage
+
+  ┌─ isAnomalyArray (6 gates) ─────────────────────────────────────┐
+  │                                                                 │
+  │  acceptance:    [good]                              → true      │
+  │  degenerate:    []                                   → true      │
+  │  rejection A:   {}                                   → false ← not array
+  │  rejection B/D: [{metric:'x'}]                       → false ← missing
+  │  rejection E:   [{...good, change:{direction:'…'}}] → false ← direction
+  │  rejection G:   [{...good, severity:'huge'}]        → false ← severity
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ isDiagnosis (5 gates) ────────────────────────────────────────┐
+  │                                                                 │
+  │  acceptance:    valid diagnosis object               → true      │
+  │  degenerate:    arrays of evidence may be empty      → true      │
+  │  rejection 1:   null                                  → false    │
+  │  rejection 2:   'some string'                        → false    │
+  │  rejection 3:   {valid except missing conclusion}    → false    │
+  │  rejection 4:   {valid except evidence: 'not array'} → false    │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ isRecommendationArray (8 gates incl. dual-shape impact) ─────┐
+  │                                                                 │
+  │  acceptance:    [valid with legacy string impact]    → true     │
+  │  acceptance':   [valid with rich object impact]      → true     │
+  │  degenerate:    []                                   → true     │
+  │  rejection A:   {} (not array)                       → false    │
+  │  rejection B:   [bad feature (not in enum)]          → false    │
+  │  rejection C:   [bad confidence (not in enum)]       → false    │
+  │  rejection D:   [missing steps]                      → false    │
+  │  rejection E:   [object impact missing range]        → false ★  │
+  │                                                                 │
+  │  ★ this is the migration-trap test: if a refactor               │
+  │    drops the range check, this is the test that fires.          │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ parseAgentJson (3 strategies + 1 throw) ─────────────────────┐
+  │                                                                 │
+  │  acceptance A:  fenced ```json block                 → parsed   │
+  │  acceptance B:  plain JSON                           → parsed   │
+  │  acceptance C:  embedded JSON in prose                → parsed   │
+  │  rejection:     no JSON anywhere                     → throws   │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate

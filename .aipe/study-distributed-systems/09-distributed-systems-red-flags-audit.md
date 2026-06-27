@@ -175,6 +175,31 @@ The Olist subprocess adapter was deleted in PR #8 (2026-06-18). All three previo
 
 ---
 
+### Code in this codebase
+
+A cross-cutting index for the ranked findings above — each row points at the file, the line range, and what the reader should look at when they open it.
+
+| Risk | File | Line(s) | What to look at |
+|------|------|---------|-----------------|
+| 1 (CRITICAL) | `lib/state/insights.ts` | 4-6 | per-process Map; no cross-instance link |
+| 1 | `lib/state/investigations.ts` | 11, 22-41 | mem-first fallback chain; misses on cold instance |
+| 1 | `app/api/agent/route.ts` | 37-62 | `resolveAnomaly` — the fallback chain that silently misses |
+| 2 (HIGH) | `lib/data-source/bloomreach-data-source.ts` | 190-205 | `liveCall` — no `AbortSignal.timeout` composed in |
+| 2 | `app/api/agent/route.ts` | 20 | `maxDuration = 300` — the only ceiling on the MCP call |
+| 3 (HIGH cond.) | `lib/data-source/types.ts` | 38-40 | `DataSourceCallOptions` has no idempotency key field |
+| 3 | `lib/agents/base.ts` | 144-156 | tool-call dispatch — no per-call idempotency |
+| 4 (MED) | `lib/agents/base.ts` | 102 | `anthropic.messages.create` — no retry wrapper |
+| 5 (MED) | `lib/hooks/useInvestigation.ts` | 18-19, 137-140 | sessionStorage handoff — tab-only |
+| 5 | `app/api/agent/route.ts` | 228-230 | the "no diagnosis was handed over" throw |
+| 6 (LOW) | `lib/data-source/bloomreach-data-source.ts` | 145 | `ttl = options.cacheTtlMs ?? 60_000` — no callsite overrides |
+| 7 (LOW) | `app/api/agent/route.ts` | 169-264 | stream has no event ID or resume |
+| 7 | `lib/hooks/useInvestigation.ts` | 184-208 | consumer has no Last-Event-ID logic |
+| 8 (LOW ext.) | external | — | no circuit breaker on `BloomreachDataSource` for non-429 |
+| 9 (retired) | — | — | eval pipeline removed in PR #8; `EVAL_RUN_TAG` gone with it |
+| 10 (retired) | — | — | `OlistDataSource` deleted in PR #8; subprocess lifecycle moot |
+
+---
+
 ## Primary diagram
 
 ```
@@ -212,29 +237,6 @@ The Olist subprocess adapter was deleted in PR #8 (2026-06-18). All three previo
   the top 3 (RISKs 1, 2, 3) are the ones worth fixing first;
   everything below is honest about the bound on impact
 ```
-
----
-
-## Implementation in codebase
-
-| Risk | File | Line(s) | What to look at |
-|------|------|---------|-----------------|
-| 1 (CRITICAL) | `lib/state/insights.ts` | 4-6 | per-process Map; no cross-instance link |
-| 1 | `lib/state/investigations.ts` | 11, 22-41 | mem-first fallback chain; misses on cold instance |
-| 1 | `app/api/agent/route.ts` | 37-62 | `resolveAnomaly` — the fallback chain that silently misses |
-| 2 (HIGH) | `lib/data-source/bloomreach-data-source.ts` | 190-205 | `liveCall` — no `AbortSignal.timeout` composed in |
-| 2 | `app/api/agent/route.ts` | 20 | `maxDuration = 300` — the only ceiling on the MCP call |
-| 3 (HIGH cond.) | `lib/data-source/types.ts` | 38-40 | `DataSourceCallOptions` has no idempotency key field |
-| 3 | `lib/agents/base.ts` | 144-156 | tool-call dispatch — no per-call idempotency |
-| 4 (MED) | `lib/agents/base.ts` | 102 | `anthropic.messages.create` — no retry wrapper |
-| 5 (MED) | `lib/hooks/useInvestigation.ts` | 18-19, 137-140 | sessionStorage handoff — tab-only |
-| 5 | `app/api/agent/route.ts` | 228-230 | the "no diagnosis was handed over" throw |
-| 6 (LOW) | `lib/data-source/bloomreach-data-source.ts` | 145 | `ttl = options.cacheTtlMs ?? 60_000` — no callsite overrides |
-| 7 (LOW) | `app/api/agent/route.ts` | 169-264 | stream has no event ID or resume |
-| 7 | `lib/hooks/useInvestigation.ts` | 184-208 | consumer has no Last-Event-ID logic |
-| 8 (LOW ext.) | external | — | no circuit breaker on `BloomreachDataSource` for non-429 |
-| 9 (retired) | — | — | eval pipeline removed in PR #8; `EVAL_RUN_TAG` gone with it |
-| 10 (retired) | — | — | `OlistDataSource` deleted in PR #8; subprocess lifecycle moot |
 
 ---
 

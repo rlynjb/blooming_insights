@@ -194,6 +194,40 @@ Regression evals for an LLM feature work like snapshot tests for deterministic c
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.** The regression eval ships as one of the four pillars in `eval/`. The 269 Vitest tests under `test/` are independent (they assert plumbing with fakes); regression eval runs real agents.
+
+#### The runner
+
+- **File:** `eval/scripts/run-regression.ts` (~742 lines — the largest of the four runners; handles capture mode, score mode, both judges, the result-dir layout, and the per-fixture per-agent dispatch)
+- **Modes:** `--mode=capture` writes to `eval/results/<date>-capture/`; `--mode=score` writes to `eval/results/<date>-score-baseline/` (or any suffix passed via `EVAL_RUN_TAG`).
+- **Dispatch:** each fixture declares which agent runs (`monitoring`, `diagnostic`, `recommendation`, `query`, `intent`); the runner imports the corresponding helper from `eval/scripts/lib/run-{diagnostic,query,intent,recommendation,agent}-agent.ts`.
+
+#### The two scorers
+
+- **File:** `eval/scripts/lib/structural-diff.ts` — walks candidate vs golden, asserts types + required-field presence, returns `{ pass, diffs[] }`.
+- **File:** `eval/scripts/lib/similarity-judge.ts` — wraps the `eval/judges/similarity-judge.md` prompt around the candidate + golden, sends to `claude-sonnet-4-6`, parses `{ semantic_pass, confidence, notes, differences }`.
+
+#### The fixtures
+
+- **Directory:** `eval/fixtures/regression-golden/` — 10 captured fixtures (`01` through `10`), each a JSON file with `input` (what the agent gets) and `output` (the captured golden). Coverage: monitoring (empty schema + 3-anomalies), diagnostic (sp / electronics / voucher), recommendation (sp / electronics / voucher), query (revenue-by-state), intent (classify-investigation).
+
+#### The judge prompt
+
+- **File:** `eval/judges/similarity-judge.md` (~225 lines) — the rubric the similarity judge runs against. Defines what "same substance" means per agent surface (monitoring = same anomalies + comparable severity; diagnostic = same supported hypothesis; recommendation = same mechanisms; query = same ranking + 5% magnitude tolerance).
+
+#### The baseline run
+
+- **File:** `eval/results/2026-06-15-score-baseline/regression-summary.md` — the load-bearing receipt. Capture happened on 2026-06-15; score ran immediately against the same prompts. Result: **100% structural pass, 30% semantic pass** (only voucher diagnosis, voucher recommendation, and intent classification produce stable conclusions on identical inputs). The 7 fixtures that drifted show real conclusion-level changes documented in the `differences` arrays (e.g., "platform-wide surge → electronics-specific event" for `04-diagnostic-electronics`).
+
+#### npm script wiring
+
+- **File:** `package.json`
+- **Scripts:** `"eval:regression": "tsx eval/scripts/run-regression.ts"` (line in scripts block)
+
+---
+
 ## Regression evals — diagram
 
 This diagram spans the State layer (where the golden fixtures + result dirs live), the Eval-harness layer (the capture and score modes), and the Provider boundary (the live agent + the similarity-judge model). A reader who sees only this should grasp that capture is one-time + destructive; score is non-destructive + emits a paper trail; and the two-mode scoring is what makes verbatim non-determinism survivable.
@@ -233,40 +267,6 @@ This diagram spans the State layer (where the golden fixtures + result dirs live
 ```
 
 One captured golden serves multiple score runs; the structural mode never hits the provider boundary; the semantic mode does, once per fixture per run.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.** The regression eval ships as one of the four pillars in `eval/`. The 269 Vitest tests under `test/` are independent (they assert plumbing with fakes); regression eval runs real agents.
-
-### The runner
-
-- **File:** `eval/scripts/run-regression.ts` (~742 lines — the largest of the four runners; handles capture mode, score mode, both judges, the result-dir layout, and the per-fixture per-agent dispatch)
-- **Modes:** `--mode=capture` writes to `eval/results/<date>-capture/`; `--mode=score` writes to `eval/results/<date>-score-baseline/` (or any suffix passed via `EVAL_RUN_TAG`).
-- **Dispatch:** each fixture declares which agent runs (`monitoring`, `diagnostic`, `recommendation`, `query`, `intent`); the runner imports the corresponding helper from `eval/scripts/lib/run-{diagnostic,query,intent,recommendation,agent}-agent.ts`.
-
-### The two scorers
-
-- **File:** `eval/scripts/lib/structural-diff.ts` — walks candidate vs golden, asserts types + required-field presence, returns `{ pass, diffs[] }`.
-- **File:** `eval/scripts/lib/similarity-judge.ts` — wraps the `eval/judges/similarity-judge.md` prompt around the candidate + golden, sends to `claude-sonnet-4-6`, parses `{ semantic_pass, confidence, notes, differences }`.
-
-### The fixtures
-
-- **Directory:** `eval/fixtures/regression-golden/` — 10 captured fixtures (`01` through `10`), each a JSON file with `input` (what the agent gets) and `output` (the captured golden). Coverage: monitoring (empty schema + 3-anomalies), diagnostic (sp / electronics / voucher), recommendation (sp / electronics / voucher), query (revenue-by-state), intent (classify-investigation).
-
-### The judge prompt
-
-- **File:** `eval/judges/similarity-judge.md` (~225 lines) — the rubric the similarity judge runs against. Defines what "same substance" means per agent surface (monitoring = same anomalies + comparable severity; diagnostic = same supported hypothesis; recommendation = same mechanisms; query = same ranking + 5% magnitude tolerance).
-
-### The baseline run
-
-- **File:** `eval/results/2026-06-15-score-baseline/regression-summary.md` — the load-bearing receipt. Capture happened on 2026-06-15; score ran immediately against the same prompts. Result: **100% structural pass, 30% semantic pass** (only voucher diagnosis, voucher recommendation, and intent classification produce stable conclusions on identical inputs). The 7 fixtures that drifted show real conclusion-level changes documented in the `differences` arrays (e.g., "platform-wide surge → electronics-specific event" for `04-diagnostic-electronics`).
-
-### npm script wiring
-
-- **File:** `package.json`
-- **Scripts:** `"eval:regression": "tsx eval/scripts/run-regression.ts"` (line in scripts block)
 
 ---
 

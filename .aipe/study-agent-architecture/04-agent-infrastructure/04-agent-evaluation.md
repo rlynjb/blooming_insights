@@ -139,6 +139,8 @@ The practical consequence: every run produces a trajectory you can open and read
 
 The condition under which it works: the trajectory has to be complete and faithful — every step the AptKit loop takes has to emit an event. The current shape covers all of the AptKit agent's observable steps because the `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100–142`) forwards every `CapabilityEvent` AptKit emits into a `send()` call that pushes into the collected buffer while streaming to the client. There's no in-loop decision that goes unrecorded.
 
+**Where the streamed trajectory record lives in the repo.** The `AgentEvent` union is in `lib/mcp/events.ts`. The source of events is `BloomingTraceSinkAdapter` at `lib/agents/aptkit-adapters.ts:100–142` — translates AptKit's `CapabilityEvent` ({step | tool_call_start | tool_call_end}) into the Blooming `onText` / `onToolCall` / `onToolResult` hooks. The route boundary is `app/api/agent/route.ts` — wires the adapter's hooks into a `send(...)` that appends to a `collected: AgentEvent[]` buffer while streaming each event to the client. Persistence: `lib/state/investigations.ts` (in-memory `Map`) + the dev cache file + the committed demo seed. Inspection surfaces: `GET /api/agent?insightId=<id>` replays the array; `/debug` views it; the investigation page consumes it via `lib/hooks/useInvestigation.ts`. The closest committed artefact to a frozen captured trajectory is `lib/state/demo-investigations.json` — diff a new run against it by eye.
+
 ### Move 2 — Unit tests grade the LOOP, not the trajectory quality
 
 The technical thing: **221 vitest tests use the injected model client and `DataSource`/`McpCaller` seams** to drive the loop with fake responses, then assert the loop's reactive behaviour — parse-failure fallback, the forced-final tool-less path, the budget cap, the schema gate, validators returning safe defaults. The tests cover both the legacy `runAgentLoop` path (preserved at `lib/agents/base-legacy.ts`) and the AptKit wrappers' integration points (the three adapter classes in `lib/agents/aptkit-adapters.ts`).
@@ -169,6 +171,8 @@ What these tests do well: they pin down the *invariants* of the loop and the ada
 What these tests don't do: grade whether the trajectory itself was *good*. They assert "given fake response X, the loop did Y" — they don't assert "given anomaly X, the model's chosen tools and order were optimal." That's the gap a trajectory-eval harness would fill, and it's absent from this repo today.
 
 The condition under which it works: the fakes have to be representative. A fake `McpCaller` that returns `{count: 42000}` lets the loop run; whether the model actually decides correctly *given that count* is a model-quality question, not a loop-shape question. The tests are deliberately scoped to the latter.
+
+**Where the loop-shape tests live in the repo.** Directory: `test/` — 221 tests covering the legacy `runAgentLoop` path, the AptKit adapter boundary, the MCP boundary, state, streaming, and the data-source adapters. Seams used: the `McpCaller` type alias (`lib/agents/base.ts:14` — `Pick<DataSource, 'callTool'>`) and the Anthropic client passed into the agent wrappers — both injected, no network in tests. The `DataSource` interface (`lib/data-source/types.ts`) is the contract every fake satisfies.
 
 ### Move 3 — The trajectory-grade harness, honestly named as absent
 
@@ -283,25 +287,6 @@ Two layers built (✓), one absent (✗)
   │ can drive them without a subprocess or live Bloomreach session │
   └──────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-Two layers built.
-
-**Loop-shape unit tests (the 221):**
-**Directory:** `test/` (221 tests covering the legacy `runAgentLoop` path, the AptKit adapter boundary, the MCP boundary, state, streaming, and the data-source adapters)
-**Seams used:** the `McpCaller` type alias (`lib/agents/base.ts:14` — `Pick<DataSource, 'callTool'>`) and the Anthropic client passed into the agent wrappers — both injected, no network in tests. The `DataSource` interface (`lib/data-source/types.ts`) is the contract every fake satisfies.
-
-**The streamed trajectory record:**
-**File:** `lib/mcp/events.ts` — `AgentEvent` union
-**Source of events:** `BloomingTraceSinkAdapter` at `lib/agents/aptkit-adapters.ts:100–142` translates AptKit's `CapabilityEvent` ({step | tool_call_start | tool_call_end}) into the Blooming `onText` / `onToolCall` / `onToolResult` hooks.
-**Route boundary:** `app/api/agent/route.ts` — wires the adapter's hooks into a `send(...)` that appends to a `collected: AgentEvent[]` buffer while streaming each event to the client.
-**Persistence:** `lib/state/investigations.ts` (in-memory `Map`) + the dev cache file + the committed demo seed
-**Inspection surfaces:** `GET /api/agent?insightId=<id>` replays the array; `/debug` views it; the investigation page consumes it via `lib/hooks/useInvestigation.ts`
-
-**Trajectory-grade harness:** absent. The closest committed artefact is the demo-investigations seed (`lib/state/demo-investigations.json`) — a frozen captured trajectory you can diff against by eye.
 
 ---
 

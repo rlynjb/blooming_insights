@@ -186,7 +186,11 @@ What this repo has vs what a critic loop would look like
 
 The diagnostic agent's recovery pass is invoked only when the loop's final text didn't parse as a Diagnosis. The system prompt is *not* "evaluate the answer" — it's "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data." The user message hands the model the anomaly plus a stringified summary of every tool call the loop already ran. The model is being told *what to produce*, not asked *whether the prior produced thing was correct*.
 
-The recommendation agent has the parallel structure — same recovery shape.
+**Where this lives in the repo.** `DiagnosticAgent.synthesize()` in `lib/agents/diagnostic.ts` L87–L126 — invoked from L75 only on parse failure of the loop's `finalText`; the tool-less `anthropic.messages.create` call is at L97 with the "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data." system prompt at L101.
+
+The recommendation agent has the parallel structure — same recovery shape: `RecommendationAgent.synthesize()` in `lib/agents/recommendation.ts` L82–L132 — invoked from L70–L71 on parse failure; returns a `Recommendation[]` (or `null` for the caller to default to `[]`).
+
+What's NOT here: no critic call that *grades* a Diagnosis before returning it; no retry of `runAgentLoop` with a "fix these issues" feedback message; no separate-model judge using a different model family on the producer's output (e.g. Haiku judging a Sonnet answer); no bounded round counter for retries beyond the single forced synthesis pass.
 
 The principle: **forced synthesis and self-critique solve different problems.** Forced synthesis solves "the loop exhausted its budget without emitting parseable JSON." Self-critique solves "the loop emitted parseable JSON but the JSON is wrong." This repo accepts the second problem (a parseable-but-wrong diagnosis ships as-is) and only handles the first. That's a deliberate choice: the substantive correctness is checked downstream by the user reading the conclusion, not by a critic that shares the producer's blind spots.
 
@@ -226,55 +230,6 @@ The three positions you can take
 
   This repo sits at B for diagnostic and recommendation;
   at A for monitoring and query (no synthesize retry).
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented as a critic loop (Case B with nuance).** There is no separate model call that grades a producer's output. The closest existing surface is the *forced synthesis recovery* in diagnostic and recommendation — a same-model tool-less retry when the main loop didn't emit parseable JSON.
-
-**Closest existing surface — diagnostic agent's forced synthesis**
-**File:** `lib/agents/diagnostic.ts`
-**Function / class:** `DiagnosticAgent.synthesize()`
-**Line range:** L87–L126 — invoked from L75 only on parse failure of the loop's `finalText`; tool-less `anthropic.messages.create` at L97 with system prompt "You are concluding a completed investigation. Output ONLY a JSON diagnosis. Never ask for more data." (L101).
-
-**Closest existing surface — recommendation agent's forced synthesis**
-**File:** `lib/agents/recommendation.ts`
-**Function / class:** `RecommendationAgent.synthesize()`
-**Line range:** L82–L132 — invoked from L70–L71 on parse failure; same shape as diagnostic's, returns a `Recommendation[]` (or `null` for the caller to default to `[]`).
-
-**What's NOT here**
-
-- No critic call that *grades* a Diagnosis before returning it.
-- No retry of `runAgentLoop` with a "fix these issues" feedback message.
-- No separate-model judge using a different model family on the producer's output (e.g. Haiku judging a Sonnet answer).
-- No bounded round counter for retries beyond the single forced synthesis pass.
-
-**Why the project sits here and not at a critic loop**
-
-The substantive correctness of a diagnosis can't be reliably checked by the same model on a second pass — the model wrote a plausible explanation; it'll read its own plausible explanation as plausible. Adding a critic costs ~2x tokens per investigation for catching format issues that the parser already catches structurally. The forced synthesis pass catches the most common real failure (the loop spent its budget asking "should I query more" instead of emitting JSON) without paying for substantive judgment the critic wouldn't reliably give.
-
-```
-shape (what a critic loop WOULD add — illustrative, not in repo):
-
-  // Hypothetical critic step (not present in this repo)
-  const draft = await runAgentLoop(...);                         // existing
-  const parsed = tryParseDiagnosis(draft.finalText);
-  if (!parsed) {
-    const recovered = await this.synthesize(anomaly, draft.toolCalls);  // existing
-    if (!recovered) return FALLBACK;
-    parsed = recovered;
-  }
-
-  // ↓↓↓ what reflexion/critic loop would add ↓↓↓
-  const verdict = await anthropic.messages.create({
-    model: 'claude-haiku-4-5',                                    // cheap judge
-    system: CRITIC_PROMPT,
-    messages: [{ role: 'user', content: { anomaly, evidence, parsed } }],
-  });
-  if (verdict.approved) return parsed;
-  // retry the producer with verdict.issues as feedback (cap N rounds)
 ```
 
 ---

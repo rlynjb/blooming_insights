@@ -185,6 +185,20 @@ A finite shared buffer demands two disciplines, not one: bound every inflow at t
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **Tool-result inflow cap:** `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) and `truncate(s)` (L31–L34). Applied at L150 before each `tool_result` block (pushed L161–L171).
+- **UI-stream cap (separate):** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the `tool_call_end` event payload only — not the window.
+- **Schema-prefix caps:** `MAX_EVENTS = 20` (`lib/agents/monitoring.ts` L21), `MAX_PROPS_PER_EVENT = 10` (L22), `MAX_CPROPS = 30` (L33); whole `schemaSummary` L15–L48; intent comment at L14. Imported and reused by `lib/agents/diagnostic.ts` L6 and `lib/agents/recommendation.ts` L6.
+- **Answer-room reservation:** `budgetSpent`/`forceFinal` (`lib/agents/base.ts` L90–L91), tools withheld on the final turn at L101, the create call at L102. Per-agent tool budgets: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57).
+- **Output cap (the one real token control):** `max_tokens` default `4096` (`lib/agents/base.ts` L74), synthesis `2048` (`diagnostic.ts` L99 / `recommendation.ts` L98), classifier `16` (`lib/agents/intent.ts` L20).
+
+The codebase bounds the *input* by characters and reserves the *output* with `max_tokens` and the forced-final turn. It never reads `res.usage` to learn how full the window actually got — that gap is named in → ../01-llm-foundations/06-token-economics.md.
+
+---
+
 ## The context window — diagram
 
 This diagram spans the layers a request crosses and where each budget is applied. The Service layer enforces every inflow cap in characters; the Provider boundary is where the bounded array meets the model and `max_tokens` reserves the output room.
@@ -222,20 +236,6 @@ This diagram spans the layers a request crosses and where each budget is applied
 ```
 
 Inflow is capped in the Service layer; the answer's room is reserved by withholding tools on the final turn and by `max_tokens` at the boundary. The UI-stream budget runs alongside and never touches the window.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **Tool-result inflow cap:** `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) and `truncate(s)` (L31–L34). Applied at L150 before each `tool_result` block (pushed L161–L171).
-- **UI-stream cap (separate):** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the `tool_call_end` event payload only — not the window.
-- **Schema-prefix caps:** `MAX_EVENTS = 20` (`lib/agents/monitoring.ts` L21), `MAX_PROPS_PER_EVENT = 10` (L22), `MAX_CPROPS = 30` (L33); whole `schemaSummary` L15–L48; intent comment at L14. Imported and reused by `lib/agents/diagnostic.ts` L6 and `lib/agents/recommendation.ts` L6.
-- **Answer-room reservation:** `budgetSpent`/`forceFinal` (`lib/agents/base.ts` L90–L91), tools withheld on the final turn at L101, the create call at L102. Per-agent tool budgets: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57).
-- **Output cap (the one real token control):** `max_tokens` default `4096` (`lib/agents/base.ts` L74), synthesis `2048` (`diagnostic.ts` L99 / `recommendation.ts` L98), classifier `16` (`lib/agents/intent.ts` L20).
-
-The codebase bounds the *input* by characters and reserves the *output* with `max_tokens` and the forced-final turn. It never reads `res.usage` to learn how full the window actually got — that gap is named in → ../01-llm-foundations/06-token-economics.md.
 
 ---
 

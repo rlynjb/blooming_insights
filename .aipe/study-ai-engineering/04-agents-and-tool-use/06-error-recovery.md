@@ -253,6 +253,85 @@ The alpha MCP server revokes tokens after a few minutes and its own 401 instruct
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.**
+
+#### Loop protection (budget = cap)
+
+- **File:** `lib/agents/base.ts`
+- **Function / class:** `runAgentLoop` — `forceFinal` logic
+- **Line range:** L85 (turn loop), L90 (`budgetSpent`), L91 (`forceFinal`), L101 (tools withheld on final); `maxTurns = 8` at L73
+- **Role:** Structurally terminates the loop — withholding tools on the forced-final turn makes a further `tool_use` impossible.
+
+#### Per-agent budgets
+
+- **File:** `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`) · `recommendation.ts` L57 (`4`) · `monitoring.ts` L84 (`6`) · `query.ts` L41 (`6`)
+- **Role:** The tuned caps; bound latency under the ~1.1s MCP spacing and protect against runaway loops.
+
+#### Output cascade (tier 1→2→3)
+
+- **File:** `lib/agents/diagnostic.ts` (and `recommendation.ts`)
+- **Function / class:** `investigate` cascade + `synthesize`; `FALLBACK`
+- **Line range:** cascade L74–L75; `synthesize` L87–L126 (`create` L97, `max_tokens: 2048`, `try/catch → null` L123); `FALLBACK` L16–L20. Recommendation: cascade L69–L73 (`[]` at L73), `synthesize` L82–L133.
+- **Role:** Three recovery tiers ending in a safe default that never throws.
+
+#### Monitoring graceful degrade
+
+- **File:** `lib/agents/monitoring.ts`
+- **Function / class:** `MonitoringAgent.scan`
+- **Line range:** L95–L102 (parse `try/catch → []` at L98–99; `isAnomalyArray` guard → `[]` at L101)
+- **Role:** Treats an unparseable scan as "no anomalies," not as a failure.
+
+#### Transport recovery
+
+- **File:** `lib/mcp/client.ts`
+- **Function / class:** `callTool` + `isRateLimited` + `parseRetryAfterMs`
+- **Line range:** `isRateLimited` L18–L22; backoff retry L122–L132 (`maxRetries` 3, `retryDelayMs` 10_000, `retryCeilingMs` 20_000 — defaults L89/L93–94; parsed-hint preference via `parseRetryAfterMs` L31–38); no-cache-on-error L137–L139; construction `minIntervalMs: 1100` in `connect.ts` L92
+- **Role:** Retries rate-limits with exponential backoff (preferring the server-stated window) within the spacing gate; never caches error results.
+
+#### Route pre-stream setup guard
+
+- **File:** `app/api/agent/route.ts`
+- **Function / class:** `GET` — `getOrCreateSessionId` + `connectMcp` wrapper
+- **Line range:** L155–L165 (`try/catch` → real error JSON); the in-stream throw → `error` event at L255–L260
+- **Role:** A setup throw returns the real message as a 500 body instead of a bare framework 500; a mid-run throw becomes a streamed `{ type:'error' }` event.
+
+#### Client auto-reconnect (revoked alpha token)
+
+- **File:** `app/page.tsx` (feed) + `lib/hooks/useInvestigation.ts`
+- **Function / class:** streamed-`error` handler (feed) + `useInvestigation` 401 handler
+- **Line range:** `app/page.tsx` L386–L410 (match → `/api/mcp/reset` + reload once, guarded by `bi:reconnecting` L389/L395); `useInvestigation.ts` L171–L177 (401 `needsAuth` → redirect)
+- **Role:** Recovers the alpha server's minutes-long token revocation without surfacing an error, exactly once.
+
+**Pseudocode — the full recovery cascade** (`base.ts` + `diagnostic.ts` + `client.ts`):
+
+```typescript
+// LOOP PROTECTION (base.ts) — budget IS the cap
+for (let turn = 0; turn < maxTurns; turn++) {           // L85
+  const forceFinal = turn === maxTurns - 1 ||
+    (maxToolCalls !== undefined && toolCalls.length >= maxToolCalls);  // L90-91
+  if (!forceFinal) params.tools = toolSchemas;          // L101 — withheld on final
+}
+
+// OUTPUT CASCADE (diagnostic.ts) — three safe tiers
+const diag = tryParseDiagnosis(finalText)               // L75 tier 1
+    ?? (await this.synthesize(anomaly, toolCalls))      // L75 tier 2 (try/catch → null)
+    ?? FALLBACK;                                         // L75 tier 3 (never throws)
+
+// TRANSPORT (client.ts) — exponential backoff + no-poison
+while (isRateLimited(result) && retries < maxRetries) { // L122
+  retries++;
+  const hintMs   = parseRetryAfterMs(result);           // L124 — server-stated window
+  const backoffMs = retryDelayMs * 2 ** (retries - 1);  // L125 — exponential
+  const waitMs   = Math.min(hintMs ?? backoffMs, retryCeilingMs);  // L126 — capped
+  await sleep(waitMs); result = await this.liveCall(name, args);   // L130-131
+}
+if (result.isError) return { result, durationMs, fromCache: false };  // L137 — not cached
+```
+
+---
+
 ## Error recovery — diagram
 
 The diagram spans four layers. The Client layer auto-reconnects on a revoked token. The Route layer wraps setup and turns safe defaults into guaranteed events. The Agent layer holds the three-tier output cascade and the budget that bounds the loop. The Provider boundary holds the transport recovery (backoff retry, no-cache-on-error). Every arrow that fails falls to a recovery, never to a crash.
@@ -300,85 +379,6 @@ The diagram spans four layers. The Client layer auto-reconnects on a revoked tok
 ```
 
 A reader who sees only this diagram should grasp: the client reconnects once on a revoked token, the route wraps setup and always streams a valid value, the budget bounds the loop, the output cascade falls through three safe tiers, and the transport backs off and never caches errors.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.**
-
-### Loop protection (budget = cap)
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop` — `forceFinal` logic
-- **Line range:** L85 (turn loop), L90 (`budgetSpent`), L91 (`forceFinal`), L101 (tools withheld on final); `maxTurns = 8` at L73
-- **Role:** Structurally terminates the loop — withholding tools on the forced-final turn makes a further `tool_use` impossible.
-
-### Per-agent budgets
-
-- **File:** `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`) · `recommendation.ts` L57 (`4`) · `monitoring.ts` L84 (`6`) · `query.ts` L41 (`6`)
-- **Role:** The tuned caps; bound latency under the ~1.1s MCP spacing and protect against runaway loops.
-
-### Output cascade (tier 1→2→3)
-
-- **File:** `lib/agents/diagnostic.ts` (and `recommendation.ts`)
-- **Function / class:** `investigate` cascade + `synthesize`; `FALLBACK`
-- **Line range:** cascade L74–L75; `synthesize` L87–L126 (`create` L97, `max_tokens: 2048`, `try/catch → null` L123); `FALLBACK` L16–L20. Recommendation: cascade L69–L73 (`[]` at L73), `synthesize` L82–L133.
-- **Role:** Three recovery tiers ending in a safe default that never throws.
-
-### Monitoring graceful degrade
-
-- **File:** `lib/agents/monitoring.ts`
-- **Function / class:** `MonitoringAgent.scan`
-- **Line range:** L95–L102 (parse `try/catch → []` at L98–99; `isAnomalyArray` guard → `[]` at L101)
-- **Role:** Treats an unparseable scan as "no anomalies," not as a failure.
-
-### Transport recovery
-
-- **File:** `lib/mcp/client.ts`
-- **Function / class:** `callTool` + `isRateLimited` + `parseRetryAfterMs`
-- **Line range:** `isRateLimited` L18–L22; backoff retry L122–L132 (`maxRetries` 3, `retryDelayMs` 10_000, `retryCeilingMs` 20_000 — defaults L89/L93–94; parsed-hint preference via `parseRetryAfterMs` L31–38); no-cache-on-error L137–L139; construction `minIntervalMs: 1100` in `connect.ts` L92
-- **Role:** Retries rate-limits with exponential backoff (preferring the server-stated window) within the spacing gate; never caches error results.
-
-### Route pre-stream setup guard
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `GET` — `getOrCreateSessionId` + `connectMcp` wrapper
-- **Line range:** L155–L165 (`try/catch` → real error JSON); the in-stream throw → `error` event at L255–L260
-- **Role:** A setup throw returns the real message as a 500 body instead of a bare framework 500; a mid-run throw becomes a streamed `{ type:'error' }` event.
-
-### Client auto-reconnect (revoked alpha token)
-
-- **File:** `app/page.tsx` (feed) + `lib/hooks/useInvestigation.ts`
-- **Function / class:** streamed-`error` handler (feed) + `useInvestigation` 401 handler
-- **Line range:** `app/page.tsx` L386–L410 (match → `/api/mcp/reset` + reload once, guarded by `bi:reconnecting` L389/L395); `useInvestigation.ts` L171–L177 (401 `needsAuth` → redirect)
-- **Role:** Recovers the alpha server's minutes-long token revocation without surfacing an error, exactly once.
-
-**Pseudocode — the full recovery cascade** (`base.ts` + `diagnostic.ts` + `client.ts`):
-
-```typescript
-// LOOP PROTECTION (base.ts) — budget IS the cap
-for (let turn = 0; turn < maxTurns; turn++) {           // L85
-  const forceFinal = turn === maxTurns - 1 ||
-    (maxToolCalls !== undefined && toolCalls.length >= maxToolCalls);  // L90-91
-  if (!forceFinal) params.tools = toolSchemas;          // L101 — withheld on final
-}
-
-// OUTPUT CASCADE (diagnostic.ts) — three safe tiers
-const diag = tryParseDiagnosis(finalText)               // L75 tier 1
-    ?? (await this.synthesize(anomaly, toolCalls))      // L75 tier 2 (try/catch → null)
-    ?? FALLBACK;                                         // L75 tier 3 (never throws)
-
-// TRANSPORT (client.ts) — exponential backoff + no-poison
-while (isRateLimited(result) && retries < maxRetries) { // L122
-  retries++;
-  const hintMs   = parseRetryAfterMs(result);           // L124 — server-stated window
-  const backoffMs = retryDelayMs * 2 ** (retries - 1);  // L125 — exponential
-  const waitMs   = Math.min(hintMs ?? backoffMs, retryCeilingMs);  // L126 — capped
-  await sleep(waitMs); result = await this.liveCall(name, args);   // L130-131
-}
-if (result.isError) return { result, durationMs, fromCache: false };  // L137 — not cached
-```
 
 ---
 

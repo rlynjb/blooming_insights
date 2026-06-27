@@ -209,6 +209,26 @@ The practical consequence: blooming insights' specific failure was "one prompt c
 
 The condition under which "deterministic route + pipeline" is enough: the stage *order* is knowable up front AND the workers are single-purpose AND no peer handoff is needed. All three are true here.
 
+**Where this lives in the repo.** The deterministic supervisor sits in `app/api/agent/route.ts`'s `GET` stream `start()` body at L199–L249 — lead-agent select (L199–L200), query branch (L210–L218), diagnostic→recommendation (L224–L249). This is the `if`-ladder that picks the next agent. No model is consulted. If you imagine the LLM-supervisor alternative, this is the file you'd replace.
+
+Each stage's per-agent specialisation lives in `lib/agents/base.ts` `runAgentLoop()` at L48–L176 — loop at L85, natural stop on zero `tool_use` at L121, observation fed back at L171, forced-final on budget spent at L90. All four agents share this loop; the per-agent tool subset comes from `lib/mcp/tools.ts` and the per-agent `maxToolCalls` cap is 6/6/6/4. The decomposition is real; the orchestration on top of it is deterministic.
+
+The same "don't pay for capability the job doesn't need" principle runs one layer down at the per-call level: `classifyIntent()` in `lib/agents/intent.ts` uses `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` at L14 — Haiku, not Sonnet — because classification doesn't need Sonnet-grade reasoning. Sonnet 4.6 is everywhere else (see `base.ts` L9).
+
+```
+shape (not full impl):
+
+  // The "supervisor" is THIS — an if-ladder in code, not an agent
+  const leadAgent: AgentName =
+    q && !insightId      ? 'coordinator'    // query flow
+    : step === 'recommend' ? 'recommendation'
+                           : 'diagnostic';   // pipeline default
+
+  // The pipeline order is fixed; the route hands diagnosis to recommendation
+  const diagnosis = await diagAgent.investigate(inv, hooks);
+  const recs     = await recAgent.propose(inv, diagnosis, hooks);
+```
+
 ### Phase A vs Phase B — what would force the gate to move
 
 ```
@@ -292,47 +312,6 @@ The escalation gate — full picture
   │   — written in code, not as an agent.                        │
   │                                                              │
   └──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-This is the boundary file for SECTION C. It does not have a single line range; it names a *decision* taken across the codebase. The artifacts are:
-
-**The deterministic supervisor (route, not agent)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** the `GET` stream `start()` body
-**Line range:** L199–L249 — lead-agent select (L199–L200), query branch (L210–L218), diagnostic→recommendation (L224–L249).
-
-This is the `if`-ladder that picks the next agent. No model is consulted. If you imagine the LLM-supervisor alternative, this is the file you'd replace.
-
-**The single shared ReAct loop (all 4 agents call it)**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L48–L176 — loop (L85), natural stop on zero `tool_use` (L121), observation fed back (L171), forced-final turn on budget spent (L90).
-
-Each stage gets its own per-agent tool subset (`lib/mcp/tools.ts`) and its own `maxToolCalls` cap (6/6/6/4). The decomposition is real; the orchestration on top of it is deterministic.
-
-**The cheap-model classifier (haiku, not sonnet)**
-**File:** `lib/agents/intent.ts`
-**Function / class:** `classifyIntent()`
-**Line range:** L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (Sonnet 4.6 is everywhere else, base.ts L9).
-
-This is the gate applied at the per-call level: classification doesn't need Sonnet-grade reasoning, so it gets Haiku. Same principle — don't pay for capability the job doesn't need.
-
-```
-shape (not full impl):
-
-  // The "supervisor" is THIS — an if-ladder in code, not an agent
-  const leadAgent: AgentName =
-    q && !insightId      ? 'coordinator'    // query flow
-    : step === 'recommend' ? 'recommendation'
-                           : 'diagnostic';   // pipeline default
-
-  // The pipeline order is fixed; the route hands diagnosis to recommendation
-  const diagnosis = await diagAgent.investigate(inv, hooks);
-  const recs     = await recAgent.propose(inv, diagnosis, hooks);
 ```
 
 ---

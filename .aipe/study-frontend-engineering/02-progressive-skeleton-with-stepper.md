@@ -79,6 +79,13 @@ Structure pass — the progressive composition
 
 ## How it works
 
+**Use cases.** Four places the composition is reached for:
+
+- **Feed page during the initial briefing scan.** `app/page.tsx:560-808`. The full four-tier composition: ProcessStepper at L561-L568, CoverageGrid at L624, Skeleton stack at L626-L633, hand-rolled StatusLog aside at L743-L808.
+- **Diagnose page during the diagnostic agent run.** `app/investigate/[id]/page.tsx:115-220`. ProcessStepper at L115-L119, EvidencePanel's shape-true skeleton at L150 (via the `loading` prop), shared StatusLog component at L214-L220.
+- **Recommend page during the recommendation agent run.** `app/investigate/[id]/recommend/page.tsx:112-194`. ProcessStepper at L112-L116, RecommendationCardSkeleton stack at L172-L174, shared StatusLog component at L186-L192.
+- **StreamingResponse for the `?q=` ask flow.** `components/chat/StreamingResponse.tsx:182-215`. The smaller-scale variant: no stepper (it's not pipeline-shaped), no tiles, but Skeleton at L213 + an inline `bi-dots` "thinking…" + the trace expands inline (L246-L272). Demonstrates the same pattern at a smaller scale.
+
 ### Move 1 — mental model: four primitives that stack on the time axis
 
 You know how a YouTube video has a low-res placeholder, then a buffering spinner, then the first frame, then real motion? Same shape: progressively richer information at each tier, no blank moment between them. The four primitives are stacked on the *time axis* of perceived progress.
@@ -144,6 +151,67 @@ The `sub` field is where the streaming data feeds back into the stepper. On the 
 - The `sub` field → the stepper becomes static. The user knows they're at stage 2, doesn't know whether it's making progress.
 - The `state` field's four states → the stepper can't distinguish active from pending; pages can't show "where you are in the pipeline."
 
+**Code in this codebase — `components/shared/ProcessStepper.tsx:66-138`** (the stepper render):
+
+```
+  function ProcessStepper({ monitoring, diagnostic, recommendation }) {
+    const inputs: StepInput[] = [monitoring, diagnostic, recommendation];
+    return (
+      <div
+        role="group"                                 ← a11y: groups the three steps
+        aria-label="analysis pipeline"
+        style={{ display: 'flex', /* … */ }}
+      >
+        {STEPS.map((step, i) => {                   ← STEPS is fixed:
+          const { state, sub, href } = inputs[i];      monitoring / diagnostic /
+                                                       recommendation
+          const labelColor =
+            state === 'pending'  ? 'var(--text-tertiary)' :
+            state === 'error'    ? 'var(--accent-coral)' :
+                                   'var(--text-primary)';
+          const subColor = state === 'active'
+            ? 'var(--text-secondary)'
+            : 'var(--text-tertiary)';
+          // …
+          const inner = (
+            <>
+              <span
+                aria-hidden                          ← number/check/exclamation is
+                className={state === 'active'           decorative; the label carries
+                  ? 'animate-pulse' : undefined}        the semantic name
+                style={badgeStyle(state)}
+              >
+                {state === 'complete' ? '✓' :
+                 state === 'error'    ? '!' : i + 1}
+              </span>
+              <div style={{ minWidth: 0 }}>
+                <div className="lowercase" style={{ /* labelStyle */, color: labelColor }}>
+                  {step.label}                       ← "monitoring anomalies" etc.
+                </div>
+                {sub && (
+                  <div className="lowercase" style={{ /* subStyle */, color: subColor }}
+                       title={sub}>
+                    {sub}                            ← the live status from streaming data
+                  </div>                                e.g. "query 4 · select_events(…)"
+                )}
+              </div>
+            </>
+          );
+          return href ? (
+            <Link key={step.key} href={href} style={wrapStyle}>{inner}</Link>
+          ) : (
+            <div key={step.key} style={wrapStyle}>{inner}</div>
+          );                                          ← becomes a <Link> only when href
+        })}                                              is passed (the diagnose page
+      </div>                                            makes step 3 jumpable when ready)
+    );
+  }
+       │
+       └─ the four states (pending/active/complete/error) + the optional sub-line
+          + the optional href compose to give every page-stage combination its own
+          rendering — same component, three pages, six different visible states.
+```
+
 ### Move 2.2 — the shape layer: skeletons that hold the layout
 
 `Skeleton` (`components/shared/Skeleton.tsx`) is 18 lines: one animated `<div>` with configurable `height` and `width`, `background: var(--bg-surface)`, `borderRadius: 4`, and the Tailwind `animate-pulse` class. It does one thing: occupy space the eventual content will occupy.
@@ -180,6 +248,32 @@ The `EvidencePanel` skeleton wraps the placeholder block in `aria-hidden` (`Evid
 - The shape-true skeleton (vs generic boxes) → the layout still jumps slightly when content arrives, because the placeholder's vertical rhythm differs from the loaded shape.
 - The `aria-hidden` wrapper → screen readers read out a string of empty boxes as content; the user hears noise that isn't the page.
 
+**Code in this codebase — `components/shared/Skeleton.tsx:1-18`** (the entire primitive):
+
+```
+  interface SkeletonProps {
+    height?: number | string;       ← optional; default 80
+    width?: number | string;        ← optional; default '100%'
+  }
+
+  export default function Skeleton({ height = 80, width = '100%' }: SkeletonProps) {
+    return (
+      <div
+        className="animate-pulse"     ← Tailwind utility = CSS keyframe animation
+        style={{
+          background: 'var(--bg-surface)',  ← darker than the page, lighter than border
+          borderRadius: 4,                    so it reads as "card-shaped placeholder"
+          height,
+          width,
+        }}
+      />
+    );
+  }
+       │
+       └─ 18 LOC. one job. consumed by every page-level loading state.
+          its smallness IS the point — composition wins, not configuration.
+```
+
 ### Move 2.3 — the tile layer: progressive disclosure per-category
 
 `CoverageGrid` (`components/feed/CoverageGrid.tsx`) is the feed-specific fourth primitive — a 10-category tile grid that fills in as the monitoring agent's gate reports each category. This is the move that's hardest to find in other codebases because it's specific to *coverage-of-a-checklist* progress, not just *progress-of-one-thing* progress.
@@ -214,6 +308,66 @@ The pending tile state is visually distinct: dashed border, no icon background, 
 - The pending-state rendering → tiles only appear after they're reported, and the layout grows as the grid fills in. The user gets "1 tile, 2 tiles, 3 tiles…" growing the page.
 - The per-category `Map` lookup → the component can't distinguish reported from pending; loses the progressive-disclosure property.
 - The "anomaly coverage" header counters (`monitored`, `firing`, `no data`) → the user can't see the rollup of progress; loses the "checking 5/10…" thread of awareness.
+
+**Code in this codebase — `components/feed/CoverageGrid.tsx:61-115`** (the tile layer header + counters):
+
+```
+  function CoverageGrid({ coverage, insights, loading = false }) {
+    if ((!coverage || coverage.length === 0) && !loading) return null;
+                                                       ↑ idle: render nothing
+
+    const byCat = new Map(coverage.map((c) => [c.category, c]));  ← lookup by category
+    const insightByCat = new Map<CategoryId, Insight>();
+    for (const i of insights)
+      if (i.category && !insightByCat.has(i.category))
+        insightByCat.set(i.category, i);              ← which insight FIRES which tile
+
+    // counts reflect what's been reported SO FAR — tick up as tiles stream in
+    const checked   = coverage.length;
+    const monitored = coverage.filter(c => c.coverage !== 'unavailable').length;
+    const firing    = CATEGORIES.filter(c => insightByCat.has(c.id)).length;
+    const skipped   = coverage.filter(c => c.coverage === 'unavailable');
+    const settling  = loading && checked < CATEGORIES.length;  ← still scanning?
+
+    return (
+      <div className="bi-fade-up">                    ← gentle entrance animation
+        <div /* header row */>
+          <div>
+            <div style={{ /* title */ }}>anomaly coverage</div>
+            <div style={{ /* counter row */ }}>
+              10 categories ·
+              <span style={{ color: 'var(--accent-teal)' }}>{monitored} monitored</span> ·
+              <span style={{ color: 'var(--accent-coral)' }}>{firing} firing</span> ·
+              <span style={{ color: 'var(--text-tertiary)' }}>{skipped.length} no data</span>
+              {settling && (                          ← only while still scanning
+                <span className="animate-pulse" style={{ color: 'var(--text-tertiary)' }}>
+                  {' '}· checking {checked}/10…
+                </span>                               ← the running progress thread
+              )}
+            </div>
+          </div>
+          <div /* legend row */>{/* coral/teal/amber dots + planned */}</div>
+        </div>
+        <div style={{ display: 'grid',
+                      gridTemplateColumns:
+                        'repeat(auto-fill, minmax(190px, 1fr))', gap: 12 }}>
+          {CATEGORIES.map((cat) => {                  ← ALWAYS renders all 10
+            const report = byCat.get(cat.id);            categories; per-tile
+            const Icon = ICONS[cat.id];                  state comes from byCat
+            const coverageState = report?.coverage ?? 'unavailable';
+            // …tile rendering: pending if !report, live if report present
+          })}
+        </div>
+      </div>
+    );
+  }
+       │
+       └─ the load-bearing property: CATEGORIES.map runs every render and produces
+          all 10 tiles. each tile picks its state from byCat.get(cat.id). missing
+          entries render as pending; present entries render as live. so each
+          coverage_item event flips one tile from pending to live — without
+          changing the grid's layout.
+```
 
 ### Move 2.4 — the trace layer: the sticky sidebar that streams the work
 
@@ -257,6 +411,65 @@ The same `StatusLog` is rendered on both investigation pages (`app/investigate/[
 - The trace layer entirely → the user sees the stepper saying "active" and the skeletons holding the layout, but the work itself is invisible. The "this is actually doing something" reassurance is gone.
 - The streaming append (vs append-on-done) → trace items appear all at once when the agent finishes, defeating the watch-the-work property.
 - The sticky position → the trace scrolls off-screen as the main content grows, losing visibility during long runs.
+
+**Code in this codebase — `app/page.tsx:560-568, 624-633, 743-808`** (the composition site on the feed — all four tiers assembled, with the trace layer as the sticky `<aside>`):
+
+```
+  // process stepper — monitoring runs here; the other two run on investigate
+  <ProcessStepper
+    monitoring={{
+      state: monitoringState(status),                  ← 'active'/'complete'/'error'
+      sub: monitoringSub(status, stepStatus,              from feed status flag
+                         queryCount, insights.length),  ← live sub from stream events
+    }}
+    diagnostic={{ state: 'pending', sub: 'opens when you investigate' }}
+    recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
+  />
+
+  …
+
+  // anomaly coverage grid — the category checklist, ABOVE the cards
+  <CoverageGrid coverage={coverage} insights={insights}
+                loading={status === 'loading' && !reconnecting} />
+
+  // loading
+  {status === 'loading' && !reconnecting && (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <Skeleton height={96} />                         ← four 96px-tall card-shaped
+      <Skeleton height={96} />                            placeholders. when insights
+      <Skeleton height={96} />                            arrive, this block unmounts
+      <Skeleton height={96} />                            and the InsightCards mount
+    </div>                                                in roughly the same space
+  )}
+
+  …
+
+  // ── col 2 — live statuses / logs, so the user sees background work ──
+  <aside style={{ position: 'sticky', top: 16, /* … */ }}>
+    <div className="lowercase" style={{ /* sticky header */ }}>
+      how this briefing was gathered ·{' '}
+      {traceItems.length > 0
+        ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
+        : '-- queries'}
+      {status === 'loading' && ' · scanning…'}        ← the suffix that signals
+    </div>                                                ongoing work
+    <div style={{ padding: '10px 16px 16px' }}>
+      {traceItems.length > 0 ? (
+        <ReasoningTrace items={traceItems} />          ← real trace once events arrive
+      ) : status === 'loading' ? (
+        <p>connecting to the agent…</p>                ← placeholder before event #1
+      ) : (
+        <p>-- the agent's query-by-query trace…</p>    ← idle/demo-without-trace
+      )}
+    </div>
+  </aside>
+       │
+       └─ this is the inline copy of StatusLog (audit red flag #5).
+          the shared component (components/shared/StatusLog.tsx) does the same
+          shape — used on both investigate pages. extracting this inline aside
+          to use the shared component is the natural fold-along when app/page.tsx
+          gets its hooks-extraction refactor.
+```
 
 ### Move 3 — the principle
 
@@ -327,225 +540,6 @@ PROGRESSIVE COMPOSITION — the feed page during a live briefing
 ```
 
 The diagram is the contract. One stream drives four UI tiers; each tier handles a different user question on a different time scale.
-
----
-
-## Implementation in codebase
-
-**Use cases.** Four places the composition is reached for:
-
-- **Feed page during the initial briefing scan.** `app/page.tsx:560-808`. The full four-tier composition: ProcessStepper at L561-L568, CoverageGrid at L624, Skeleton stack at L626-L633, hand-rolled StatusLog aside at L743-L808.
-- **Diagnose page during the diagnostic agent run.** `app/investigate/[id]/page.tsx:115-220`. ProcessStepper at L115-L119, EvidencePanel's shape-true skeleton at L150 (via the `loading` prop), shared StatusLog component at L214-L220.
-- **Recommend page during the recommendation agent run.** `app/investigate/[id]/recommend/page.tsx:112-194`. ProcessStepper at L112-L116, RecommendationCardSkeleton stack at L172-L174, shared StatusLog component at L186-L192.
-- **StreamingResponse for the `?q=` ask flow.** `components/chat/StreamingResponse.tsx:182-215`. The smaller-scale variant: no stepper (it's not pipeline-shaped), no tiles, but Skeleton at L213 + an inline `bi-dots` "thinking…" + the trace expands inline (L246-L272). Demonstrates the same pattern at a smaller scale.
-
-### Code side by side, with a line-by-line read
-
-`components/shared/Skeleton.tsx:1-18` — the entire component:
-
-```
-  interface SkeletonProps {
-    height?: number | string;       ← optional; default 80
-    width?: number | string;        ← optional; default '100%'
-  }
-
-  export default function Skeleton({ height = 80, width = '100%' }: SkeletonProps) {
-    return (
-      <div
-        className="animate-pulse"     ← Tailwind utility = CSS keyframe animation
-        style={{
-          background: 'var(--bg-surface)',  ← darker than the page, lighter than border
-          borderRadius: 4,                    so it reads as "card-shaped placeholder"
-          height,
-          width,
-        }}
-      />
-    );
-  }
-       │
-       └─ 18 LOC. one job. consumed by every page-level loading state.
-          its smallness IS the point — composition wins, not configuration.
-```
-
-`components/shared/ProcessStepper.tsx:66-138` — the stepper render:
-
-```
-  function ProcessStepper({ monitoring, diagnostic, recommendation }) {
-    const inputs: StepInput[] = [monitoring, diagnostic, recommendation];
-    return (
-      <div
-        role="group"                                 ← a11y: groups the three steps
-        aria-label="analysis pipeline"
-        style={{ display: 'flex', /* … */ }}
-      >
-        {STEPS.map((step, i) => {                   ← STEPS is fixed:
-          const { state, sub, href } = inputs[i];      monitoring / diagnostic /
-                                                       recommendation
-          const labelColor =
-            state === 'pending'  ? 'var(--text-tertiary)' :
-            state === 'error'    ? 'var(--accent-coral)' :
-                                   'var(--text-primary)';
-          const subColor = state === 'active'
-            ? 'var(--text-secondary)'
-            : 'var(--text-tertiary)';
-          // …
-          const inner = (
-            <>
-              <span
-                aria-hidden                          ← number/check/exclamation is
-                className={state === 'active'           decorative; the label carries
-                  ? 'animate-pulse' : undefined}        the semantic name
-                style={badgeStyle(state)}
-              >
-                {state === 'complete' ? '✓' :
-                 state === 'error'    ? '!' : i + 1}
-              </span>
-              <div style={{ minWidth: 0 }}>
-                <div className="lowercase" style={{ /* labelStyle */, color: labelColor }}>
-                  {step.label}                       ← "monitoring anomalies" etc.
-                </div>
-                {sub && (
-                  <div className="lowercase" style={{ /* subStyle */, color: subColor }}
-                       title={sub}>
-                    {sub}                            ← the live status from streaming data
-                  </div>                                e.g. "query 4 · select_events(…)"
-                )}
-              </div>
-            </>
-          );
-          return href ? (
-            <Link key={step.key} href={href} style={wrapStyle}>{inner}</Link>
-          ) : (
-            <div key={step.key} style={wrapStyle}>{inner}</div>
-          );                                          ← becomes a <Link> only when href
-        })}                                              is passed (the diagnose page
-      </div>                                            makes step 3 jumpable when ready)
-    );
-  }
-       │
-       └─ the four states (pending/active/complete/error) + the optional sub-line
-          + the optional href compose to give every page-stage combination its own
-          rendering — same component, three pages, six different visible states.
-```
-
-`components/feed/CoverageGrid.tsx:61-115` (the tile layer header + counters):
-
-```
-  function CoverageGrid({ coverage, insights, loading = false }) {
-    if ((!coverage || coverage.length === 0) && !loading) return null;
-                                                       ↑ idle: render nothing
-
-    const byCat = new Map(coverage.map((c) => [c.category, c]));  ← lookup by category
-    const insightByCat = new Map<CategoryId, Insight>();
-    for (const i of insights)
-      if (i.category && !insightByCat.has(i.category))
-        insightByCat.set(i.category, i);              ← which insight FIRES which tile
-
-    // counts reflect what's been reported SO FAR — tick up as tiles stream in
-    const checked   = coverage.length;
-    const monitored = coverage.filter(c => c.coverage !== 'unavailable').length;
-    const firing    = CATEGORIES.filter(c => insightByCat.has(c.id)).length;
-    const skipped   = coverage.filter(c => c.coverage === 'unavailable');
-    const settling  = loading && checked < CATEGORIES.length;  ← still scanning?
-
-    return (
-      <div className="bi-fade-up">                    ← gentle entrance animation
-        <div /* header row */>
-          <div>
-            <div style={{ /* title */ }}>anomaly coverage</div>
-            <div style={{ /* counter row */ }}>
-              10 categories ·
-              <span style={{ color: 'var(--accent-teal)' }}>{monitored} monitored</span> ·
-              <span style={{ color: 'var(--accent-coral)' }}>{firing} firing</span> ·
-              <span style={{ color: 'var(--text-tertiary)' }}>{skipped.length} no data</span>
-              {settling && (                          ← only while still scanning
-                <span className="animate-pulse" style={{ color: 'var(--text-tertiary)' }}>
-                  {' '}· checking {checked}/10…
-                </span>                               ← the running progress thread
-              )}
-            </div>
-          </div>
-          <div /* legend row */>{/* coral/teal/amber dots + planned */}</div>
-        </div>
-        <div style={{ display: 'grid',
-                      gridTemplateColumns:
-                        'repeat(auto-fill, minmax(190px, 1fr))', gap: 12 }}>
-          {CATEGORIES.map((cat) => {                  ← ALWAYS renders all 10
-            const report = byCat.get(cat.id);            categories; per-tile
-            const Icon = ICONS[cat.id];                  state comes from byCat
-            const coverageState = report?.coverage ?? 'unavailable';
-            // …tile rendering: pending if !report, live if report present
-          })}
-        </div>
-      </div>
-    );
-  }
-       │
-       └─ the load-bearing property: CATEGORIES.map runs every render and produces
-          all 10 tiles. each tile picks its state from byCat.get(cat.id). missing
-          entries render as pending; present entries render as live. so each
-          coverage_item event flips one tile from pending to live — without
-          changing the grid's layout.
-```
-
-`app/page.tsx:560-568, 624-633, 743-808` (the composition site on the feed):
-
-```
-  // process stepper — monitoring runs here; the other two run on investigate
-  <ProcessStepper
-    monitoring={{
-      state: monitoringState(status),                  ← 'active'/'complete'/'error'
-      sub: monitoringSub(status, stepStatus,              from feed status flag
-                         queryCount, insights.length),  ← live sub from stream events
-    }}
-    diagnostic={{ state: 'pending', sub: 'opens when you investigate' }}
-    recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
-  />
-
-  …
-
-  // anomaly coverage grid — the category checklist, ABOVE the cards
-  <CoverageGrid coverage={coverage} insights={insights}
-                loading={status === 'loading' && !reconnecting} />
-
-  // loading
-  {status === 'loading' && !reconnecting && (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Skeleton height={96} />                         ← four 96px-tall card-shaped
-      <Skeleton height={96} />                            placeholders. when insights
-      <Skeleton height={96} />                            arrive, this block unmounts
-      <Skeleton height={96} />                            and the InsightCards mount
-    </div>                                                in roughly the same space
-  )}
-
-  …
-
-  // ── col 2 — live statuses / logs, so the user sees background work ──
-  <aside style={{ position: 'sticky', top: 16, /* … */ }}>
-    <div className="lowercase" style={{ /* sticky header */ }}>
-      how this briefing was gathered ·{' '}
-      {traceItems.length > 0
-        ? `${queryCount} ${queryCount === 1 ? 'query' : 'queries'}`
-        : '-- queries'}
-      {status === 'loading' && ' · scanning…'}        ← the suffix that signals
-    </div>                                                ongoing work
-    <div style={{ padding: '10px 16px 16px' }}>
-      {traceItems.length > 0 ? (
-        <ReasoningTrace items={traceItems} />          ← real trace once events arrive
-      ) : status === 'loading' ? (
-        <p>connecting to the agent…</p>                ← placeholder before event #1
-      ) : (
-        <p>-- the agent's query-by-query trace…</p>    ← idle/demo-without-trace
-      )}
-    </div>
-  </aside>
-       │
-       └─ this is the inline copy of StatusLog (audit red flag #5).
-          the shared component (components/shared/StatusLog.tsx) does the same
-          shape — used on both investigate pages. extracting this inline aside
-          to use the shared component is the natural fold-along when app/page.tsx
-          gets its hooks-extraction refactor.
-```
 
 ---
 

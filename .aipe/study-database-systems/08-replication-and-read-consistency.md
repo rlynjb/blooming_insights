@@ -155,55 +155,13 @@ We don't have a primary. We don't have replicas. We have N stateless serverless 
 
 This is closer to **stateless web architecture circa 2005 with cookies as the state vehicle** than it is to anything modern replicated. Which is correct for the scale, but you should know that's what you're shipping.
 
-### Move 3 — the principle
+The cross-request investigation lookup uses three fallbacks because the server can't be trusted to have the state:
 
-**Read consistency is a contract about WHEN, not IF.** Every multi-copy system gives up some "when" — the only choice is which guarantee you buy and at what cost. Strong consistency costs latency. Eventual costs UX surprises. Read-your-writes costs routing complexity. Whichever you pick, the application has to be designed knowing which guarantee it has. The mistake is assuming "the data will be there" without naming the contract — and that's exactly the kind of mistake this codebase would make under load, today, because no contract is named.
+1. `?insight=...` query param (client-sent blob)
+2. `getAnomaly(insightId)` / `getInsight(insightId)` from the in-memory Map (this-instance hit, otherwise miss)
+3. Demo fixture lookup
 
-## Primary diagram
-
-```
-  blooming insights — multi-instance divergence (the real shape)
-
-  ┌─ user A's browser ──────┐         ┌─ user B's browser ──────┐
-  │  sessionStorage holds   │         │  sessionStorage holds   │
-  │  {A1, A2, A3}           │         │  {B1, B2}                │
-  └────────────┬────────────┘         └────────────┬────────────┘
-               │                                    │
-               │  HTTP                              │  HTTP
-               ▼                                    ▼
-       ┌─ Vercel ─────────────────────────────────────────────────┐
-       │                                                            │
-       │  instance 1                  instance 2                    │
-       │  ┌──────────────┐            ┌──────────────┐              │
-       │  │ Map A1,A2,A3 │            │ Map B1,B2    │              │
-       │  └──────────────┘            └──────────────┘              │
-       │       ↑                            ↑                       │
-       │       │ no shared store, no replication, no failover       │
-       │       │                                                    │
-       └───────┴────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                       ┌─ Bloomreach ─┐
-                       │  the actual  │
-                       │  source of   │
-                       │  truth       │
-                       └──────────────┘
-
-  consistency model: "client carries its own state via cookies + query params."
-  contract: weak. no "read your writes" on the server side.
-  this works because users don't expect cross-instance state today.
-```
-
-## Implementation in codebase
-
-### Use cases
-
-- **Cross-request investigation lookup** uses three fallbacks because the server can't be trusted to have the state (`app/api/agent/route.ts` L37-47):
-  1. `?insight=...` query param (client-sent blob)
-  2. `getAnomaly(insightId)` / `getInsight(insightId)` from the in-memory Map (this-instance hit, otherwise miss)
-  3. Demo fixture lookup
-
-### Code side by side
+Side-by-side with the real code:
 
 ```
   app/api/agent/route.ts  (lines 37–62)
@@ -249,6 +207,45 @@ This is closer to **stateless web architecture circa 2005 with cookies as the st
        └─ each call to /api/briefing produces a "current briefing" that is
           local to one instance. there is no "the" current briefing across
           the deployment.
+```
+
+### Move 3 — the principle
+
+**Read consistency is a contract about WHEN, not IF.** Every multi-copy system gives up some "when" — the only choice is which guarantee you buy and at what cost. Strong consistency costs latency. Eventual costs UX surprises. Read-your-writes costs routing complexity. Whichever you pick, the application has to be designed knowing which guarantee it has. The mistake is assuming "the data will be there" without naming the contract — and that's exactly the kind of mistake this codebase would make under load, today, because no contract is named.
+
+## Primary diagram
+
+```
+  blooming insights — multi-instance divergence (the real shape)
+
+  ┌─ user A's browser ──────┐         ┌─ user B's browser ──────┐
+  │  sessionStorage holds   │         │  sessionStorage holds   │
+  │  {A1, A2, A3}           │         │  {B1, B2}                │
+  └────────────┬────────────┘         └────────────┬────────────┘
+               │                                    │
+               │  HTTP                              │  HTTP
+               ▼                                    ▼
+       ┌─ Vercel ─────────────────────────────────────────────────┐
+       │                                                            │
+       │  instance 1                  instance 2                    │
+       │  ┌──────────────┐            ┌──────────────┐              │
+       │  │ Map A1,A2,A3 │            │ Map B1,B2    │              │
+       │  └──────────────┘            └──────────────┘              │
+       │       ↑                            ↑                       │
+       │       │ no shared store, no replication, no failover       │
+       │       │                                                    │
+       └───────┴────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                       ┌─ Bloomreach ─┐
+                       │  the actual  │
+                       │  source of   │
+                       │  truth       │
+                       └──────────────┘
+
+  consistency model: "client carries its own state via cookies + query params."
+  contract: weak. no "read your writes" on the server side.
+  this works because users don't expect cross-instance state today.
 ```
 
 ## Elaborate

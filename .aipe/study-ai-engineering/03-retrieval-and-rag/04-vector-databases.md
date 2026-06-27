@@ -155,6 +155,14 @@ Nearest-neighbor is a `for` loop until the `for` loop is too slow, and the entir
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not by querying a vector store — there are no vectors and no nearest-neighbor index anywhere.
+
+The honest analog is that the codebase already runs the *storage tier* a small vector index would use. `McpClient`'s cache is an in-memory `Map<string, {result, expiresAt}>` (`lib/mcp/client.ts` L18); the schema is held in a module-level `let cached: WorkspaceSchema | null` (`lib/mcp/schema.ts` L130); past investigations persist to JSON (`lib/state/investigations.ts` reads `demo-investigations.json` and a dev cache file). That is precisely the "in-memory / JSON, <1k items, brute-force scan" tier where a vector database is unnecessary — you store in a `Map` or a JSON file and scan. A vector store would live in `lib/state/` (the file tier) graduating to a managed DB only at scale. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Vector databases — diagram
 
 This diagram spans the Service layer (the query) and the State layer (where vectors live across tiers). A reader who sees only this should grasp that storage and the nearest-neighbor method change with scale, and that blooming insights already lives in Tier 0.
@@ -185,14 +193,6 @@ This diagram spans the Service layer (the query) and the State layer (where vect
 ```
 
 The arrow down the State layer is the upgrade path; you climb it only when the tier above runs out, not by default.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not by querying a vector store — there are no vectors and no nearest-neighbor index anywhere.
-
-The honest analog is that the codebase already runs the *storage tier* a small vector index would use. `McpClient`'s cache is an in-memory `Map<string, {result, expiresAt}>` (`lib/mcp/client.ts` L18); the schema is held in a module-level `let cached: WorkspaceSchema | null` (`lib/mcp/schema.ts` L130); past investigations persist to JSON (`lib/state/investigations.ts` reads `demo-investigations.json` and a dev cache file). That is precisely the "in-memory / JSON, <1k items, brute-force scan" tier where a vector database is unnecessary — you store in a `Map` or a JSON file and scan. A vector store would live in `lib/state/` (the file tier) graduating to a managed DB only at scale. The `Project exercises` block below is the primary buildable target.
 
 ---
 

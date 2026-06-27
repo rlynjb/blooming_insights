@@ -217,6 +217,52 @@ Serverless functions do not share memory between invocations. The anomaly the mo
 
 **Move 3 — the principle.** When the backend cannot hold state between two requests (StrictMode double-invoke, serverless per-instance memory, page navigation), the client must own it. `sessionStorage` is the client's durable map; the started-guard is the client's idempotency key; the query param is the client's way of handing the backend exactly the state it forgot.
 
+### Code in this codebase
+
+The hook (`lib/hooks/useInvestigation.ts`) owns the started-guard, the four `sessionStorage` keys, and the reader loop; the two route pages call it; `InvestigationSubject` consumes the feed-side insight handoff.
+
+**File:** `lib/hooks/useInvestigation.ts`
+**Function / class:** `useInvestigation` — the whole hook
+**Line range:** L37–L216
+
+Key landmarks (grepped):
+
+- **Key builders** — `stashKey` (L18) builds `bi:inv:<step>:<id>`; `diagHandoffKey` (L19) builds `bi:diag:<id>`.
+- **Started-guard** — `startedRef` declared L43; the two-line guard at L47–L48 (`if (startedRef.current) return;` / `startedRef.current = true;`).
+- **No-cancel-on-cleanup rationale** — the comment block at L32–L36 states it explicitly: "we deliberately do NOT cancel the fetch on effect cleanup." The effect returns no cleanup function.
+- **Hydrate-from-stash** — L50–L63 reads `bi:inv:<step>:<id>`, restores all four state slots, `setComplete(true)`, and `return`s before any fetch.
+- **Closure mirrors** — `cItems`/`cDiag`/`cRecs` declared L65–L67; mutated alongside React state in every `handle` case (L97–L151).
+- **Recommend-step diagnosis load** — L69–L84 reads `bi:diag:<id>` into `handedDiagnosis` and `setDiagnosis`.
+- **Stash + handoff write on `done`** — L130–L144: stashes `bi:inv:<step>:<id>` (L133–L136) and, when `step === 'diagnose' && cDiag`, writes `bi:diag:<id>` (L138–L140).
+- **Live-mode URL build** — L153–L168: appends `&live=1` (L159), reads `bi:insight:<id>` into `&insight=` (L160–L161), and (recommend step) appends `&diagnosis=` (L162–L164).
+- **Reader loop** — L184–L208 (see `../02-dsa/03-ndjson-line-buffering.md` for the line-buffering mechanics).
+
+**File:** `app/investigate/[id]/page.tsx`
+**Function / class:** `InvestigatePage`
+**Line range:** L33–L38, L149
+
+Step 2's page calls `useInvestigation(id, 'diagnose')` (L38) — destructures `{ items, diagnosis, complete, error }`, omitting `recommendations` because step 2 does not run the recommendation agent. Renders `<InvestigationSubject id={id} />` (L149) for the subject card.
+
+**File:** `app/investigate/[id]/recommend/page.tsx`
+**Function / class:** `RecommendPage`
+**Line range:** L32–L36, L145
+
+Step 3 calls `useInvestigation(id, 'recommend')` (L36) — destructures all five slots including `recommendations`. The diagnosis it shows for context comes from the `bi:diag:<id>` handoff the hook reads internally. Also renders `<InvestigationSubject id={id} />` (L145).
+
+**File:** `components/investigation/InvestigationSubject.tsx`
+**Function / class:** `InvestigationSubject`
+**Line range:** L11–L24
+
+The consumer of the feed's insight handoff: reads `bi:insight:<id>` (L17), parses it into the subject card, and renders `null` (L24) if it is absent (e.g. a direct deep-link with no feed visit). The comment at L7–L10 documents that the feed writes this key in both demo and live.
+
+**Server side (where the handoff lands):** `app/api/agent/route.ts` reads `?insight=` (L114), `?step=` (L117–L118), and `?diagnosis=` (L119); `resolveAnomaly` (L37) prefers the client-provided `?insight=` over its own in-memory `getAnomaly`; the recommend branch (L225–L228) parses `?diagnosis=` via `parseDiagnosis`.
+
+**GitHub links:**
+- `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L37-L216
+- started-guard (L43–L48): https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L43-L48
+- handoff write (L130–L144): https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L130-L144
+- `components/investigation/InvestigationSubject.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/components/investigation/InvestigationSubject.tsx#L11-L24
+
 ---
 
 ## Client stream handoff — diagram
@@ -267,52 +313,6 @@ The full lifecycle of one investigation, from feed click to step 3, showing ever
 ```
 
 The diagram stands alone: four `sessionStorage` keys (`bi:insight:`, `bi:inv:diagnose:`, `bi:inv:recommend:`, `bi:diag:`) are the only things that survive a route change or a cross-instance hop. The network boundary is crossed twice; each crossing is handed the state the server cannot remember on its own.
-
----
-
-## Implementation in codebase
-
-**File:** `lib/hooks/useInvestigation.ts`
-**Function / class:** `useInvestigation` — the whole hook
-**Line range:** L37–L216
-
-Key landmarks (grepped):
-
-- **Key builders** — `stashKey` (L18) builds `bi:inv:<step>:<id>`; `diagHandoffKey` (L19) builds `bi:diag:<id>`.
-- **Started-guard** — `startedRef` declared L43; the two-line guard at L47–L48 (`if (startedRef.current) return;` / `startedRef.current = true;`).
-- **No-cancel-on-cleanup rationale** — the comment block at L32–L36 states it explicitly: "we deliberately do NOT cancel the fetch on effect cleanup." The effect returns no cleanup function.
-- **Hydrate-from-stash** — L50–L63 reads `bi:inv:<step>:<id>`, restores all four state slots, `setComplete(true)`, and `return`s before any fetch.
-- **Closure mirrors** — `cItems`/`cDiag`/`cRecs` declared L65–L67; mutated alongside React state in every `handle` case (L97–L151).
-- **Recommend-step diagnosis load** — L69–L84 reads `bi:diag:<id>` into `handedDiagnosis` and `setDiagnosis`.
-- **Stash + handoff write on `done`** — L130–L144: stashes `bi:inv:<step>:<id>` (L133–L136) and, when `step === 'diagnose' && cDiag`, writes `bi:diag:<id>` (L138–L140).
-- **Live-mode URL build** — L153–L168: appends `&live=1` (L159), reads `bi:insight:<id>` into `&insight=` (L160–L161), and (recommend step) appends `&diagnosis=` (L162–L164).
-- **Reader loop** — L184–L208 (see `../02-dsa/03-ndjson-line-buffering.md` for the line-buffering mechanics).
-
-**File:** `app/investigate/[id]/page.tsx`
-**Function / class:** `InvestigatePage`
-**Line range:** L33–L38, L149
-
-Step 2's page calls `useInvestigation(id, 'diagnose')` (L38) — destructures `{ items, diagnosis, complete, error }`, omitting `recommendations` because step 2 does not run the recommendation agent. Renders `<InvestigationSubject id={id} />` (L149) for the subject card.
-
-**File:** `app/investigate/[id]/recommend/page.tsx`
-**Function / class:** `RecommendPage`
-**Line range:** L32–L36, L145
-
-Step 3 calls `useInvestigation(id, 'recommend')` (L36) — destructures all five slots including `recommendations`. The diagnosis it shows for context comes from the `bi:diag:<id>` handoff the hook reads internally. Also renders `<InvestigationSubject id={id} />` (L145).
-
-**File:** `components/investigation/InvestigationSubject.tsx`
-**Function / class:** `InvestigationSubject`
-**Line range:** L11–L24
-
-The consumer of the feed's insight handoff: reads `bi:insight:<id>` (L17), parses it into the subject card, and renders `null` (L24) if it is absent (e.g. a direct deep-link with no feed visit). The comment at L7–L10 documents that the feed writes this key in both demo and live.
-
-**Server side (where the handoff lands):** `app/api/agent/route.ts` reads `?insight=` (L114), `?step=` (L117–L118), and `?diagnosis=` (L119); `resolveAnomaly` (L37) prefers the client-provided `?insight=` over its own in-memory `getAnomaly`; the recommend branch (L225–L228) parses `?diagnosis=` via `parseDiagnosis`.
-
-**GitHub links:**
-- `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L37-L216
-- started-guard (L43–L48): https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L43-L48
-- handoff write (L130–L144): https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts#L130-L144
-- `components/investigation/InvestigationSubject.tsx`: https://github.com/rlynjb/blooming_insights/blob/main/components/investigation/InvestigationSubject.tsx#L11-L24
 
 ---
 

@@ -191,6 +191,73 @@ Skeleton = captured fixture + value-specific assertion + degeneracy track. Drop 
 
 **The optional hardening that's NOT done here:** a CI job that re-fetches the fixture from the live MCP and diffs against the committed version. This is the contract-test layer — it would convert the silent "fixtures are stale" failure mode into a loud one. Today, if Bloomreach renames `events` to `event_definitions` tomorrow, every test still passes against the old captured payload and production breaks the first time a real call returns the new shape.
 
+### Code in this codebase
+
+**Use case A — the load helper + the canonical assertion.** All 24 tests use the same `loadFixture` helper. The lines that pin the parser against captured reality are the specific value assertions.
+
+```
+test/mcp/schema.test.ts  (lines 5–16 — the load setup)
+
+  function loadFixture(name: string): unknown {
+    const p = join(__dirname, '../fixtures', name);
+    return JSON.parse(readFileSync(p, 'utf-8'));     ← reads committed file
+  }
+
+  const eventSchemaFixture   = loadFixture('get_event_schema.json');
+  const customerPropsFixture = loadFixture('get_customer_property_schema.json');
+  const catalogsFixture      = loadFixture('list_catalogs.json');
+  const overviewFixture      = loadFixture('get_project_overview.json');
+       │
+       └─ 4 of the 8 fixtures feed parseWorkspaceSchema; the other 4 feed
+          monitoring + tool-coverage tests. Each fixture is committed JSON
+          captured from a real Bloomreach project on a known date.
+
+test/mcp/schema.test.ts  (lines 101–104 — the load-bearing assertion)
+
+  it('first event (campaign, 204917) is the most active', () => {
+    expect(schema.events[0].name).toBe('campaign');      ← real value, not invented
+    expect(schema.events[0].eventCount).toBe(204917);    ← pins sort order
+  });
+       │
+       └─ swap "campaign" for a different event tomorrow and the parser must
+          still get the most-frequent-first ordering right; this is a
+          regression guard against a sort bug introduced in a refactor.
+```
+
+**Use case B — the robustness block, covering inputs the fixtures don't.** The fixtures cover the happy shape (28 events, populated customer properties, full project overview). The robustness block constructs inline degenerate inputs the parser must also survive.
+
+```
+test/mcp/schema.test.ts  (lines 170–297 — the robustness block, abridged)
+
+  describe('robustness', () => {
+    it('handles an empty events array', () => {
+      const r = parseWorkspaceSchema({
+        eventSchema:   { structuredContent: { events: [] } },  ← inline degenerate
+        customerProps: customerPropsFixture,                    ← real for the others
+        catalogs:      catalogsFixture,
+        overview:      overviewFixture,
+      });
+      expect(r.events).toEqual([]);                  ← parser survives empty
+    });
+
+    it('falls back to text content when no structuredContent', () => {
+      const r = parseWorkspaceSchema({
+        eventSchema:   { content: [{ type: 'text', text: '{"events": [...]}' }] },
+        customerProps: customerPropsFixture,
+        catalogs:      catalogsFixture,
+        overview:      overviewFixture,
+      });
+      expect(r.events.length).toBeGreaterThan(0);    ← text-only path works
+    });
+       │
+       └─ these inputs DON'T come from a fixture — they're inline because no
+          captured payload happens to have an empty events array or a
+          missing structuredContent envelope. The two styles cohabit:
+          fixture-driven for the happy path, inline-constructed for the
+          degenerates.
+  });
+```
+
 ### Move 3 — the principle
 
 **Fixture-driven testing is the strongest cheap test for an external boundary.** A handful of captured responses costs a one-time call to capture and gives you regression coverage forever — *as long as the external shape doesn't drift*. The pattern's blind spot is exactly that: drift. The fix isn't "stop using fixtures"; it's "add a contract test that runs against the live boundary to detect drift." Use both. The fixture pins behaviour fast and cheap; the contract test catches the day reality moves.
@@ -261,73 +328,6 @@ Fixture-driven schema parser — full pattern
   │  parser if needed                                                │
   │  TODAY: not built; fixtures can silently go stale                │
   └──────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use case A — the load helper + the canonical assertion.** All 24 tests use the same `loadFixture` helper. The lines that pin the parser against captured reality are the specific value assertions.
-
-```
-test/mcp/schema.test.ts  (lines 5–16 — the load setup)
-
-  function loadFixture(name: string): unknown {
-    const p = join(__dirname, '../fixtures', name);
-    return JSON.parse(readFileSync(p, 'utf-8'));     ← reads committed file
-  }
-
-  const eventSchemaFixture   = loadFixture('get_event_schema.json');
-  const customerPropsFixture = loadFixture('get_customer_property_schema.json');
-  const catalogsFixture      = loadFixture('list_catalogs.json');
-  const overviewFixture      = loadFixture('get_project_overview.json');
-       │
-       └─ 4 of the 8 fixtures feed parseWorkspaceSchema; the other 4 feed
-          monitoring + tool-coverage tests. Each fixture is committed JSON
-          captured from a real Bloomreach project on a known date.
-
-test/mcp/schema.test.ts  (lines 101–104 — the load-bearing assertion)
-
-  it('first event (campaign, 204917) is the most active', () => {
-    expect(schema.events[0].name).toBe('campaign');      ← real value, not invented
-    expect(schema.events[0].eventCount).toBe(204917);    ← pins sort order
-  });
-       │
-       └─ swap "campaign" for a different event tomorrow and the parser must
-          still get the most-frequent-first ordering right; this is a
-          regression guard against a sort bug introduced in a refactor.
-```
-
-**Use case B — the robustness block, covering inputs the fixtures don't.** The fixtures cover the happy shape (28 events, populated customer properties, full project overview). The robustness block constructs inline degenerate inputs the parser must also survive.
-
-```
-test/mcp/schema.test.ts  (lines 170–297 — the robustness block, abridged)
-
-  describe('robustness', () => {
-    it('handles an empty events array', () => {
-      const r = parseWorkspaceSchema({
-        eventSchema:   { structuredContent: { events: [] } },  ← inline degenerate
-        customerProps: customerPropsFixture,                    ← real for the others
-        catalogs:      catalogsFixture,
-        overview:      overviewFixture,
-      });
-      expect(r.events).toEqual([]);                  ← parser survives empty
-    });
-
-    it('falls back to text content when no structuredContent', () => {
-      const r = parseWorkspaceSchema({
-        eventSchema:   { content: [{ type: 'text', text: '{"events": [...]}' }] },
-        customerProps: customerPropsFixture,
-        catalogs:      catalogsFixture,
-        overview:      overviewFixture,
-      });
-      expect(r.events.length).toBeGreaterThan(0);    ← text-only path works
-    });
-       │
-       └─ these inputs DON'T come from a fixture — they're inline because no
-          captured payload happens to have an empty events array or a
-          missing structuredContent envelope. The two styles cohabit:
-          fixture-driven for the happy path, inline-constructed for the
-          degenerates.
-  });
 ```
 
 ## Elaborate

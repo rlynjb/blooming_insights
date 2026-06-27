@@ -132,6 +132,8 @@ WITH:    enumerate 2–3 hypotheses → query to falsify each → conclude
          └─ breadth committed before any result can bias it ─┘
 ```
 
+**Code in this codebase — force hypotheses before action.** `lib/agents/prompts/diagnostic.md`, the Role + Investigation approach sections at L5 (Role: "generate 2–3 competing hypotheses"); L20 ("Generate 2–3 hypotheses before your first tool call"); L21–L24 ("design queries to falsify each"). Forces breadth before depth so the model enumerates competing explanations before any query result can anchor it.
+
 ---
 
 ### Capture the reasoning as a typed field — `hypothesesConsidered[]`
@@ -159,6 +161,8 @@ reasoning as field:   hypothesesConsidered[{ hypothesis, supported, reasoning }]
                       └─ queryable · assertable · renderable ─┘
 ```
 
+**Code in this codebase — capture reasoning as a typed field.** `lib/agents/prompts/diagnostic.md` + `lib/mcp/validate.ts`, the `## Output` `hypothesesConsidered` schema; `isDiagnosis` guard. `diagnostic.md` L69–L75 (`{ hypothesis, supported, reasoning }`), L90 (field rules); `isDiagnosis` requires `hypothesesConsidered` to be an array (`validate.ts`). Captures CoT as typed, validated data — the textbook "reasoning in a thinking field, not free prose" — so it is queryable, assertable, and renderable.
+
 ---
 
 ### The ReAct loop externalizes thought too
@@ -175,6 +179,8 @@ two reasoning artifacts in one diagnostic run
 ```
 
 The Thought stream is transient (great for watching the run, → 06); the `hypothesesConsidered` array is durable (it survives into the saved diagnosis). CoT's job is the durable one.
+
+**Code in this codebase — ReAct externalizes process reasoning.** `lib/agents/base.ts`, `runAgentLoop` text-block extraction → `onText` at L108–L113 (text blocks surfaced as the live Thought stream). The model's text between tool calls is its interleaved reasoning, streamed as `reasoning_step` events — a transient companion to the durable `hypothesesConsidered` array.
 
 ---
 
@@ -213,6 +219,10 @@ CoT fit by agent
 ```
 
 The codebase applies CoT exactly where the task is multi-hypothesis reasoning and withholds it everywhere the output is a measurement, a downstream summary, or a single token.
+
+**Code in this codebase — where CoT is deliberately absent.** `monitoring.md`, `recommendation.md`, `intent.ts` — the non-diagnostic outputs. Monitoring output (no reasoning field) `monitoring.md` L69–L97; recommendation `rationale` (one line, not a chain) `recommendation.md` L49–L74; classifier `max_tokens: 16` `intent.ts` L20. CoT withheld where the output is a measurement, a downstream summary, or a single token — adding it would be cost without payoff, and would break the classifier outright.
+
+**Why this is a codebase strength.** The diagnostic agent puts CoT exactly where multi-hypothesis reasoning is the task, and captures it as structure rather than prose — the modern shape. Equally important, the other three agents *omit* it deliberately: the team did not reflexively sprinkle "think step by step" everywhere. Knowing where CoT does not belong (a 16-token classifier) is as much the signal as knowing where it does.
 
 ---
 
@@ -257,44 +267,6 @@ This diagram spans the diagnostic flow. The Prompt layer forces hypotheses befor
 ```
 
 The reasoning is forced up front, externalized live by ReAct, and captured durably as typed fields — structure, not elicitation.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented (structured CoT in the diagnostic agent).**
-
-### Force hypotheses before action
-
-- **File:** `lib/agents/prompts/diagnostic.md`
-- **Function / class:** the Role + Investigation approach sections
-- **Line range:** L5 (Role: "generate 2–3 competing hypotheses"); L20 ("Generate 2–3 hypotheses before your first tool call"); L21–L24 ("design queries to falsify each")
-- **Role:** forces breadth before depth so the model enumerates competing explanations before any query result can anchor it.
-
-### Capture reasoning as a typed field
-
-- **File:** `lib/agents/prompts/diagnostic.md` + `lib/mcp/validate.ts`
-- **Function / class:** the `## Output` `hypothesesConsidered` schema; `isDiagnosis` guard
-- **Line range:** `diagnostic.md` L69–L75 (`{ hypothesis, supported, reasoning }`), L90 (field rules); `isDiagnosis` requires `hypothesesConsidered` to be an array (`validate.ts`)
-- **Role:** captures CoT as typed, validated data — the textbook "reasoning in a thinking field, not free prose" — so it is queryable, assertable, and renderable.
-
-### ReAct externalizes process reasoning
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop` text-block extraction → `onText`
-- **Line range:** L108–L113 (text blocks surfaced as the live Thought stream)
-- **Role:** the model's text between tool calls is its interleaved reasoning, streamed as `reasoning_step` events — a transient companion to the durable `hypothesesConsidered` array.
-
-### Where CoT is deliberately absent
-
-- **File:** `monitoring.md`, `recommendation.md`, `intent.ts`
-- **Function / class:** the non-diagnostic outputs
-- **Line range:** monitoring output (no reasoning field) `monitoring.md` L69–L97; recommendation `rationale` (one line, not a chain) `recommendation.md` L49–L74; classifier `max_tokens: 16` `intent.ts` L20
-- **Role:** CoT withheld where the output is a measurement, a downstream summary, or a single token — adding it would be cost without payoff, and would break the classifier outright.
-
-### Why this is a codebase strength
-
-The diagnostic agent puts CoT exactly where multi-hypothesis reasoning is the task, and captures it as structure rather than prose — the modern shape. Equally important, the other three agents *omit* it deliberately: the team did not reflexively sprinkle "think step by step" everywhere. Knowing where CoT does not belong (a 16-token classifier) is as much the signal as knowing where it does.
 
 ---
 

@@ -271,6 +271,88 @@ The cost: every new question the agent might ask requires a new tool. Adding "gi
 
 **Author the protocol server when your agent's reasoning shape differs from the underlying API shape.** A SQL database is a query API. An agent reasoning about anomalies is a task API. Authoring the MCP server in the middle lets you translate once, in code you own, rather than translating per-call in the model's tool-use reasoning. This is the same principle as a BFF (backend-for-frontend) layer in a UI architecture: a thin server that shapes upstream APIs to the consumer's exact needs.
 
+### Code in this codebase
+
+The authored MCP server is its own package (`mcp-server-olist/`); the parent spawns it via `OlistDataSource`. The dispatch + three tools + the SQLite DB live in the child package; the parent-side path resolution lives in `lib/data-source/olist-data-source.ts`.
+
+**File:** `mcp-server-olist/src/index.ts`
+**Function / class:** `main()` (L10–L23)
+**Line range:** L1–L25
+**Role:** Process entry — bootstraps the MCP server, logs ready to stderr, lets stdin keep the event loop alive. The whole file is 25 lines because there's nothing else to do — `startServer()` returns once the SDK's `connect()` resolves and the request handlers are registered.
+**GitHub:** `mcp-server-olist/src/index.ts`
+
+**File:** `mcp-server-olist/src/server.ts`
+**Function / class:** `TOOL_DEFINITIONS` (L32–L51); `callTool(db, name, args)` (L79–L108); `buildServer(db)` (L113–L133); `startServer()` (L137–L143); envelope helpers (L54–L74)
+**Line range:** L1–L143
+**Role:** The dispatch + envelope layer. `callTool` is the pure function the test suite imports directly. `buildServer` registers the two MCP request handlers (`ListToolsRequestSchema`, `CallToolRequestSchema`). `startServer` opens the DB, builds the server, connects stdio.
+**GitHub:** `mcp-server-olist/src/server.ts`
+
+```typescript
+// server.ts L79–L108 — the dispatch (verbatim)
+export function callTool(
+  db: Database.Database,
+  name: string,
+  args: unknown,
+): ReturnType<typeof successEnvelope> | ReturnType<typeof errorEnvelope> {
+  try {
+    switch (name) {
+      case 'get_metric_timeseries': {
+        const validated = getMetricTimeseries.validateInput(args);
+        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
+        return successEnvelope(getMetricTimeseries.execute(db, validated));
+      }
+      case 'get_segments': {
+        const validated = getSegments.validateInput(args);
+        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
+        return successEnvelope(getSegments.execute(db, validated));
+      }
+      case 'get_anomaly_context': {
+        const validated = getAnomalyContext.validateInput(args);
+        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
+        return successEnvelope(getAnomalyContext.execute(db, validated));
+      }
+      default:
+        return errorEnvelope(`unknown tool: ${name}`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return errorEnvelope(`tool error: ${msg}`);
+  }
+}
+```
+
+The `try/catch` around the switch is the load-bearing safety net — the SDK's request handler never sees an exception, only an envelope. Everything that goes wrong becomes `isError: true`.
+
+**File:** `mcp-server-olist/src/db.ts`
+**Function / class:** `openDb(path)` (L32–L43); `resolveDbPath()` (L18–L27); `truncateEpoch(epoch, granularity)` (L67–L77); `epochToIsoDate` / `isoDateToEpoch` (L47–L62)
+**Line range:** L1–L77
+**Role:** SQLite wrapper. Opens the DB read-only + WAL + foreign_keys ON. Stays a thin shim over better-sqlite3 — no connection pool, no async, no caching (better-sqlite3 caches prepared statements transparently).
+**GitHub:** `mcp-server-olist/src/db.ts`
+
+`resolveDbPath()` walks up from the source file location to find the package root — this lets the DB resolve correctly whether the server is invoked from `npm run start`, spawned as a subprocess from the parent, or imported in a vitest test.
+
+**File:** `mcp-server-olist/src/tools/get_metric_timeseries.ts` (~212 LOC)
+**Function / class:** `validateInput(raw): string | Input`; `execute(db, input): Output`
+**Role:** Tool 1 — the agent's primary "what changed?" query. Aggregates a metric over a time window, optional dimension grouping and filter. Prepared SQL via better-sqlite3.
+**GitHub:** `mcp-server-olist/src/tools/get_metric_timeseries.ts`
+
+**File:** `mcp-server-olist/src/tools/get_segments.ts` (~105 LOC)
+**Function / class:** same shape — `validateInput` + `execute`
+**Role:** Tool 2 — discovery. Lists distinct values of a dimension with order_count + revenue. The agent uses this to find what to filter on before drilling in with `get_metric_timeseries`.
+**GitHub:** `mcp-server-olist/src/tools/get_segments.ts`
+
+**File:** `mcp-server-olist/src/tools/get_anomaly_context.ts` (~284 LOC)
+**Function / class:** same shape — `validateInput` + `execute` (L1–L60 visible)
+**Role:** Tool 3 — evidence-gathering for the diagnostic agent. Given a flagged anomaly (segment + window) and a baseline window, returns `anomaly_summary`, `related_segments`, and up to 10 representative orders. The diagnostic agent reads this verbatim into `evidence[]`.
+**GitHub:** `mcp-server-olist/src/tools/get_anomaly_context.ts`
+
+**File:** `mcp-server-olist/data/olist.db` (3.6 MB, committed)
+**Tables:** `orders`, `order_items`, `customers`, `sellers`, `products`, `payments`, `seeded_anomalies`
+**Role:** The data. Seeded from the Olist Brazilian e-commerce dataset (real customer/order data from 2016–2018, 26-week window). The `seeded_anomalies` table contains 3 hand-crafted ground-truth anomalies the eval pipeline scores against. Committed because the eval depends on a stable seed across machines.
+
+**File:** `lib/data-source/olist-data-source.ts` L82–L91 (`defaultServerEntry()`)
+**Role:** The parent-side path resolution that locates `mcp-server-olist/dist/src/index.js` at runtime. Walks up from the file location until it finds the sibling package. This is the load-bearing detail that lets the subprocess spawn work both in dev (from `lib/data-source/`) and from any compiled output position.
+
 ---
 
 ## Authored MCP server — diagram
@@ -335,102 +417,6 @@ The cost: every new question the agent might ask requires a new tool. Adding "gi
 ```
 
 Parent owns the lifecycle; child owns the protocol + DB. The boundary is one OS pipe carrying JSON-RPC frames. Tear down the pipe and the child exits cleanly.
-
----
-
-## Implementation in codebase
-
-**File:** `mcp-server-olist/src/index.ts`
-**Function / class:** `main()` (L10–L23)
-**Line range:** L1–L25
-**Role:** Process entry — bootstraps the MCP server, logs ready to stderr, lets stdin keep the event loop alive. The whole file is 25 lines because there's nothing else to do — `startServer()` returns once the SDK's `connect()` resolves and the request handlers are registered.
-**GitHub:** `mcp-server-olist/src/index.ts`
-
----
-
-**File:** `mcp-server-olist/src/server.ts`
-**Function / class:** `TOOL_DEFINITIONS` (L32–L51); `callTool(db, name, args)` (L79–L108); `buildServer(db)` (L113–L133); `startServer()` (L137–L143); envelope helpers (L54–L74)
-**Line range:** L1–L143
-**Role:** The dispatch + envelope layer. `callTool` is the pure function the test suite imports directly. `buildServer` registers the two MCP request handlers (`ListToolsRequestSchema`, `CallToolRequestSchema`). `startServer` opens the DB, builds the server, connects stdio.
-**GitHub:** `mcp-server-olist/src/server.ts`
-
-```typescript
-// server.ts L79–L108 — the dispatch (verbatim)
-export function callTool(
-  db: Database.Database,
-  name: string,
-  args: unknown,
-): ReturnType<typeof successEnvelope> | ReturnType<typeof errorEnvelope> {
-  try {
-    switch (name) {
-      case 'get_metric_timeseries': {
-        const validated = getMetricTimeseries.validateInput(args);
-        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
-        return successEnvelope(getMetricTimeseries.execute(db, validated));
-      }
-      case 'get_segments': {
-        const validated = getSegments.validateInput(args);
-        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
-        return successEnvelope(getSegments.execute(db, validated));
-      }
-      case 'get_anomaly_context': {
-        const validated = getAnomalyContext.validateInput(args);
-        if (typeof validated === 'string') return errorEnvelope(`invalid input: ${validated}`);
-        return successEnvelope(getAnomalyContext.execute(db, validated));
-      }
-      default:
-        return errorEnvelope(`unknown tool: ${name}`);
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return errorEnvelope(`tool error: ${msg}`);
-  }
-}
-```
-
-The `try/catch` around the switch is the load-bearing safety net — the SDK's request handler never sees an exception, only an envelope. Everything that goes wrong becomes `isError: true`.
-
----
-
-**File:** `mcp-server-olist/src/db.ts`
-**Function / class:** `openDb(path)` (L32–L43); `resolveDbPath()` (L18–L27); `truncateEpoch(epoch, granularity)` (L67–L77); `epochToIsoDate` / `isoDateToEpoch` (L47–L62)
-**Line range:** L1–L77
-**Role:** SQLite wrapper. Opens the DB read-only + WAL + foreign_keys ON. Stays a thin shim over better-sqlite3 — no connection pool, no async, no caching (better-sqlite3 caches prepared statements transparently).
-**GitHub:** `mcp-server-olist/src/db.ts`
-
-`resolveDbPath()` walks up from the source file location to find the package root — this lets the DB resolve correctly whether the server is invoked from `npm run start`, spawned as a subprocess from the parent, or imported in a vitest test.
-
----
-
-**File:** `mcp-server-olist/src/tools/get_metric_timeseries.ts` (~212 LOC)
-**Function / class:** `validateInput(raw): string | Input`; `execute(db, input): Output`
-**Role:** Tool 1 — the agent's primary "what changed?" query. Aggregates a metric over a time window, optional dimension grouping and filter. Prepared SQL via better-sqlite3.
-**GitHub:** `mcp-server-olist/src/tools/get_metric_timeseries.ts`
-
----
-
-**File:** `mcp-server-olist/src/tools/get_segments.ts` (~105 LOC)
-**Function / class:** same shape — `validateInput` + `execute`
-**Role:** Tool 2 — discovery. Lists distinct values of a dimension with order_count + revenue. The agent uses this to find what to filter on before drilling in with `get_metric_timeseries`.
-**GitHub:** `mcp-server-olist/src/tools/get_segments.ts`
-
----
-
-**File:** `mcp-server-olist/src/tools/get_anomaly_context.ts` (~284 LOC)
-**Function / class:** same shape — `validateInput` + `execute` (L1–L60 visible)
-**Role:** Tool 3 — evidence-gathering for the diagnostic agent. Given a flagged anomaly (segment + window) and a baseline window, returns `anomaly_summary`, `related_segments`, and up to 10 representative orders. The diagnostic agent reads this verbatim into `evidence[]`.
-**GitHub:** `mcp-server-olist/src/tools/get_anomaly_context.ts`
-
----
-
-**File:** `mcp-server-olist/data/olist.db` (3.6 MB, committed)
-**Tables:** `orders`, `order_items`, `customers`, `sellers`, `products`, `payments`, `seeded_anomalies`
-**Role:** The data. Seeded from the Olist Brazilian e-commerce dataset (real customer/order data from 2016–2018, 26-week window). The `seeded_anomalies` table contains 3 hand-crafted ground-truth anomalies the eval pipeline scores against. Committed because the eval depends on a stable seed across machines.
-
----
-
-**File:** `lib/data-source/olist-data-source.ts` L82–L91 (`defaultServerEntry()`)
-**Role:** The parent-side path resolution that locates `mcp-server-olist/dist/src/index.js` at runtime. Walks up from the file location until it finds the sibling package. This is the load-bearing detail that lets the subprocess spawn work both in dev (from `lib/data-source/`) and from any compiled output position.
 
 ---
 

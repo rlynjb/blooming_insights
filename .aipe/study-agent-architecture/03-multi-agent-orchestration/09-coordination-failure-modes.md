@@ -133,6 +133,28 @@ Per-agent caps:
 - recommendation: 4 tool calls
 - query: 6 tool calls
 
+**Where this lives in the repo.** The mechanism is `runAgentLoop()` in `lib/agents/base.ts` L90–L101 — `budgetSpent` check (L90), `forceFinal` derivation (L91), tools stripped from request when forced (L101). The per-agent caps: `lib/agents/monitoring.ts` L101 (`maxToolCalls: 6`), `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), `lib/agents/recommendation.ts` L57 (`maxToolCalls: 4`), `lib/agents/query.ts` L41 (`maxToolCalls: 6`). The MCP rate-limit spacer (the secondary cascade bound) is `lib/mcp/connect.ts` L92 — `minIntervalMs: 1100` on the McpClient constructor options.
+
+```
+shape (the mechanism for tool-call cascade — most-load-bearing):
+
+  // lib/agents/base.ts L90–L101
+  const budgetSpent = maxToolCalls !== undefined
+    && toolCalls.length >= maxToolCalls;
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;
+  const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+    model: AGENT_MODEL,
+    max_tokens: maxTokens,
+    system: forceFinal && synthesisInstruction
+      ? `${system}\n\n${synthesisInstruction}` : system,
+    messages,
+  };
+  if (!forceFinal) params.tools = toolSchemas;
+  // ▲ when forceFinal is true, tools are NOT passed; model
+  //   literally cannot emit another tool_use; must produce text
+  const res = await anthropic.messages.create(params);
+```
+
 The practical consequence: the cascade is *structurally impossible past the cap*. Once the budget is spent, the loop strips tools from the API request — the model literally cannot emit another tool_use. It's forced to emit text. The cascade can't run longer than the cap allows.
 
 The condition under which this works: the cap is set conservatively. 6 turns is enough for the diagnostic agent's typical 3–5 query investigation; 4 is enough for the recommendation agent's typical 2–3 feature lookups. If a future agent's job genuinely needed 12 turns, the cap would need to be raised — at the cost of larger blast radius if the cascade fires.
@@ -160,6 +182,8 @@ Mixed-model + bounded budgets
 The practical consequence: the run cost is bounded above by `sum(per-stage-budget)`. There's no scenario where one agent eats the whole budget — the per-stage caps slice it. The Haiku classifier saves ~10x on the intent-routing call, where Sonnet-grade reasoning isn't needed.
 
 The condition under which this works: the per-stage budgets are calibrated to typical agent behavior. Quarterly review of actual per-run cost would catch drift; today the budgets are tight enough that drift is unlikely.
+
+**Where this lives in the repo.** The cheap-classifier choice is `lib/agents/intent.ts` `classifyIntent()` at L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`. The expensive-workers choice is `lib/agents/base.ts` `AGENT_MODEL` constant at L9 — `AGENT_MODEL = 'claude-sonnet-4-6'`.
 
 ### Layer 3 — Infinite handoff (structurally absent)
 
@@ -193,6 +217,8 @@ The practical consequence: the failure literally cannot fire. Future code review
 
 The condition under which this works: the prevention is permanent unless someone adds handoff tools. If a future PR added them, the prevention would have to be replaced with a `MAX_HOPS` counter — but that's a future decision, not a current debt.
 
+**Where this lives in the repo.** `lib/mcp/tools.ts` per-agent tool allow-lists — no `transfer_to_*` tools in any agent's subset; no agent has the capability to hand off.
+
 ### Layer 4 — Synthesis failure (structurally absent)
 
 The technical thing: in supervisor-worker with an LLM supervisor (cross-ref the supervisor-worker note), the supervisor reads multiple workers' outputs and *merges them into a final answer*. When workers contradict, an LLM supervisor tends to *average* the contradictions into a confident-sounding compromise — losing the signal that the disagreement existed.
@@ -222,6 +248,8 @@ The practical consequence: there is no path where two agents' outputs could be a
 
 The condition under which this works: the codebase avoids adopting an LLM supervisor and an LLM merge. The "when not to go multi-agent" note documents the architectural commitment.
 
+**Where this lives in the repo.** `app/api/agent/route.ts` `GET` stream `start()` body L237–L247 — the "synthesis" between diagnostic and recommendation is a function call passing the typed `Diagnosis`; no LLM merger runs.
+
 ### Layer 5 — Context bloat (structurally absent)
 
 The technical thing: when agents share a blackboard (cross-ref the shared-state-and-message-passing note), each agent's context window grows with every other agent's output. At 6+ agents, "lost in the middle" becomes the dominant failure mode — the model can't find the signal in the noise.
@@ -246,6 +274,8 @@ Why context bloat cannot happen here
 The practical consequence: each agent's context window stays small and focused. Adding a future agent (e.g. a hypothetical summarization agent) doesn't bloat the existing agents' windows — it gets its own scoped context.
 
 The condition under which this works: the message schema (Diagnosis) is expressive enough that the recommendation agent doesn't need more than what's passed. If the schema grew past ~15 fields, the message itself would start to feel like shared state, at which point the graph-orchestration note's graph-runtime curated-state model becomes the next step.
+
+**Where this lives in the repo.** The architectural choice of message passing is documented in `./08-shared-state-and-message-passing.md`; the `Diagnosis` schema (the message) is `lib/mcp/types.ts` L95–L104.
 
 ### Layer 6 — Token revocation mid-run (controlled mechanically)
 
@@ -274,6 +304,8 @@ The mechanism, pseudocode
 The practical consequence: the user gets one automatic reconnect attempt per failure. If the reconnect also fails (e.g. token genuinely revoked, admin policy), the system surfaces an error rather than looping. The session-storage flag is the bound.
 
 The condition under which this works: the failure is transient (a revoked token can be re-authorized via the OAuth flow). If the failure were truly terminal, the auto-reconnect would still try once and then surface the error — graceful degradation.
+
+**Where this lives in the repo.** `app/page.tsx` — the reconnect handler in the agent-stream error path: L394 (clear flag on success), L410 (read flag), L416 (set flag), L427 (clear on reconnect).
 
 ### Phase A vs Phase B — the failures the design retires vs the ones it accepts
 
@@ -358,86 +390,6 @@ The full failure-mode landscape
   Thesis: 3 failures structurally absent (zero on-call cost)
           3 failures mechanically controlled (specific code,
           bounded values, grep-able)
-```
-
----
-
-## Implementation in codebase
-
-**Case A — the failure-prevention story is concrete, with each failure anchored to specific code.**
-
-### Tool-call cascade — controlled by maxToolCalls + forced-final-turn
-
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L90–L101 — `budgetSpent` check (L90), `forceFinal` derivation (L91), tools stripped from request when forced (L101)
-
-**Per-agent caps:**
-- `lib/agents/monitoring.ts` L101 — `maxToolCalls: 6`
-- `lib/agents/diagnostic.ts` L62 — `maxToolCalls: 6`
-- `lib/agents/recommendation.ts` L57 — `maxToolCalls: 4`
-- `lib/agents/query.ts` L41 — `maxToolCalls: 6`
-
-### Cost blowup — controlled by mixed-model + per-stage budgets
-
-**Cheap classifier (Haiku for intent):**
-**File:** `lib/agents/intent.ts`
-**Function / class:** `classifyIntent()`
-**Line range:** L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`
-
-**Expensive workers (Sonnet for loops):**
-**File:** `lib/agents/base.ts`
-**Function / class:** `AGENT_MODEL` constant
-**Line range:** L9 — `AGENT_MODEL = 'claude-sonnet-4-6'`
-
-### Infinite handoff — structurally absent
-
-**File:** `lib/mcp/tools.ts`
-**Function / class:** per-agent tool allow-lists
-**Line range:** entire file — no `transfer_to_*` tools in any agent's subset; no agent has the capability to hand off
-
-### Synthesis failure — structurally absent
-
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body, pipeline section
-**Line range:** L237–L247 — the "synthesis" between diagnostic and recommendation is a function call passing the typed `Diagnosis`; no LLM merger runs
-
-### Context bloat — structurally absent
-
-**File:** cross-ref `./08-shared-state-and-message-passing.md`
-**Function / class:** the architectural choice of message passing
-**Line range:** see Layer 5 above and `lib/mcp/types.ts` L95–L104 for the `Diagnosis` schema (the message)
-
-### Token revocation mid-run — controlled by one-time guarded auto-reconnect
-
-**File:** `app/page.tsx`
-**Function / class:** the reconnect handler in the agent-stream error path
-**Line range:** L394 (clear flag on success), L410 (read flag), L416 (set flag), L427 (clear on reconnect)
-
-### MCP rate limit (the secondary cascade bound)
-
-**File:** `lib/mcp/connect.ts`
-**Function / class:** McpClient constructor options
-**Line range:** L92 — `minIntervalMs: 1100` (the per-call spacer that also bounds upstream pressure during a tool-call cascade)
-
-```
-shape (the mechanism for tool-call cascade — most-load-bearing):
-
-  // lib/agents/base.ts L90–L101
-  const budgetSpent = maxToolCalls !== undefined
-    && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;
-  const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-    model: AGENT_MODEL,
-    max_tokens: maxTokens,
-    system: forceFinal && synthesisInstruction
-      ? `${system}\n\n${synthesisInstruction}` : system,
-    messages,
-  };
-  if (!forceFinal) params.tools = toolSchemas;
-  // ▲ when forceFinal is true, tools are NOT passed; model
-  //   literally cannot emit another tool_use; must produce text
-  const res = await anthropic.messages.create(params);
 ```
 
 ---

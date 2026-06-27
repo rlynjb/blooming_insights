@@ -187,6 +187,60 @@ Risk 1 — failure timeline
 
 ---
 
+### Code in this codebase
+
+The verification commands to confirm each gap yourself, with expected output:
+
+```
+Risk verification — grep commands and expected output
+
+# Risk 1 — no AbortController / signal on outbound fetch
+$ grep -rn "AbortController\|AbortSignal\|signal:" lib/ app/
+   → returns only the StrictMode-cleanup comment in
+     lib/hooks/useInvestigation.ts:34. No app-side signal usage.
+
+# Risk 6 — McpClient instantiated per request
+$ grep -n "new McpClient" lib/ app/
+   → lib/mcp/connect.ts:91 (one site, inside connectMcpInner)
+
+# Risk 4 — rate-limit text matching
+$ grep -n "rate limit\|retry.*after" lib/mcp/client.ts
+   → lib/mcp/client.ts:21 (the regex)
+     lib/mcp/client.ts:33-37 (the parser)
+
+# Risk 8 — single AUTH_SECRET, no list support
+$ grep -n "AUTH_SECRET" lib/mcp/
+   → lib/mcp/auth.ts:53 (env read), 55-59 (error if missing)
+     no comma-split, no fallback key
+
+# Risk 10 — no-transform set in two places, no test
+$ grep -rn "no-transform" lib/ app/ test/
+   → app/api/agent/route.ts:109 + app/api/briefing/route.ts:147 +
+     app/api/briefing/route.ts:262. No test verifying the directive
+     is honored end-to-end.
+```
+
+And the file × risk move-map — which file owns the fix for which risk:
+
+```
+Move map — file × risk
+
+  file                                 risks it owns
+  ────                                  ─────────────
+  lib/mcp/transport.ts                  #1 (add AbortSignal to fetch)
+  lib/mcp/client.ts                     #2 (route-level budget tracking)
+                                        #4 (structured-error path)
+                                        #6 (instance-keyed cache)
+                                        #7 (session-keyed lastCallAt)
+  lib/mcp/auth.ts                       #3 (KV fallback for OAuth state)
+                                        #8 (multi-key AUTH_SECRET list)
+  lib/hooks/useInvestigation.ts         #5 (StrictMode-safe cancellation)
+  lib/mcp/connect.ts                    #9 (cold-start pre-warming)
+  test/network-streaming.spec.ts (new)  #10 (TTFB/TTSB smoke test)
+```
+
+---
+
 ## Primary diagram
 
 ```
@@ -220,60 +274,6 @@ Risk map — full recap, ranked
 │  #9  no DNS resilience (pre-warming or fallback)                    │
 │  #10 no-transform unverified empirically                            │
 └────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### What to grep when you want to verify these gaps yourself
-
-```
-Risk verification — grep commands and expected output
-
-# Risk 1 — no AbortController / signal on outbound fetch
-$ grep -rn "AbortController\|AbortSignal\|signal:" lib/ app/
-   → returns only the StrictMode-cleanup comment in
-     lib/hooks/useInvestigation.ts:34. No app-side signal usage.
-
-# Risk 6 — McpClient instantiated per request
-$ grep -n "new McpClient" lib/ app/
-   → lib/mcp/connect.ts:91 (one site, inside connectMcpInner)
-
-# Risk 4 — rate-limit text matching
-$ grep -n "rate limit\|retry.*after" lib/mcp/client.ts
-   → lib/mcp/client.ts:21 (the regex)
-     lib/mcp/client.ts:33-37 (the parser)
-
-# Risk 8 — single AUTH_SECRET, no list support
-$ grep -n "AUTH_SECRET" lib/mcp/
-   → lib/mcp/auth.ts:53 (env read), 55-59 (error if missing)
-     no comma-split, no fallback key
-
-# Risk 10 — no-transform set in two places, no test
-$ grep -rn "no-transform" lib/ app/ test/
-   → app/api/agent/route.ts:109 + app/api/briefing/route.ts:147 +
-     app/api/briefing/route.ts:262. No test verifying the directive
-     is honored end-to-end.
-```
-
-### Where each fix would land
-
-```
-Move map — file × risk
-
-  file                                 risks it owns
-  ────                                  ─────────────
-  lib/mcp/transport.ts                  #1 (add AbortSignal to fetch)
-  lib/mcp/client.ts                     #2 (route-level budget tracking)
-                                        #4 (structured-error path)
-                                        #6 (instance-keyed cache)
-                                        #7 (session-keyed lastCallAt)
-  lib/mcp/auth.ts                       #3 (KV fallback for OAuth state)
-                                        #8 (multi-key AUTH_SECRET list)
-  lib/hooks/useInvestigation.ts         #5 (StrictMode-safe cancellation)
-  lib/mcp/connect.ts                    #9 (cold-start pre-warming)
-  test/network-streaming.spec.ts (new)  #10 (TTFB/TTSB smoke test)
 ```
 
 ---

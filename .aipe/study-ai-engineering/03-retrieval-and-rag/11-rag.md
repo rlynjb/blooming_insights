@@ -166,6 +166,14 @@ RAG is retrieve-then-generate, and "retrieve" is an interface with two implement
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (embedding-RAG); implemented as live-tool retrieval.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — a deliberate "no RAG until a feature provably needs it" decision.
+
+The retrieval-augmented generation *shape* is fully present, with a live tool as the retriever. The agent loop (`lib/agents/base.ts`, the tool-calling round-trip in `../04-agents-and-tool-use/02-tool-calling.md`) lets the model decide what to retrieve; the loop runs `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11 monitoring, L16 diagnostic) against the live Bloomreach source; the result is fed back as grounding context and the model generates a diagnosis or recommendation conditioned on it. The 60-second TTL cache (`lib/mcp/client.ts`) bounds how fresh the retrieved data is. What is absent is the *embedding-index retriever* — no chunking, no embeddings, no vector store, no cosine — because the data is a fresh, exact, queryable API where an index would be stale and lossy. The embedding-RAG path would live in `lib/mcp/` + `lib/state/` and is warranted only for the semantic-search-over-past-investigations feature. The `Project exercises` block below is the primary buildable target for that one threshold-crossing feature.
+
+---
+
 ## RAG — diagram
 
 This diagram spans the Service layer (the two retriever choices) and shows blooming insights' path. A reader who sees only this should grasp that RAG is retrieve-then-generate, that the retriever is swappable, and that the codebase chose the live-tool retriever.
@@ -196,14 +204,6 @@ This diagram spans the Service layer (the two retriever choices) and shows bloom
 ```
 
 Both columns are RAG; the codebase chose the live-tool retriever because its data demands fresh, exact retrieval.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (embedding-RAG); implemented as live-tool retrieval.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings or a vector store — a deliberate "no RAG until a feature provably needs it" decision.
-
-The retrieval-augmented generation *shape* is fully present, with a live tool as the retriever. The agent loop (`lib/agents/base.ts`, the tool-calling round-trip in `../04-agents-and-tool-use/02-tool-calling.md`) lets the model decide what to retrieve; the loop runs `execute_analytics_eql` / `execute_analytics` (`lib/mcp/tools.ts` L11 monitoring, L16 diagnostic) against the live Bloomreach source; the result is fed back as grounding context and the model generates a diagnosis or recommendation conditioned on it. The 60-second TTL cache (`lib/mcp/client.ts`) bounds how fresh the retrieved data is. What is absent is the *embedding-index retriever* — no chunking, no embeddings, no vector store, no cosine — because the data is a fresh, exact, queryable API where an index would be stale and lossy. The embedding-RAG path would live in `lib/mcp/` + `lib/state/` and is warranted only for the semantic-search-over-past-investigations feature. The `Project exercises` block below is the primary buildable target for that one threshold-crossing feature.
 
 ---
 

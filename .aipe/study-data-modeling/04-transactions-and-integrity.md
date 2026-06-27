@@ -309,6 +309,158 @@ This is **defense-in-depth** for one specific seam: the browser can send anythin
 
 Integrity lives at boundaries. The compiler covers the in-language boundaries; runtime guards cover the language boundaries (JSON-from-LLM, JSON-from-URL); transactions cover the store boundaries. This repo's strong half is the LLM-seam guards — correctly placed, fail-closed, permissive on optionals. Its weak half is the missing store-level integrity: no atomicity, no FK, no cross-Map invariant enforcement. That weakness is **inherited from the storage choice** (in-memory `Map`), not from the code. The moment the store grows up — Postgres, SQLite, even a disk-backed kv — the FK constraint plus the transaction will retire the weakness for free.
 
+### Code in this codebase
+
+The repo anchors for each integrity layer Move 2 walked — the LLM-seam guards, the fail-closed pattern, the session-scoped store write, the Olist FK + WAL story, and the wire-format check.
+
+#### The three runtime guards
+
+```
+lib/mcp/validate.ts  (lines 1–57)
+
+  export function parseAgentJson(text: string): unknown {
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = (fence ? fence[1] : text).trim();
+    try { return JSON.parse(candidate); }
+    catch { /* fall through to substring scan */ }
+    const start = candidate.search(/[[{]/);
+    const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+    if (start >= 0 && end > start) {
+      return JSON.parse(candidate.slice(start, end + 1));
+    }
+    throw new Error('no parseable json in agent output');
+  }
+       │
+       └─ three-fallback parser. the fenced-block case is the
+          common path; the substring scan is the "agent wrote prose
+          around the JSON" recovery.
+
+  const SEVERITIES: Severity[] = ['critical', 'warning', 'info', 'positive'];
+
+  export function isAnomalyArray(v: unknown): v is Anomaly[] {
+    return Array.isArray(v) && v.every((a) =>
+      !!a && typeof a === 'object' &&
+      typeof (a as any).metric === 'string' &&
+      Array.isArray((a as any).scope) &&
+      !!(a as any).change && typeof (a as any).change.value === 'number' &&
+      ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+      typeof (a as any).change.baseline === 'string' &&
+      SEVERITIES.includes((a as any).severity)
+    );
+  }
+       │
+       └─ the workhorse. note the `v is Anomaly[]` type predicate —
+          this is how TypeScript narrows the type for callers after a
+          true return. cast through `as any` for the field accesses
+          (the input is `unknown`); the predicate then rebinds the
+          narrowed type at the call site.
+```
+
+#### The fail-closed pattern at the agent layer
+
+```
+lib/agents/monitoring.ts  (lines 112–119)
+
+  let parsed: unknown;
+  try {
+    parsed = parseAgentJson(finalText);
+  } catch {
+    return [];                       ← fail-closed: empty briefing
+  }
+  if (!isAnomalyArray(parsed)) return [];   ← fail-closed: empty briefing
+  return [...parsed]
+    .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
+    .slice(0, 10);
+       │
+       └─ the two return-[] paths are the integrity gate. invalid JSON
+          OR wrong shape → empty array. the briefing renders "no
+          anomalies found" rather than crashing on a malformed field
+          access in the UI.
+```
+
+#### The session-scoped store write (UPDATED 2026-06-16)
+
+```
+lib/state/insights.ts  (lines 57–71)
+
+  export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+    // Replace the previous briefing for THIS session — each run IS the current
+    // feed, not an addition. Without clearing, a warm serverless instance (or a
+    // long-running dev server) accumulates stale insights from earlier runs, so
+    // the feed shows yesterday's anomalies alongside today's. Investigations are
+    // keyed separately and untouched here. Only this session's sub-maps are
+    // cleared — never the outer map, never another session's feed.
+    const s = sessionState(sessionId);          ← per-session sub-feed
+    s.insights.clear();                          ← clears ONLY this session
+    s.anomalies.clear();                         ← clears ONLY this session
+    items.forEach((i, idx) => {
+      s.insights.set(i.id, i);
+      if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+    });
+  }
+       │
+       └─ cross-session safe: the outer Map is never cleared. test/state/
+          insights.test.ts has the explicit cross-session-isolation test.
+          intra-session: still single-threaded + no I/O, still safe by the
+          runtime model. for a real durable store the fix would be:
+            session_id INDEX + DELETE WHERE session_id=? + INSERT
+            wrapped in BEGIN/COMMIT (Postgres) or db.transaction (sqlite).
+```
+
+#### The Olist FK + WAL story
+
+```
+mcp-server-olist/src/db.ts  (lines 38–43)
+
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  db.pragma('journal_mode = WAL');     ← concurrent readers don't block
+  db.pragma('foreign_keys = ON');      ← FKs enforced at runtime
+       │
+       └─ readers run against the DB the seeder produced. WAL means a future
+          writer could append without blocking these reads. foreign_keys=ON
+          is critical — SQLite's default is OFF, so a fresh DB with FK
+          DDL but no pragma will silently accept orphans.
+
+
+mcp-server-olist/scripts/seed-olist.ts  (the schema, lines 184–245)
+
+  CREATE TABLE order_items (
+    order_id    TEXT NOT NULL REFERENCES orders(id),    ← FK + NOT NULL
+    product_id  TEXT NOT NULL REFERENCES products(id),  ← FK + NOT NULL
+    price_brl   INTEGER NOT NULL,                        ← cents, NOT NULL
+    freight_brl INTEGER NOT NULL
+  );
+       │
+       └─ every join column is FK-constrained AND NOT NULL. orphan inserts
+          fail. NULL price/freight inserts fail. the schema enforces the
+          domain rule that every order_items row references a real order
+          and a real product, with real cents.
+```
+
+#### The wire-format inline check
+
+```
+app/api/agent/route.ts  (lines 37–47)
+
+  if (insightParam) {
+    try {
+      const i = JSON.parse(insightParam) as Insight;
+      if (i && typeof i.metric === 'string'
+            && i.change
+            && Array.isArray(i.scope)
+            && i.severity) {
+        return insightToAnomaly(i);
+      }
+    } catch {
+      /* malformed param — fall through to the server-side lookup */
+    }
+  }
+       │
+       └─ narrow 4-field check. fail-soft: any malformed input falls
+          through to the in-memory lookup, then the demo seed. the
+          route returns 404 only if all three sources are empty.
+```
+
 ---
 
 ## Primary diagram
@@ -352,158 +504,6 @@ The integrity layers, recap.
   │   ★ WEAK: holds today only because the runtime is           │
   │     single-threaded and the loop has no I/O                 │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### The three runtime guards
-
-```
-lib/mcp/validate.ts  (lines 1–57)
-
-  export function parseAgentJson(text: string): unknown {
-    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    const candidate = (fence ? fence[1] : text).trim();
-    try { return JSON.parse(candidate); }
-    catch { /* fall through to substring scan */ }
-    const start = candidate.search(/[[{]/);
-    const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-    if (start >= 0 && end > start) {
-      return JSON.parse(candidate.slice(start, end + 1));
-    }
-    throw new Error('no parseable json in agent output');
-  }
-       │
-       └─ three-fallback parser. the fenced-block case is the
-          common path; the substring scan is the "agent wrote prose
-          around the JSON" recovery.
-
-  const SEVERITIES: Severity[] = ['critical', 'warning', 'info', 'positive'];
-
-  export function isAnomalyArray(v: unknown): v is Anomaly[] {
-    return Array.isArray(v) && v.every((a) =>
-      !!a && typeof a === 'object' &&
-      typeof (a as any).metric === 'string' &&
-      Array.isArray((a as any).scope) &&
-      !!(a as any).change && typeof (a as any).change.value === 'number' &&
-      ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
-      typeof (a as any).change.baseline === 'string' &&
-      SEVERITIES.includes((a as any).severity)
-    );
-  }
-       │
-       └─ the workhorse. note the `v is Anomaly[]` type predicate —
-          this is how TypeScript narrows the type for callers after a
-          true return. cast through `as any` for the field accesses
-          (the input is `unknown`); the predicate then rebinds the
-          narrowed type at the call site.
-```
-
-### The fail-closed pattern at the agent layer
-
-```
-lib/agents/monitoring.ts  (lines 112–119)
-
-  let parsed: unknown;
-  try {
-    parsed = parseAgentJson(finalText);
-  } catch {
-    return [];                       ← fail-closed: empty briefing
-  }
-  if (!isAnomalyArray(parsed)) return [];   ← fail-closed: empty briefing
-  return [...parsed]
-    .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
-    .slice(0, 10);
-       │
-       └─ the two return-[] paths are the integrity gate. invalid JSON
-          OR wrong shape → empty array. the briefing renders "no
-          anomalies found" rather than crashing on a malformed field
-          access in the UI.
-```
-
-### The session-scoped store write (UPDATED 2026-06-16)
-
-```
-lib/state/insights.ts  (lines 57–71)
-
-  export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-    // Replace the previous briefing for THIS session — each run IS the current
-    // feed, not an addition. Without clearing, a warm serverless instance (or a
-    // long-running dev server) accumulates stale insights from earlier runs, so
-    // the feed shows yesterday's anomalies alongside today's. Investigations are
-    // keyed separately and untouched here. Only this session's sub-maps are
-    // cleared — never the outer map, never another session's feed.
-    const s = sessionState(sessionId);          ← per-session sub-feed
-    s.insights.clear();                          ← clears ONLY this session
-    s.anomalies.clear();                         ← clears ONLY this session
-    items.forEach((i, idx) => {
-      s.insights.set(i.id, i);
-      if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ cross-session safe: the outer Map is never cleared. test/state/
-          insights.test.ts has the explicit cross-session-isolation test.
-          intra-session: still single-threaded + no I/O, still safe by the
-          runtime model. for a real durable store the fix would be:
-            session_id INDEX + DELETE WHERE session_id=? + INSERT
-            wrapped in BEGIN/COMMIT (Postgres) or db.transaction (sqlite).
-```
-
-### The Olist FK + WAL story
-
-```
-mcp-server-olist/src/db.ts  (lines 38–43)
-
-  const db = new Database(path, { readonly: true, fileMustExist: true });
-  db.pragma('journal_mode = WAL');     ← concurrent readers don't block
-  db.pragma('foreign_keys = ON');      ← FKs enforced at runtime
-       │
-       └─ readers run against the DB the seeder produced. WAL means a future
-          writer could append without blocking these reads. foreign_keys=ON
-          is critical — SQLite's default is OFF, so a fresh DB with FK
-          DDL but no pragma will silently accept orphans.
-
-
-mcp-server-olist/scripts/seed-olist.ts  (the schema, lines 184–245)
-
-  CREATE TABLE order_items (
-    order_id    TEXT NOT NULL REFERENCES orders(id),    ← FK + NOT NULL
-    product_id  TEXT NOT NULL REFERENCES products(id),  ← FK + NOT NULL
-    price_brl   INTEGER NOT NULL,                        ← cents, NOT NULL
-    freight_brl INTEGER NOT NULL
-  );
-       │
-       └─ every join column is FK-constrained AND NOT NULL. orphan inserts
-          fail. NULL price/freight inserts fail. the schema enforces the
-          domain rule that every order_items row references a real order
-          and a real product, with real cents.
-```
-
-### The wire-format inline check
-
-```
-app/api/agent/route.ts  (lines 37–47)
-
-  if (insightParam) {
-    try {
-      const i = JSON.parse(insightParam) as Insight;
-      if (i && typeof i.metric === 'string'
-            && i.change
-            && Array.isArray(i.scope)
-            && i.severity) {
-        return insightToAnomaly(i);
-      }
-    } catch {
-      /* malformed param — fall through to the server-side lookup */
-    }
-  }
-       │
-       └─ narrow 4-field check. fail-soft: any malformed input falls
-          through to the in-memory lookup, then the demo seed. the
-          route returns 404 only if all three sources are empty.
 ```
 
 ---

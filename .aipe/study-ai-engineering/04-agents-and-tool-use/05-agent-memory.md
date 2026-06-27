@@ -205,6 +205,57 @@ Today, long-term memory serves one job: make a repeat visit to a known investiga
 
 ---
 
+### Code in this codebase
+
+**Case A (partial).** Short-term and exact-key long-term memory are implemented; semantic/vector memory is not.
+
+#### Short-term memory (per-run conversation)
+
+- **File:** `lib/agents/base.ts`
+- **Function / class:** `runAgentLoop` — the `messages` array
+- **Line range:** initialized L79–L81; assistant turn appended L105; tool results appended L171; discarded at return L123 / L175
+- **Role:** The working memory the model reasons over within one run; local to the function, garbage-collected on return, never shared across agents or runs.
+
+#### Long-term memory (exact-keyed snapshot replay)
+
+- **File:** `lib/state/investigations.ts`
+- **Function / class:** `getCachedInvestigation` (read) + `saveInvestigation` (write)
+- **Line range:** read L22–L28 (three-tier: `mem` → `CACHE_FILE` → `DEMO_FILE`); write L30–L41 (`mem` always, file only when `PERSIST`, L7/L32)
+- **Role:** Persists and replays the streamed event list keyed by exact `insightId`; the durable layer across runs.
+
+#### Where long-term memory is read and written
+
+- **File:** `app/api/agent/route.ts`
+- **Function / class:** `GET` — replay branch + save call
+- **Line range:** replay L127–L141 (`filterByStep(cached, step)` L129; `REPLAY_DELAY_MS = 180` at L105/L135); save L254 (gated on `step == null`)
+- **Role:** Reads the cache on entry (instant per-step replay on hit) and writes the collected events on completion of the combined capture run.
+
+#### What is NOT implemented
+
+- **Not yet implemented.** blooming insights stores investigations by exact `insightId` and retrieves them with a hash lookup; it has no embeddings, vector store, or similarity search, so it cannot recall "investigations like this one." Semantic memory would live in a new `lib/state/investigation-memory.ts` (embed anomaly+diagnosis, store vectors, retrieve top-k) alongside `lib/state/investigations.ts`, and feed the diagnostic agent's prompt — the RAG-inside-an-agent pattern (see ../03-retrieval-and-rag/).
+
+**Pseudocode — both memory layers** (`base.ts` + `investigations.ts`):
+
+```typescript
+// SHORT-TERM (base.ts): grows within one run, then gone
+const messages = [{ role: 'user', content: userPrompt }];   // L79
+for (let turn = 0; turn < maxTurns; turn++) {
+  const res = await create({ messages, ... });              // L102 — sees all
+  messages.push({ role: 'assistant', content: res.content });  // L105
+  messages.push({ role: 'user', content: toolResults });   // L171
+}                                                            // messages GC'd on return
+
+// LONG-TERM (investigations.ts): exact key, three-tier fallback
+function getCachedInvestigation(insightId) {                // L22
+  if (mem.has(insightId)) return mem.get(insightId);        // L23 process Map
+  const f = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;  // L24 dev file
+  if (f) return f;
+  return readJson(DEMO_FILE)[insightId] ?? null;            // L26-27 seed or null
+}
+```
+
+---
+
 ## Agent memory — diagram
 
 The diagram spans three layers. The Agent layer holds short-term memory (the per-run `messages` array). The State layer holds long-term memory (the three-tier keyed store). The Route layer is where they meet — it reads long-term on entry and writes it on completion, and it never sees short-term memory (which lives and dies inside the agent).
@@ -235,57 +286,6 @@ The diagram spans three layers. The Agent layer holds short-term memory (the per
 ```
 
 A reader who sees only this diagram should grasp: short-term memory lives inside the agent and dies with the run; long-term memory is an exact-keyed snapshot store in the State layer; there is no semantic layer.
-
----
-
-## Implementation in codebase
-
-**Case A (partial).** Short-term and exact-key long-term memory are implemented; semantic/vector memory is not.
-
-### Short-term memory (per-run conversation)
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `runAgentLoop` — the `messages` array
-- **Line range:** initialized L79–L81; assistant turn appended L105; tool results appended L171; discarded at return L123 / L175
-- **Role:** The working memory the model reasons over within one run; local to the function, garbage-collected on return, never shared across agents or runs.
-
-### Long-term memory (exact-keyed snapshot replay)
-
-- **File:** `lib/state/investigations.ts`
-- **Function / class:** `getCachedInvestigation` (read) + `saveInvestigation` (write)
-- **Line range:** read L22–L28 (three-tier: `mem` → `CACHE_FILE` → `DEMO_FILE`); write L30–L41 (`mem` always, file only when `PERSIST`, L7/L32)
-- **Role:** Persists and replays the streamed event list keyed by exact `insightId`; the durable layer across runs.
-
-### Where long-term memory is read and written
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `GET` — replay branch + save call
-- **Line range:** replay L127–L141 (`filterByStep(cached, step)` L129; `REPLAY_DELAY_MS = 180` at L105/L135); save L254 (gated on `step == null`)
-- **Role:** Reads the cache on entry (instant per-step replay on hit) and writes the collected events on completion of the combined capture run.
-
-### What is NOT implemented
-
-- **Not yet implemented.** blooming insights stores investigations by exact `insightId` and retrieves them with a hash lookup; it has no embeddings, vector store, or similarity search, so it cannot recall "investigations like this one." Semantic memory would live in a new `lib/state/investigation-memory.ts` (embed anomaly+diagnosis, store vectors, retrieve top-k) alongside `lib/state/investigations.ts`, and feed the diagnostic agent's prompt — the RAG-inside-an-agent pattern (see ../03-retrieval-and-rag/).
-
-**Pseudocode — both memory layers** (`base.ts` + `investigations.ts`):
-
-```typescript
-// SHORT-TERM (base.ts): grows within one run, then gone
-const messages = [{ role: 'user', content: userPrompt }];   // L79
-for (let turn = 0; turn < maxTurns; turn++) {
-  const res = await create({ messages, ... });              // L102 — sees all
-  messages.push({ role: 'assistant', content: res.content });  // L105
-  messages.push({ role: 'user', content: toolResults });   // L171
-}                                                            // messages GC'd on return
-
-// LONG-TERM (investigations.ts): exact key, three-tier fallback
-function getCachedInvestigation(insightId) {                // L22
-  if (mem.has(insightId)) return mem.get(insightId);        // L23 process Map
-  const f = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;  // L24 dev file
-  if (f) return f;
-  return readJson(DEMO_FILE)[insightId] ?? null;            // L26-27 seed or null
-}
-```
 
 ---
 

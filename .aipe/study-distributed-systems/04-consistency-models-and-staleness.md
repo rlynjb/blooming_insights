@@ -101,6 +101,11 @@ blooming insights gets strong consistency *inside* one process (React state, in-
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- User opens an investigation, runs the diagnose step, closes the laptop, comes back two hours later. Step 2's diagnosis is still in sessionStorage (tab still open) → step 3 works. If they closed the tab, sessionStorage cleared → step 3 fails with "no diagnosis was handed over."
+- Briefing is generated at 9:00am. Same user re-opens at 9:00:30. The McpClient cache (60s TTL) returns the same EQL results without hitting Bloomreach. Same insights. Even if a fraud event happened at 9:00:15, it's invisible until the cache expires.
+- A test fixture seeds `cached: WorkspaceSchema` directly via `_resetSchemaCache()` (`lib/mcp/schema.ts:194-196`) — exposed precisely because test runs need to control consistency at the process-cache layer.
+
 #### Part 1 — the stateful-client / stateless-server pattern (the load-bearing one)
 
 The investigation flow has two route invocations: step 2 (`/api/agent?step=diagnose`) produces a diagnosis; step 3 (`/api/agent?step=recommend`) consumes that diagnosis. The server does NOT store the diagnosis between these two calls. The *client* carries it.
@@ -133,6 +138,39 @@ The boundary conditions:
 - **Different browser/device.** No sharing. Opening step 3 on a phone after running step 2 on a laptop will fail the handoff.
 - **Diagnosis bigger than ~4MB.** sessionStorage limit per origin (browser-dependent, commonly 5–10MB). Hasn't been hit in practice but it's a soft ceiling.
 
+```
+  lib/hooks/useInvestigation.ts  (lines 18-19, 70-84, 137-140)
+
+  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
+  const diagHandoffKey = (id) => `bi:diag:${id}`;        ← the carrier key
+
+  // for the recommend step, load the handed-over diagnosis:
+  if (step === 'recommend') {
+    try {
+      const raw = sessionStorage.getItem(diagHandoffKey(id));
+      if (raw) {
+        const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
+        handedDiagnosis = d.diagnosis ?? null;
+        cDiag = handedDiagnosis;
+        if (handedDiagnosis) setDiagnosis(handedDiagnosis);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // on 'done' during the diagnose step:
+  if (step === 'diagnose' && cDiag) {
+    sessionStorage.setItem(
+      diagHandoffKey(id),
+      JSON.stringify({ diagnosis: cDiag }),               ← THE WRITE
+    );
+  }
+       │
+       └─ this is the read-your-writes mechanism. The client writes
+          the diagnosis at the end of step 2 and reads it at the start
+          of step 3. Server holds nothing between the two requests —
+          surviving instance recycles by design.
+```
+
 #### Part 2 — the 60s TTL as a bounded-staleness window (Bloomreach side only)
 
 `BloomreachDataSource.callTool` caches every successful result for 60 seconds (`lib/data-source/bloomreach-data-source.ts:145, 186`). That's a bounded-staleness guarantee — any data returned to the caller is at most 60 seconds out of date relative to Bloomreach. The Olist side has no cache (`lib/data-source/olist-data-source.ts:162` always returns `fromCache: false`), so its results are always fresh relative to the SQLite snapshot. This is an asymmetric staleness contract across the two backends: a `bi:mode=live-bloomreach` briefing sees 60-second-stale data; a `bi:mode=live-sql` briefing sees database-current data. The agent layer is told the same `fromCache: boolean` either way and doesn't care, but a UI tooltip about "last updated" would need to know which backend it asked.
@@ -157,6 +195,36 @@ The boundary conditions:
 
 The bound is fixed and the same for every tool. There's no per-tool TTL — `list_funnels` (schema-shaped, changes daily) and `execute_analytics_eql` (data-shaped, could change minute-to-minute) both get 60s. The right next move at scale: variable TTL per tool, longer for schema tools, shorter for analytics. Not done because the workload doesn't demand it.
 
+```
+  lib/data-source/bloomreach-data-source.ts  (lines 130-137, 144-152)
+
+  this.minIntervalMs = opts.minIntervalMs ?? 200;
+  this.maxRetries = opts.maxRetries ?? 3;
+  this.retryDelayMs = opts.retryDelayMs ?? 10_000;
+  this.retryCeilingMs = opts.retryCeilingMs ?? 20_000;
+  // ttl defaults to 60_000 per call
+
+  const cacheKey = `${name}:${JSON.stringify(args)}`;
+  const ttl = options.cacheTtlMs ?? 60_000;
+
+  if (!options.skipCache) {
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {        ← lazy check
+      return { result: cached.result as T,
+               durationMs: 0,
+               fromCache: true };
+    }
+  }
+       │
+       └─ this is the Bloomreach-side bounded-staleness mechanism. Every
+          cached read is at most 60s stale relative to Bloomreach. Per-call
+          TTL is overridable (cacheTtlMs option) but no caller currently
+          does. The Olist adapter has no equivalent — fromCache is always
+          false there (olist-data-source.ts:162), and the same DataSource
+          interface returns identical-shaped envelopes from both sides
+          with different freshness guarantees underneath.
+```
+
 #### Part 3 — the schema cache as "strong-within-process"
 
 `lib/mcp/schema.ts:131-196` holds a module-level `cached: WorkspaceSchema | null`. First request pays the four-call cost (~5s with spacing); every subsequent request in that process reads the cached value.
@@ -179,6 +247,30 @@ The bound is fixed and the same for every tool. There's no per-tool TTL — `lis
 ```
 
 This is strong consistency within one process for the process's lifetime. It's also unbounded staleness — if Bloomreach updates the schema (a new event type added), this process never sees the change. There's `_resetSchemaCache()` exposed for tests but no production trigger. The implicit assumption is that schema changes happen on a much longer timescale than a Vercel process's lifetime, so the staleness is bounded *in practice* by how often Vercel recycles instances. Inferred — not measured.
+
+```
+  lib/mcp/schema.ts  (lines 131-133, 170-192)
+
+  let cached: WorkspaceSchema | null = null;          ← module-level cache
+
+  export async function bootstrapSchema(mcp): Promise<WorkspaceSchema> {
+    if (cached) return cached;                         ← strong-within-process,
+    const { projectId, projectName } = await resolveProject(mcp);
+    const args = { project_id: projectId };
+    const eventSchema = await callOrThrow(mcp, 'get_event_schema', args);
+    const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
+    const catalogs = await callOrThrow(mcp, 'list_catalogs', args);
+    const overview = await callOrThrow(mcp, 'get_project_overview', args);
+    cached = parseWorkspaceSchema({ projectId, projectName, eventSchema,
+                                    customerProps, catalogs, overview });
+    return cached;
+  }
+       │
+       └─ no production invalidation. The cached schema lives as long
+          as the Node process. Vercel will recycle the process eventually,
+          which is the de-facto staleness bound. _resetSchemaCache() is
+          test-only.
+```
 
 #### Part 4 — what NOT YET EXERCISED looks like
 
@@ -253,104 +345,6 @@ They become relevant the moment the app adds a second writer to any state. For e
   the only "stale read" boundary that bites in practice:
     a briefing that re-runs within 60s sees the same MCP results,
     even if Bloomreach got new events between the two runs.
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- User opens an investigation, runs the diagnose step, closes the laptop, comes back two hours later. Step 2's diagnosis is still in sessionStorage (tab still open) → step 3 works. If they closed the tab, sessionStorage cleared → step 3 fails with "no diagnosis was handed over."
-- Briefing is generated at 9:00am. Same user re-opens at 9:00:30. The McpClient cache (60s TTL) returns the same EQL results without hitting Bloomreach. Same insights. Even if a fraud event happened at 9:00:15, it's invisible until the cache expires.
-- A test fixture seeds `cached: WorkspaceSchema` directly via `_resetSchemaCache()` (`lib/mcp/schema.ts:194-196`) — exposed precisely because test runs need to control consistency at the process-cache layer.
-
-**Code side by side.**
-
-```
-  lib/hooks/useInvestigation.ts  (lines 18-19, 70-84, 137-140)
-
-  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
-  const diagHandoffKey = (id) => `bi:diag:${id}`;        ← the carrier key
-
-  // for the recommend step, load the handed-over diagnosis:
-  if (step === 'recommend') {
-    try {
-      const raw = sessionStorage.getItem(diagHandoffKey(id));
-      if (raw) {
-        const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
-        handedDiagnosis = d.diagnosis ?? null;
-        cDiag = handedDiagnosis;
-        if (handedDiagnosis) setDiagnosis(handedDiagnosis);
-      }
-    } catch { /* ignore */ }
-  }
-
-  // on 'done' during the diagnose step:
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(
-      diagHandoffKey(id),
-      JSON.stringify({ diagnosis: cDiag }),               ← THE WRITE
-    );
-  }
-       │
-       └─ this is the read-your-writes mechanism. The client writes
-          the diagnosis at the end of step 2 and reads it at the start
-          of step 3. Server holds nothing between the two requests —
-          surviving instance recycles by design.
-```
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 130-137, 144-152)
-
-  this.minIntervalMs = opts.minIntervalMs ?? 200;
-  this.maxRetries = opts.maxRetries ?? 3;
-  this.retryDelayMs = opts.retryDelayMs ?? 10_000;
-  this.retryCeilingMs = opts.retryCeilingMs ?? 20_000;
-  // ttl defaults to 60_000 per call
-
-  const cacheKey = `${name}:${JSON.stringify(args)}`;
-  const ttl = options.cacheTtlMs ?? 60_000;
-
-  if (!options.skipCache) {
-    const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {        ← lazy check
-      return { result: cached.result as T,
-               durationMs: 0,
-               fromCache: true };
-    }
-  }
-       │
-       └─ this is the Bloomreach-side bounded-staleness mechanism. Every
-          cached read is at most 60s stale relative to Bloomreach. Per-call
-          TTL is overridable (cacheTtlMs option) but no caller currently
-          does. The Olist adapter has no equivalent — fromCache is always
-          false there (olist-data-source.ts:162), and the same DataSource
-          interface returns identical-shaped envelopes from both sides
-          with different freshness guarantees underneath.
-```
-
-```
-  lib/mcp/schema.ts  (lines 131-133, 170-192)
-
-  let cached: WorkspaceSchema | null = null;          ← module-level cache
-
-  export async function bootstrapSchema(mcp): Promise<WorkspaceSchema> {
-    if (cached) return cached;                         ← strong-within-process,
-    const { projectId, projectName } = await resolveProject(mcp);
-    const args = { project_id: projectId };
-    const eventSchema = await callOrThrow(mcp, 'get_event_schema', args);
-    const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
-    const catalogs = await callOrThrow(mcp, 'list_catalogs', args);
-    const overview = await callOrThrow(mcp, 'get_project_overview', args);
-    cached = parseWorkspaceSchema({ projectId, projectName, eventSchema,
-                                    customerProps, catalogs, overview });
-    return cached;
-  }
-       │
-       └─ no production invalidation. The cached schema lives as long
-          as the Node process. Vercel will recycle the process eventually,
-          which is the de-facto staleness bound. _resetSchemaCache() is
-          test-only.
 ```
 
 ---

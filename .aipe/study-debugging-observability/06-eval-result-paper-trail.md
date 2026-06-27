@@ -125,6 +125,16 @@ Skeleton mapped. Now walk the runner, the writer, the judge, the flywheel.
 
 ### Move 2 — walk the parts
 
+**Use cases.** Four real moments the paper trail is doing visible work:
+
+- **PR D: detection-precision baseline reveals the monitoring-prompt bug.** Ran K=10 of the monitoring agent against the seeded Olist data. Detection precision came back at 5% under loose match — far below the expected ~50%. Reading `eval/results/2026-06-15/detection-K10-raw.json` showed the agent was emitting time-windowed anomalies that didn't align with the seeded ground-truth windows. The bug was in the monitoring prompt's date framing — "the last 90 days" was being interpreted relative to a date the agent had baked in from training data rather than the current run date. Phase 2.5 fixed the prompt to inject `today` explicitly; re-ran with `EVAL_RUN_TAG=after-fix`; precision lifted 5x to 25%. The verification was a *side-by-side measurement* of two committed dirs, not a re-deploy.
+
+- **PR E: recommendation eval's run 8 surfaces the BRL cents-vs-Reais bug.** Ran K=10 of the recommendation agent. Eight of the runs scored well; run 8 came back with `impact_sized: 0` and a judge `notes` field reading *"AOV BRL 131,965 is implausible for a Brazilian consumer electronics order — these are stored as cents in the source schema."* That one sentence was the bug. The agent treated `purchase.price_brl` (stored as cents in the seeded data) as Reais, computed an Average Order Value 100x too high, and the judge caught the absurdity. The fix was a unit-conversion guard in the agent's number-handling step. Without the judge, the result would have looked statistically fine — 9/10 is a great number; the bug only surfaced because one criterion flagged one run.
+
+- **PR F: regression eval catches the same BRL bug recurring at run 8 of K=10.** A few weeks later, a refactor of the recommendation agent's tool calling regressed the unit-conversion fix. The regression eval (K=10 against the captured golden run) flagged the same numerical fingerprint — R$131,965 AOV — at run 8. The *exact same run index*, the *exact same fingerprint*. That convergence was the diagnostic — "the same numerical signature recurring in the same iteration slot means the same code path failed in the same way." Two adjacent result dirs (PR E's and PR F's) made the recurrence visible at a glance. Numerical fingerprints across runs are a real observability primitive.
+
+- **PR G: regression baseline 30% reveals conclusion-stability as the system's weakest property.** Ran a K=10 regression against three golden snapshots. The score came back at 30% — diagnoses matched the golden 30% of the time across snapshots. That number isn't a per-bug signal; it's a *property* signal — the system's conclusions are unstable across re-runs of the same input. The result dir `2026-06-15-score-baseline` is the committed evidence of that property; the next pass at improving the diagnostic agent has a measurable target to lift.
+
 #### The runner — K iterations against a known fixture
 
 The reader anchor: you've written a benchmark that runs a function N times and prints the median. Same shape — but here the function is a full agent loop (Anthropic + MCP + tools), the input is a fixed dataset (seeded Olist data with 3 known anomalies), and "median" is replaced with per-criterion scores from an LLM judge.
@@ -152,6 +162,30 @@ Boundary: K=10 costs ~$1-3 in Anthropic spend. The sequential-not-parallel choic
   writeJson(eval/results/<date>[-<tag>]/summary.md)
 ```
 
+**Code in this codebase (RETIRED — file paths preserved as historical record) — the K-loop.** Sequential to avoid cross-run race:
+
+```
+  eval/scripts/run-detection.ts  (the K-loop)
+
+  const perRun: PerRunScore[] = [];
+  for (let i = 0; i < K; i++) {                                  ← sequential, not parallel
+    const insights = await runMonitoringAgentOnce(seeded);       ← fresh subprocess per call
+    const loose = scoreRun(insights, seeded, 'loose');
+    const strict = scoreRun(insights, seeded, 'strict');
+    perRun.push({ i, insights, loose, strict });
+  }
+  const aggregate = aggregateScores(perRun);
+  writeFileSync(join(resultsDir, 'detection-K10-raw.json'),
+                JSON.stringify(perRun, null, 2));
+  writeFileSync(join(resultsDir, 'detection-K10-loose.json'),
+                JSON.stringify(aggregate.loose, null, 2));
+        │
+        └─ the sequential loop is deliberate. Parallel K=10 against
+           the same OlistDataSource WOULD race the SQLite reads and
+           mix the trails. The parallel-run race anecdote (below)
+           is what made the sequential choice non-negotiable.
+```
+
 #### EVAL_RUN_TAG — the sibling-dir primitive
 
 The reader anchor: you've named output files with a date stamp and watched them overwrite each other on a second same-day run. The fix is usually `<date>-<seq>` or `<date>-<descriptor>`. Here it's `<date>[-<tag>]`, driven by an environment variable.
@@ -173,6 +207,43 @@ Boundary: there's no enforcement. If you forget `EVAL_RUN_TAG`, you overwrite. T
   same-day re-run WITHOUT a tag    same-day re-run WITH a tag
   → overwrites the earlier run     → sibling dir, both measurements
     (history lost)                   land in git diff side by side
+```
+
+**Code in this codebase (RETIRED — file paths preserved as historical record) — the result-dir naming:**
+
+```
+  eval/scripts/run-detection.ts  (the results-dir computation)
+
+  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
+  // 2026-06-15-after-fix) without overwriting the earlier baseline.
+  const tag = process.env.EVAL_RUN_TAG;                          ← optional env var
+  const today = new Date().toISOString().slice(0, 10);            ← YYYY-MM-DD
+  const dirName = tag ? `${today}-${tag}` : today;                ← sibling when tagged
+  const resultsDir = resolve(REPO_ROOT, 'eval/results', dirName); ← absolute path
+  mkdirSync(resultsDir, { recursive: true });                     ← create if missing
+        │
+        └─ no flag handling, no CLI arg — the env var IS the API.
+           Forgetting the tag overwrites; setting it preserves history.
+           The discipline lives in shell muscle memory, not in code
+           validation. Cheap and clear.
+```
+
+**Code in this codebase (RETIRED — file paths preserved as historical record) — git as the history substrate:**
+
+```
+  eval/results/  (as of 2026-06-16)
+
+  2026-06-15/                     ← PR D initial baseline (detection 5%)
+  2026-06-15-after-fix/           ← PR D after Phase 2.5 prompt fix (25%)
+  2026-06-15-capture/             ← PR F regression-golden capture
+  2026-06-15-score-baseline/      ← PR G regression score baseline (30%)
+        │
+        └─ four sibling dirs, all same date, different EVAL_RUN_TAG.
+           `git log eval/results/` shows the chronological order of
+           measurement; `diff` shows the deltas. The naming convention
+           is what makes the trail bisectable by hand — no tooling
+           required to see "after-fix lifted detection 5x over the
+           initial baseline."
 ```
 
 #### The judge — LLM-as-judge as a debug signal source
@@ -205,6 +276,32 @@ Boundary: judge calibration is the load-bearing trust check. The repo manually s
     → cents-vs-Reais conversion error
     → fix the agent's unit handling
     → re-measure with EVAL_RUN_TAG=after-fix
+```
+
+**Code in this codebase (RETIRED — file paths preserved as historical record) — the judge prompts committed under `eval/judges/`:**
+
+```
+  eval/judges/recommendation-judge.md  (the rubric, abbreviated)
+
+  ## Rubric
+
+  For each candidate Recommendation, score 0 or 1 on each criterion:
+
+  - impact_sized: Does estimatedImpact include a defensible numeric range?
+                  Reject if the number is implausible for the data domain
+                  (e.g. AOV of BRL 131,965 for consumer electronics is
+                  implausible — these are stored as cents).
+  - evidence_cited: Does rationale reference concrete metrics from the
+                    diagnosis evidence?
+  - steps_actionable: Are steps[] concrete enough that a marketer could
+                      execute without further interpretation?
+        │
+        └─ the rubric IS the observability contract. The "BRL 131,965"
+           example in the prompt is calibration tuning — once the bug
+           surfaced, the rubric was updated to include it explicitly
+           as a teaching example for the judge. The prompt itself
+           becomes a paper trail of which bugs the system has learned
+           to catch.
 ```
 
 #### The summary — human-narrative rollup
@@ -266,111 +363,6 @@ The full eval paper trail, from runner invocation to git-committed evidence.
   │  jq '.runs[7]' eval/results/.../diagnosis-K10-judge.json        │
   │     → cite the specific run that broke                          │
   └────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-Four real moments the paper trail is doing visible work:
-
-- **PR D: detection-precision baseline reveals the monitoring-prompt bug.** Ran K=10 of the monitoring agent against the seeded Olist data. Detection precision came back at 5% under loose match — far below the expected ~50%. Reading `eval/results/2026-06-15/detection-K10-raw.json` showed the agent was emitting time-windowed anomalies that didn't align with the seeded ground-truth windows. The bug was in the monitoring prompt's date framing — "the last 90 days" was being interpreted relative to a date the agent had baked in from training data rather than the current run date. Phase 2.5 fixed the prompt to inject `today` explicitly; re-ran with `EVAL_RUN_TAG=after-fix`; precision lifted 5x to 25%. The verification was a *side-by-side measurement* of two committed dirs, not a re-deploy.
-
-- **PR E: recommendation eval's run 8 surfaces the BRL cents-vs-Reais bug.** Ran K=10 of the recommendation agent. Eight of the runs scored well; run 8 came back with `impact_sized: 0` and a judge `notes` field reading *"AOV BRL 131,965 is implausible for a Brazilian consumer electronics order — these are stored as cents in the source schema."* That one sentence was the bug. The agent treated `purchase.price_brl` (stored as cents in the seeded data) as Reais, computed an Average Order Value 100x too high, and the judge caught the absurdity. The fix was a unit-conversion guard in the agent's number-handling step. Without the judge, the result would have looked statistically fine — 9/10 is a great number; the bug only surfaced because one criterion flagged one run.
-
-- **PR F: regression eval catches the same BRL bug recurring at run 8 of K=10.** A few weeks later, a refactor of the recommendation agent's tool calling regressed the unit-conversion fix. The regression eval (K=10 against the captured golden run) flagged the same numerical fingerprint — R$131,965 AOV — at run 8. The *exact same run index*, the *exact same fingerprint*. That convergence was the diagnostic — "the same numerical signature recurring in the same iteration slot means the same code path failed in the same way." Two adjacent result dirs (PR E's and PR F's) made the recurrence visible at a glance. Numerical fingerprints across runs are a real observability primitive.
-
-- **PR G: regression baseline 30% reveals conclusion-stability as the system's weakest property.** Ran a K=10 regression against three golden snapshots. The score came back at 30% — diagnoses matched the golden 30% of the time across snapshots. That number isn't a per-bug signal; it's a *property* signal — the system's conclusions are unstable across re-runs of the same input. The result dir `2026-06-15-score-baseline` is the committed evidence of that property; the next pass at improving the diagnostic agent has a measurable target to lift.
-
-### Code side by side, with a line-by-line read
-
-The result-dir naming — EVAL_RUN_TAG as the sibling primitive:
-
-```
-  eval/scripts/run-detection.ts  (the results-dir computation)
-
-  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
-  // 2026-06-15-after-fix) without overwriting the earlier baseline.
-  const tag = process.env.EVAL_RUN_TAG;                          ← optional env var
-  const today = new Date().toISOString().slice(0, 10);            ← YYYY-MM-DD
-  const dirName = tag ? `${today}-${tag}` : today;                ← sibling when tagged
-  const resultsDir = resolve(REPO_ROOT, 'eval/results', dirName); ← absolute path
-  mkdirSync(resultsDir, { recursive: true });                     ← create if missing
-        │
-        └─ no flag handling, no CLI arg — the env var IS the API.
-           Forgetting the tag overwrites; setting it preserves history.
-           The discipline lives in shell muscle memory, not in code
-           validation. Cheap and clear.
-```
-
-The runner's iteration loop — sequential to avoid cross-run race:
-
-```
-  eval/scripts/run-detection.ts  (the K-loop)
-
-  const perRun: PerRunScore[] = [];
-  for (let i = 0; i < K; i++) {                                  ← sequential, not parallel
-    const insights = await runMonitoringAgentOnce(seeded);       ← fresh subprocess per call
-    const loose = scoreRun(insights, seeded, 'loose');
-    const strict = scoreRun(insights, seeded, 'strict');
-    perRun.push({ i, insights, loose, strict });
-  }
-  const aggregate = aggregateScores(perRun);
-  writeFileSync(join(resultsDir, 'detection-K10-raw.json'),
-                JSON.stringify(perRun, null, 2));
-  writeFileSync(join(resultsDir, 'detection-K10-loose.json'),
-                JSON.stringify(aggregate.loose, null, 2));
-        │
-        └─ the sequential loop is deliberate. Parallel K=10 against
-           the same OlistDataSource WOULD race the SQLite reads and
-           mix the trails. The parallel-run race anecdote (below)
-           is what made the sequential choice non-negotiable.
-```
-
-The judge prompts — committed under `eval/judges/`:
-
-```
-  eval/judges/recommendation-judge.md  (the rubric, abbreviated)
-
-  ## Rubric
-
-  For each candidate Recommendation, score 0 or 1 on each criterion:
-
-  - impact_sized: Does estimatedImpact include a defensible numeric range?
-                  Reject if the number is implausible for the data domain
-                  (e.g. AOV of BRL 131,965 for consumer electronics is
-                  implausible — these are stored as cents).
-  - evidence_cited: Does rationale reference concrete metrics from the
-                    diagnosis evidence?
-  - steps_actionable: Are steps[] concrete enough that a marketer could
-                      execute without further interpretation?
-        │
-        └─ the rubric IS the observability contract. The "BRL 131,965"
-           example in the prompt is calibration tuning — once the bug
-           surfaced, the rubric was updated to include it explicitly
-           as a teaching example for the judge. The prompt itself
-           becomes a paper trail of which bugs the system has learned
-           to catch.
-```
-
-The committed result dirs — git as the history substrate:
-
-```
-  eval/results/  (as of 2026-06-16)
-
-  2026-06-15/                     ← PR D initial baseline (detection 5%)
-  2026-06-15-after-fix/           ← PR D after Phase 2.5 prompt fix (25%)
-  2026-06-15-capture/             ← PR F regression-golden capture
-  2026-06-15-score-baseline/      ← PR G regression score baseline (30%)
-        │
-        └─ four sibling dirs, all same date, different EVAL_RUN_TAG.
-           `git log eval/results/` shows the chronological order of
-           measurement; `diff` shows the deltas. The naming convention
-           is what makes the trail bisectable by hand — no tooling
-           required to see "after-fix lifted detection 5x over the
-           initial baseline."
 ```
 
 ---

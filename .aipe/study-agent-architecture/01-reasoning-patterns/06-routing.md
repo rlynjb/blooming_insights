@@ -133,6 +133,8 @@ The practical consequence: every input the heuristic matches is free routing. La
 
 The condition under which it works: the heuristic's confidence has to be calibrated. A heuristic that matches on substring "recommendation" routes any input mentioning the word — including "I don't need a recommendation, just tell me…" That over-matching is fine when the next layer (LLM) can correct it, dangerous when the heuristic is the only layer.
 
+**Where this lives in the repo.** `parseIntent(raw: string): Intent` in `lib/agents/intent.ts` L6–L12 — three substring checks against the lowercased input, with a `'diagnostic'` default at L11. Used both as the fast-path heuristic AND as the normalizer on the LLM classifier's output.
+
 ### Move 2.2 — The LLM layer
 
 The technical thing: a small/cheap model called with a constrained system prompt that says "classify the input as one of N labels, output the label only." Output is parsed into one of the expected categories.
@@ -158,6 +160,8 @@ LLM classifier — shape, not impl
 The practical consequence: the LLM call is fast (small max_tokens, cheap model) but it's still an API call — adds ~200–500ms and tiny token cost. Worth it for ambiguous inputs where a heuristic would miss; not worth it for inputs the heuristic already catches.
 
 The condition under which it works: the classifier has to be reliable enough that downstream agents trust its label. Two things help: (a) constrain the output to one word so parsing is trivial, and (b) provide a `parseIntent` fallback (the same heuristic) on the model's output text — so even if the model adds prose, "the answer is monitoring" still parses as `monitoring`.
+
+**Where this lives in the repo.** `classifyIntent(anthropic, query): Promise<Intent>` in `lib/agents/intent.ts` L17–L31 — model `claude-haiku-4-5-20251001` (L14), `max_tokens: 16` (L20), constrained system prompt at L21–L23, text extracted at L26–L29, run through `parseIntent` at L30.
 
 ### Move 2.3 — Where this routing lives in the codebase
 
@@ -185,6 +189,21 @@ The two functions, pseudocode shape
 ```
 
 The practical consequence: the LLM call exists only on the free-form question path. The investigation flow (when an existing anomaly is referenced) skips routing entirely — the route knows it's a diagnosis regardless of words. Routing is paid for only when the input is genuinely ambiguous.
+
+**Where this lives in the repo.** The router fires inside `app/api/agent/route.ts`'s `GET` handler free-form query branch at L210–L218 — `classifyIntent` called at L211, intent flowed into `QueryAgent.answer(q, intent)` at L214. Routing does NOT fire on the investigation path (L224–L249); that path uses the deterministic `if`-ladder per `01-chains-vs-agents.md`. The destination — `QueryAgent.answer(query, intent, hooks)` in `lib/agents/query.ts` L24–L48 — templates the intent into the system prompt at L28 (`replace(/\{intent\}/g, intent)`), shaping the agent's behavior for the classified intent.
+
+```
+shape (not full impl):
+  // route.ts: free-form query path
+  if (q && !insightId) {
+    const intent = await classifyIntent(anthropic, q);                  // L211
+    stepFor('coordinator', 'thought',
+            `interpreting your question as a ${intent} query…`);         // L212
+    const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools);
+    const answer = await queryAgent.answer(q, intent, hooksFor('coordinator')); // L214
+    // …
+  }
+```
 
 The condition under which it works: the heuristic and LLM agree on the output vocabulary (`'monitoring' | 'diagnostic' | 'recommendation'`). They both produce the same labels because the classifier parses the LLM's text through the heuristic — so anything the LLM emits gets normalized to one of three values. There's no third label vocabulary to maintain.
 
@@ -288,45 +307,6 @@ The router in blooming insights — and what it bridges to
   │  Same router shape, destinations are agents instead of an        │
   │  intent string. This is the supervisor pattern in SECTION C.    │
   └─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**The heuristic-first layer**
-**File:** `lib/agents/intent.ts`
-**Function / class:** `parseIntent(raw: string): Intent`
-**Line range:** L6–L12
-
-Three substring checks against the lowercased input, with a `'diagnostic'` default at L11. Used both as the fast-path heuristic AND as the normalizer on the LLM classifier's output.
-
-**The LLM classifier layer**
-**File:** `lib/agents/intent.ts`
-**Function / class:** `classifyIntent(anthropic, query): Promise<Intent>`
-**Line range:** L17–L31 — model `claude-haiku-4-5-20251001` (L14), `max_tokens: 16` (L20), constrained system prompt at L21–L23, text extracted at L26–L29, run through `parseIntent` at L30.
-
-**Where the router fires**
-**File:** `app/api/agent/route.ts`
-**Function / class:** the `GET` handler's free-form query branch
-**Line range:** L210–L218 — `classifyIntent` called at L211, intent flowed into `QueryAgent.answer(q, intent)` at L214. Routing does NOT fire on the investigation path (L224–L249); that path uses the deterministic `if`-ladder per `01-chains-vs-agents.md`.
-
-**The destination — QueryAgent uses the intent in its prompt**
-**File:** `lib/agents/query.ts`
-**Function / class:** `QueryAgent.answer(query, intent, hooks)`
-**Line range:** L24–L48 — intent is templated into the system prompt at L28 (`replace(/\{intent\}/g, intent)`), shaping the agent's behavior for the classified intent.
-
-```
-shape (not full impl):
-  // route.ts: free-form query path
-  if (q && !insightId) {
-    const intent = await classifyIntent(anthropic, q);                  // L211
-    stepFor('coordinator', 'thought',
-            `interpreting your question as a ${intent} query…`);         // L212
-    const queryAgent = new QueryAgent(anthropic, conn.mcp, schema, allTools);
-    const answer = await queryAgent.answer(q, intent, hooksFor('coordinator')); // L214
-    // …
-  }
 ```
 
 ---

@@ -204,6 +204,51 @@ When you own the backend, author the tool surface the model needs — not the su
 
 ---
 
+### Code in this codebase
+
+**Case A — implemented.** `mcp-server-olist/` is a sibling Node package, ~1800 LOC of authored TypeScript.
+
+#### The MCP server entrypoint
+
+- **File:** `mcp-server-olist/src/index.ts` + `mcp-server-olist/src/server.ts`
+- **Role:** Boot the MCP server on stdio, register the three tools, start serving. Spawned as a subprocess by `OlistDataSource` (`lib/data-source/olist-data-source.ts`) for live-sql mode and by every eval run.
+
+#### The three tool handlers
+
+- **Files:** `mcp-server-olist/src/tools/get_metric_timeseries.ts`, `get_segments.ts`, `get_anomaly_context.ts`
+- **Role:** Each is a Zod-validated handler that takes typed args, runs a parameterized SQL query, and returns a typed result. No open SQL surface.
+
+#### The shared schemas
+
+- **File:** `mcp-server-olist/src/schemas.ts`
+- **Role:** The Zod schemas the three tools share — metric / dimension / segment / time_range / bucket types — and the JSON-schema export the MCP `tools/list` flow advertises to the agent.
+
+#### The DB layer
+
+- **File:** `mcp-server-olist/src/db.ts`
+- **Role:** Opens `mcp-server-olist/data/olist.db` (better-sqlite3, synchronous), exposes `prepare()` and a small set of helpers. The DB is read-only at runtime; only the seed script writes.
+
+#### The seed script (ground truth)
+
+- **File:** `mcp-server-olist/scripts/seed-olist.ts` (compiled to `dist/scripts/seed-olist.js`; run via `npm run seed`)
+- **Role:** Generates ~10k synthetic Olist orders, applies the three seeded anomalies (`sp-revenue-drop-w4`, `electronics-spike-w2`, `voucher-dropoff-w10-on`), and writes both the data AND the `seeded_anomalies` rows. This is the load-bearing script — without it, the eval pillar has no ground truth.
+
+#### The DataSource adapter
+
+- **File:** `lib/data-source/olist-data-source.ts`
+- **Role:** Implements `DataSource` (from `lib/data-source/types.ts`) by spawning the Olist server as a child process and routing `callTool` / `listTools` over stdio. The route handlers and eval scripts both go through this — they never spawn the subprocess directly.
+
+#### npm scripts
+
+- **File:** `mcp-server-olist/package.json`
+- **Scripts:** `"build": "tsc -p tsconfig.json"`, `"seed": "tsc -p tsconfig.json && node dist/scripts/seed-olist.js"`, `"start": "node dist/src/index.js"`.
+
+#### Tests
+
+- **Directory:** `mcp-server-olist/test/` — Vitest tests for each tool handler (input validation, SQL correctness against a known seed), part of the 269 total.
+
+---
+
 ## Authoring an MCP server — diagram
 
 This diagram spans the Service layer (the agents that emit tool calls), the Network boundary (stdio MCP transport), the Provider boundary (the authored server process), and the State layer (the SQLite DB + the `seeded_anomalies` ground truth). A reader who sees only this should grasp that the authored server is YOUR code on YOUR data with YOUR query authoring — and that the seeded-anomalies table is what makes the eval pillar load-bearing.
@@ -240,51 +285,6 @@ This diagram spans the Service layer (the agents that emit tool calls), the Netw
 ```
 
 The agent never sees SQL; the model never authors a query; the eval reads `seeded_anomalies` to know what's correct. Three abstractions, three trust boundaries, one stack you wrote end-to-end.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented.** `mcp-server-olist/` is a sibling Node package, ~1800 LOC of authored TypeScript.
-
-### The MCP server entrypoint
-
-- **File:** `mcp-server-olist/src/index.ts` + `mcp-server-olist/src/server.ts`
-- **Role:** Boot the MCP server on stdio, register the three tools, start serving. Spawned as a subprocess by `OlistDataSource` (`lib/data-source/olist-data-source.ts`) for live-sql mode and by every eval run.
-
-### The three tool handlers
-
-- **Files:** `mcp-server-olist/src/tools/get_metric_timeseries.ts`, `get_segments.ts`, `get_anomaly_context.ts`
-- **Role:** Each is a Zod-validated handler that takes typed args, runs a parameterized SQL query, and returns a typed result. No open SQL surface.
-
-### The shared schemas
-
-- **File:** `mcp-server-olist/src/schemas.ts`
-- **Role:** The Zod schemas the three tools share — metric / dimension / segment / time_range / bucket types — and the JSON-schema export the MCP `tools/list` flow advertises to the agent.
-
-### The DB layer
-
-- **File:** `mcp-server-olist/src/db.ts`
-- **Role:** Opens `mcp-server-olist/data/olist.db` (better-sqlite3, synchronous), exposes `prepare()` and a small set of helpers. The DB is read-only at runtime; only the seed script writes.
-
-### The seed script (ground truth)
-
-- **File:** `mcp-server-olist/scripts/seed-olist.ts` (compiled to `dist/scripts/seed-olist.js`; run via `npm run seed`)
-- **Role:** Generates ~10k synthetic Olist orders, applies the three seeded anomalies (`sp-revenue-drop-w4`, `electronics-spike-w2`, `voucher-dropoff-w10-on`), and writes both the data AND the `seeded_anomalies` rows. This is the load-bearing script — without it, the eval pillar has no ground truth.
-
-### The DataSource adapter
-
-- **File:** `lib/data-source/olist-data-source.ts`
-- **Role:** Implements `DataSource` (from `lib/data-source/types.ts`) by spawning the Olist server as a child process and routing `callTool` / `listTools` over stdio. The route handlers and eval scripts both go through this — they never spawn the subprocess directly.
-
-### npm scripts
-
-- **File:** `mcp-server-olist/package.json`
-- **Scripts:** `"build": "tsc -p tsconfig.json"`, `"seed": "tsc -p tsconfig.json && node dist/scripts/seed-olist.js"`, `"start": "node dist/src/index.js"`.
-
-### Tests
-
-- **Directory:** `mcp-server-olist/test/` — Vitest tests for each tool handler (input validation, SQL correctness against a known seed), part of the 269 total.
 
 ---
 

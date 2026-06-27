@@ -170,6 +170,24 @@ Sampling randomness is a per-task setting, not a global default: classification 
 
 ---
 
+### Code in this codebase
+
+**Partially addressed — `max_tokens` only.** No `temperature`, `top_p`, or `top_k` is set on any `anthropic.messages.create` call; Claude's defaults apply everywhere. The only per-call decoding tuning is `max_tokens`.
+
+#### Files, functions, and line ranges
+
+- **Agent turn params (no temperature):** `lib/agents/base.ts` L92–L100; `max_tokens: maxTokens` with default `4096` at L74; call at L102.
+- **Diagnostic synthesis (no temperature):** `lib/agents/diagnostic.ts` L97–L116; `max_tokens: 2048` at L99.
+- **Recommendation synthesis (no temperature):** `lib/agents/recommendation.ts` L96–L122; `max_tokens: 2048` at L98.
+- **Intent classifier (no temperature; `max_tokens: 16`):** `lib/agents/intent.ts` L18–L25; the `16` at L20; one-word system prompt L21–L23.
+- **Models:** `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9); `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14).
+
+#### Why default temperature is defensible for these agents
+
+Three of the four agents are JSON-extraction analysts: they read tool results and emit a structured artifact, then everything is parsed and validated downstream (→ 01-what-an-llm-is.md). For that work, mild output variation is invisible — the parse step normalizes phrasing away, and the type guards reject anything malformed regardless of how it was sampled. Determinism would not improve the *parsed* result; it would only make snapshot testing of the raw text easier. So leaving temperature at default costs nothing the system cares about. The two calls that genuinely want determinism — the classifier and the synthesis pass — are where the absence is a real (small) gap.
+
+---
+
 ## Sampling parameters — diagram
 
 This diagram shows where decoding controls would act in the call path, and what blooming insights actually sets at each call. The Provider layer owns the sampling step; the Service layer sets only `max_tokens`.
@@ -198,24 +216,6 @@ This diagram shows where decoding controls would act in the call path, and what 
 ```
 
 The randomness knobs live entirely on the Provider side and are never overridden. The Service side controls only how *long* the output can be, not how *varied*.
-
----
-
-## Implementation in codebase
-
-**Partially addressed — `max_tokens` only.** No `temperature`, `top_p`, or `top_k` is set on any `anthropic.messages.create` call; Claude's defaults apply everywhere. The only per-call decoding tuning is `max_tokens`.
-
-### Files, functions, and line ranges
-
-- **Agent turn params (no temperature):** `lib/agents/base.ts` L92–L100; `max_tokens: maxTokens` with default `4096` at L74; call at L102.
-- **Diagnostic synthesis (no temperature):** `lib/agents/diagnostic.ts` L97–L116; `max_tokens: 2048` at L99.
-- **Recommendation synthesis (no temperature):** `lib/agents/recommendation.ts` L96–L122; `max_tokens: 2048` at L98.
-- **Intent classifier (no temperature; `max_tokens: 16`):** `lib/agents/intent.ts` L18–L25; the `16` at L20; one-word system prompt L21–L23.
-- **Models:** `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9); `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14).
-
-### Why default temperature is defensible for these agents
-
-Three of the four agents are JSON-extraction analysts: they read tool results and emit a structured artifact, then everything is parsed and validated downstream (→ 01-what-an-llm-is.md). For that work, mild output variation is invisible — the parse step normalizes phrasing away, and the type guards reject anything malformed regardless of how it was sampled. Determinism would not improve the *parsed* result; it would only make snapshot testing of the raw text easier. So leaving temperature at default costs nothing the system cares about. The two calls that genuinely want determinism — the classifier and the synthesis pass — are where the absence is a real (small) gap.
 
 ---
 

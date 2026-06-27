@@ -237,6 +237,34 @@ The takeaway is **the pipeline is one shape with two carriers.** In-process: a f
 
 This is what people mean by "agents as pipeline stages": agents that ship typed messages between themselves the way functions ship typed return values, with code owning the order.
 
+**Where the kernel lives in the repo.** Each of the four load-bearing pieces is pinned to specific files and lines:
+
+- **Pipeline order (code owns it):** `app/api/agent/route.ts` `GET` stream `start()` body L224–L249 — STEP 2 diagnose (L231–L240), STEP 3 recommend (L244–L249), inter-stage handoff via `diagnosis` (L238, L247).
+- **Typed inter-stage message:** `lib/mcp/types.ts` `interface Diagnosis` at L95–L104.
+- **Cross-request handoff (client side):** `lib/hooks/useInvestigation.ts` — the `case 'done':` block of the SSE handler at L138 (`sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`).
+- **Cross-request handoff (server side):** `app/api/agent/route.ts` `parseDiagnosis()` at L86–L97 — validates that the handed-over object has `conclusion`, `evidence[]`, `hypothesesConsidered[]` before resuming the pipeline.
+- **Per-stage budgets (the per-stage "size" of each pipeline link):** `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), `lib/agents/recommendation.ts` L57 (`maxToolCalls: 4`), `lib/agents/monitoring.ts` L101 (`maxToolCalls: 6`).
+- **Demo replay filter (the same pipeline, sliced by step):** `app/api/agent/route.ts` `filterByStep()` at L66–L84 — the cached combined run is filtered to just `diagnose` or just `recommend` events for replay.
+
+```
+shape (not full impl):
+
+  // route.ts — code owns the pipeline order; agents take the DataSource seam
+  if (step === 'recommend') {
+    diagnosis = parseDiagnosis(diagnosisParam);  // resumed handoff
+  } else {
+    const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools);
+    diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+    send({ type: 'diagnosis', diagnosis });      // emit to UI + persist
+  }
+
+  if (step !== 'diagnose') {
+    const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools);
+    const recs = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+    for (const r of recs) send({ type: 'recommendation', recommendation: r });
+  }
+```
+
 
 The full picture is below.
 
@@ -287,59 +315,6 @@ Sequential pipeline — the full picture in this codebase
   │  }                                                                    │
   │  (the typed contract between diagnostic and recommendation stages)    │
   └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Case A — the pipeline is the primary topology.**
-
-**The pipeline order (code owns it)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body
-**Line range:** L224–L249 — STEP 2 diagnose (L231–L240), STEP 3 recommend (L244–L249), inter-stage handoff via `diagnosis` (L238, L247)
-
-**The typed inter-stage message**
-**File:** `lib/mcp/types.ts`
-**Function / class:** `interface Diagnosis`
-**Line range:** L95–L104
-
-**The cross-request handoff (client side)**
-**File:** `lib/hooks/useInvestigation.ts`
-**Function / class:** the `case 'done':` block of the SSE handler
-**Line range:** L138 (write) — `sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`
-
-**The cross-request handoff (server side)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `parseDiagnosis()`
-**Line range:** L86–L97 — validates that the handed-over object has `conclusion`, `evidence[]`, `hypothesesConsidered[]` before resuming the pipeline
-
-**Per-stage budgets (the per-stage "size" of each pipeline link)**
-**File:** `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), `lib/agents/recommendation.ts` L57 (`maxToolCalls: 4`), `lib/agents/monitoring.ts` L101 (`maxToolCalls: 6`)
-
-**Demo replay filter (the same pipeline, sliced by step)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `filterByStep()`
-**Line range:** L66–L84 — the cached combined run is filtered to just `diagnose` or just `recommend` events for replay
-
-```
-shape (not full impl):
-
-  // route.ts — code owns the pipeline order; agents take the DataSource seam
-  if (step === 'recommend') {
-    diagnosis = parseDiagnosis(diagnosisParam);  // resumed handoff
-  } else {
-    const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools);
-    diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-    send({ type: 'diagnosis', diagnosis });      // emit to UI + persist
-  }
-
-  if (step !== 'diagnose') {
-    const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools);
-    const recs = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
-    for (const r of recs) send({ type: 'recommendation', recommendation: r });
-  }
 ```
 
 ---

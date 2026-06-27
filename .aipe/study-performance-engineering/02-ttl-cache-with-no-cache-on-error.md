@@ -247,75 +247,9 @@ The principle: **errors are transient; cached values pretend they're not**. Cach
 
 ---
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Cache the wins, not the losses.** A cache's contract is "this answer is stable for N seconds." Errors break that contract — they're explicitly *un*stable (they exist because something transient went wrong). Caching an error pretends the brokenness is the new normal, and the user pays the cost until the TTL expires. The fix is one line in the write path: check `isError` before storing. blooming insights' cache does this; it's the difference between a cache that helps every time and a cache that helps most of the time and occasionally locks you out for a minute. The general lesson: **any cache write path needs to inspect what it's caching** — not just timestamp it and stash it.
-
----
-
-## Primary diagram
-
-The full picture — key derivation, read path, miss path, write path with the error guard.
-
-```
-  blooming insights — McpClient TTL cache, the full kernel
-
-  ┌─ Input ──────────────────────────────────────────────────────────┐
-  │  callTool(name, args, options)                                    │
-  │  e.g. callTool('execute_analytics_eql', { project_id, eql })      │
-  └────────────────────────┬──────────────────────────────────────────┘
-                           │
-  ┌─ KEY ──────────────────▼──────────────────────────────────────────┐
-  │  cacheKey = `${name}:${JSON.stringify(args)}`                     │
-  │  ★ EXACT MATCH — different arg ordering = different key ★          │
-  │  ★ NO semantic similarity ★                                        │
-  └────────────────────────┬──────────────────────────────────────────┘
-                           │
-                  ┌────────▼────────┐
-                  │ skipCache?      │
-                  └───┬─────────┬───┘
-                     no        yes
-                      │         │
-  ┌─ READ ────────────▼─┐       │
-  │  cached = map.get(key)│      │
-  │  if cached AND        │      │
-  │     expiresAt > now:  │      │
-  │    ★ HIT (skip all)★  │      │
-  │    return {result,    │      │
-  │      durationMs: 0,   │      │
-  │      fromCache: true} │      │
-  └──────────┬────────────┘      │
-             │ MISS               │
-             ▼                    ▼
-  ┌─ LIVE CALL (lib/mcp/client.ts:115-132) ───────────────────────────┐
-  │  start = now                                                      │
-  │  liveCall:                                                        │
-  │    spacing gate (sleep up to 1100ms)                              │
-  │    HTTPS POST to Bloomreach                                       │
-  │  retry loop (if rate-limited, up to 3x with up to 20s wait each)  │
-  │  durationMs = now - start                                         │
-  └────────────────────────┬──────────────────────────────────────────┘
-                           │
-  ┌─ WRITE GUARD ──────────▼──────────────────────────────────────────┐
-  │  if (result as any)?.isError === true:                            │
-  │    ★ DO NOT STORE — return error envelope ★                        │
-  │    return { result, durationMs, fromCache: false }                │
-  │                                                                    │
-  │  ★ only on SUCCESS: ★                                              │
-  │  map.set(key, { result, expiresAt: now + 60_000 })                │
-  │  return { result, durationMs, fromCache: false }                  │
-  └────────────────────────────────────────────────────────────────────┘
-
-  THE INVARIANT:
-    map[key] only ever holds a successful result
-    a rate-limit error never poisons the cache for 60s
-```
-
----
-
-## Implementation in codebase
-
-### Use cases — where the cache hits and misses
+##### Use cases — where the cache hits and misses
 
 - **Intra-investigation re-derive.** Claude exploring a hypothesis often re-runs the same EQL within seconds (e.g. "let me check conversion last 30 days... ok normal... let me re-run that for the prior period to compare"). Hit rate ~10-30% of calls in a typical diagnostic agent.
 - **Bootstrap chain.** `bootstrapSchema` (`lib/mcp/schema.ts:170`) makes 4-6 MCP calls — none of them are cached at the McpClient level because the schema cache (a separate cache at `lib/mcp/schema.ts:131`) intercepts them at a higher layer.
@@ -323,7 +257,7 @@ The full picture — key derivation, read path, miss path, write path with the e
 - **Error scenarios where the guard matters.** Rate-limit retry storms on a busy Bloomreach day; transient network errors from the upstream MCP server; auth errors on cookie expiry mid-investigation.
 - **`?skipCache=true` / `options.skipCache`** path — used by the `/debug/mcp` route for "force fresh" debugging.
 
-### Code side by side
+##### Code side by side
 
 **The cache initialization and the cacheKey shape.**
 
@@ -440,6 +374,72 @@ The full picture — key derivation, read path, miss path, write path with the e
            which is a deliberate UX choice. The fromCache flag also lets
            any aggregation distinguish "we paid 0ms because cache" from
            "we paid 0ms because the call was free (it shouldn't be).
+```
+
+---
+
+### Move 3 — the principle
+
+**Cache the wins, not the losses.** A cache's contract is "this answer is stable for N seconds." Errors break that contract — they're explicitly *un*stable (they exist because something transient went wrong). Caching an error pretends the brokenness is the new normal, and the user pays the cost until the TTL expires. The fix is one line in the write path: check `isError` before storing. blooming insights' cache does this; it's the difference between a cache that helps every time and a cache that helps most of the time and occasionally locks you out for a minute. The general lesson: **any cache write path needs to inspect what it's caching** — not just timestamp it and stash it.
+
+---
+
+## Primary diagram
+
+The full picture — key derivation, read path, miss path, write path with the error guard.
+
+```
+  blooming insights — McpClient TTL cache, the full kernel
+
+  ┌─ Input ──────────────────────────────────────────────────────────┐
+  │  callTool(name, args, options)                                    │
+  │  e.g. callTool('execute_analytics_eql', { project_id, eql })      │
+  └────────────────────────┬──────────────────────────────────────────┘
+                           │
+  ┌─ KEY ──────────────────▼──────────────────────────────────────────┐
+  │  cacheKey = `${name}:${JSON.stringify(args)}`                     │
+  │  ★ EXACT MATCH — different arg ordering = different key ★          │
+  │  ★ NO semantic similarity ★                                        │
+  └────────────────────────┬──────────────────────────────────────────┘
+                           │
+                  ┌────────▼────────┐
+                  │ skipCache?      │
+                  └───┬─────────┬───┘
+                     no        yes
+                      │         │
+  ┌─ READ ────────────▼─┐       │
+  │  cached = map.get(key)│      │
+  │  if cached AND        │      │
+  │     expiresAt > now:  │      │
+  │    ★ HIT (skip all)★  │      │
+  │    return {result,    │      │
+  │      durationMs: 0,   │      │
+  │      fromCache: true} │      │
+  └──────────┬────────────┘      │
+             │ MISS               │
+             ▼                    ▼
+  ┌─ LIVE CALL (lib/mcp/client.ts:115-132) ───────────────────────────┐
+  │  start = now                                                      │
+  │  liveCall:                                                        │
+  │    spacing gate (sleep up to 1100ms)                              │
+  │    HTTPS POST to Bloomreach                                       │
+  │  retry loop (if rate-limited, up to 3x with up to 20s wait each)  │
+  │  durationMs = now - start                                         │
+  └────────────────────────┬──────────────────────────────────────────┘
+                           │
+  ┌─ WRITE GUARD ──────────▼──────────────────────────────────────────┐
+  │  if (result as any)?.isError === true:                            │
+  │    ★ DO NOT STORE — return error envelope ★                        │
+  │    return { result, durationMs, fromCache: false }                │
+  │                                                                    │
+  │  ★ only on SUCCESS: ★                                              │
+  │  map.set(key, { result, expiresAt: now + 60_000 })                │
+  │  return { result, durationMs, fromCache: false }                  │
+  └────────────────────────────────────────────────────────────────────┘
+
+  THE INVARIANT:
+    map[key] only ever holds a successful result
+    a rate-limit error never poisons the cache for 60s
 ```
 
 ---

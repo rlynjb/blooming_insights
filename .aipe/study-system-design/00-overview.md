@@ -317,28 +317,6 @@ The full recap visual — every component, every layer, every external dependenc
 
 ---
 
-## Implementation in codebase
-
-The map above is the index. **Reading order:** start with [audit.md](./audit.md) — Pass 1, one section per lens, the one-pass survey of the architecture against the 8-lens inventory. Then drop into the Pass 2 pattern files — each picks one named architectural pattern this codebase actually exercises and walks the mechanism in mechanism-level depth.
-
-| File | Type | What you get |
-|---|---|---|
-| [audit.md](./audit.md) | Pass 1 audit | 8 lens sections + ranked top-3 findings. Verdict-first, cross-linked into each pattern file. |
-| [01-request-flow.md](./01-request-flow.md) | Pattern | The seven-hop briefing pipeline; gates, layer crossings, the demo short-circuit, the three runtime modes. |
-| [02-oauth-boundary.md](./02-oauth-boundary.md) | Pattern | OAuth 2.0 + PKCE + DCR via the MCP SDK's `OAuthClientProvider`; the encrypted-cookie store + ALS pattern that survives Vercel's ephemeral instances. |
-| [03-provider-abstraction.md](./03-provider-abstraction.md) | Pattern | Two-seam vertical stack — upper `DataSource` (three implementations: Bloomreach + Synthetic + the abstract interface) + lower `McpTransport` (HTTP-SDK swap, Bloomreach-only); `makeDataSource(mode, sessionId)` factory. |
-| [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) | Pattern | The `BloomreachDataSource.callTool` four-stage funnel: cache check → spacing gate → live call → bounded retry; never cache on error. |
-| [05-streaming-ndjson.md](./05-streaming-ndjson.md) | Pattern | Producer/consumer over `ReadableStream`; the `AgentEvent` discriminated union; line-buffering kernel; why `fetch`-stream and not `EventSource`. |
-| [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) | Pattern | Five agents from `@aptkit/core`, bridged through three Blooming-owned adapter classes; per-agent prompt/tool subset; same agents over swappable `DataSource`. |
-| [07-client-stream-handoff.md](./07-client-stream-handoff.md) | Pattern | The `useInvestigation` hook: `startedRef` StrictMode latch + four `sessionStorage` keys that bridge boundaries the server can't. |
-| [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) | Pattern | The pure schema-capability gate that scopes monitoring's tool-call budget to runnable categories before any EQL fires. |
-| [11-aptkit-primitive-adapters.md](./11-aptkit-primitive-adapters.md) | Pattern | The three adapter classes (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) that translate Blooming runtime objects into AptKit's generic primitives. The senior "generic primitive + domain adapter" pattern. |
-| [12-synthetic-data-source.md](./12-synthetic-data-source.md) | Pattern | The Blooming-owned in-process synthetic adapter — same `DataSource` interface as Bloomreach, no OAuth/network/rate-limit; the "two adapters, one interface, different failure modes" lesson. |
-| [09-eval-pipeline.md](./09-eval-pipeline.md) | RETIRED | Historical artifact (eval suite removed in PR #8, 2026-06-18). Banner preserved. |
-| [10-authored-mcp-server.md](./10-authored-mcp-server.md) | RETIRED | Historical artifact (Olist MCP server removed in PR #8, 2026-06-18). Banner preserved. |
-
----
-
 ## Elaborate
 
 ### Why no database
@@ -361,5 +339,23 @@ The earlier `.aipe/study-system-design/` is preserved as the curriculum-DSA comp
 ## Sections
 
 - **[README.md](README.md)** — reading order: audit.md first, then the 10 discovered-pattern files.
+
+The map above is the index. **Reading order:** start with [audit.md](./audit.md) — Pass 1, one section per lens, the one-pass survey of the architecture against the 8-lens inventory. Then drop into the Pass 2 pattern files — each picks one named architectural pattern this codebase actually exercises and walks the mechanism in mechanism-level depth.
+
+| File | Type | What you get |
+|---|---|---|
+| [audit.md](./audit.md) | Pass 1 audit | 8 lens sections + ranked top-3 findings. Verdict-first, cross-linked into each pattern file. |
+| [01-request-flow.md](./01-request-flow.md) | Pattern | The seven-hop briefing pipeline; gates, layer crossings, the demo short-circuit, the three runtime modes. |
+| [02-oauth-boundary.md](./02-oauth-boundary.md) | Pattern | OAuth 2.0 + PKCE + DCR via the MCP SDK's `OAuthClientProvider`; the encrypted-cookie store + ALS pattern that survives Vercel's ephemeral instances. |
+| [03-provider-abstraction.md](./03-provider-abstraction.md) | Pattern | Two-seam vertical stack — upper `DataSource` (three implementations: Bloomreach + Synthetic + the abstract interface) + lower `McpTransport` (HTTP-SDK swap, Bloomreach-only); `makeDataSource(mode, sessionId)` factory. |
+| [04-caching-and-rate-limiting.md](./04-caching-and-rate-limiting.md) | Pattern | The `BloomreachDataSource.callTool` four-stage funnel: cache check → spacing gate → live call → bounded retry; never cache on error. |
+| [05-streaming-ndjson.md](./05-streaming-ndjson.md) | Pattern | Producer/consumer over `ReadableStream`; the `AgentEvent` discriminated union; line-buffering kernel; why `fetch`-stream and not `EventSource`. |
+| [06-multi-agent-orchestration.md](./06-multi-agent-orchestration.md) | Pattern | Five agents from `@aptkit/core`, bridged through three Blooming-owned adapter classes; per-agent prompt/tool subset; same agents over swappable `DataSource`. |
+| [07-client-stream-handoff.md](./07-client-stream-handoff.md) | Pattern | The `useInvestigation` hook: `startedRef` StrictMode latch + four `sessionStorage` keys that bridge boundaries the server can't. |
+| [08-schema-gated-coverage.md](./08-schema-gated-coverage.md) | Pattern | The pure schema-capability gate that scopes monitoring's tool-call budget to runnable categories before any EQL fires. |
+| [11-aptkit-primitive-adapters.md](./11-aptkit-primitive-adapters.md) | Pattern | The three adapter classes (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) that translate Blooming runtime objects into AptKit's generic primitives. The senior "generic primitive + domain adapter" pattern. |
+| [12-synthetic-data-source.md](./12-synthetic-data-source.md) | Pattern | The Blooming-owned in-process synthetic adapter — same `DataSource` interface as Bloomreach, no OAuth/network/rate-limit; the "two adapters, one interface, different failure modes" lesson. |
+| [09-eval-pipeline.md](./09-eval-pipeline.md) | RETIRED | Historical artifact (eval suite removed in PR #8, 2026-06-18). Banner preserved. |
+| [10-authored-mcp-server.md](./10-authored-mcp-server.md) | RETIRED | Historical artifact (Olist MCP server removed in PR #8, 2026-06-18). Banner preserved. |
 
 ---

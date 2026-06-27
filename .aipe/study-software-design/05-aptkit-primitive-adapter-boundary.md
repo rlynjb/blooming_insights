@@ -172,59 +172,7 @@ The kernel as load-bearing parts
 
 Each adapter is small (22–45 LOC). Each is the only file in Blooming that knows ONE specific translation. Drop any single adapter and exactly one library boundary breaks; the other two keep working.
 
-### Move 3 — the principle
-
-The adapter is the discipline that lets a reusable library stay generic. AptKit ships with three primitive interfaces because it doesn't want to know which model provider, which tool transport, or which trace consumer the host application uses. Blooming ships three small adapter classes because Blooming doesn't want to leak Anthropic/DataSource/NDJSON details into a generic agent library. **Each side hides its specifics behind a small interface; the adapter is the file that absorbs the impedance.** That's the trade: one small class per boundary, in exchange for a library that can be reused unchanged in another app and an app that can swap libraries without rewriting every agent class.
-
-This is the same lesson as `01-mcp-client-deep-module.md` — interface size vs absorbed behavior — applied at the dependency boundary instead of the protocol boundary. Reading both files in order shows the principle scaling: one adapter per backend at the DataSource seam, one adapter per primitive at the AptKit seam.
-
----
-
-## Primary diagram
-
-The full picture — three primitives, three adapters, three independent translations, one boundary.
-
-```
-AptKit primitive adapters — the deep-module recap
-
-   Blooming agent class                ┌─ lib/agents/aptkit-adapters.ts ────────┐
-   ┌──────────────────────┐             │                                          │
-   │ MonitoringAgent      │  per call   │  AnthropicModelProviderAdapter           │
-   │ DiagnosticAgent      │ ──────────► │    complete(request)                     │
-   │ RecommendationAgent  │             │      a. ModelMessage → Anthropic shape   │
-   │ QueryAgent           │             │      b. ModelTool    → Anthropic.Tool    │
-   └──────────────────────┘             │      c. signal       → SDK option        │
-                                        │      d. anthropic.messages.create        │
-                                        │      e. log usage at agents/<name>:…     │
-                                        │      f. content[]    → ModelContentBlock │
-                                        │                                          │
-                                        │  BloomingToolRegistryAdapter             │
-                                        │    listTools()                            │
-                                        │      a. McpToolDef[]  → ToolDefinition[]  │
-                                        │    callTool(name, args, opts?)            │
-                                        │      a. forward to dataSource.callTool    │
-                                        │      b. {result, durationMs} envelope     │
-                                        │                                          │
-                                        │  BloomingTraceSinkAdapter                │
-                                        │    emit(event)                            │
-                                        │      step       → hooks.onText            │
-                                        │      tool_start → hooks.onToolCall +      │
-                                        │                   queue ToolCall          │
-                                        │      tool_end   → dequeue + hooks.onToolResult │
-                                        └──────────────────────────────────────────┘
-                                                       │
-                                                       ▼
-                                               @aptkit/core@0.3.0 agent loop
-                                               (knows NONE of: Anthropic,
-                                                DataSource, NDJSON, ToolCall)
-
-   3 adapter classes.  ~110 LOC of translation.  3 cleanly separated kernels.
-   the library stays generic; the app keeps its wire format.
-```
-
----
-
-## Implementation in codebase
+### Move 2 — code in this codebase
 
 **Use cases.** Every agent-driven path runs through these adapters. Concrete scenarios:
 
@@ -232,7 +180,7 @@ AptKit primitive adapters — the deep-module recap
 - `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts:35-44`) — same pattern, AptKit's `DiagnosticInvestigationAgent` underneath. The route handler in `/api/agent` doesn't know AptKit is involved; it sees a Blooming class with a familiar method signature.
 - A future swap of AptKit (e.g. `@aptkit/core@0.4.0` with breaking changes to one primitive) would touch one adapter class. Blooming's agent classes, route handlers, UI, NDJSON contract: all unchanged. That's the property the adapter boundary buys.
 
-### The model provider adapter — bidirectional SDK translation
+**The model provider adapter — bidirectional SDK translation.** Seven mechanics absorbed behind a single `complete(request)` method.
 
 ```
 lib/agents/aptkit-adapters.ts  (lines 26–72)
@@ -291,7 +239,7 @@ lib/agents/aptkit-adapters.ts  (lines 26–72)
           changes. that's the depth ratio paying for itself.
 ```
 
-### The tool-registry adapter — the DataSource bridge
+**The tool-registry adapter — the DataSource bridge.** Twenty-two lines, two methods, and the entire DataSource protocol hides behind it from AptKit's perspective.
 
 ```
 lib/agents/aptkit-adapters.ts  (lines 75–97)
@@ -327,7 +275,7 @@ lib/agents/aptkit-adapters.ts  (lines 75–97)
           behind this 22-LOC adapter from AptKit's perspective.
 ```
 
-### The trace-sink adapter — event translation with start↔end pairing
+**The trace-sink adapter — event translation with start↔end pairing.** The one place any adapter holds state. The `activeToolCalls` queue is the load-bearing piece that keeps the NDJSON contract unchanged across the migration.
 
 ```
 lib/agents/aptkit-adapters.ts  (lines 100–142)
@@ -375,7 +323,7 @@ lib/agents/aptkit-adapters.ts  (lines 100–142)
           investigation trace becomes harder to read. small queue, load-bearing.
 ```
 
-### The wiring — Blooming agent classes shrunk to instantiation
+**The wiring — Blooming agent classes shrunk to instantiation.** Each agent class collapsed to ~14 LOC of construct-and-forward; the loop body that used to live here moved into `@aptkit/core`.
 
 ```
 lib/agents/monitoring.ts  (lines 81–95)
@@ -398,6 +346,56 @@ lib/agents/monitoring.ts  (lines 81–95)
           diagnostic, recommendation, query) all have the same shape now —
           construct three adapters, pass to AptKit, forward the result.
           the loop body that used to live here moved into @aptkit/core entirely.
+```
+
+### Move 3 — the principle
+
+The adapter is the discipline that lets a reusable library stay generic. AptKit ships with three primitive interfaces because it doesn't want to know which model provider, which tool transport, or which trace consumer the host application uses. Blooming ships three small adapter classes because Blooming doesn't want to leak Anthropic/DataSource/NDJSON details into a generic agent library. **Each side hides its specifics behind a small interface; the adapter is the file that absorbs the impedance.** That's the trade: one small class per boundary, in exchange for a library that can be reused unchanged in another app and an app that can swap libraries without rewriting every agent class.
+
+This is the same lesson as `01-mcp-client-deep-module.md` — interface size vs absorbed behavior — applied at the dependency boundary instead of the protocol boundary. Reading both files in order shows the principle scaling: one adapter per backend at the DataSource seam, one adapter per primitive at the AptKit seam.
+
+---
+
+## Primary diagram
+
+The full picture — three primitives, three adapters, three independent translations, one boundary.
+
+```
+AptKit primitive adapters — the deep-module recap
+
+   Blooming agent class                ┌─ lib/agents/aptkit-adapters.ts ────────┐
+   ┌──────────────────────┐             │                                          │
+   │ MonitoringAgent      │  per call   │  AnthropicModelProviderAdapter           │
+   │ DiagnosticAgent      │ ──────────► │    complete(request)                     │
+   │ RecommendationAgent  │             │      a. ModelMessage → Anthropic shape   │
+   │ QueryAgent           │             │      b. ModelTool    → Anthropic.Tool    │
+   └──────────────────────┘             │      c. signal       → SDK option        │
+                                        │      d. anthropic.messages.create        │
+                                        │      e. log usage at agents/<name>:…     │
+                                        │      f. content[]    → ModelContentBlock │
+                                        │                                          │
+                                        │  BloomingToolRegistryAdapter             │
+                                        │    listTools()                            │
+                                        │      a. McpToolDef[]  → ToolDefinition[]  │
+                                        │    callTool(name, args, opts?)            │
+                                        │      a. forward to dataSource.callTool    │
+                                        │      b. {result, durationMs} envelope     │
+                                        │                                          │
+                                        │  BloomingTraceSinkAdapter                │
+                                        │    emit(event)                            │
+                                        │      step       → hooks.onText            │
+                                        │      tool_start → hooks.onToolCall +      │
+                                        │                   queue ToolCall          │
+                                        │      tool_end   → dequeue + hooks.onToolResult │
+                                        └──────────────────────────────────────────┘
+                                                       │
+                                                       ▼
+                                               @aptkit/core@0.3.0 agent loop
+                                               (knows NONE of: Anthropic,
+                                                DataSource, NDJSON, ToolCall)
+
+   3 adapter classes.  ~110 LOC of translation.  3 cleanly separated kernels.
+   the library stays generic; the app keeps its wire format.
 ```
 
 ---

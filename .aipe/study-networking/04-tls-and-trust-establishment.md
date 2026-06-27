@@ -90,6 +90,12 @@ The shape — two crypto domains, no overlap
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **First user load in production.** Browser hits `https://<app>.vercel.app`; TLS terminates at edge; function reads cookies; if `bi_auth` present, decrypts it; if not, returns `{needsAuth, authUrl}` and the browser navigates to Bloomreach's IdP over TLS.
+  → **OAuth callback.** The IdP 302s back to `/api/mcp/callback?code=…` over TLS; the function decrypts `bi_auth` to recover the PKCE verifier saved during `connect`, exchanges the code over TLS to Bloomreach, persists new tokens in the re-encrypted cookie.
+  → **Cold start after instance death.** Function comes up with no memory of prior state; the cookie's encrypted blob is the only state that survived; decrypts, reads tokens, proceeds.
+
 **TLS on every hop.** All three production hops are HTTPS. The browser → edge link uses TLS terminated at Vercel; the cert is whatever Vercel provisions for `*.vercel.app` (or your custom domain via Let's Encrypt). The function → Bloomreach link uses TLS terminated by Bloomreach; their cert chain is validated by Node's bundled trust store. Same for the function → Anthropic link. We do not pin certs; we do not load a custom CA; we do not disable validation.
 
 ```
@@ -134,6 +140,48 @@ Pseudocode — Secure flag enforces TLS
 
 The boundary that catches people: in development on `localhost`, `Secure` cookies don't ride at all (the browser drops them), so `session.ts` and `auth.ts` both omit `secure: true` when `NODE_ENV !== 'production'`. Forgetting that pattern would make dev OAuth silently fail with no cookies.
 
+The split, in the matching session-cookie helper:
+
+```
+lib/mcp/session.ts  (lines 10-14, dev/prod cookie split)
+
+function sessionCookieOpts() {
+  return process.env.NODE_ENV === 'production'
+    ? { httpOnly: true, secure: true, sameSite: 'none' as const, path: '/' }
+    : { httpOnly: true, sameSite: 'lax' as const, path: '/' };
+                       │
+                       └─ no secure:true in dev, because localhost is
+                          http://. A Secure cookie on a non-TLS hop
+                          would simply not be sent — the dev OAuth
+                          flow would silently break.
+}
+```
+
+And the matching attribute set on `bi_auth`, the encrypted cookie:
+
+```
+lib/mcp/auth.ts  (lines 86-103, withAuthCookies' flush)
+
+(await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
+  httpOnly: true,
+       │
+       └─ JS in the page can't read it; XSS can't exfiltrate the cookie
+          even if it can hit your API.
+  secure: true,
+       │
+       └─ load-bearing in prod: browser refuses to send this over HTTP.
+          Combined with the public app being HTTPS-only on Vercel, the
+          encrypted blob never crosses cleartext.
+  sameSite: 'none',
+       │
+       └─ required for the cross-site OAuth callback: SameSite=Lax would
+          drop the cookie on the IdP→callback bounce in some browsers,
+          and we'd lose the PKCE verifier.
+  path: '/',
+  maxAge: AUTH_COOKIE_MAX_AGE,   // 10 days, matches token lifetime
+});
+```
+
 **The cookie encryption — AES-256-GCM under `AUTH_SECRET`.** This is the only crypto code we write. We take the `AUTH_SECRET` env var, SHA-256 it into a 32-byte key, generate a fresh random 12-byte IV per encryption, encrypt the JSON-stringified store, append the GCM auth tag, base64url the whole thing, and put it in the cookie. To decrypt: extract IV (first 12 bytes), auth tag (next 16), ciphertext (rest), `createDecipheriv`, `setAuthTag`, decrypt. A tampered ciphertext or rotated `AUTH_SECRET` triggers the GCM auth-tag check to fail, decrypt throws, and `decryptStore` returns `{}` — treated as "no auth."
 
 ```
@@ -166,7 +214,57 @@ Pseudocode — AES-256-GCM round trip
 
 The choice of GCM (authenticated encryption) is load-bearing. With CBC + HMAC you'd have two keys and a chance to make order-of-operations mistakes (encrypt-then-MAC vs MAC-then-encrypt). GCM bundles confidentiality + integrity into one primitive with one key, and decrypt fails closed on any tampering. The 12-byte IV is the GCM standard; a fresh IV per encryption is mandatory (reusing one with the same key catastrophically breaks confidentiality).
 
-**What's NOT here.** No cert pinning. No custom CA loading. No mTLS (we authenticate to Bloomreach with an OAuth Bearer, not a client cert). No proxy configuration. No `tls.connect` direct calls. No HSTS header we set ourselves (Vercel may set one). No CSP header we set. These are all `not yet exercised`.
+The actual encrypt/decrypt round trip — the one place we write app crypto:
+
+```
+lib/mcp/auth.ts  (lines 62-79, the encrypt/decrypt round trip)
+
+function encryptStore(store: Store): string {
+  const iv = randomBytes(12);
+                       │
+                       └─ fresh per encryption; reusing an IV with the
+                          same key catastrophically breaks GCM. Node's
+                          randomBytes is cryptographically secure.
+  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
+                       │
+                       └─ aesKey() = sha256(AUTH_SECRET) → 32 bytes.
+                          AES-256-GCM = authenticated encryption with
+                          associated data; one primitive does confi-
+                          dentiality + integrity. We pass no AAD because
+                          there's nothing to bind it to.
+  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
+                                                              │
+                                                              └─ base64url
+                                                                 because the
+                                                                 cookie value
+                                                                 cannot contain
+                                                                 +, /, or =.
+}
+
+function decryptStore(token: string): Store {
+  try {
+    const buf = Buffer.from(token, 'base64url');
+    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
+    decipher.setAuthTag(buf.subarray(12, 28));
+                       │
+                       └─ MUST be called BEFORE update/final in GCM.
+                          Wrong order or missing tag → throws on final.
+    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
+    return JSON.parse(plain) as Store;
+  } catch {
+    return {};
+                       │
+                       └─ tampered ciphertext, rotated AUTH_SECRET, or
+                          corrupt cookie all land here. We FAIL CLOSED:
+                          empty store = "no auth", forcing a fresh OAuth.
+                          Crucially we do not throw — the request can
+                          still serve the auth-required path.
+  }
+}
+```
+
+**What's NOT here.** No cert pinning. No custom CA loading. No mTLS (we authenticate to Bloomreach with an OAuth Bearer, not a client cert). No proxy configuration. No `tls.connect` direct calls. No HSTS header we set ourselves (Vercel may set one). No CSP header we set. These are all `not yet exercised`. A grep for `pinning`, `ca:`, `rejectUnauthorized`, `tls.connect`, `https.Agent` across `lib/` and `app/` returns no app hits. If we later needed to talk to an internal service with a private CA, or wanted to pin Bloomreach's cert against MITM at the platform layer, the insertion point would be `lib/mcp/transport.ts`'s `makeCapturingFetch` — passing a custom `dispatcher` with a TLS-aware connector.
 
 ### Principle
 
@@ -219,112 +317,6 @@ Service band ──────────────────────�
 │  Bloomreach (their TLS)     │                │  Anthropic (their TLS)   │
 └─────────────────────────────┘                └──────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **First user load in production.** Browser hits `https://<app>.vercel.app`; TLS terminates at edge; function reads cookies; if `bi_auth` present, decrypts it; if not, returns `{needsAuth, authUrl}` and the browser navigates to Bloomreach's IdP over TLS.
-  → **OAuth callback.** The IdP 302s back to `/api/mcp/callback?code=…` over TLS; the function decrypts `bi_auth` to recover the PKCE verifier saved during `connect`, exchanges the code over TLS to Bloomreach, persists new tokens in the re-encrypted cookie.
-  → **Cold start after instance death.** Function comes up with no memory of prior state; the cookie's encrypted blob is the only state that survived; decrypts, reads tokens, proceeds.
-
-### `bi_auth` cookie write (the only place we write app crypto)
-
-```
-lib/mcp/auth.ts  (lines 62-79, the encrypt/decrypt round trip)
-
-function encryptStore(store: Store): string {
-  const iv = randomBytes(12);
-                       │
-                       └─ fresh per encryption; reusing an IV with the
-                          same key catastrophically breaks GCM. Node's
-                          randomBytes is cryptographically secure.
-  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
-                       │
-                       └─ aesKey() = sha256(AUTH_SECRET) → 32 bytes.
-                          AES-256-GCM = authenticated encryption with
-                          associated data; one primitive does confi-
-                          dentiality + integrity. We pass no AAD because
-                          there's nothing to bind it to.
-  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
-                                                              │
-                                                              └─ base64url
-                                                                 because the
-                                                                 cookie value
-                                                                 cannot contain
-                                                                 +, /, or =.
-}
-
-function decryptStore(token: string): Store {
-  try {
-    const buf = Buffer.from(token, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
-    decipher.setAuthTag(buf.subarray(12, 28));
-                       │
-                       └─ MUST be called BEFORE update/final in GCM.
-                          Wrong order or missing tag → throws on final.
-    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
-    return JSON.parse(plain) as Store;
-  } catch {
-    return {};
-                       │
-                       └─ tampered ciphertext, rotated AUTH_SECRET, or
-                          corrupt cookie all land here. We FAIL CLOSED:
-                          empty store = "no auth", forcing a fresh OAuth.
-                          Crucially we do not throw — the request can
-                          still serve the auth-required path.
-  }
-}
-```
-
-### `Secure` cookie flag — the TLS-only contract
-
-```
-lib/mcp/auth.ts  (lines 86-103, withAuthCookies' flush)
-
-(await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-  httpOnly: true,
-       │
-       └─ JS in the page can't read it; XSS can't exfiltrate the cookie
-          even if it can hit your API.
-  secure: true,
-       │
-       └─ load-bearing in prod: browser refuses to send this over HTTP.
-          Combined with the public app being HTTPS-only on Vercel, the
-          encrypted blob never crosses cleartext.
-  sameSite: 'none',
-       │
-       └─ required for the cross-site OAuth callback: SameSite=Lax would
-          drop the cookie on the IdP→callback bounce in some browsers,
-          and we'd lose the PKCE verifier.
-  path: '/',
-  maxAge: AUTH_COOKIE_MAX_AGE,   // 10 days, matches token lifetime
-});
-```
-
-### `lib/mcp/session.ts` — the matching session cookie
-
-```
-lib/mcp/session.ts  (lines 10-14, dev/prod cookie split)
-
-function sessionCookieOpts() {
-  return process.env.NODE_ENV === 'production'
-    ? { httpOnly: true, secure: true, sameSite: 'none' as const, path: '/' }
-    : { httpOnly: true, sameSite: 'lax' as const, path: '/' };
-                       │
-                       └─ no secure:true in dev, because localhost is
-                          http://. A Secure cookie on a non-TLS hop
-                          would simply not be sent — the dev OAuth
-                          flow would silently break.
-}
-```
-
-### What's absent (and the verdict)
-
-A grep for `pinning`, `ca:`, `rejectUnauthorized`, `tls.connect`, `https.Agent` across `lib/` and `app/` returns no app hits. The verdict: `not yet exercised`. If we later needed to talk to an internal service with a private CA, or wanted to pin Bloomreach's cert against MITM at the platform layer, the insertion point would be `lib/mcp/transport.ts`'s `makeCapturingFetch` — passing a custom `dispatcher` with a TLS-aware connector.
 
 ---
 

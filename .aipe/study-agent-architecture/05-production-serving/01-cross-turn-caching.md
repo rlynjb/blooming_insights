@@ -145,6 +145,8 @@ The practical consequence: when the diagnostic agent re-runs the same query insi
 
 The condition under which it works (and doesn't): the cache assumes args determine result. That's true for analytics tool calls on a slow-moving aggregate — the underlying data doesn't shift second-to-second. It's *not* always true; the cache is opted out for the "force fresh" path via a `skip_cache` flag. The cache also never stores errors — an `is_error: true` result returns to the agent but isn't written, so a 429 doesn't poison the cache for the rest of the run.
 
+**Where this lives in the repo.** `McpClient.callTool` in `lib/mcp/client.ts` L97–L146 — key at L102, TTL default at L103, read at L105–L110, error-no-cache at L137–L139, write at L143–L144. The 60s TTL `Map` keyed on `name:JSON.stringify(args)`. Returns `{ result, durationMs: 0, fromCache: true }` on a hit (L108). On error, returns the result but does not cache (L137–L139).
+
 ### Layer 2: whole-run replay — the demo cache
 
 The technical thing: a separate, coarser cache that stores entire investigations (the streamed event sequence the agent produced) and replays them on `/investigate` requests when the data is requested with no `live=1` flag. No agents run on a replay; the events stream from disk with a small per-event delay to look live.
@@ -169,6 +171,8 @@ The whole-run replay — agents do not run
 The practical consequence: the demo experience (clicking a stored anomaly tile) runs without an API key, without MCP, without Bloomreach access. It's a whole-run cache hit. The cost paid was at recording time; the replay is free. That's an even coarser cache than intra-run — the *whole trajectory* is the value, the `insightId` is the key.
 
 The condition under which this works: the underlying anomaly is stable enough that the recorded investigation is still a useful answer when replayed. For a demo of capability, that's always true. For a live diagnosis, it isn't — which is exactly why the `&live=1` flag exists.
+
+**Where this lives in the repo.** `app/api/agent/route.ts` — the `GET` stream's cache-first branch (`getCachedInvestigation`) at L125–L141 (cache lookup at L127; event replay at L130–L140). A captured investigation streams from disk, no agents run, no MCP calls, no Claude calls. Used by demo links (`insightId` without `live=1`).
 
 ### Layer 3 (absent): cross-run semantic cache — the one this codebase skipped
 
@@ -296,55 +300,6 @@ blooming insights: cross-turn caching, three scopes labelled by what's in/out
   IN:  intra-run (L1)  +  whole-run replay (L0)
   OUT: cross-run semantic (L2) — by deliberate design
        provider prefix cache (L3) — gap also covered in ai-eng
-```
-
----
-
-## Implementation in codebase
-
-**Case A (partial) — the two scopes that are built.**
-
-**Intra-run cache (Layer 1)**
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool`
-**Line range:** L97–L146 (key at L102, TTL default at L103, read at L105–L110, error-no-cache at L137–L139, write at L143–L144)
-
-The 60s TTL `Map` keyed on `name:JSON.stringify(args)`. Returns `{ result, durationMs: 0, fromCache: true }` on a hit (L108). On error, returns the result but does not cache (L137–L139). This is the cache the agent loops lean on for repeated tool calls within a single investigation.
-
-**Whole-run replay (Layer 0)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** the `GET` stream's cache-first branch (`getCachedInvestigation`)
-**Line range:** L125–L141 (cache lookup at L127; event replay at L130–L140)
-
-A captured investigation streams from disk, no agents run, no MCP calls, no Claude calls. Used by demo links (`insightId` without `live=1`). This is the coarsest cache — the *whole trajectory* is the value.
-
-**Case B — what's deliberately skipped.**
-
-**Cross-run semantic cache (Layer 2)**
-**Honest sentence:** not implemented. A semantic cache would key on an embedding of the sub-question and return a cached prior result on a nearest-neighbor hit; the deliberate choice was to skip it because a stale hit poisons the whole trajectory (the agent reasons forward from a stale value, and every downstream turn inherits the error), and the analytics data is exactly the kind of moving target that makes "stale enough to matter" hard to detect.
-
-**Provider prompt-prefix cache (Layer 3)**
-**Honest sentence:** not set. The Anthropic Messages API supports `cache_control` markers on stable parts of the request; this codebase doesn't set them. Covered in detail in `../../study-ai-engineering/06-production-serving/01-llm-caching.md` (the ai-eng caching file).
-
-```
-shape (not full impl):
-  // intra-run cache (client.ts L97–L146)
-  const cacheKey = `${name}:${JSON.stringify(args)}`;
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result, durationMs: 0, fromCache: true };
-  }
-  // ...liveCall, retry, error checks...
-  if (!isError) this.cache.set(cacheKey, { result, expiresAt: now + 60_000 });
-
-  // whole-run replay (route.ts L125–L141)
-  const cached = getCachedInvestigation(insightId);
-  if (cached) {
-    const stream = new ReadableStream({
-      start(c) { for (const e of cached) { c.enqueue(encode(e)); await sleep(...); } }
-    });
-    return new Response(stream, { headers: NDJSON_HEADERS });
-  }
 ```
 
 ---

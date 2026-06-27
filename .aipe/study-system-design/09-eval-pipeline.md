@@ -259,6 +259,78 @@ The judge prompt itself is calibrated against the same anti-bias techniques the 
 
 This is the same principle as a CI build artifact, scaled down: each eval is reproducible from its inputs (fixture + DB seed + prompt hash + model name + `captured_with`), and each output is keyed by date so two engineers running the same evals on the same day can name them apart.
 
+### Code in this codebase
+
+The four pillar entry scripts live in `eval/scripts/`; the shared agent driver and the LLM-judge harness live in `eval/scripts/lib/`; the paper trail lands in `eval/results/<date>[/<tag>]/`.
+
+**File:** `eval/scripts/run-detection.ts`
+**Function / class:** `main()` (L109–L263); `loadSeededAnomalies()` (L70–L84); `makeResultsDir()` (L89–L100); `loadEnvLocal()` (L30–L51)
+**Role:** Pillar 1 entry — K=10 by default (`parseK()` L57–L65), spawns `OlistDataSource` per K via `runMonitoringAgentOnce`, scores both loose and strict, writes 4 JSON files + `summary.md`.
+**GitHub:** `eval/scripts/run-detection.ts`
+
+```
+// L132–L144 — the K-loop
+for (let i = 1; i <= K; i++) {
+  const capture = await runMonitoringAgentOnce(i, `${sessionId}-run${i}`);
+  const score = scoreRun(capture.insights, anomalies);
+  perRun.push({
+    runIndex: capture.runIndex,
+    durationMs: capture.durationMs,
+    error: capture.error,
+    insights: capture.insights,
+    score,
+    toolCalls: capture.toolCalls.map((tc) => ({ toolName: tc.toolName, args: tc.args })),
+    reasoning: capture.reasoning,
+  });
+  // … per-K log line with loose+strict P/R …
+}
+```
+
+The `EVAL_RUN_TAG` read at L95 is the same-day re-run escape hatch — set it before a re-run and the results dir becomes `eval/results/2026-06-15-after-fix/` instead of overwriting `2026-06-15/`.
+
+**File:** `eval/scripts/lib/run-agent.ts`
+**Function / class:** `runMonitoringAgentOnce(runIndex, sessionId)` (L51–end); `AgentRunCapture` interface (L27–L43)
+**Role:** The shared agent driver for detection's K-loop. Mirrors `app/api/briefing/route.ts` exactly — same factory call shape, same hook surface, same workspace schema — but with stdio capture instead of NDJSON stream. Hardcodes `live-sql` (Olist) because eval only scores the Olist path.
+**GitHub:** `eval/scripts/lib/run-agent.ts`
+
+The subprocess-per-K isolation (L56: `const dataSource = new OlistDataSource()` — fresh per call, disposed in `finally`) is the load-bearing detail: if one run's subprocess crashes, the next K gets a clean spawn. Without it, a single subprocess corruption would cascade across K.
+
+**File:** `eval/scripts/lib/judge.ts`
+**Function / class:** `judgeDiagnosis(anthropic, input, prompt)`; `JUDGE_MODEL` (L72); `parseJudgeResponse()`; `JudgeOutput` / `JudgeError` interfaces
+**Role:** The LLM-as-judge harness for pillar 2. One Anthropic call per candidate, retried once on malformed JSON, then `judge_error`. Truncates tool results to 4 KB (`TOOL_RESULT_TRUNCATE` L77) before showing the judge.
+**GitHub:** `eval/scripts/lib/judge.ts`
+
+The same harness shape is repeated in `judge-rec.ts` (pillar 3) and `similarity-judge.ts` (pillar 4 score mode). Three judges, same anti-bias structure, different rubrics.
+
+**File:** `eval/scripts/run-regression.ts`
+**Function / class:** `main()` (L726–L737); `captureMode()` (L291–L376); `scoreMode()` (L381–L620); `promptHash()` (L163–L175); `runFixture()` (L193–L286)
+**Role:** Pillar 4 entry — two modes split by `--capture` flag. Capture mode runs each fixture once and writes the output back into the fixture file as the golden; score mode runs each fixture and judges against the captured golden via structural diff + similarity judge. The `promptHash()` call writes a SHA-256 of the prompt file content into the fixture so a later score-mode run knows whether the prompt has changed under it.
+**GitHub:** `eval/scripts/run-regression.ts`
+
+```
+// L380–L398 (excerpt) — pre-flight uncaptured check
+const uncaptured = fixtures.filter((f) => f.golden_output == null);
+if (uncaptured.length > 0) {
+  console.error(`[regression:score] ${uncaptured.length}/${fixtures.length} fixtures have null golden_output:`);
+  for (const f of uncaptured) console.error(`  - ${f.id}`);
+  console.error('Run `npm run eval:regression -- --capture` first to populate goldens.');
+  process.exit(1);
+}
+```
+
+The fail-loud-upfront pattern is deliberate: a regression eval that silently passes when half the fixtures are uncaptured is worse than no eval at all. The exit-on-uncaptured is the trust contract for the paper trail.
+
+**File:** `eval/results/<YYYY-MM-DD>[/<tag>]/`
+**Role:** The paper trail — every pillar writes JSON + a markdown scorecard here. Convention: one dir per date, optional `-<tag>` suffix for same-day re-runs (via `EVAL_RUN_TAG`).
+**Layout:**
+- `detection-K<n>-loose.json` / `-strict.json` / `-raw.json` — pillar 1
+- `diagnosis-K<n>-judge.json` / `-raw.json` — pillar 2
+- `recommendation-K<n>-judge.json` / `-raw.json` — pillar 3
+- `regression-judge.json` / `-candidates.json` / `-summary.json` / `-summary.md` — pillar 4
+- `summary.md` — per-pillar human-readable scorecard
+
+Already on disk: `2026-06-15/`, `2026-06-15-after-fix/`, `2026-06-15-capture/`, `2026-06-15-score-baseline/` — the same-day-multi-tag pattern in action.
+
 ---
 
 ## Eval pipeline — diagram
@@ -306,86 +378,6 @@ This is the same principle as a CI build artifact, scaled down: each eval is rep
 ```
 
 Five layers, four pillars, one date-keyed paper trail. The architecture is asymmetric in the judge layer (deterministic for detection, LLM for the others) and that asymmetry is the load-bearing design call.
-
----
-
-## Implementation in codebase
-
-**File:** `eval/scripts/run-detection.ts`
-**Function / class:** `main()` (L109–L263); `loadSeededAnomalies()` (L70–L84); `makeResultsDir()` (L89–L100); `loadEnvLocal()` (L30–L51)
-**Role:** Pillar 1 entry — K=10 by default (`parseK()` L57–L65), spawns `OlistDataSource` per K via `runMonitoringAgentOnce`, scores both loose and strict, writes 4 JSON files + `summary.md`.
-**GitHub:** `eval/scripts/run-detection.ts`
-
-```
-// L132–L144 — the K-loop
-for (let i = 1; i <= K; i++) {
-  const capture = await runMonitoringAgentOnce(i, `${sessionId}-run${i}`);
-  const score = scoreRun(capture.insights, anomalies);
-  perRun.push({
-    runIndex: capture.runIndex,
-    durationMs: capture.durationMs,
-    error: capture.error,
-    insights: capture.insights,
-    score,
-    toolCalls: capture.toolCalls.map((tc) => ({ toolName: tc.toolName, args: tc.args })),
-    reasoning: capture.reasoning,
-  });
-  // … per-K log line with loose+strict P/R …
-}
-```
-
-The `EVAL_RUN_TAG` read at L95 is the same-day re-run escape hatch — set it before a re-run and the results dir becomes `eval/results/2026-06-15-after-fix/` instead of overwriting `2026-06-15/`.
-
----
-
-**File:** `eval/scripts/lib/run-agent.ts`
-**Function / class:** `runMonitoringAgentOnce(runIndex, sessionId)` (L51–end); `AgentRunCapture` interface (L27–L43)
-**Role:** The shared agent driver for detection's K-loop. Mirrors `app/api/briefing/route.ts` exactly — same factory call shape, same hook surface, same workspace schema — but with stdio capture instead of NDJSON stream. Hardcodes `live-sql` (Olist) because eval only scores the Olist path.
-**GitHub:** `eval/scripts/lib/run-agent.ts`
-
-The subprocess-per-K isolation (L56: `const dataSource = new OlistDataSource()` — fresh per call, disposed in `finally`) is the load-bearing detail: if one run's subprocess crashes, the next K gets a clean spawn. Without it, a single subprocess corruption would cascade across K.
-
----
-
-**File:** `eval/scripts/lib/judge.ts`
-**Function / class:** `judgeDiagnosis(anthropic, input, prompt)`; `JUDGE_MODEL` (L72); `parseJudgeResponse()`; `JudgeOutput` / `JudgeError` interfaces
-**Role:** The LLM-as-judge harness for pillar 2. One Anthropic call per candidate, retried once on malformed JSON, then `judge_error`. Truncates tool results to 4 KB (`TOOL_RESULT_TRUNCATE` L77) before showing the judge.
-**GitHub:** `eval/scripts/lib/judge.ts`
-
-The same harness shape is repeated in `judge-rec.ts` (pillar 3) and `similarity-judge.ts` (pillar 4 score mode). Three judges, same anti-bias structure, different rubrics.
-
----
-
-**File:** `eval/scripts/run-regression.ts`
-**Function / class:** `main()` (L726–L737); `captureMode()` (L291–L376); `scoreMode()` (L381–L620); `promptHash()` (L163–L175); `runFixture()` (L193–L286)
-**Role:** Pillar 4 entry — two modes split by `--capture` flag. Capture mode runs each fixture once and writes the output back into the fixture file as the golden; score mode runs each fixture and judges against the captured golden via structural diff + similarity judge. The `promptHash()` call writes a SHA-256 of the prompt file content into the fixture so a later score-mode run knows whether the prompt has changed under it.
-**GitHub:** `eval/scripts/run-regression.ts`
-
-```
-// L380–L398 (excerpt) — pre-flight uncaptured check
-const uncaptured = fixtures.filter((f) => f.golden_output == null);
-if (uncaptured.length > 0) {
-  console.error(`[regression:score] ${uncaptured.length}/${fixtures.length} fixtures have null golden_output:`);
-  for (const f of uncaptured) console.error(`  - ${f.id}`);
-  console.error('Run `npm run eval:regression -- --capture` first to populate goldens.');
-  process.exit(1);
-}
-```
-
-The fail-loud-upfront pattern is deliberate: a regression eval that silently passes when half the fixtures are uncaptured is worse than no eval at all. The exit-on-uncaptured is the trust contract for the paper trail.
-
----
-
-**File:** `eval/results/<YYYY-MM-DD>[/<tag>]/`
-**Role:** The paper trail — every pillar writes JSON + a markdown scorecard here. Convention: one dir per date, optional `-<tag>` suffix for same-day re-runs (via `EVAL_RUN_TAG`).
-**Layout:**
-- `detection-K<n>-loose.json` / `-strict.json` / `-raw.json` — pillar 1
-- `diagnosis-K<n>-judge.json` / `-raw.json` — pillar 2
-- `recommendation-K<n>-judge.json` / `-raw.json` — pillar 3
-- `regression-judge.json` / `-candidates.json` / `-summary.json` / `-summary.md` — pillar 4
-- `summary.md` — per-pillar human-readable scorecard
-
-Already on disk: `2026-06-15/`, `2026-06-15-after-fix/`, `2026-06-15-capture/`, `2026-06-15-score-baseline/` — the same-day-multi-tag pattern in action.
 
 ---
 

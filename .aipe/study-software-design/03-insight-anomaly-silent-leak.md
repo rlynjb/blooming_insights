@@ -212,6 +212,101 @@ Deeper-fix sketch
 
 The wire format IS the leak source. Fix the wire format and the leak goes away.
 
+### Move 2 — code in this codebase
+
+**Use cases.** Three places this leak bites.
+
+- **Adding `affectedCustomers` to `Anomaly`.** The contributor edits `lib/mcp/types.ts` and probably remembers to update `anomalyToInsight` (it's nearby in feel). They forget `insightToAnomaly` because it lives in a different file. The diagnostic agent's prompt template references `${anomaly.affectedCustomers}` and gets `undefined`. Tests pass. The agent's reasoning silently degrades for the round-tripped case.
+
+- **The user investigates an insight from the feed.** Click on an insight card → `/investigate/[id]` → opens an investigation. The investigation route fetches `/api/agent?step=diagnose&insight=<JSON of full Insight>`. The route calls `insightToAnomaly` to rebuild the Anomaly for the agent. The rebuilt Anomaly has `evidence: []` even though the original Anomaly had real evidence — because `insightToAnomaly` (`app/api/agent/route.ts:30`) hardcodes `evidence: []`.
+
+- **Refactoring the Insight type.** Someone renames `Insight.metric` to `Insight.metricName` for clarity. TypeScript flags `anomalyToInsight` (which assigns to `Insight.metric`) and `insightToAnomaly` (which reads `i.metric`). Both compile errors land, the contributor fixes both. Good — the type-level rename was caught. But that's the only case TypeScript catches.
+
+**The canonical mapping (state module).** This is the function that owns the full field list — eight verbatim copies plus five derivations.
+
+```
+lib/state/insights.ts  (lines 8–28)
+
+  export function anomalyToInsight(a: Anomaly): Insight {
+    const id = crypto.randomUUID();                       ← derived
+    const sign = a.change.direction === 'down' ? '-' : '+';
+    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`...
+    return {
+      id,
+      timestamp: new Date().toISOString(),                ← derived
+      severity: a.severity,                                ← COPY
+      headline,                                            ← derived
+      summary: ...,                                        ← derived
+      metric: a.metric,                                    ← COPY
+      change: a.change,                                    ← COPY
+      scope: a.scope,                                      ← COPY
+      source: 'monitoring',                                ← stamped
+      evidence: a.evidence,                                ← COPY
+      impact: a.impact,                                    ← COPY
+      history: a.history,                                  ← COPY
+      category: a.category,                                ← COPY
+      ...deriveInsightFields(a),                           ← enriched
+    };
+  }
+       │
+       │  fields copied verbatim:
+       │    severity, metric, change, scope, evidence, impact, history, category
+       │    (8 fields)
+       │
+       └─ this function owns the FULL field list. it is the canonical mapping.
+```
+
+**The inverse, in a different file (the leak).** Same knowledge, different file, four silent drops.
+
+```
+app/api/agent/route.ts  (lines 29–31)
+
+  function insightToAnomaly(i: Insight): Anomaly {
+    return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
+  }
+       │
+       │  fields copied:
+       │    metric, scope, change, severity  ← only 4
+       │
+       │  fields dropped (silently):
+       │    evidence — hardcoded to [] even though Insight.evidence often has data
+       │    impact   — silently omitted
+       │    history  — silently omitted
+       │    category — silently omitted
+       │
+       └─ TypeScript approves this function because every required Anomaly field
+          is present. evidence is `Evidence[]` not `Evidence[] | undefined`, so
+          the literal `[]` satisfies the type. the other three are optional,
+          so omitting them is fine for the compiler.
+
+          the LEAK is that this function and anomalyToInsight encode the SAME
+          knowledge (what fields cross between the two types) but TypeScript
+          can't force them to copy the same subset.
+```
+
+**The wire format that forces the leak's existence.** The inverse only exists because the browser passes the full `Insight` shape as a query param. Change the wire format and the leak retires.
+
+```
+the browser-side call (app/page.tsx and friends):
+
+  const url = `/api/agent?step=diagnose&insight=${encodeURIComponent(JSON.stringify(insight))}`
+  fetch(url)
+
+the route side (app/api/agent/route.ts L60–L65):
+
+  const insightParam = req.nextUrl.searchParams.get('insight')
+  const insight = insightParam ? JSON.parse(insightParam) as Insight : null
+  if (insight) {
+    const anomaly = insightToAnomaly(insight)   ← the rebuild call
+    runDiagnostic(anomaly, ...)
+  }
+       │
+       └─ the route accepts the full Insight shape from the browser. that's
+          why insightToAnomaly exists. change the wire format to accept just
+          insight.id (and look up the cached anomaly server-side), and the
+          inverse retires entirely.
+```
+
 ### Move 3 — the principle
 
 The hiding test is adversarial: pick the secret you think is hidden, grep for it, count files. One = real hide. Two or three = leak. TypeScript helps with type-level secrets (interfaces, function signatures) but not with behavioral secrets (which fields a function copies). Behavioral consistency between two functions has to be enforced by either (a) colocating them so a reviewer notices the asymmetry, or (b) a test that asserts the round-trip. Lacking both, the divergence happens silently. The deeper move is to ask *why* the leak exists at all — often it's a consequence of an earlier design decision (here, the wire format) that, if reconsidered, retires the leak entirely.
@@ -256,103 +351,6 @@ The Insight↔Anomaly leak — recap
               │                                  → insightToAnomaly → Anomaly'
               │                                  → diagnostic agent runs on
               │                                    Anomaly' (missing 4 fields)
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.** Three places this leak bites.
-
-- **Adding `affectedCustomers` to `Anomaly`.** The contributor edits `lib/mcp/types.ts` and probably remembers to update `anomalyToInsight` (it's nearby in feel). They forget `insightToAnomaly` because it lives in a different file. The diagnostic agent's prompt template references `${anomaly.affectedCustomers}` and gets `undefined`. Tests pass. The agent's reasoning silently degrades for the round-tripped case.
-
-- **The user investigates an insight from the feed.** Click on an insight card → `/investigate/[id]` → opens an investigation. The investigation route fetches `/api/agent?step=diagnose&insight=<JSON of full Insight>`. The route calls `insightToAnomaly` to rebuild the Anomaly for the agent. The rebuilt Anomaly has `evidence: []` even though the original Anomaly had real evidence — because `insightToAnomaly` (`app/api/agent/route.ts:30`) hardcodes `evidence: []`.
-
-- **Refactoring the Insight type.** Someone renames `Insight.metric` to `Insight.metricName` for clarity. TypeScript flags `anomalyToInsight` (which assigns to `Insight.metric`) and `insightToAnomaly` (which reads `i.metric`). Both compile errors land, the contributor fixes both. Good — the type-level rename was caught. But that's the only case TypeScript catches.
-
-### The canonical mapping (state module)
-
-```
-lib/state/insights.ts  (lines 8–28)
-
-  export function anomalyToInsight(a: Anomaly): Insight {
-    const id = crypto.randomUUID();                       ← derived
-    const sign = a.change.direction === 'down' ? '-' : '+';
-    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`...
-    return {
-      id,
-      timestamp: new Date().toISOString(),                ← derived
-      severity: a.severity,                                ← COPY
-      headline,                                            ← derived
-      summary: ...,                                        ← derived
-      metric: a.metric,                                    ← COPY
-      change: a.change,                                    ← COPY
-      scope: a.scope,                                      ← COPY
-      source: 'monitoring',                                ← stamped
-      evidence: a.evidence,                                ← COPY
-      impact: a.impact,                                    ← COPY
-      history: a.history,                                  ← COPY
-      category: a.category,                                ← COPY
-      ...deriveInsightFields(a),                           ← enriched
-    };
-  }
-       │
-       │  fields copied verbatim:
-       │    severity, metric, change, scope, evidence, impact, history, category
-       │    (8 fields)
-       │
-       └─ this function owns the FULL field list. it is the canonical mapping.
-```
-
-### The inverse, in a different file (the leak)
-
-```
-app/api/agent/route.ts  (lines 29–31)
-
-  function insightToAnomaly(i: Insight): Anomaly {
-    return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
-  }
-       │
-       │  fields copied:
-       │    metric, scope, change, severity  ← only 4
-       │
-       │  fields dropped (silently):
-       │    evidence — hardcoded to [] even though Insight.evidence often has data
-       │    impact   — silently omitted
-       │    history  — silently omitted
-       │    category — silently omitted
-       │
-       └─ TypeScript approves this function because every required Anomaly field
-          is present. evidence is `Evidence[]` not `Evidence[] | undefined`, so
-          the literal `[]` satisfies the type. the other three are optional,
-          so omitting them is fine for the compiler.
-
-          the LEAK is that this function and anomalyToInsight encode the SAME
-          knowledge (what fields cross between the two types) but TypeScript
-          can't force them to copy the same subset.
-```
-
-### The wire format that forces the leak's existence
-
-```
-the browser-side call (app/page.tsx and friends):
-
-  const url = `/api/agent?step=diagnose&insight=${encodeURIComponent(JSON.stringify(insight))}`
-  fetch(url)
-
-the route side (app/api/agent/route.ts L60–L65):
-
-  const insightParam = req.nextUrl.searchParams.get('insight')
-  const insight = insightParam ? JSON.parse(insightParam) as Insight : null
-  if (insight) {
-    const anomaly = insightToAnomaly(insight)   ← the rebuild call
-    runDiagnostic(anomaly, ...)
-  }
-       │
-       └─ the route accepts the full Insight shape from the browser. that's
-          why insightToAnomaly exists. change the wire format to accept just
-          insight.id (and look up the cached anomaly server-side), and the
-          inverse retires entirely.
 ```
 
 ---

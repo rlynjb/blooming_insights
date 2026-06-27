@@ -219,6 +219,118 @@ The `score` mode of the eval pipeline does **structural diff** between a fresh r
 
 A data model is correct when its determinism story matches its consumers' reproducibility needs. **Synthetic data with `Math.random()` is a contradiction** — the whole point of synthetic data is "I control the inputs, so I control the outputs." `mulberry32(seed=42)` makes the seed-to-DB step deterministic, the seeded-anomalies table makes the DB-to-eval contract auditable, and the regression-golden fixtures make the eval-output shape structurally testable. Every step in the loop is reproducible except the LLM itself — and even there, the K=10 averaging gives statistical reproducibility. The discipline transfers: any time you're building a data layer that feeds an AI eval, pin the data with a deterministic seed, model the ground truth as records, and capture the result shapes as committed contracts.
 
+### Code in this codebase
+
+The repo anchors for the determinism chain Move 2 walked — the PRNG, the seeded anomaly constants, the eval's read of those rows, and the regression-golden fixture shape.
+
+#### The deterministic PRNG
+
+```
+mcp-server-olist/scripts/seed-olist.ts  (lines 36–45)
+
+  function mulberry32(seed: number): () => number {
+    let state = seed >>> 0;                   ← coerce to uint32
+    return function next() {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;  ← [0, 1)
+    };
+  }
+
+  const OLIST_SEED = 42;                       ← the constant
+  const rng = mulberry32(OLIST_SEED);
+       │
+       └─ pure ALU; no allocations after the closure capture; no
+          dependence on time, environment, or process state. the
+          ONLY thing that affects the output is the seed.
+```
+
+#### The seeded anomaly definitions
+
+```
+mcp-server-olist/scripts/seed-olist.ts  (lines 143–179)
+
+  const SEEDED_ANOMALIES = [
+    {
+      id: 'sp-revenue-drop-w4',
+      metric: 'revenue',
+      dimension: 'state',
+      segment: 'SP',
+      start_ts: START_TS + 3 * 7 * 86400,
+      end_ts:   START_TS + 4 * 7 * 86400,
+      expected_severity: 'critical',
+      description: 'Revenue in São Paulo (SP) drops ~30% in week 4 ...',
+      _generator: { kind: 'multiplier', value: 0.7 }   ← ★ NOT in DB
+    },
+    { ... 'electronics-spike-w2', multiplier 2.5  ... },
+    { ... 'voucher-dropoff-w10-on', multiplier 0.05 ... },
+  ] as const;
+       │
+       └─ the multiplier (_generator.value) is the load-bearing fact.
+          it's applied during generation in shouldKeepOrder() and
+          generateAnomalyBoosters(). it lives ONLY in this constant —
+          the DB stores the human description, not the multiplier.
+          this is audit finding #4: drift risk if description and
+          multiplier stop matching.
+```
+
+#### Where the seeded anomalies are read by the eval
+
+```
+eval/scripts/lib/run-agent.ts and run-detection.ts
+
+  // load the ground truth FROM THE DB the agent just read
+  const seededAnomalies = db.prepare('SELECT * FROM seeded_anomalies').all();
+
+  // run the agent K times, score each run
+  for (let k = 0; k < K; k++) {
+    const agentOutput = await runMonitoringAgent(...);
+    const matches = matchAnomalies(agentOutput, seededAnomalies);
+    runs.push({ runIndex: k, anomalies: agentOutput, matches });
+  }
+       │
+       └─ the DB is the source of truth. the eval queries it; the agent
+          queries it. one shared substrate, two consumers. that's why
+          the seeded_anomalies row IS the spec — both sides read it.
+```
+
+#### The regression-golden fixture shape
+
+```
+eval/fixtures/regression-golden/01-monitoring-empty.json  (excerpt)
+
+  {
+    "id": "01-monitoring-empty",
+    "agent": "monitoring",
+    "description": "Monitoring scan of the live Olist DataSource ...",
+    "input": {
+      "dataset": "olist",
+      "categories": "[] (no checklist provided — broad scan)",
+      "notes": "..."
+    },
+    "golden_output": [
+      {
+        "metric": "payment_value",
+        "category": "payment_type_collapse",
+        "scope": ["payment_type:voucher"],
+        "change": { "value": 79.4, "direction": "down", ... },
+        "severity": "critical",
+        "impact": "...",
+        "evidence": [...]
+      }
+    ]
+  }
+       │
+       └─ every field in golden_output[] is checked structurally when
+          the `score` mode runs. a renamed field is a regression.
+          a re-ordered array is a regression. a new optional field
+          requires a deliberate re-capture.
+          ten such fixtures cover monitoring (2), diagnostic (3),
+          recommendation (3), query (1), intent (1).
+```
+
 ---
 
 ## Primary diagram
@@ -259,118 +371,6 @@ The full eval-data loop, with reproducibility annotated.
   │    → score mode structural-diffs against them                │
   │    → drift surfaces as a failing test                        │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### The deterministic PRNG
-
-```
-mcp-server-olist/scripts/seed-olist.ts  (lines 36–45)
-
-  function mulberry32(seed: number): () => number {
-    let state = seed >>> 0;                   ← coerce to uint32
-    return function next() {
-      state = (state + 0x6d2b79f5) >>> 0;
-      let t = state;
-      t = Math.imul(t ^ (t >>> 15), t | 1);
-      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;  ← [0, 1)
-    };
-  }
-
-  const OLIST_SEED = 42;                       ← the constant
-  const rng = mulberry32(OLIST_SEED);
-       │
-       └─ pure ALU; no allocations after the closure capture; no
-          dependence on time, environment, or process state. the
-          ONLY thing that affects the output is the seed.
-```
-
-### The seeded anomaly definitions
-
-```
-mcp-server-olist/scripts/seed-olist.ts  (lines 143–179)
-
-  const SEEDED_ANOMALIES = [
-    {
-      id: 'sp-revenue-drop-w4',
-      metric: 'revenue',
-      dimension: 'state',
-      segment: 'SP',
-      start_ts: START_TS + 3 * 7 * 86400,
-      end_ts:   START_TS + 4 * 7 * 86400,
-      expected_severity: 'critical',
-      description: 'Revenue in São Paulo (SP) drops ~30% in week 4 ...',
-      _generator: { kind: 'multiplier', value: 0.7 }   ← ★ NOT in DB
-    },
-    { ... 'electronics-spike-w2', multiplier 2.5  ... },
-    { ... 'voucher-dropoff-w10-on', multiplier 0.05 ... },
-  ] as const;
-       │
-       └─ the multiplier (_generator.value) is the load-bearing fact.
-          it's applied during generation in shouldKeepOrder() and
-          generateAnomalyBoosters(). it lives ONLY in this constant —
-          the DB stores the human description, not the multiplier.
-          this is audit finding #4: drift risk if description and
-          multiplier stop matching.
-```
-
-### Where the seeded anomalies are read by the eval
-
-```
-eval/scripts/lib/run-agent.ts and run-detection.ts
-
-  // load the ground truth FROM THE DB the agent just read
-  const seededAnomalies = db.prepare('SELECT * FROM seeded_anomalies').all();
-
-  // run the agent K times, score each run
-  for (let k = 0; k < K; k++) {
-    const agentOutput = await runMonitoringAgent(...);
-    const matches = matchAnomalies(agentOutput, seededAnomalies);
-    runs.push({ runIndex: k, anomalies: agentOutput, matches });
-  }
-       │
-       └─ the DB is the source of truth. the eval queries it; the agent
-          queries it. one shared substrate, two consumers. that's why
-          the seeded_anomalies row IS the spec — both sides read it.
-```
-
-### The regression-golden fixture shape
-
-```
-eval/fixtures/regression-golden/01-monitoring-empty.json  (excerpt)
-
-  {
-    "id": "01-monitoring-empty",
-    "agent": "monitoring",
-    "description": "Monitoring scan of the live Olist DataSource ...",
-    "input": {
-      "dataset": "olist",
-      "categories": "[] (no checklist provided — broad scan)",
-      "notes": "..."
-    },
-    "golden_output": [
-      {
-        "metric": "payment_value",
-        "category": "payment_type_collapse",
-        "scope": ["payment_type:voucher"],
-        "change": { "value": 79.4, "direction": "down", ... },
-        "severity": "critical",
-        "impact": "...",
-        "evidence": [...]
-      }
-    ]
-  }
-       │
-       └─ every field in golden_output[] is checked structurally when
-          the `score` mode runs. a renamed field is a regression.
-          a re-ordered array is a regression. a new optional field
-          requires a deliberate re-capture.
-          ten such fixtures cover monitoring (2), diagnostic (3),
-          recommendation (3), query (1), intent (1).
 ```
 
 ---

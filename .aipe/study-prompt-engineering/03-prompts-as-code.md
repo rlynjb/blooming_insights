@@ -125,6 +125,8 @@ edit prompt → git diff → PR review → merge → ships with the build
 
 Because the read runs at import, the prompt is also baked into the running process — there is no live-edit path, no dashboard override, no way for the deployed prompt to differ from the committed one. That immutability-at-runtime is a feature: the prompt that ran is exactly the prompt in the commit.
 
+**Code in this codebase — prompts loaded as versioned source.** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` + `lib/agents/prompts/*.md`, module-level `PROMPT` constant via `readFileSync` at `monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13. The prompt is a repo file loaded as source at import — diffable, reviewable, runtime-immutable.
+
 ### The markdown choice: prose that reviews like prose
 
 The prompts are Markdown, not code template literals, and that matters for review. A reviewer reading the diagnostic prompt's "Investigation approach" section reads it as prose — the way the model reads it — not as an escaped string with `\n`s. The instruction *is* the artifact; Markdown keeps it legible as one. The headings (`## Role`, `## Hard rules`) double as a structure a reviewer can scan (→ 01-anatomy.md).
@@ -170,6 +172,8 @@ prompt version:  monitoring prompt @ abc123     ─┐
 model version:   the agent model constant       ─┘
 ```
 
+**Code in this codebase — model IDs (separate from the prompts).** `lib/agents/base.ts`, `lib/agents/intent.ts` — `AGENT_MODEL` and `CLASSIFIER_MODEL` constants at `base.ts` L9 (`'claude-sonnet-4-6'`), `intent.ts` L14 (`'claude-haiku-4-5-20251001'`). The model version lives in code, decoupled from the prompt files — unpaired and independently versioned.
+
 **Gap 2 — no prompt-version → output observability.** The route handler streams the trace and persists the events on stream close, but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which monitoring prompt was live then, on which model?" without correlating git history to a deploy timestamp by hand.
 
 ```
@@ -179,6 +183,10 @@ NOT saved:  prompt sha · model id · prompt version tag
 ```
 
 **Why this is the "worked-on-Sonnet-breaks-on-the-next-Sonnet" risk, precisely.** Change the agent-model constant to a newer model. The prompts are unchanged, so the diff looks safe — one line, a model string. But the prompts were tuned against the *old* model's behavior: its default formatting, its tendency to fence JSON, its adherence to the monitoring prompt's "do not re-run variations" rule. The new model may format differently, and now the diagnostic agent's parse-failure rate climbs. Because the prompt version and model version aren't paired or co-logged, the regression presents as "diagnoses got worse" with no signal pointing at the model bump. The fix that would make it traceable — log `{promptSha, model}` with every output — is exactly the missing half.
+
+**Code in this codebase — output persistence (no prompt/model metadata).** `app/api/agent/route.ts`, the `saveInvestigation` call in the stream's `start`, L254 (`saveInvestigation(insightId!, collected)`); `collected` is the `AgentEvent[]` of outputs, declared at L171 and pushed to in `send` at L173. Persists the streamed outputs for cache-replay; carries no prompt SHA, model ID, or version tag — the observability gap.
+
+**Why this is a codebase strength (the half it has).** The prompts being plain `.md` under `lib/` means every behavior change is a reviewable diff with git history, and the import-time read guarantees the deployed prompt equals the committed prompt. That is the foundation; the missing half is additive, not a rewrite.
 
 ---
 
@@ -219,37 +227,6 @@ This diagram spans the authoring half (solid) and the observability half (dashed
 ```
 
 The authoring half is solid; the model ID is decoupled; the observability half is empty — which is the line between "we can review a prompt" and "we can trace a regression to one."
-
----
-
-## Implementation in codebase
-
-**Case A — partial. The authoring half is implemented; the observability half is not.**
-
-### Prompts loaded as versioned source
-
-- **File:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` + `lib/agents/prompts/*.md`
-- **Function / class:** module-level `PROMPT` constant via `readFileSync`
-- **Line range:** `monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13.
-- **Role:** the prompt is a repo file loaded as source at import — diffable, reviewable, runtime-immutable.
-
-### Model IDs (separate from the prompts)
-
-- **File:** `lib/agents/base.ts`, `lib/agents/intent.ts`
-- **Function / class:** `AGENT_MODEL`, `CLASSIFIER_MODEL` constants
-- **Line range:** `base.ts` L9 (`'claude-sonnet-4-6'`), `intent.ts` L14 (`'claude-haiku-4-5-20251001'`).
-- **Role:** the model version lives in code, decoupled from the prompt files — unpaired and independently versioned.
-
-### Output persistence (no prompt/model metadata)
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `saveInvestigation` call in the stream's `start`
-- **Line range:** L254 (`saveInvestigation(insightId!, collected)`); `collected` is the `AgentEvent[]` of outputs, declared at L171 and pushed to in `send` at L173.
-- **Role:** persists the streamed outputs for cache-replay; carries no prompt SHA, model ID, or version tag — the observability gap.
-
-### Why this is a codebase strength (the half it has)
-
-The prompts being plain `.md` under `lib/` means every behavior change is a reviewable diff with git history, and the import-time read guarantees the deployed prompt equals the committed prompt. That is the foundation; the missing half is additive, not a rewrite.
 
 ---
 

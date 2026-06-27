@@ -500,77 +500,9 @@ The bulk `{type:'coverage'}` variant still exists for the plain-JSON fallback pa
 
 Decouple producer cadence from consumer render via a stream and a shared event contract. The producer writes when it has something to write. The consumer reads when chunks arrive. Neither side waits for the other to finish. The contract (the `AgentEvent` union) is the only coupling.
 
----
+### Code in this codebase
 
-## Streaming reasoning over NDJSON — diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (app/api/agent/route.ts · ?step=diagnose | recommend)            │
-│                                                                                  │
-│  ReadableStream<Uint8Array>                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  start(controller)  — try/catch/finally                                  │    │
-│  │                                                                          │    │
-│  │  send(reasoning_step 'reading the workspace schema…')  ← FIRST   │    │
-│  │  schema = await bootstrapSchema(conn.mcp)              ← inside stream  │    │
-│  │                                                                          │    │
-│  │  step=diagnose → DiagnosticAgent ─→ send(reasoning_step/tool_*)         │    │
-│  │                                  ─→ send(diagnosis)   ──→ enqueue(bytes)│    │
-│  │  step=recommend→ RecommendationAgent ─→ send(reasoning_step/tool_*)     │    │
-│  │   (diagnosis handed in via &diagnosis=) ─→ send(recommendation ×N)     │    │
-│  │                                                                          │    │
-│  │  send(done)  →  finally: controller.close()                             │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                  │
-│  Response({ body: stream, headers: { 'Content-Type': 'application/x-ndjson' }}) │
-└────────────────────────────────────────┬─────────────────────────────────────────┘
-                                         │
-                             NETWORK BOUNDARY
-                             HTTP chunked transfer
-                             one NDJSON line per event
-                                         │
-                                         ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│  UI LAYER  (lib/hooks/useInvestigation.ts ← page.tsx + recommend/page.tsx)       │
-│                                                                                  │
-│  fetch('/api/agent?insightId=...&step=...')                                      │
-│       │                                                                          │
-│       ▼                                                                          │
-│  res.body.getReader()                                                            │
-│       │                                                                          │
-│       └─ read() loop ──→ TextDecoder.decode(chunk, { stream:true })              │
-│                               │                                                  │
-│                               ▼                                                  │
-│                       buf += decoded                                             │
-│                       lines = buf.split('\n')                                    │
-│                       buf  = lines.pop()        ← keep trailing partial          │
-│                               │                                                  │
-│                               ▼                                                  │
-│                       for line of lines: JSON.parse(line) as AgentEvent         │
-│                               │                                                  │
-│                               ▼                                                  │
-│                       handle(e) ──→ switch(e.type)                               │
-│                               │                                                  │
-│              ┌────────────────┼────────────────┬──────────────────┐             │
-│              ▼                ▼                ▼                  ▼             │
-│        setItems(...)    setDiagnosis(...)  setRecommendations(...)  setComplete  │
-│              │                │                │                  │             │
-│              └────────────────┴────────────────┴──────────────────┘             │
-│                                       │                                          │
-│                       on 'done': stash bi:inv:<step>:<id>                        │
-│                       + (diagnose) hand off bi:diag:<id>                         │
-│                                       │                                          │
-│                               React re-renders                                   │
-│                               ReasoningTrace · EvidencePanel · RecommendationCard│
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
-
-The service layer produces. The network carries. The UI layer consumes. Nothing is shared across the boundary except bytes.
-
----
-
-## Implementation in codebase
+The wire contract lives in `lib/mcp/events.ts`; the producer in `app/api/agent/route.ts`; the consumer in `lib/hooks/useInvestigation.ts` and `app/page.tsx`.
 
 | File | Function / symbol | Lines |
 |---|---|---|
@@ -656,6 +588,74 @@ GitHub:
 - [`lib/hooks/useInvestigation.ts`](https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts)
 - [`app/investigate/[id]/page.tsx`](https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/page.tsx)
 - [`app/investigate/[id]/recommend/page.tsx`](https://github.com/rlynjb/blooming_insights/blob/main/app/investigate/%5Bid%5D/recommend/page.tsx)
+
+---
+
+## Streaming reasoning over NDJSON — diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  SERVICE LAYER  (app/api/agent/route.ts · ?step=diagnose | recommend)            │
+│                                                                                  │
+│  ReadableStream<Uint8Array>                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  start(controller)  — try/catch/finally                                  │    │
+│  │                                                                          │    │
+│  │  send(reasoning_step 'reading the workspace schema…')  ← FIRST   │    │
+│  │  schema = await bootstrapSchema(conn.mcp)              ← inside stream  │    │
+│  │                                                                          │    │
+│  │  step=diagnose → DiagnosticAgent ─→ send(reasoning_step/tool_*)         │    │
+│  │                                  ─→ send(diagnosis)   ──→ enqueue(bytes)│    │
+│  │  step=recommend→ RecommendationAgent ─→ send(reasoning_step/tool_*)     │    │
+│  │   (diagnosis handed in via &diagnosis=) ─→ send(recommendation ×N)     │    │
+│  │                                                                          │    │
+│  │  send(done)  →  finally: controller.close()                             │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+│  Response({ body: stream, headers: { 'Content-Type': 'application/x-ndjson' }}) │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │
+                             NETWORK BOUNDARY
+                             HTTP chunked transfer
+                             one NDJSON line per event
+                                         │
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  UI LAYER  (lib/hooks/useInvestigation.ts ← page.tsx + recommend/page.tsx)       │
+│                                                                                  │
+│  fetch('/api/agent?insightId=...&step=...')                                      │
+│       │                                                                          │
+│       ▼                                                                          │
+│  res.body.getReader()                                                            │
+│       │                                                                          │
+│       └─ read() loop ──→ TextDecoder.decode(chunk, { stream:true })              │
+│                               │                                                  │
+│                               ▼                                                  │
+│                       buf += decoded                                             │
+│                       lines = buf.split('\n')                                    │
+│                       buf  = lines.pop()        ← keep trailing partial          │
+│                               │                                                  │
+│                               ▼                                                  │
+│                       for line of lines: JSON.parse(line) as AgentEvent         │
+│                               │                                                  │
+│                               ▼                                                  │
+│                       handle(e) ──→ switch(e.type)                               │
+│                               │                                                  │
+│              ┌────────────────┼────────────────┬──────────────────┐             │
+│              ▼                ▼                ▼                  ▼             │
+│        setItems(...)    setDiagnosis(...)  setRecommendations(...)  setComplete  │
+│              │                │                │                  │             │
+│              └────────────────┴────────────────┴──────────────────┘             │
+│                                       │                                          │
+│                       on 'done': stash bi:inv:<step>:<id>                        │
+│                       + (diagnose) hand off bi:diag:<id>                         │
+│                                       │                                          │
+│                               React re-renders                                   │
+│                               ReasoningTrace · EvidencePanel · RecommendationCard│
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The service layer produces. The network carries. The UI layer consumes. Nothing is shared across the boundary except bytes.
 
 ---
 

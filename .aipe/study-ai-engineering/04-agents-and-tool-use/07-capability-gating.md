@@ -156,56 +156,25 @@ The monitoring agent's `scan(hooks?, categories: AnomalyCategory[] = [])` takes 
 
 ---
 
-## Capability gating — diagram
-
-The diagram spans three layers. The Route layer runs the gate. The Agent layer receives only the runnable subset. The UI layer renders the full verdict. The gate is the cheap checkpoint that protects the expensive agent and feeds the grid.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  UI LAYER   components/feed/CoverageGrid.tsx                          │
-│   10 tiles from the fixed registry:                                  │
-│     full → clear/firing   limited → amber   unavailable → ghost      │
-│   fed by coverage_item events streamed per category                  │
-└───────────────────────────────▲───────────────────────────────────────┘
-                                │  coverage (all 10, incl. ghosts)
-┌───────────────────────────────┴───────────────────────────────────────┐
-│  ROUTE LAYER   app/api/briefing/route.ts                             │
-│   schema ──schemaCapabilities──→ Set<string>  │
-│            ──coverageReport────→ CoverageItem[10] ─► UI         │
-│            ──runnableCategories→ AnomalyCategory[] ─┐           │
-└───────────────────────────────────────────────────────────│───────────┘
-                                                            │ runnable (full+limited)
-┌───────────────────────────────────────────────────────────▼───────────┐
-│  AGENT LAYER   lib/agents/monitoring.ts                              │
-│   scan(hooks, runnable)  ── builds {categories} checklist        │
-│     → runAgentLoop spends ~1 req/s MCP budget ONLY on runnable        │
-│       (never queries the 3 categories the schema can't support)      │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-A reader who sees only this diagram should grasp: one cheap schema classification both scopes the rate-limited agent (runnable subset) and renders the coverage grid (full report) — gate before spend.
-
----
-
-## Implementation in codebase
+### Code in this codebase
 
 **Case A — implemented.**
 
-### The category registry + the gate functions
+#### The category registry + the gate functions
 
 - **File:** `lib/agents/categories.ts`
 - **Function / class:** `AnomalyCategory` (interface) · `CATEGORIES` · `schemaCapabilities` · `coverageFor` · `missingFor` · `coverageReport` · `runnableCategories`
 - **Line range:** `AnomalyCategory` L7–L15 · `CATEGORIES` L19–L112 (10 categories) · `schemaCapabilities` L116–L127 · `coverageFor` L131–L136 · `missingFor` L139–L141 · `coverageReport` L144–L155 · `runnableCategories` L158–L160
 - **Role:** Declares each category's `requires`/`enriches` deps; flattens the schema to a capability `Set`; classifies each category full/limited/unavailable; returns the full report (UI) and the runnable subset (agent).
 
-### Where the gate runs and feeds the agent
+#### Where the gate runs and feeds the agent
 
 - **File:** `app/api/briefing/route.ts`
 - **Function / class:** `GET` handler — the coverage stage
 - **Line range:** L202–L204 (`schemaCapabilities` → `coverageReport` → `runnableCategories`); L209–L212 (stream one `coverage_item` per category to the grid); L223 (`agent.scan(hooks, runnable)`)
 - **Role:** Runs the gate after schema bootstrap and before the agent; streams the verdict to the UI; hands the agent only the runnable categories.
 
-### Where the runnable set enters the prompt
+#### Where the runnable set enters the prompt
 
 - **File:** `lib/agents/monitoring.ts`
 - **Function / class:** `MonitoringAgent.scan`
@@ -234,6 +203,37 @@ const anomalies = await agent.scan(hooks, runnable);       // L223  spends budge
 ```
 
 GitHub: https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/categories.ts#L116-L160
+
+---
+
+## Capability gating — diagram
+
+The diagram spans three layers. The Route layer runs the gate. The Agent layer receives only the runnable subset. The UI layer renders the full verdict. The gate is the cheap checkpoint that protects the expensive agent and feeds the grid.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  UI LAYER   components/feed/CoverageGrid.tsx                          │
+│   10 tiles from the fixed registry:                                  │
+│     full → clear/firing   limited → amber   unavailable → ghost      │
+│   fed by coverage_item events streamed per category                  │
+└───────────────────────────────▲───────────────────────────────────────┘
+                                │  coverage (all 10, incl. ghosts)
+┌───────────────────────────────┴───────────────────────────────────────┐
+│  ROUTE LAYER   app/api/briefing/route.ts                             │
+│   schema ──schemaCapabilities──→ Set<string>  │
+│            ──coverageReport────→ CoverageItem[10] ─► UI         │
+│            ──runnableCategories→ AnomalyCategory[] ─┐           │
+└───────────────────────────────────────────────────────────│───────────┘
+                                                            │ runnable (full+limited)
+┌───────────────────────────────────────────────────────────▼───────────┐
+│  AGENT LAYER   lib/agents/monitoring.ts                              │
+│   scan(hooks, runnable)  ── builds {categories} checklist        │
+│     → runAgentLoop spends ~1 req/s MCP budget ONLY on runnable        │
+│       (never queries the 3 categories the schema can't support)      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+A reader who sees only this diagram should grasp: one cheap schema classification both scopes the rate-limited agent (runnable subset) and renders the coverage grid (full report) — gate before spend.
 
 ---
 

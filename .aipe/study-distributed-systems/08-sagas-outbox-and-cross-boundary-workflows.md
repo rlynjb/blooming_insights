@@ -105,6 +105,11 @@ In blooming insights' two-step investigation, the first part is present (diagnos
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- The user opens an insight, sees the diagnosis stream in over ~30s, reads it for a minute, then clicks "next step" to see recommendations. The user is the orchestrator; the server is two independent runs.
+- The user closes the tab between steps. Reopens the recommend URL directly. sessionStorage is empty → no `diagnosis` query param → step 3 throws "no diagnosis was handed over." Fix: navigate back to step 2 (which can replay from the cached `AgentEvent[]`), then forward to step 3.
+- A future scenario: the recommendation agent gets a "execute" button per card. Clicking it would issue a write call. This is the boundary where the existing pattern stops being sufficient — you'd need an idempotency key per click and a server-side record of "this recommendation has been executed."
+
 #### Part 1 — the two-step investigation as a saga (with the user as orchestrator)
 
 ```
@@ -147,6 +152,37 @@ Boundary conditions:
 - **Tab close after step 2, before step 3.** sessionStorage dies. The diagnosis is lost from the client's perspective. The cached events on the server can still replay step 2 in the demo path, but the live path requires the diagnosis in the query string. So a fresh tab can re-run step 2 (via cached replay if available) and then step 3.
 - **Step 3 fails mid-run.** The recommendation agent throws or times out. The route emits `{ type: 'error' }` and closes. The diagnosis is still in sessionStorage. The user can retry by reloading step 3.
 
+```
+  lib/hooks/useInvestigation.ts  (lines 72-84, 137-140)
+
+  // for the recommend step, load the handed-over diagnosis:
+  if (step === 'recommend') {
+    try {
+      const raw = sessionStorage.getItem(diagHandoffKey(id));
+      if (raw) {
+        const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
+        handedDiagnosis = d.diagnosis ?? null;
+        cDiag = handedDiagnosis;
+        if (handedDiagnosis) setDiagnosis(handedDiagnosis);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // on 'done' during the diagnose step:
+  if (step === 'diagnose' && cDiag) {
+    sessionStorage.setItem(
+      diagHandoffKey(id),
+      JSON.stringify({ diagnosis: cDiag }),
+    );
+  }
+       │
+       └─ this is the workflow's persistence layer. The diagnosis is
+          handed from step 2 to step 3 through the user's browser. No
+          server-side store, no queue, no workflow engine. The user
+          click between sessionStorage.setItem and sessionStorage.getItem
+          is the workflow trigger.
+```
+
 #### Part 2 — the cached AgentEvent[] as a poor-man's outbox
 
 The **transactional outbox pattern** says: when you do a database write, also write a row to an "outbox" table in the same transaction. A separate process polls the outbox and publishes those rows as events to a message bus. The point is: the DB write and the event publication can't get out of sync — they're in the same transaction.
@@ -185,6 +221,83 @@ blooming insights doesn't write to a DB and doesn't publish to a bus. But the `c
 It's outbox-*shaped*, not outbox-*correct*. Correct outbox requires the log write and the side-effect write to be in the same transaction; here, the only "side effect" is the events streamed to the client, and they were emitted *during* the run (not after — there's no separate publish step). It's closer to a write-ahead log than a true outbox.
 
 The point of naming it: when the day comes that the agent has a *write* side effect (e.g. "create a Bloomreach voucher"), the existing `collected[]` pattern is already shaped right to track "did this side effect happen?" — you'd add an `event_kind: 'side_effect_succeeded'` to the log and use it as the durable record of what to NOT redo on retry.
+
+```
+  app/api/agent/route.ts  (lines 169-264)
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const collected: AgentEvent[] = [];                ← the outbox-shaped log
+      const send = (e: AgentEvent) => {
+        collected.push(e);                                 ← append-only,
+        controller.enqueue(encoder.encode(encodeEvent(e))); ordered, complete
+      };
+      // ...
+      try {
+        // STEP 2 (diagnose) or combined: run diagnostic agent
+        if (step === 'recommend') {
+          diagnosis = parseDiagnosis(diagnosisParam);    ← workflow STATE comes
+          if (!diagnosis) {                                from the URL param
+            throw new Error('no diagnosis was handed over — open the diagnosis step first');
+          }
+        } else {
+          diagAgent = new DiagnosticAgent(...);
+          diagnosis = await diagAgent.investigate(inv, hooks);
+          send({ type: 'diagnosis', diagnosis });        ← the handed-over data
+        }
+        // STEP 3 (recommend) or combined: run recommendation agent
+        if (step !== 'diagnose') {
+          recAgent = new RecommendationAgent(...);
+          const recommendations = await recAgent.propose(inv, diagnosis!, hooks);
+          for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+        }
+        send({ type: 'done' });
+        if (step == null) saveInvestigation(insightId!, collected);  ← persist
+      } catch (e) {                                                     the log
+        send({ type: 'error', message: ... });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+       │
+       └─ note that saveInvestigation only runs when `step == null`
+          (the combined run, used by demo capture). The two-step split
+          DOES NOT persist its events — they live only in the stream.
+          This is a deliberate limit: live two-step runs are not
+          replayable on disconnect. The user must re-run a failed step.
+```
+
+```
+  lib/state/investigations.ts  (lines 22-41)
+
+  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+    if (mem.has(insightId)) return mem.get(insightId)!;
+    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+    if (fromFile) return fromFile;
+    const fromDemo = readJson(DEMO_FILE)[insightId];
+    return fromDemo ?? null;
+  }
+
+  export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+    mem.set(insightId, events);                       ← in-memory always
+    if (PERSIST) {                                       (dev / same-process)
+      const all = readJson(CACHE_FILE);
+      all[insightId] = events;
+      try { writeFileSync(CACHE_FILE, JSON.stringify(all)); }
+      catch { /* best effort */ }
+    }
+  }
+       │
+       └─ this IS the workflow's durable record — for cached/demo
+          replays. The committed demo-investigations.json fixture is
+          a frozen snapshot of one investigation; the dev file is
+          a sliding cache; the in-memory Map is the production layer.
+          NOTE: production Vercel has no FS write capability, so the
+          persistence is in-memory-only there — meaning a recycle
+          loses the saved log entirely. The fallback chain (mem → dev
+          file → demo file) is the only durability story for replays.
+```
 
 #### Part 3 — what compensation would look like (and why it's absent today)
 
@@ -305,125 +418,6 @@ The right next move IF a write step lands: pick one tool (Temporal Cloud is the 
   no compensation logic exists because no step has side effects.
   collected[] is outbox-SHAPED but not outbox-CORRECT (no separate
   publish/commit boundary).
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- The user opens an insight, sees the diagnosis stream in over ~30s, reads it for a minute, then clicks "next step" to see recommendations. The user is the orchestrator; the server is two independent runs.
-- The user closes the tab between steps. Reopens the recommend URL directly. sessionStorage is empty → no `diagnosis` query param → step 3 throws "no diagnosis was handed over." Fix: navigate back to step 2 (which can replay from the cached `AgentEvent[]`), then forward to step 3.
-- A future scenario: the recommendation agent gets a "execute" button per card. Clicking it would issue a write call. This is the boundary where the existing pattern stops being sufficient — you'd need an idempotency key per click and a server-side record of "this recommendation has been executed."
-
-**Code side by side.**
-
-```
-  app/api/agent/route.ts  (lines 169-264)
-
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const collected: AgentEvent[] = [];                ← the outbox-shaped log
-      const send = (e: AgentEvent) => {
-        collected.push(e);                                 ← append-only,
-        controller.enqueue(encoder.encode(encodeEvent(e))); ordered, complete
-      };
-      // ...
-      try {
-        // STEP 2 (diagnose) or combined: run diagnostic agent
-        if (step === 'recommend') {
-          diagnosis = parseDiagnosis(diagnosisParam);    ← workflow STATE comes
-          if (!diagnosis) {                                from the URL param
-            throw new Error('no diagnosis was handed over — open the diagnosis step first');
-          }
-        } else {
-          diagAgent = new DiagnosticAgent(...);
-          diagnosis = await diagAgent.investigate(inv, hooks);
-          send({ type: 'diagnosis', diagnosis });        ← the handed-over data
-        }
-        // STEP 3 (recommend) or combined: run recommendation agent
-        if (step !== 'diagnose') {
-          recAgent = new RecommendationAgent(...);
-          const recommendations = await recAgent.propose(inv, diagnosis!, hooks);
-          for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
-        }
-        send({ type: 'done' });
-        if (step == null) saveInvestigation(insightId!, collected);  ← persist
-      } catch (e) {                                                     the log
-        send({ type: 'error', message: ... });
-      } finally {
-        controller.close();
-      }
-    },
-  });
-       │
-       └─ note that saveInvestigation only runs when `step == null`
-          (the combined run, used by demo capture). The two-step split
-          DOES NOT persist its events — they live only in the stream.
-          This is a deliberate limit: live two-step runs are not
-          replayable on disconnect. The user must re-run a failed step.
-```
-
-```
-  lib/hooks/useInvestigation.ts  (lines 72-84, 137-140)
-
-  // for the recommend step, load the handed-over diagnosis:
-  if (step === 'recommend') {
-    try {
-      const raw = sessionStorage.getItem(diagHandoffKey(id));
-      if (raw) {
-        const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
-        handedDiagnosis = d.diagnosis ?? null;
-        cDiag = handedDiagnosis;
-        if (handedDiagnosis) setDiagnosis(handedDiagnosis);
-      }
-    } catch { /* ignore */ }
-  }
-
-  // on 'done' during the diagnose step:
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(
-      diagHandoffKey(id),
-      JSON.stringify({ diagnosis: cDiag }),
-    );
-  }
-       │
-       └─ this is the workflow's persistence layer. The diagnosis is
-          handed from step 2 to step 3 through the user's browser. No
-          server-side store, no queue, no workflow engine. The user
-          click between sessionStorage.setItem and sessionStorage.getItem
-          is the workflow trigger.
-```
-
-```
-  lib/state/investigations.ts  (lines 22-41)
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];
-    return fromDemo ?? null;
-  }
-
-  export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
-    mem.set(insightId, events);                       ← in-memory always
-    if (PERSIST) {                                       (dev / same-process)
-      const all = readJson(CACHE_FILE);
-      all[insightId] = events;
-      try { writeFileSync(CACHE_FILE, JSON.stringify(all)); }
-      catch { /* best effort */ }
-    }
-  }
-       │
-       └─ this IS the workflow's durable record — for cached/demo
-          replays. The committed demo-investigations.json fixture is
-          a frozen snapshot of one investigation; the dev file is
-          a sliding cache; the in-memory Map is the production layer.
-          NOTE: production Vercel has no FS write capability, so the
-          persistence is in-memory-only there — meaning a recycle
-          loses the saved log entirely. The fallback chain (mem → dev
-          file → demo file) is the only durability story for replays.
 ```
 
 ---

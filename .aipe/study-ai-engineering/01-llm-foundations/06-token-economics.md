@@ -180,6 +180,24 @@ Cost engineering is two disciplines: bound the worst case before the call (budge
 
 ---
 
+### Code in this codebase
+
+**Partially addressed — bounds present, meter absent.** Cost is controlled by `maxToolCalls` budgets, input truncation, and haiku-vs-sonnet tiering, but nothing reads `res.usage`; there is no `ai_call_log`, per-run token total, or cost dashboard.
+
+#### Files, functions, and line ranges
+
+- **Call-count budgets (`maxToolCalls`):** monitoring `6` (`lib/agents/monitoring.ts` L74), diagnostic `6` (`lib/agents/diagnostic.ts` L61), recommendation `4` (`lib/agents/recommendation.ts` L57), query `6` (`lib/agents/query.ts` L41); enforced via `budgetSpent`/`forceFinal` at `lib/agents/base.ts` L90–L91.
+- **Input truncation:** `MAX_TOOL_RESULT_CHARS = 16_000` / `truncate` — `lib/agents/base.ts` L29, L31–L34; `schemaSummary` caps — `lib/agents/monitoring.ts` L15–L48.
+- **Model tiering:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14; `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9.
+- **The big line item:** `synthesize()` sonnet calls — `lib/agents/diagnostic.ts` L87–L126 (`max_tokens: 2048` at L99), `lib/agents/recommendation.ts` L82–L132 (L98).
+- **The absent meter:** no read of `res.usage` anywhere; the model call at `lib/agents/base.ts` L102 returns it and discards it.
+
+#### Where the meter would live
+
+A token-accounting field would accumulate on `AgentRunResult` (`lib/agents/base.ts` L24–L27), populated by reading `res.usage` after `create` (L102) and after each `synthesize()` call. The route (`app/api/agent/route.ts`) would sum per-agent totals and either stream a final `usage` event or write an `ai_call_log` row alongside `saveInvestigation` (called at `app/api/agent/route.ts` L254; the store is `lib/state/investigations.ts` L30).
+
+---
+
 ## Token economics — diagram
 
 This diagram spans the call path and marks where each cost lever acts and where the missing meter would sit. Service-layer dials bound the spend; the Provider response carries the usage the codebase never reads.
@@ -210,24 +228,6 @@ This diagram spans the call path and marks where each cost lever acts and where 
 ```
 
 Every lever the codebase pulls is upstream of the call (bound the spend); the one thing it never touches is `res.usage` downstream of the call (measure the spend).
-
----
-
-## Implementation in codebase
-
-**Partially addressed — bounds present, meter absent.** Cost is controlled by `maxToolCalls` budgets, input truncation, and haiku-vs-sonnet tiering, but nothing reads `res.usage`; there is no `ai_call_log`, per-run token total, or cost dashboard.
-
-### Files, functions, and line ranges
-
-- **Call-count budgets (`maxToolCalls`):** monitoring `6` (`lib/agents/monitoring.ts` L74), diagnostic `6` (`lib/agents/diagnostic.ts` L61), recommendation `4` (`lib/agents/recommendation.ts` L57), query `6` (`lib/agents/query.ts` L41); enforced via `budgetSpent`/`forceFinal` at `lib/agents/base.ts` L90–L91.
-- **Input truncation:** `MAX_TOOL_RESULT_CHARS = 16_000` / `truncate` — `lib/agents/base.ts` L29, L31–L34; `schemaSummary` caps — `lib/agents/monitoring.ts` L15–L48.
-- **Model tiering:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14; `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9.
-- **The big line item:** `synthesize()` sonnet calls — `lib/agents/diagnostic.ts` L87–L126 (`max_tokens: 2048` at L99), `lib/agents/recommendation.ts` L82–L132 (L98).
-- **The absent meter:** no read of `res.usage` anywhere; the model call at `lib/agents/base.ts` L102 returns it and discards it.
-
-### Where the meter would live
-
-A token-accounting field would accumulate on `AgentRunResult` (`lib/agents/base.ts` L24–L27), populated by reading `res.usage` after `create` (L102) and after each `synthesize()` call. The route (`app/api/agent/route.ts`) would sum per-agent totals and either stream a final `usage` event or write an `ai_call_log` row alongside `saveInvestigation` (called at `app/api/agent/route.ts` L254; the store is `lib/state/investigations.ts` L30).
 
 ---
 

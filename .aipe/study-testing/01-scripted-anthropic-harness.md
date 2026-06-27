@@ -220,72 +220,7 @@ Drop any one of these three and the pattern collapses:
 
 Skeleton = queue + shape + mock.calls. Optional hardening: helper functions for `toolUseBlock(id, name, input)` and `textBlock(text)` (so the queue stays readable), a `callCount()` accessor exposed from the closure (convenience, not necessity).
 
-### Move 3 — the principle
-
-**A probabilistic core is testable when you can substitute it at a known seam.** The Anthropic SDK is the seam; the script is the substitution. The pattern travels to any probabilistic external — payments, geo lookup, third-party AI APIs. The test bench wraps the boundary; the production code runs the real path. What you give up: any signal about the *model's* quality (that's evals, next door). What you get: assertions on every branch of the deterministic glue, fast.
-
-## Primary diagram
-
-The full harness, every part labelled:
-
-```
-The scripted-Anthropic harness — full view
-
-  ┌─ FAKE Anthropic SDK ────────────────────────────────────┐
-  │                                                         │
-  │  function buildFakeAnthropic(responses) {                │
-  │    let idx = 0;                                          │
-  │    const create = vi.fn(async () => {                    │
-  │      const resp = responses[idx];                        │  ← queue + index
-  │      idx = idx + 1;                                      │
-  │      return {                                            │
-  │        id: 'msg_test', type: 'message', role: 'asst',   │
-  │        model: AGENT_MODEL, stop_sequence: null,         │  ← shape-faithful
-  │        usage: { input_tokens: 1, output_tokens: 1, … }, │
-  │        container: null,                                  │
-  │        content:     resp.content,                        │
-  │        stop_reason: resp.stop_reason,                    │
-  │      };                                                  │
-  │    });                                                   │
-  │    return { messages: { create }, callCount: () => idx } │  ← vi.fn → mock.calls
-  │  }                                                       │
-  └──────────────────────────┬──────────────────────────────┘
-                             │ injected as Anthropic
-                             ▼
-  ┌─ ★ REAL agent code ★ ──────────────────────────────────┐
-  │                                                         │
-  │  new DiagnosticAgent(fakeAnthropic, fakeMcp, schema,    │  agent class
-  │                       toolDefs)                          │  is real
-  │     .investigate(anomaly, { onToolCall, onText, … })    │
-  │     │                                                   │
-  │     ├─ builds system prompt                              │  real
-  │     ├─ calls runAgentLoop                                │  real
-  │     │   ├─ for turn in 0..maxTurns                       │  real
-  │     │   ├─ pulls next scripted response                  │  via fake
-  │     │   ├─ extracts text + tool_use blocks               │  real
-  │     │   ├─ calls mcp.callTool per tool_use               │  via fake
-  │     │   ├─ appends tool_result to messages               │  real
-  │     │   └─ enforces maxTurns + maxToolCalls + forceFinal │  real
-  │     ├─ parses output via parseAgentJson                  │  real
-  │     ├─ validates via isDiagnosis                         │  real
-  │     └─ on failure, runs synthesize() fallback            │  real
-  └──────────────────────────┬──────────────────────────────┘
-                             │ calls mcp.callTool
-                             ▼
-  ┌─ FAKE McpCaller ───────────────────────────────────────┐
-  │                                                         │
-  │  function buildFakeMcp(impl) {                          │
-  │    return {                                             │
-  │      async callTool(name, args) {                       │
-  │        const result = await impl(name, args);          │
-  │        return { result, durationMs: 1, fromCache: false }│
-  │      }                                                  │
-  │    };                                                   │
-  │  }                                                      │
-  └─────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
+### Code in this codebase
 
 **Use case A — proving the agent loop's branches end-to-end.** `test/agents/base.test.ts` has 8 tests, each exercising one branch of `runAgentLoop` (tool-then-text, text-only, tool-throws, maxTurns hit, maxToolCalls hit, onText surfacing, synthesisInstruction on forced-final turn). The load-bearing one is the `synthesisInstruction` test on lines 361–383 — it's the bug-prone branch and the test uses `create.mock.calls[0][0].system` vs `calls[1][0].system` to inspect the actual prompts sent.
 
@@ -379,6 +314,71 @@ test/agents/diagnostic.test.ts  (lines 273–291 — the synthesis fallback)
           unmeasured in this repo. See `study-ai-engineering/05-evals-and-
           observability/` for the testing discipline that would close it.
   });
+```
+
+### Move 3 — the principle
+
+**A probabilistic core is testable when you can substitute it at a known seam.** The Anthropic SDK is the seam; the script is the substitution. The pattern travels to any probabilistic external — payments, geo lookup, third-party AI APIs. The test bench wraps the boundary; the production code runs the real path. What you give up: any signal about the *model's* quality (that's evals, next door). What you get: assertions on every branch of the deterministic glue, fast.
+
+## Primary diagram
+
+The full harness, every part labelled:
+
+```
+The scripted-Anthropic harness — full view
+
+  ┌─ FAKE Anthropic SDK ────────────────────────────────────┐
+  │                                                         │
+  │  function buildFakeAnthropic(responses) {                │
+  │    let idx = 0;                                          │
+  │    const create = vi.fn(async () => {                    │
+  │      const resp = responses[idx];                        │  ← queue + index
+  │      idx = idx + 1;                                      │
+  │      return {                                            │
+  │        id: 'msg_test', type: 'message', role: 'asst',   │
+  │        model: AGENT_MODEL, stop_sequence: null,         │  ← shape-faithful
+  │        usage: { input_tokens: 1, output_tokens: 1, … }, │
+  │        container: null,                                  │
+  │        content:     resp.content,                        │
+  │        stop_reason: resp.stop_reason,                    │
+  │      };                                                  │
+  │    });                                                   │
+  │    return { messages: { create }, callCount: () => idx } │  ← vi.fn → mock.calls
+  │  }                                                       │
+  └──────────────────────────┬──────────────────────────────┘
+                             │ injected as Anthropic
+                             ▼
+  ┌─ ★ REAL agent code ★ ──────────────────────────────────┐
+  │                                                         │
+  │  new DiagnosticAgent(fakeAnthropic, fakeMcp, schema,    │  agent class
+  │                       toolDefs)                          │  is real
+  │     .investigate(anomaly, { onToolCall, onText, … })    │
+  │     │                                                   │
+  │     ├─ builds system prompt                              │  real
+  │     ├─ calls runAgentLoop                                │  real
+  │     │   ├─ for turn in 0..maxTurns                       │  real
+  │     │   ├─ pulls next scripted response                  │  via fake
+  │     │   ├─ extracts text + tool_use blocks               │  real
+  │     │   ├─ calls mcp.callTool per tool_use               │  via fake
+  │     │   ├─ appends tool_result to messages               │  real
+  │     │   └─ enforces maxTurns + maxToolCalls + forceFinal │  real
+  │     ├─ parses output via parseAgentJson                  │  real
+  │     ├─ validates via isDiagnosis                         │  real
+  │     └─ on failure, runs synthesize() fallback            │  real
+  └──────────────────────────┬──────────────────────────────┘
+                             │ calls mcp.callTool
+                             ▼
+  ┌─ FAKE McpCaller ───────────────────────────────────────┐
+  │                                                         │
+  │  function buildFakeMcp(impl) {                          │
+  │    return {                                             │
+  │      async callTool(name, args) {                       │
+  │        const result = await impl(name, args);          │
+  │        return { result, durationMs: 1, fromCache: false }│
+  │      }                                                  │
+  │    };                                                   │
+  │  }                                                      │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate

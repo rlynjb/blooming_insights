@@ -303,48 +303,7 @@ There are no mutexes, no semaphores, no `Atomics`, no `SharedArrayBuffer` in the
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Move 3 — the principle
-
-**In a single-threaded async runtime, the right question isn't "do I need a lock?" — it's "does my read see a write I didn't make?"** If yes, scope the state per task (ALS) or make the access atomic (no `await` between read and write). If no, the unsynchronized shared `Map` is fine. The repo's design is consistent with this: every place state is shared, the answer is either "last-writer-wins is correct here" (the Maps) or "ALS makes it not shared" (auth). There is no middle ground where unsynchronized state is wrong but tolerated.
-
----
-
-## Primary diagram
-
-The full shared-state picture for one warm Node instance handling two concurrent requests:
-
-```
-  Two concurrent requests, one warm instance — what they share, what they don't
-
-  ┌─ Vercel function (Node 20) ───────────────────────────────────────────┐
-  │                                                                       │
-  │   request A: GET /api/agent              request B: GET /api/briefing │
-  │       │                                       │                        │
-  │       └──────── one event loop ───────────────┘                        │
-  │                                                                       │
-  │   ┌─ SHARED at module scope (no locking) ───────────────────────────┐ │
-  │   │   insights Map           (both write, putInsights clears+sets)  │ │
-  │   │   investigations Map     (each writes its own insightId key)    │ │
-  │   │   cached schema          (both may compute, identical result)   │ │
-  │   │   McpClient instances ← each request builds its OWN McpClient,  │ │
-  │   │                         so .cache and .lastCallAt are NOT shared │ │
-  │   └─────────────────────────────────────────────────────────────────┘ │
-  │                                                                       │
-  │   ┌─ PER-REQUEST via ALS (lib/mcp/auth.ts) ─────────────────────────┐ │
-  │   │   requestStore.run(ctx_A, fnA)   requestStore.run(ctx_B, fnB)   │ │
-  │   │   ctx_A.store / ctx_A.dirty     ctx_B.store / ctx_B.dirty       │ │
-  │   │      ← isolated; reads from inside fnA see ctx_A only            │ │
-  │   └─────────────────────────────────────────────────────────────────┘ │
-  │                                                                       │
-  │   ┌─ PER-CALL function locals ──────────────────────────────────────┐ │
-  │   │   messages[], toolCalls[], collected[] — local to each run      │ │
-  │   └─────────────────────────────────────────────────────────────────┘ │
-  └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 8) Code in this codebase
 
 **Use cases.** The places where shared-state reasoning is actually invoked:
 
@@ -429,6 +388,45 @@ The full shared-state picture for one warm Node instance handling two concurrent
           MCP work on the very first concurrent cold-warm transition. If you wanted
           to fix it: cache the Promise<WorkspaceSchema>, not the resolved value, so
           the second caller awaits the first's in-flight bootstrap.
+```
+
+### Move 3 — the principle
+
+**In a single-threaded async runtime, the right question isn't "do I need a lock?" — it's "does my read see a write I didn't make?"** If yes, scope the state per task (ALS) or make the access atomic (no `await` between read and write). If no, the unsynchronized shared `Map` is fine. The repo's design is consistent with this: every place state is shared, the answer is either "last-writer-wins is correct here" (the Maps) or "ALS makes it not shared" (auth). There is no middle ground where unsynchronized state is wrong but tolerated.
+
+---
+
+## Primary diagram
+
+The full shared-state picture for one warm Node instance handling two concurrent requests:
+
+```
+  Two concurrent requests, one warm instance — what they share, what they don't
+
+  ┌─ Vercel function (Node 20) ───────────────────────────────────────────┐
+  │                                                                       │
+  │   request A: GET /api/agent              request B: GET /api/briefing │
+  │       │                                       │                        │
+  │       └──────── one event loop ───────────────┘                        │
+  │                                                                       │
+  │   ┌─ SHARED at module scope (no locking) ───────────────────────────┐ │
+  │   │   insights Map           (both write, putInsights clears+sets)  │ │
+  │   │   investigations Map     (each writes its own insightId key)    │ │
+  │   │   cached schema          (both may compute, identical result)   │ │
+  │   │   McpClient instances ← each request builds its OWN McpClient,  │ │
+  │   │                         so .cache and .lastCallAt are NOT shared │ │
+  │   └─────────────────────────────────────────────────────────────────┘ │
+  │                                                                       │
+  │   ┌─ PER-REQUEST via ALS (lib/mcp/auth.ts) ─────────────────────────┐ │
+  │   │   requestStore.run(ctx_A, fnA)   requestStore.run(ctx_B, fnB)   │ │
+  │   │   ctx_A.store / ctx_A.dirty     ctx_B.store / ctx_B.dirty       │ │
+  │   │      ← isolated; reads from inside fnA see ctx_A only            │ │
+  │   └─────────────────────────────────────────────────────────────────┘ │
+  │                                                                       │
+  │   ┌─ PER-CALL function locals ──────────────────────────────────────┐ │
+  │   │   messages[], toolCalls[], collected[] — local to each run      │ │
+  │   └─────────────────────────────────────────────────────────────────┘ │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

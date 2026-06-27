@@ -183,6 +183,8 @@ re-plan on failure               no re-plan — the loop just adapts
 
 So the right way to characterize it: blooming insights replaced the *plan phase* with a *plan section in the system prompt*. That's a deliberate choice — the steps for monitoring really are knowable up front (you always check purchase volume first, then revenue, then conversion, then traffic), so a runtime planner would re-derive a list that's already known. The cost saved is one expensive planner call per scan; the cost paid is that the plan is static and can't adapt per workspace.
 
+**Where this lives in the repo.** The static "Suggested query plan" section sits in `lib/agents/prompts/monitoring.md` under `## Suggested query plan (~5 calls, global)` at L39–L47 — five EQL queries with their roles, then a "Derive:" line at L47 naming what to compute from the results. The `MonitoringAgent` (`lib/agents/monitoring.ts` L69–L120) hands that prompt to the model as part of the system prompt and runs a normal ReAct loop (`runAgentLoop`, `lib/agents/base.ts` L48–L176) with `maxToolCalls: 6` over it. The model walks the plan with some adaptation (it's allowed to shift the time window if data is empty per L31–L37 of the prompt) but it doesn't write its own plan. The diagnostic and recommendation agents share `runAgentLoop` but receive no plan section — they're pure ReAct, not Position B.
+
 ```
 The trade visualised
 
@@ -242,44 +244,6 @@ The three positions you can take
 
   This repo sits at A for 3 agents, B for monitoring.
   The breakpoint to C is: per-run inputs the prompt can't enumerate.
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (Case B with nuance).** No agent has a separate planner call. The closest thing is the *static* "Suggested query plan" section in monitoring's system prompt.
-
-**Closest existing surface — the static plan in the monitoring prompt**
-**File:** `lib/agents/prompts/monitoring.md`
-**Section:** `## Suggested query plan (~5 calls, global)`
-**Line range:** L39–L47 — five EQL queries with their roles, then a "Derive:" line at L47 naming what to compute from the results
-
-This plan is identical across every monitoring scan. The MonitoringAgent (`lib/agents/monitoring.ts` L69–L120) hands it to the model as part of the system prompt and runs a normal ReAct loop (`runAgentLoop`, `lib/agents/base.ts` L48–L176) with `maxToolCalls: 6` over it. The model walks the plan with some adaptation (it's allowed to shift the time window if data is empty per L31–L37 of the prompt) but it doesn't write its own plan.
-
-**Why the project sits here and not at a runtime planner**
-
-The monitoring task's steps are knowable up front — every workspace gets the same 90d-vs-prior-90d comparison on the same four metrics (purchase volume, revenue, funnel conversion, traffic). The diagnostic and recommendation tasks' steps are *not* knowable up front — the EQL depends on what the prior step's data showed — so they're pure ReAct, not plan-and-execute. A runtime planner would buy nothing here that the prompt doesn't already give for free.
-
-```
-shape (what a runtime planner WOULD add — illustrative, not in repo):
-
-  // PHASE 1 — plan (hypothetical, not present in this repo)
-  const plan = await planner.create({
-    model: 'claude-opus-4',                // expensive
-    system: PLANNER_PROMPT,
-    messages: [{ role: 'user', content: anomaly }],
-  });
-  // PHASE 2 — execute (would replace runAgentLoop)
-  for (const step of plan.steps) {
-    const result = await executor.create({
-      model: 'claude-haiku-4-5',           // cheap
-      system: EXECUTOR_PROMPT,
-      messages: [{ role: 'user', content: step }],
-      tools: filterToolSchemas(allTools, step.allowedTools),
-    });
-    results[step.id] = result;
-  }
 ```
 
 ---

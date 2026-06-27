@@ -241,6 +241,190 @@ What breaks: if the agent loop ever reaches around the interface and asks "is th
 
 The in-process synthetic fixture is a data-modeling pattern at the test seam. Two truths: (1) the **shape of the data** is governed by the same interface as the real source — same `WorkspaceSchema`, same `Anomaly[]`, same tool envelope, so the agents can't tell the difference. (2) the **lifecycle of the data** is *opposite* — real data is fetched, possibly rate-limited, possibly failed; fake data is bundled, instant, never fails. The pattern's power comes from honoring (1) while accepting (2) as an asymmetry the factory hides. The lesson generalizes: when you want to substitute a fake for a real implementation at a seam, the data shape is the contract; the lifecycle is the cost you accept.
 
+### Code in this codebase
+
+The repo anchors for the interface, the synthetic implementation, the dispatch switch, the factory, and the const-literal data Move 2 walked.
+
+#### Use cases
+
+- **Live-synthetic mode in the UI.** The mode toggle on `app/page.tsx` offers `'live-bloomreach'` and `'live-synthetic'` (alongside the demo mode that bypasses agents entirely). When the user picks live-synthetic, the route handler calls `makeDataSource('live-synthetic', sessionId)`, gets a `SyntheticDataSource`, and runs the full agent loop against it. The agents make real tool calls, the LLM does real reasoning, the trace shows real timings — only the data is fake. This is the **demo with the real agent loop** path; it doesn't require OAuth and doesn't burn the Bloomreach rate limit.
+- **Local development without Bloomreach credentials.** A developer cloning the repo for the first time can run `npm run dev`, pick the live-synthetic mode in the UI, and exercise the full app without setting up OAuth. The Bloomreach mode is still there for when they have credentials.
+- **Testing the agent loops end-to-end.** Tests in `test/data-source/synthetic-data-source.test.ts` (and the agent test suite) use `SyntheticDataSource` directly as the injected data source. The agents run their real loops against deterministic data; the test asserts on the shape of the result.
+
+#### The interface contract
+
+```
+lib/data-source/types.ts  (lines 17–71)
+
+  export interface DataSource {
+    callTool(
+      name: string,                                ← tool name (any tool advertised)
+      args: Record<string, unknown>,               ← agent's tool input
+      opts?: DataSourceCallOptions,                ← signal etc.
+    ): Promise<DataSourceCallResult>;              ← envelope (see below)
+
+    listTools(opts?: DataSourceListOptions): Promise<unknown>;
+  }
+
+  export interface DataSourceCallResult {
+    result: unknown;                               ← MCP-shaped result
+    durationMs: number;                            ← for the UI trace
+    fromCache: boolean;                            ← shown in trace dot
+  }
+       │
+       │  the contract is intentionally MINIMAL — two methods,
+       │  one envelope. anything more would couple the agent
+       │  to a specific adapter. the file comment names this:
+       │  "Defined by what the agents + bootstrapSchema actually
+       │   consume from the existing McpClient surface".
+       └──
+```
+
+#### The synthetic implementation
+
+```
+lib/data-source/synthetic-data-source.ts  (lines 314–331)
+
+  export class SyntheticDataSource implements DataSource {
+    async listTools(_opts?): Promise<{ tools: ToolDef[] }> {
+      return { tools: toolDefs };                  ← const catalog (L153–166)
+    }
+
+    async callTool(name, args = {}, _opts?): Promise<DataSourceCallResult> {
+      const started = Date.now();                  ← envelope honesty:
+      const payload = this.dispatch(name, args);     real durationMs even if
+      return {                                       the data is fake
+        result: payload,
+        durationMs: Date.now() - started,
+        fromCache: false,                          ← always false — synthetic
+      };                                              doesn't cache (the data IS
+    }                                                 already in memory)
+  }
+       │
+       │  the class is THIN. the work is in dispatch().
+       │  callTool's only job is the envelope; dispatch's only
+       │  job is the per-tool data.
+       └──
+```
+
+#### The dispatch (the switch over tool name)
+
+```
+lib/data-source/synthetic-data-source.ts  (lines 333–495)  ← excerpt
+
+  private dispatch(name: string, args: Record<string, unknown>): ToolResult {
+    switch (name) {
+      case 'list_cloud_organizations':
+        return ok({ data: [{ id: 'org-synthetic-blooming',
+                             name: 'Synthetic Blooming Org' }] });
+      case 'list_projects':
+        return ok({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] });
+      case 'get_event_schema':
+        return ok({                                ← projects the const literal
+          events: syntheticWorkspaceSchema.events.map((event) => ({
+            type: event.name,
+            properties: { default_group: {
+              properties: event.properties.map((property) => ({ property })),
+            }},
+          })),
+        });
+      case 'execute_analytics':
+      case 'execute_analytics_eql':                ← two tools, one payload
+        return ok({
+          ...analyticsResult,
+          query: args.eql ?? args.query ?? args.analysis ?? null,
+          project_id: args.project_id ?? PROJECT_ID,
+        });
+      ...
+      default:
+        return errorResult(name);                  ← the parallel-list smell
+    }
+  }
+       │
+       │  every case ends in ok(...) — the envelope is uniform.
+       │  the `default` branch is the smell named above:
+       │  a tool advertised by listTools but missing from the
+       │  dispatcher will land here and return an isError result.
+       └──
+```
+
+#### The factory (where the substitution happens)
+
+```
+lib/data-source/index.ts  (lines 67–100)
+
+  export async function makeDataSource(
+    mode: LiveMode,
+    sessionId: string,
+  ): Promise<MakeDataSourceResult> {
+    if (mode === 'live-synthetic') {                ← the synthetic branch
+      const dataSource = new SyntheticDataSource();
+      return {
+        ok: true,
+        mode,
+        dataSource,                                  ← the only DataSource the
+                                                       route ever sees
+        bootstrap: async () => syntheticWorkspaceSchema,
+                                                     ← the asymmetry: bootstrap
+                                                       for synthetic is instant,
+                                                       for live is 4 round-trips
+        dispose: async () => {},                     ← noop — no resources held
+      };
+    }
+
+    // live-bloomreach — defer to the existing connect path. it owns the OAuth
+    // dance, including the case where the session has no valid tokens (returns
+    // `{ ok: false, authUrl }` so the route can redirect).
+    const conn: ConnectResult = await connectMcp(sessionId);
+    if (!conn.ok) return { ok: false, mode, authUrl: conn.authUrl };
+    return { ok: true, mode, dataSource: conn.mcp,
+             bootstrap: (signal) => bootstrapSchema(conn.mcp, { signal }),
+             dispose: async () => {} };
+  }
+       │
+       │  the route holds the result. it calls `result.dataSource.callTool(...)`
+       │  the same way regardless of mode. the bootstrap asymmetry is hidden
+       │  behind a function reference — the route awaits it the same way.
+       └──
+```
+
+#### The const literals (the data IS the source code)
+
+```
+lib/data-source/synthetic-data-source.ts  (lines 85–108, 275–307)
+
+  export const syntheticWorkspaceSchema: WorkspaceSchema = {
+    projectId: 'synthetic-blooming-project',
+    projectName: 'Synthetic Blooming Workspace',
+    events: syntheticEvents,                       ← 10 events with property lists
+    customerProperties: [...],                     ← 9 customer properties
+    catalogs: [...],                               ← 2 catalogs
+    totalCustomers: 126_420,                       ← stable big number
+    totalEvents:    757_710,                       ← sum of event counts
+    oldestTimestamp: Date.UTC(2025, 11, 1),        ← 2025-12-01
+    dataHorizon: { from: '2025-12-01',             ← 182-day window
+                   to: '2026-06-01',
+                   durationDays: 182 },
+  };
+       │
+       │  ★ every field is a literal. no Date.now(), no Math.random(),
+       │    no PRNG. the data is part of the bundle.
+       └──
+
+  const analyticsResult = {                        ← the payload for both
+    summary: '...',                                  execute_analytics tools
+    currency: 'USD',
+    anomalies: [...],                              ← 2 hand-authored anomalies
+    rows:     [...],                               ← 2 time-bucket rows
+    funnel:   { view, cart, checkout, purchase },
+    history:  [...],                               ← 12 weekly values
+  };
+       │
+       │  ★ same call returns the same bytes. determinism is implicit —
+       │    no test asserts it (audit file 07, finding #7).
+       └──
+```
+
 ---
 
 ## Primary diagram
@@ -292,190 +476,6 @@ The full picture — interface, two implementations, factory, and the const lite
   │   returns: { ok, dataSource, bootstrap, dispose }         │
   │   the asymmetric work lives HERE, not in the agent        │
   └──────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-- **Live-synthetic mode in the UI.** The mode toggle on `app/page.tsx` offers `'live-bloomreach'` and `'live-synthetic'` (alongside the demo mode that bypasses agents entirely). When the user picks live-synthetic, the route handler calls `makeDataSource('live-synthetic', sessionId)`, gets a `SyntheticDataSource`, and runs the full agent loop against it. The agents make real tool calls, the LLM does real reasoning, the trace shows real timings — only the data is fake. This is the **demo with the real agent loop** path; it doesn't require OAuth and doesn't burn the Bloomreach rate limit.
-- **Local development without Bloomreach credentials.** A developer cloning the repo for the first time can run `npm run dev`, pick the live-synthetic mode in the UI, and exercise the full app without setting up OAuth. The Bloomreach mode is still there for when they have credentials.
-- **Testing the agent loops end-to-end.** Tests in `test/data-source/synthetic-data-source.test.ts` (and the agent test suite) use `SyntheticDataSource` directly as the injected data source. The agents run their real loops against deterministic data; the test asserts on the shape of the result.
-
-### The interface contract
-
-```
-lib/data-source/types.ts  (lines 17–71)
-
-  export interface DataSource {
-    callTool(
-      name: string,                                ← tool name (any tool advertised)
-      args: Record<string, unknown>,               ← agent's tool input
-      opts?: DataSourceCallOptions,                ← signal etc.
-    ): Promise<DataSourceCallResult>;              ← envelope (see below)
-
-    listTools(opts?: DataSourceListOptions): Promise<unknown>;
-  }
-
-  export interface DataSourceCallResult {
-    result: unknown;                               ← MCP-shaped result
-    durationMs: number;                            ← for the UI trace
-    fromCache: boolean;                            ← shown in trace dot
-  }
-       │
-       │  the contract is intentionally MINIMAL — two methods,
-       │  one envelope. anything more would couple the agent
-       │  to a specific adapter. the file comment names this:
-       │  "Defined by what the agents + bootstrapSchema actually
-       │   consume from the existing McpClient surface".
-       └──
-```
-
-### The synthetic implementation
-
-```
-lib/data-source/synthetic-data-source.ts  (lines 314–331)
-
-  export class SyntheticDataSource implements DataSource {
-    async listTools(_opts?): Promise<{ tools: ToolDef[] }> {
-      return { tools: toolDefs };                  ← const catalog (L153–166)
-    }
-
-    async callTool(name, args = {}, _opts?): Promise<DataSourceCallResult> {
-      const started = Date.now();                  ← envelope honesty:
-      const payload = this.dispatch(name, args);     real durationMs even if
-      return {                                       the data is fake
-        result: payload,
-        durationMs: Date.now() - started,
-        fromCache: false,                          ← always false — synthetic
-      };                                              doesn't cache (the data IS
-    }                                                 already in memory)
-  }
-       │
-       │  the class is THIN. the work is in dispatch().
-       │  callTool's only job is the envelope; dispatch's only
-       │  job is the per-tool data.
-       └──
-```
-
-### The dispatch (the switch over tool name)
-
-```
-lib/data-source/synthetic-data-source.ts  (lines 333–495)  ← excerpt
-
-  private dispatch(name: string, args: Record<string, unknown>): ToolResult {
-    switch (name) {
-      case 'list_cloud_organizations':
-        return ok({ data: [{ id: 'org-synthetic-blooming',
-                             name: 'Synthetic Blooming Org' }] });
-      case 'list_projects':
-        return ok({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] });
-      case 'get_event_schema':
-        return ok({                                ← projects the const literal
-          events: syntheticWorkspaceSchema.events.map((event) => ({
-            type: event.name,
-            properties: { default_group: {
-              properties: event.properties.map((property) => ({ property })),
-            }},
-          })),
-        });
-      case 'execute_analytics':
-      case 'execute_analytics_eql':                ← two tools, one payload
-        return ok({
-          ...analyticsResult,                      ← top-level const L275–L307
-          query: args.eql ?? args.query ?? args.analysis ?? null,
-          project_id: args.project_id ?? PROJECT_ID,
-        });
-      ...
-      default:
-        return errorResult(name);                  ← the parallel-list smell
-    }
-  }
-       │
-       │  every case ends in ok(...) — the envelope is uniform.
-       │  the `default` branch is the smell named above:
-       │  a tool advertised by listTools but missing from the
-       │  dispatcher will land here and return an isError result.
-       └──
-```
-
-### The factory (where the substitution happens)
-
-```
-lib/data-source/index.ts  (lines 67–100)
-
-  export async function makeDataSource(
-    mode: LiveMode,
-    sessionId: string,
-  ): Promise<MakeDataSourceResult> {
-    if (mode === 'live-synthetic') {                ← the synthetic branch
-      const dataSource = new SyntheticDataSource();
-      return {
-        ok: true,
-        mode,
-        dataSource,                                  ← the only DataSource the
-                                                       route ever sees
-        bootstrap: async () => syntheticWorkspaceSchema,
-                                                     ← the asymmetry: bootstrap
-                                                       for synthetic is instant,
-                                                       for live is 4 round-trips
-        dispose: async () => {},                     ← noop — no resources held
-      };
-    }
-
-    // live-bloomreach — defer to the existing connect path. it owns the OAuth
-    // dance, including the case where the session has no valid tokens (returns
-    // `{ ok: false, authUrl }` so the route can redirect).
-    const conn: ConnectResult = await connectMcp(sessionId);
-    if (!conn.ok) return { ok: false, mode, authUrl: conn.authUrl };
-    return { ok: true, mode, dataSource: conn.mcp,
-             bootstrap: (signal) => bootstrapSchema(conn.mcp, { signal }),
-             dispose: async () => {} };
-  }
-       │
-       │  the route holds the result. it calls `result.dataSource.callTool(...)`
-       │  the same way regardless of mode. the bootstrap asymmetry is hidden
-       │  behind a function reference — the route awaits it the same way.
-       └──
-```
-
-### The const literals (the data IS the source code)
-
-```
-lib/data-source/synthetic-data-source.ts  (lines 85–108, 275–307)
-
-  export const syntheticWorkspaceSchema: WorkspaceSchema = {
-    projectId: 'synthetic-blooming-project',
-    projectName: 'Synthetic Blooming Workspace',
-    events: syntheticEvents,                       ← 10 events with property lists
-    customerProperties: [...],                     ← 9 customer properties
-    catalogs: [...],                               ← 2 catalogs
-    totalCustomers: 126_420,                       ← stable big number
-    totalEvents:    757_710,                       ← sum of event counts
-    oldestTimestamp: Date.UTC(2025, 11, 1),        ← 2025-12-01
-    dataHorizon: { from: '2025-12-01',             ← 182-day window
-                   to: '2026-06-01',
-                   durationDays: 182 },
-  };
-       │
-       │  ★ every field is a literal. no Date.now(), no Math.random(),
-       │    no PRNG. the data is part of the bundle.
-       └──
-
-  const analyticsResult = {                        ← the payload for both
-    summary: '...',                                  execute_analytics tools
-    currency: 'USD',
-    anomalies: [...],                              ← 2 hand-authored anomalies
-    rows:     [...],                               ← 2 time-bucket rows
-    funnel:   { view, cart, checkout, purchase },
-    history:  [...],                               ← 12 weekly values
-  };
-       │
-       │  ★ same call returns the same bytes. determinism is implicit —
-       │    no test asserts it (audit file 07, finding #7).
-       └──
 ```
 
 ---

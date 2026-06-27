@@ -352,81 +352,9 @@ In demo (cached) mode there is no live agent at all: the route replays the combi
 
 Separate exploration from synthesis. The loop's job is to gather evidence (tool calls + results). The synthesis step's job is to produce a typed output from that evidence. Keeping them separate means you can bound the loop (prevent runaway exploration) and give the synthesis step a clean context (no tool_use scaffolding, no partial reasoning chains). The `forceFinal` mechanism is the handoff between the two modes.
 
----
+### Code in this codebase
 
-## Multi-agent orchestration — diagram
-
-The diagram below shows the full service layer. `runAgentLoop` sits at the center, receiving a prompt and tool subset from each agent and handing tool calls to the MCP/Provider boundary. The synthesis/validation step sits outside the loop.
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Route layer   app/api/agent/route.ts  (?step=diagnose|recommend|∅) │
-│                                                                     │
-│  GET /api/agent  → bootstrap inside stream → branch on step:        │
-│  ├── free-form q       : QueryAgent.answer()                        │
-│  ├── step=diagnose     : DiagnosticAgent.investigate()  (rec NOT run)│
-│  │                        send(diagnosis) → client stashes bi:diag  │
-│  ├── step=recommend    : RecommendationAgent.propose(handed diagnosis)│
-│  │                        (diagnostic NOT run; diagnosis via &diagnosis=)│
-│  └── step=∅ (combined) : both agents + saveInvestigation (demo only)│
-│  hooksFor(agent) → NDJSON stream to client                          │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │ await (sequential, one agent per request)
-┌──────────────────────────▼──────────────────────────────────────────┐
-│  Agent layer   lib/agents/                                          │
-│                                                                     │
-│  MonitoringAgent    DiagnosticAgent    RecommendationAgent          │
-│  .scan(hooks,       .investigate()     .propose()                   │
-│   runnable)         prompt: diagnostic prompt: recommendation       │
-│  prompt: monitoring tools: diagnostic  tools: recommendation        │
-│   + runnable        subset             subset                       │
-│   checklist                                                         │
-│  tools: monitoring                                                  │
-│  subset                                                             │
-│  (briefing route gates runnable categories upstream — categories.ts)│
-│         │                  │                   │                    │
-│         └──────────────────┼───────────────────┘                   │
-│                            │ all call                               │
-│                ┌───────────▼────────────┐                           │
-│                │   runAgentLoop()       │  lib/agents/base.ts       │
-│                │                        │                           │
-│                │  for turn in maxTurns  │                           │
-│                │   forceFinal?          │                           │
-│                │    send w/o tools ─────┼──→ finalText              │
-│                │   else                 │                           │
-│                │    send w/ tools ──────┼──→ tool_use blocks        │
-│                │    execute via MCP ────┼──← tool results           │
-│                │    feed back           │                           │
-│                │  return finalText,     │                           │
-│                │         toolCalls      │                           │
-│                └───────────────────────┘                           │
-│                            │                                        │
-│  Synthesis/validation step (per agent):                             │
-│  tryParse(finalText) ──── valid? ──→ typed output ──┐               │
-│       │ null                                        │               │
-│       ▼                                             ▼               │
-│  synthesize(toolCalls) ── valid? ──→ typed output → diagnostic:     │
-│       │ null                          diagnosisConfidence(diag),    │
-│       ▼                               downgrade high→med if errors  │
-│  FALLBACK / []                        recommendation: assign ids,   │
-│                                       slice(0,3)                    │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │ callTool()
-┌──────────────────────────▼──────────────────────────────────────────┐
-│  MCP / Provider boundary   lib/mcp/                                 │
-│                                                                     │
-│  McpCaller interface  ←  McpClient (prod)  /  buildFakeMcp (tests)  │
-│  Anthropic SDK client ←  real API key      /  injected fake         │
-│                                                                     │
-│  callTool(name, args) → { result, durationMs, fromCache }           │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation mechanics. The synthesis/validation step owns the contract: a typed output or a safe default.
-
----
-
-## Implementation in codebase
+Each agent class composes `runAgentLoop` (`lib/agents/base.ts`) with its own prompt + tool subset. The route splits diagnose vs recommend; the client hook hands the diagnosis from step 2 to step 3.
 
 | File | Function | Lines | Role |
 |------|----------|-------|------|
@@ -503,6 +431,78 @@ return { ...diag, confidence: confidence === 'high' && hadErrors ? 'medium' : co
 - `lib/insights/derive.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/insights/derive.ts
 - `lib/hooks/useInvestigation.ts`: https://github.com/rlynjb/blooming_insights/blob/main/lib/hooks/useInvestigation.ts
 - `app/api/agent/route.ts`: https://github.com/rlynjb/blooming_insights/blob/main/app/api/agent/route.ts
+
+---
+
+## Multi-agent orchestration — diagram
+
+The diagram below shows the full service layer. `runAgentLoop` sits at the center, receiving a prompt and tool subset from each agent and handing tool calls to the MCP/Provider boundary. The synthesis/validation step sits outside the loop.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Route layer   app/api/agent/route.ts  (?step=diagnose|recommend|∅) │
+│                                                                     │
+│  GET /api/agent  → bootstrap inside stream → branch on step:        │
+│  ├── free-form q       : QueryAgent.answer()                        │
+│  ├── step=diagnose     : DiagnosticAgent.investigate()  (rec NOT run)│
+│  │                        send(diagnosis) → client stashes bi:diag  │
+│  ├── step=recommend    : RecommendationAgent.propose(handed diagnosis)│
+│  │                        (diagnostic NOT run; diagnosis via &diagnosis=)│
+│  └── step=∅ (combined) : both agents + saveInvestigation (demo only)│
+│  hooksFor(agent) → NDJSON stream to client                          │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ await (sequential, one agent per request)
+┌──────────────────────────▼──────────────────────────────────────────┐
+│  Agent layer   lib/agents/                                          │
+│                                                                     │
+│  MonitoringAgent    DiagnosticAgent    RecommendationAgent          │
+│  .scan(hooks,       .investigate()     .propose()                   │
+│   runnable)         prompt: diagnostic prompt: recommendation       │
+│  prompt: monitoring tools: diagnostic  tools: recommendation        │
+│   + runnable        subset             subset                       │
+│   checklist                                                         │
+│  tools: monitoring                                                  │
+│  subset                                                             │
+│  (briefing route gates runnable categories upstream — categories.ts)│
+│         │                  │                   │                    │
+│         └──────────────────┼───────────────────┘                   │
+│                            │ all call                               │
+│                ┌───────────▼────────────┐                           │
+│                │   runAgentLoop()       │  lib/agents/base.ts       │
+│                │                        │                           │
+│                │  for turn in maxTurns  │                           │
+│                │   forceFinal?          │                           │
+│                │    send w/o tools ─────┼──→ finalText              │
+│                │   else                 │                           │
+│                │    send w/ tools ──────┼──→ tool_use blocks        │
+│                │    execute via MCP ────┼──← tool results           │
+│                │    feed back           │                           │
+│                │  return finalText,     │                           │
+│                │         toolCalls      │                           │
+│                └───────────────────────┘                           │
+│                            │                                        │
+│  Synthesis/validation step (per agent):                             │
+│  tryParse(finalText) ──── valid? ──→ typed output ──┐               │
+│       │ null                                        │               │
+│       ▼                                             ▼               │
+│  synthesize(toolCalls) ── valid? ──→ typed output → diagnostic:     │
+│       │ null                          diagnosisConfidence(diag),    │
+│       ▼                               downgrade high→med if errors  │
+│  FALLBACK / []                        recommendation: assign ids,   │
+│                                       slice(0,3)                    │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ callTool()
+┌──────────────────────────▼──────────────────────────────────────────┐
+│  MCP / Provider boundary   lib/mcp/                                 │
+│                                                                     │
+│  McpCaller interface  ←  McpClient (prod)  /  buildFakeMcp (tests)  │
+│  Anthropic SDK client ←  real API key      /  injected fake         │
+│                                                                     │
+│  callTool(name, args) → { result, durationMs, fromCache }           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Each agent owns its prompt and tool subset. `runAgentLoop` owns the conversation mechanics. The synthesis/validation step owns the contract: a typed output or a safe default.
 
 ---
 

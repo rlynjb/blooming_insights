@@ -144,6 +144,8 @@ For blooming insights the cases are obvious because the prompts already name the
 
 Each of those is a regression fix that currently lives only as a sentence in a prompt. The dataset turns each sentence into an enforceable case.
 
+**Code in this codebase — the informal regression suite (currently the only layer present).** `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md` — the CRITICAL / Never / Do NOT blocks within each prompt. Every CRITICAL block is a regression fix encoded as prose — `monitoring.md`'s empty-window block, the small-baseline caution, `diagnostic.md`'s historical-data block, the `customers matching` ban — each one a production miss the team already paid for. The legacy prompts honor them; nothing scores them.
+
 ---
 
 ### Part 2 — the runner feeds the REAL path
@@ -166,6 +168,10 @@ RUNNER must use the SAME path as production
 ```
 
 The seam that makes this cheap already exists. The shared agent loop injects both the provider SDK client and an MCP-caller dependency — the same seam the 169 unit tests use to pass fakes. For evals you do the opposite of the unit tests: you keep the real provider client (you want real model behavior) and inject a *deterministic* MCP caller that returns canned tool results per case, so the case's "empty 90-day window" is reproducible run to run.
+
+**Code in this codebase — the seam that would make a harness cheap.** `lib/agents/base.ts` · `lib/agents/base-legacy.ts` — the shared agent loop injects both the provider SDK client and an MCP-caller dependency, the same seam the 221 unit tests use to pass fakes. The dependency-injection point a future eval runner would borrow from. For an eval the move is the *opposite* of a unit test: keep the real provider client (you want real model behavior), inject a *deterministic* MCP caller that returns canned tool results per case, so each case is reproducible. The reference shapes the harness would score against live in `lib/state/demo-insights.json` · `lib/state/demo-investigations.json` — the committed demo snapshots are the closest in-repo artifact to "reference outputs for known inputs," recording valid Anomaly / Diagnosis / Recommendation shapes a future judge could anchor on.
+
+**Why this is Case B, not Case A.** The harness, dataset, runner, scorer, judge prompts, and committed results history would all be net-new files. The pattern is real prompt engineering and the codebase has the *seams* (dependency injection, snapshot fixtures) that would make a harness cheap to build — but none of it ships today.
 
 ---
 
@@ -260,33 +266,6 @@ This diagram spans the loop. The Engineer edits a prompt; the Harness layer runs
 ```
 
 A reader who sees only this should grasp: the dataset is fixed and growing, the runner uses the real path, and the gate checks two things — average up AND no critical regression.
-
----
-
-## Implementation in codebase
-
-**Case B — not yet implemented.** The eval harness is not in the repo; the closest existing artifact is the informal regression encoding inside the legacy prompts. The Project exercises block below is the buildable path.
-
-### The informal regression suite (currently the only layer present)
-
-- **File:** `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md`
-- **Function / class:** the CRITICAL / Never / Do NOT blocks within each prompt
-- **Role:** every CRITICAL block is a regression fix encoded as prose — `monitoring.md`'s empty-window block, the small-baseline caution, `diagnostic.md`'s historical-data block, the `customers matching` ban — each one a production miss the team already paid for. The legacy prompts honor them; nothing scores them.
-
-### The seam that would make a harness cheap
-
-- **File:** `lib/agents/base.ts` · `lib/agents/base-legacy.ts`
-- **Function / class:** the shared agent loop injects both the provider SDK client and an MCP-caller dependency — the same seam the 221 unit tests use to pass fakes.
-- **Role:** the dependency-injection point a future eval runner would borrow from. For an eval the move is the *opposite* of a unit test: keep the real provider client (you want real model behavior), inject a *deterministic* MCP caller that returns canned tool results per case, so each case is reproducible.
-
-### The reference shapes the harness would score against
-
-- **File:** `lib/state/demo-insights.json` · `lib/state/demo-investigations.json`
-- **Role:** the committed demo snapshots are the closest in-repo artifact to "reference outputs for known inputs" — they record valid Anomaly / Diagnosis / Recommendation shapes that a future harness's LLM-judge could use as anchors. They were committed for the demo path, not for eval, but the data shape is the same.
-
-### Why this is Case B, not Case A
-
-The harness, dataset, runner, scorer, judge prompts, and committed results history would all be net-new files. The pattern is real prompt engineering and the codebase has the *seams* (dependency injection, snapshot fixtures) that would make a harness cheap to build — but none of it ships today.
 
 ---
 

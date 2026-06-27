@@ -181,6 +181,16 @@ When two writers — a regenerating machine and an editing human — share a fie
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights is a read-only analyst — it streams a diagnosis and recommendations for viewing and Markdown export, but there are no user-editable persisted fields, so there is no regeneration-vs-edit conflict to guard and no `_overridden_at` anywhere.
+
+This is confirmed by the data model and state: `lib/mcp/types.ts` defines `Recommendation` (L85–L99) and `Diagnosis` (L64–L73) with *only* machine-generated fields. The recent enrichments (`effort`, `prerequisites`, `successMetric`, `estimatedImpact` as a union on `Recommendation`; `confidence`, `timeSeries` on `Diagnosis`) are all agent-emitted or *derived* — none is human-edit metadata, so there is still no `_dismissed` and no `_overridden_at`. `lib/state/insights.ts` exposes `putInsights` / `getInsight` / `getAnomaly` / `putInvestigation` (L29–L57) over an in-memory `Map` store (L4–L6) with *no edit or patch path* — every write is a machine write. The investigate UI (`app/investigate/[id]/page.tsx`) is now the *diagnose* step only: it renders the diagnosis read-only and offers Markdown export (L75–L98) but no edit or dismiss control. The `id` assigned to each recommendation (`lib/agents/recommendation.ts` L76) exists for React keys and rendering, not for tracking human edits.
+
+Where the lock would live: `lib/mcp/types.ts` (`Recommendation` gains `_overridden_at?` / `_dismissed?`), `lib/state/` (a patch/edit path that sets the marker, and a `mergeOnRegenerate` used by re-runs), and `app/investigate/[id]/page.tsx` (edit/dismiss controls). The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## User-override locks — diagram
 
 This diagram spans the UI (where the human edits), the State layer (where the marker is persisted), and the Service layer (where the regeneration step checks it). A reader who sees only this should grasp that the marker lives on the record and gates the re-run's write.
@@ -212,16 +222,6 @@ This diagram spans the UI (where the human edits), the State layer (where the ma
 ```
 
 The marker on the State-layer record is the contract between the human (UI) and the machine (Service): the re-run reads it and defers to the human where it is set.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights is a read-only analyst — it streams a diagnosis and recommendations for viewing and Markdown export, but there are no user-editable persisted fields, so there is no regeneration-vs-edit conflict to guard and no `_overridden_at` anywhere.
-
-This is confirmed by the data model and state: `lib/mcp/types.ts` defines `Recommendation` (L85–L99) and `Diagnosis` (L64–L73) with *only* machine-generated fields. The recent enrichments (`effort`, `prerequisites`, `successMetric`, `estimatedImpact` as a union on `Recommendation`; `confidence`, `timeSeries` on `Diagnosis`) are all agent-emitted or *derived* — none is human-edit metadata, so there is still no `_dismissed` and no `_overridden_at`. `lib/state/insights.ts` exposes `putInsights` / `getInsight` / `getAnomaly` / `putInvestigation` (L29–L57) over an in-memory `Map` store (L4–L6) with *no edit or patch path* — every write is a machine write. The investigate UI (`app/investigate/[id]/page.tsx`) is now the *diagnose* step only: it renders the diagnosis read-only and offers Markdown export (L75–L98) but no edit or dismiss control. The `id` assigned to each recommendation (`lib/agents/recommendation.ts` L76) exists for React keys and rendering, not for tracking human edits.
-
-Where the lock would live: `lib/mcp/types.ts` (`Recommendation` gains `_overridden_at?` / `_dismissed?`), `lib/state/` (a patch/edit path that sets the marker, and a `mergeOnRegenerate` used by re-runs), and `app/investigate/[id]/page.tsx` (edit/dismiss controls). The `Project exercises` block below is the primary buildable target.
 
 ---
 

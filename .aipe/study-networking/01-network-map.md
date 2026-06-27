@@ -110,6 +110,13 @@ The inbound stream stays open for the full 60–115 s investigation while the ou
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **Cold load of the feed.** Browser GETs `/api/briefing`; the function calls Bloomreach to read schema + run anomaly EQL across 10 categories; Anthropic narrates per category; NDJSON streams `coverage_item`, `reasoning_step`, `tool_call_start/end`, `insight`, `done` back. ~60–115 s end-to-end in live mode.
+  → **Drill into an insight.** Browser GETs `/api/agent?insightId=…&step=diagnose` (then later `…&step=recommend`); the function runs the diagnostic agent → Bloomreach (many tool calls) → Anthropic, streams the same NDJSON event shape, finally a `diagnosis` event.
+  → **Cold-start OAuth.** Browser hits any route; function `connectMcp` finds no tokens, returns 401 + `authUrl`; browser navigates; user logs in at Bloomreach; Bloomreach 302s to `/api/mcp/callback?code=…`; callback exchanges code → tokens via `transport.finishAuth`; redirect to `/`.
+  → **Debug tool call.** `/debug` POSTs `/api/mcp/call` with `{name, args}`; bypasses cache (`skipCache: true`); single Bloomreach POST, single JSON response.
+
 **The inbound connection: browser → serverless function.** The browser calls `fetch(url)` with no special options. Same-origin, so cookies (`bi_session`, `bi_auth`) ride along automatically. Vercel's edge routes the request to a serverless function instance — a fresh Node process on a cold start, a warm process on a hot one. The function returns a `Response` whose body is a `ReadableStream`; the browser starts pulling from `response.body.getReader()` as soon as the headers arrive.
 
 ```
@@ -127,6 +134,71 @@ Inbound hop — same-origin fetch, cookies ride free
 ```
 
 The seam-1 contract: every request carries the cookies the server set, the server cannot rely on anything else (no `Authorization` header from the browser, no body parameter for auth).
+
+The producer side of this seam, with the load-bearing header set inline:
+
+```
+app/api/briefing/route.ts   (lines 178-265, the live path)
+
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    const send = (e: BriefingEvent) =>
+      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
+            │
+            └─ producer side of seam-1: every visible
+               step from the agent becomes one NDJSON line.
+               No batching — flushed the moment the agent
+               emits the event.
+    …
+    const anomalies = await agent.scan({ onToolCall, onToolResult, onText }, runnable);
+       │
+       └─ the scan() awaits many hop-2a calls (rate-limited)
+          and many hop-2b calls (LLM). The inbound HTTP
+          connection stays open the whole time.
+  },
+});
+return new Response(stream, {
+  headers: {
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+       │
+       └─ no-transform is load-bearing: without it,
+          Vercel's edge may buffer/gzip-rechunk the
+          stream and the UI sees nothing until the
+          whole 60s run finishes.
+  },
+});
+```
+
+And the consumer side — the line-buffered reader that pulls from the same stream:
+
+```
+lib/hooks/useInvestigation.ts   (lines 184-208, the consumer side of seam-1)
+
+const reader = res.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });   ← stream:true keeps
+                                                   partial UTF-8 bytes
+                                                   buffered across chunks
+  const lines = buf.split('\n');
+  buf = lines.pop() ?? '';                       ← the last element is
+                                                   either empty (clean
+                                                   line boundary) or a
+                                                   partial line carried
+                                                   into the next read.
+                                                   THIS is the seam-2
+                                                   contract in the DSA
+                                                   companion file.
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try { handle(JSON.parse(line) as AgentEvent); } catch { /* malformed */ }
+  }
+}
+```
 
 **The outbound hop to Bloomreach.** Inside the function, `connectMcp(sid)` builds a `StreamableHTTPClientTransport` pointed at `mcpUrl()` (default `https://loomi-mcp-alpha.bloomreach.com/mcp/`). The SDK does the HTTP under the hood — our only insertion point is the `fetch` option, which we use to install a capturing fetch wrapper that snapshots the body of any non-2xx response so we can surface the real server error. Every actual tool call ends up as `POST /mcp/` with `Authorization: Bearer <access_token>` and a JSON-RPC body.
 
@@ -155,6 +227,37 @@ Outbound hop 2a — to Bloomreach, every call gated
 ```
 
 The boundary that catches people: Bloomreach signals rate-limit via the JSON-RPC error envelope inside an HTTP 200, not via an HTTP 429. Our client parses the text and waits — see `07-timeouts-retries-pooling-and-backpressure.md`.
+
+The transport-setup code, with every constant traced to a real concern:
+
+```
+lib/mcp/connect.ts   (lines 66-107, the outbound transport setup)
+
+const transport = new StreamableHTTPClientTransport(mcpUrl(), {
+  authProvider: provider,         ← OAuth+PKCE+DCR via BloomreachAuthProvider
+  fetch: makeCapturingFetch(httpErrors),
+});                                ← every actual fetch goes through
+                                     our wrapper so we can capture the
+                                     body of any non-OK response and
+                                     attach it to the thrown error.
+const client = new Client(
+  { name: 'blooming-insights', version: '0.1.0' },
+  { capabilities: {} },
+);
+await client.connect(transport);  ← may throw UnauthorizedError; we catch
+                                     it and surface lastAuthorizeUrl so
+                                     the browser does the IdP redirect.
+
+return {
+  ok: true,
+  mcp: new McpClient(new SdkTransport(client, httpErrors), {
+    minIntervalMs: 1100,         ← proactive spacing under the 10s window
+    retryDelayMs: 10_000,        ← fallback wait if 429 has no parseable hint
+    retryCeilingMs: 20_000,      ← cap on ANY single retry, parsed or not
+    maxRetries: 3,                ← keeps a single call from eating the route
+  }),
+};
+```
 
 **The outbound hop to Anthropic.** Same function instance, separate fetch via the official SDK. No special configuration — we hand it the API key and the model. The agent makes one Anthropic call, that call may emit `tool_use` blocks, those blocks dispatch back through `McpClient.callTool` (a fresh hop 2a), the results come back, the agent makes another Anthropic call. So a single inbound request fans out to N×Bloomreach + M×Anthropic calls before closing.
 
@@ -197,6 +300,29 @@ Cross-site round-trip — why SameSite=None matters
     the cross-site redirect ★          
        ◄── 302 to / ──                  callback exchanged
                                         code → tokens
+```
+
+The callback that closes the loop:
+
+```
+app/api/mcp/callback/route.ts   (lines 5-35, the auth round-trip closer)
+
+const code = params.get('code');
+if (!code) return NextResponse.json({ error: 'missing code' }, { status: 400 });
+const sid = await readSessionId();             ← needs bi_session to have
+                                                   survived the cross-site
+                                                   round-trip
+if (!sid) return NextResponse.json({ error: 'no session' }, { status: 400 });
+
+try {
+  await completeAuth(sid, code);                ← decrypts bi_auth, reads
+                                                   the PKCE verifier saved
+                                                   during connect, calls
+                                                   transport.finishAuth
+  return NextResponse.redirect(new URL('/', req.url));
+} catch (e) {
+  return NextResponse.json({ error: String(e) }, { status: 401 });
+}
 ```
 
 ### Principle
@@ -256,130 +382,6 @@ Provider band ▼                                          ▼
 Auxiliary cross-site round-trip — only during OAuth:
 Browser → Bloomreach IdP login page → 302 → /api/mcp/callback?code=…
 (cookies must survive: SameSite=None; Secure in production.)
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **Cold load of the feed.** Browser GETs `/api/briefing`; the function calls Bloomreach to read schema + run anomaly EQL across 10 categories; Anthropic narrates per category; NDJSON streams `coverage_item`, `reasoning_step`, `tool_call_start/end`, `insight`, `done` back. ~60–115 s end-to-end in live mode.
-  → **Drill into an insight.** Browser GETs `/api/agent?insightId=…&step=diagnose` (then later `…&step=recommend`); the function runs the diagnostic agent → Bloomreach (many tool calls) → Anthropic, streams the same NDJSON event shape, finally a `diagnosis` event.
-  → **Cold-start OAuth.** Browser hits any route; function `connectMcp` finds no tokens, returns 401 + `authUrl`; browser navigates; user logs in at Bloomreach; Bloomreach 302s to `/api/mcp/callback?code=…`; callback exchanges code → tokens via `transport.finishAuth`; redirect to `/`.
-  → **Debug tool call.** `/debug` POSTs `/api/mcp/call` with `{name, args}`; bypasses cache (`skipCache: true`); single Bloomreach POST, single JSON response.
-
-### The four routes side by side
-
-```
-app/api/briefing/route.ts   (lines 178-265, the live path)
-
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const send = (e: BriefingEvent) =>
-      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-            │
-            └─ producer side of seam-1: every visible
-               step from the agent becomes one NDJSON line.
-               No batching — flushed the moment the agent
-               emits the event.
-    …
-    const anomalies = await agent.scan({ onToolCall, onToolResult, onText }, runnable);
-       │
-       └─ the scan() awaits many hop-2a calls (rate-limited)
-          and many hop-2b calls (LLM). The inbound HTTP
-          connection stays open the whole time.
-  },
-});
-return new Response(stream, {
-  headers: {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store, no-transform',
-       │
-       └─ no-transform is load-bearing: without it,
-          Vercel's edge may buffer/gzip-rechunk the
-          stream and the UI sees nothing until the
-          whole 60s run finishes.
-  },
-});
-```
-
-```
-lib/mcp/connect.ts   (lines 66-107, the outbound transport setup)
-
-const transport = new StreamableHTTPClientTransport(mcpUrl(), {
-  authProvider: provider,         ← OAuth+PKCE+DCR via BloomreachAuthProvider
-  fetch: makeCapturingFetch(httpErrors),
-});                                ← every actual fetch goes through
-                                     our wrapper so we can capture the
-                                     body of any non-OK response and
-                                     attach it to the thrown error.
-const client = new Client(
-  { name: 'blooming-insights', version: '0.1.0' },
-  { capabilities: {} },
-);
-await client.connect(transport);  ← may throw UnauthorizedError; we catch
-                                     it and surface lastAuthorizeUrl so
-                                     the browser does the IdP redirect.
-
-return {
-  ok: true,
-  mcp: new McpClient(new SdkTransport(client, httpErrors), {
-    minIntervalMs: 1100,         ← proactive spacing under the 10s window
-    retryDelayMs: 10_000,        ← fallback wait if 429 has no parseable hint
-    retryCeilingMs: 20_000,      ← cap on ANY single retry, parsed or not
-    maxRetries: 3,                ← keeps a single call from eating the route
-  }),
-};
-```
-
-```
-lib/hooks/useInvestigation.ts   (lines 184-208, the consumer side of seam-1)
-
-const reader = res.body.getReader();
-const dec = new TextDecoder();
-let buf = '';
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += dec.decode(value, { stream: true });   ← stream:true keeps
-                                                   partial UTF-8 bytes
-                                                   buffered across chunks
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';                       ← the last element is
-                                                   either empty (clean
-                                                   line boundary) or a
-                                                   partial line carried
-                                                   into the next read.
-                                                   THIS is the seam-2
-                                                   contract in the DSA
-                                                   companion file.
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try { handle(JSON.parse(line) as AgentEvent); } catch { /* malformed */ }
-  }
-}
-```
-
-```
-app/api/mcp/callback/route.ts   (lines 5-35, the auth round-trip closer)
-
-const code = params.get('code');
-if (!code) return NextResponse.json({ error: 'missing code' }, { status: 400 });
-const sid = await readSessionId();             ← needs bi_session to have
-                                                   survived the cross-site
-                                                   round-trip
-if (!sid) return NextResponse.json({ error: 'no session' }, { status: 400 });
-
-try {
-  await completeAuth(sid, code);                ← decrypts bi_auth, reads
-                                                   the PKCE verifier saved
-                                                   during connect, calls
-                                                   transport.finishAuth
-  return NextResponse.redirect(new URL('/', req.url));
-} catch (e) {
-  return NextResponse.json({ error: String(e) }, { status: 401 });
-}
 ```
 
 ---

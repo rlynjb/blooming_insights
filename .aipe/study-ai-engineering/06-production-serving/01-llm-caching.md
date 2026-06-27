@@ -208,6 +208,34 @@ Cache at the layer where the cost lives. For a network-bound, rate-limited data 
 
 ---
 
+### Code in this codebase
+
+This is partially implemented — two of the three layers exist.
+
+#### L1 exact-match tool cache (Case A)
+
+**File:** `lib/mcp/client.ts`
+**Function / class:** `McpClient.callTool`
+**Line range:** L97–L146 (key L102, ttl L103, read L105–L110, no-cache-on-error L137–L139, write L143–L144)
+
+The cache field is `private cache = new Map<string, { result; expiresAt }>()` at L80. Default TTL `60_000` ms. Key format `` `${name}:${JSON.stringify(args)}` ``. A `skipCache` option (L105) bypasses the read but still writes through (L141–L142 comment), serving the `/debug` force-refresh path.
+
+#### L0 investigation replay cache (Case A)
+
+**File:** `lib/state/investigations.ts`
+**Function / class:** `getCachedInvestigation` (read), `saveInvestigation` (write)
+**Line range:** read L22–L28, write L30–L41
+
+Three-tier lookup: in-memory `Map` (L23) → dev file `.investigation-cache.json` (L24, dev only) → committed demo seed (L26). Wired into the route at `app/api/agent/route.ts` L127–L141 (replay branch, `REPLAY_DELAY_MS = 180` at L105) and L254 (`saveInvestigation` after a live run).
+
+#### L2 prompt caching (Case B — Not yet implemented)
+
+**Not yet implemented.** blooming insights re-sends each agent's static system prompt at full input price on every turn — the `system` field at `lib/agents/base.ts` L98 carries the multi-thousand-token prefix loaded by `readFileSync` in each agent (e.g. `lib/agents/query.ts` L13), with no `cache_control` marker anywhere.
+
+Where it would live: the `params` object constructed at `lib/agents/base.ts` L92–L100. The static prefix would move into a structured `system` array with a `cache_control: { type: 'ephemeral' }` block on the stable portion, leaving the per-run variable text (anomaly JSON, schema summary) outside the cached span. The semantic cache would live as a new module beside `lib/mcp/client.ts`, keyed on an embedding of the `?q=` query — but the codebase has no embedding infrastructure today (see `03-retrieval-and-rag`).
+
+---
+
 ## LLM caching — diagram
 
 This diagram spans all four layers across the UI, Route, Agent, and Provider boundaries. The two solid boxes are built; the two dashed boxes are the gaps.
@@ -254,34 +282,6 @@ This diagram spans all four layers across the UI, Route, Agent, and Provider bou
 ```
 
 A reader who sees only this diagram should grasp: two caches are built and protect latency/quota; the cost-bearing prompt layer is the dashed gap.
-
----
-
-## Implementation in codebase
-
-This is partially implemented — two of the three layers exist.
-
-### L1 exact-match tool cache (Case A)
-
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool`
-**Line range:** L97–L146 (key L102, ttl L103, read L105–L110, no-cache-on-error L137–L139, write L143–L144)
-
-The cache field is `private cache = new Map<string, { result; expiresAt }>()` at L80. Default TTL `60_000` ms. Key format `` `${name}:${JSON.stringify(args)}` ``. A `skipCache` option (L105) bypasses the read but still writes through (L141–L142 comment), serving the `/debug` force-refresh path.
-
-### L0 investigation replay cache (Case A)
-
-**File:** `lib/state/investigations.ts`
-**Function / class:** `getCachedInvestigation` (read), `saveInvestigation` (write)
-**Line range:** read L22–L28, write L30–L41
-
-Three-tier lookup: in-memory `Map` (L23) → dev file `.investigation-cache.json` (L24, dev only) → committed demo seed (L26). Wired into the route at `app/api/agent/route.ts` L127–L141 (replay branch, `REPLAY_DELAY_MS = 180` at L105) and L254 (`saveInvestigation` after a live run).
-
-### L2 prompt caching (Case B — Not yet implemented)
-
-**Not yet implemented.** blooming insights re-sends each agent's static system prompt at full input price on every turn — the `system` field at `lib/agents/base.ts` L98 carries the multi-thousand-token prefix loaded by `readFileSync` in each agent (e.g. `lib/agents/query.ts` L13), with no `cache_control` marker anywhere.
-
-Where it would live: the `params` object constructed at `lib/agents/base.ts` L92–L100. The static prefix would move into a structured `system` array with a `cache_control: { type: 'ephemeral' }` block on the stable portion, leaving the per-run variable text (anomaly JSON, schema summary) outside the cached span. The semantic cache would live as a new module beside `lib/mcp/client.ts`, keyed on an embedding of the `?q=` query — but the codebase has no embedding infrastructure today (see `03-retrieval-and-rag`).
 
 ---
 

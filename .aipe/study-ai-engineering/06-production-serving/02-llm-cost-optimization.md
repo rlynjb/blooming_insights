@@ -219,6 +219,40 @@ Optimize the line item that dominates, and you cannot find it without measuring.
 
 ---
 
+### Code in this codebase
+
+Partially implemented — strong on routing-at-the-edge and shrinking, absent on prompt caching, in-agent cascade, and visibility.
+
+#### Edge model routing (Case A)
+
+**File:** `lib/agents/intent.ts`
+**Function / class:** `classifyIntent` + `CLASSIFIER_MODEL`
+**Line range:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` L14; call L17–L31 (`max_tokens: 16` L20).
+
+A cheap haiku model decides the agent surface; sonnet does the actual work. Contrast `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9), used by every agent uniformly.
+
+#### Token budgets + truncation (Case A)
+
+**File:** `lib/agents/base.ts`
+**Function / class:** `runAgentLoop` budget logic + `truncate`
+**Line range:** `budgetSpent`/`forceFinal` L90–L91; `MAX_TOOL_RESULT_CHARS = 16_000` L29, `truncate` L31–L34; default `maxTokens = 4096` L74.
+
+Per-agent caps: monitoring 6 (`monitoring.ts` L84), diagnostic 6 (`diagnostic.ts` L62), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Route-side `TRUNC = 4000` at `app/api/agent/route.ts` L99.
+
+#### The output-heavy synthesis cost (Case A — the line item)
+
+**File:** `lib/agents/diagnostic.ts`
+**Function / class:** `DiagnosticAgent.synthesize`
+**Line range:** L87–L126 (sonnet at L98, `max_tokens: 2048` L99). Mirrored by `RecommendationAgent.synthesize` (`lib/agents/recommendation.ts` L82–L132, sonnet at L97, `max_tokens: 2048` L98).
+
+#### Cost telemetry + in-agent cascade + prompt caching (Case B — Not yet implemented)
+
+**Not yet implemented.** Every `anthropic.messages.create` response carries a `usage` object (`input_tokens`, `output_tokens`, cache fields), but blooming insights reads it nowhere — there is no per-run cost meter, no in-agent escalation from a cheaper model, and no `cache_control` on the prefix.
+
+Where it would live: a cost meter would accumulate `res.usage` inside `runAgentLoop` (`lib/agents/base.ts` L102) and the two `synthesize()` calls, summing per request in the route's `start()` block (`app/api/agent/route.ts` L170) and emitting a `cost` field on the `done` event (sent at L251). The cheap-first cascade would wrap the `model` choice in `runAgentLoop` (L93). Prompt caching attaches to the `system` field at L98 (see `01-llm-caching.md`).
+
+---
+
 ## LLM cost optimization — diagram
 
 This diagram spans the Route, Agent, and Provider layers and marks each cost lever as built (solid) or absent (dashed).
@@ -262,40 +296,6 @@ This diagram spans the Route, Agent, and Provider layers and marks each cost lev
 ```
 
 A reader who sees only this diagram should grasp: routing and shrinking are mostly built, the output-heavy synthesis call is the cost center, and there is no meter watching it.
-
----
-
-## Implementation in codebase
-
-Partially implemented — strong on routing-at-the-edge and shrinking, absent on prompt caching, in-agent cascade, and visibility.
-
-### Edge model routing (Case A)
-
-**File:** `lib/agents/intent.ts`
-**Function / class:** `classifyIntent` + `CLASSIFIER_MODEL`
-**Line range:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` L14; call L17–L31 (`max_tokens: 16` L20).
-
-A cheap haiku model decides the agent surface; sonnet does the actual work. Contrast `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9), used by every agent uniformly.
-
-### Token budgets + truncation (Case A)
-
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop` budget logic + `truncate`
-**Line range:** `budgetSpent`/`forceFinal` L90–L91; `MAX_TOOL_RESULT_CHARS = 16_000` L29, `truncate` L31–L34; default `maxTokens = 4096` L74.
-
-Per-agent caps: monitoring 6 (`monitoring.ts` L84), diagnostic 6 (`diagnostic.ts` L62), recommendation 4 (`recommendation.ts` L57), query 6 (`query.ts` L41). Route-side `TRUNC = 4000` at `app/api/agent/route.ts` L99.
-
-### The output-heavy synthesis cost (Case A — the line item)
-
-**File:** `lib/agents/diagnostic.ts`
-**Function / class:** `DiagnosticAgent.synthesize`
-**Line range:** L87–L126 (sonnet at L98, `max_tokens: 2048` L99). Mirrored by `RecommendationAgent.synthesize` (`lib/agents/recommendation.ts` L82–L132, sonnet at L97, `max_tokens: 2048` L98).
-
-### Cost telemetry + in-agent cascade + prompt caching (Case B — Not yet implemented)
-
-**Not yet implemented.** Every `anthropic.messages.create` response carries a `usage` object (`input_tokens`, `output_tokens`, cache fields), but blooming insights reads it nowhere — there is no per-run cost meter, no in-agent escalation from a cheaper model, and no `cache_control` on the prefix.
-
-Where it would live: a cost meter would accumulate `res.usage` inside `runAgentLoop` (`lib/agents/base.ts` L102) and the two `synthesize()` calls, summing per request in the route's `start()` block (`app/api/agent/route.ts` L170) and emitting a `cost` field on the `done` event (sent at L251). The cheap-first cascade would wrap the `model` choice in `runAgentLoop` (L93). Prompt caching attaches to the `system` field at L98 (see `01-llm-caching.md`).
 
 ---
 

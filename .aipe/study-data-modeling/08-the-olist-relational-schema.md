@@ -191,49 +191,11 @@ You know how a SQL textbook draws an e-commerce ER diagram with `customers`, `or
 
 A relational schema is correct when every column is justified by a query and every constraint is justified by an invariant the queries depend on. The Olist schema runs this discipline end-to-end: every column has a named consumer (with `weight_g` and the reviews table as the two intentional exceptions for dataset fidelity), every FK matches a real join, every NOT NULL matches a real "this can't be missing" invariant, every index matches a predicate the tools issue. The textbook lesson "design the schema against the queries" plays out concretely here. The places it cracks are the new audit findings: the unit-in-name bug (column says Reais, stores cents) and the description-vs-multiplier drift in `seeded_anomalies`.
 
----
+### Code in this codebase
 
-## Primary diagram
+The repo anchors for the schema constant and the load-bearing runtime pragmas.
 
-The full Olist schema, recap.
-
-```
-  Olist schema — full recap (mcp-server-olist/scripts/seed-olist.ts)
-
-  customers (id, state, city)                  5,000 rows
-   │ FK customer_id
-   ▼
-  orders (id, customer_id, status,             ~9,800 rows
-          purchase_ts, delivered_ts)            6-month horizon
-   │           │           │                    (2025-12-01 → 2026-06-01)
-   │ FK        │ FK        │ FK
-   ▼           ▼           ▼
-  order_items  payments    reviews              ~13k items
-  (price_brl   (type,      (score,              ~10k payments
-   = CENTS!)    value_brl   ts)                 ~6.8k reviews
-   │            = CENTS!)                       (70% of orders)
-   │ FK product_id
-   ▼
-  products (id, category, weight_g)            varies; weight unused
-
-  ─────────────────────────────────────────────────────────────
-  Not joined; read by evals:
-
-  seeded_anomalies (id, metric, dimension,     3 rows: SP-revenue,
-                    segment, start_ts, end_ts,  electronics-spike,
-                    expected_severity, desc)    voucher-dropoff
-
-  ─────────────────────────────────────────────────────────────
-  PRAGMA foreign_keys = ON      ← FK enforcement
-  PRAGMA journal_mode = WAL     ← concurrent reads
-  Read-only at runtime; rebuilt by `npm run seed` (deterministic).
-```
-
----
-
-## Implementation in codebase
-
-### The schema string
+#### The schema string
 
 ```
 mcp-server-olist/scripts/seed-olist.ts  (lines 184–245)
@@ -306,7 +268,7 @@ mcp-server-olist/scripts/seed-olist.ts  (lines 184–245)
           named tool consumer (file 03 walks them).
 ```
 
-### The runtime pragmas
+#### The runtime pragmas
 
 ```
 mcp-server-olist/src/db.ts  (lines 32–43)
@@ -326,6 +288,44 @@ mcp-server-olist/src/db.ts  (lines 32–43)
             FK DDL is documentation, not enforcement.
           - WAL mode allows multiple readers without blocking. crash-
             consistent durability via the WAL log.
+```
+
+---
+
+## Primary diagram
+
+The full Olist schema, recap.
+
+```
+  Olist schema — full recap (mcp-server-olist/scripts/seed-olist.ts)
+
+  customers (id, state, city)                  5,000 rows
+   │ FK customer_id
+   ▼
+  orders (id, customer_id, status,             ~9,800 rows
+          purchase_ts, delivered_ts)            6-month horizon
+   │           │           │                    (2025-12-01 → 2026-06-01)
+   │ FK        │ FK        │ FK
+   ▼           ▼           ▼
+  order_items  payments    reviews              ~13k items
+  (price_brl   (type,      (score,              ~10k payments
+   = CENTS!)    value_brl   ts)                 ~6.8k reviews
+   │            = CENTS!)                       (70% of orders)
+   │ FK product_id
+   ▼
+  products (id, category, weight_g)            varies; weight unused
+
+  ─────────────────────────────────────────────────────────────
+  Not joined; read by evals:
+
+  seeded_anomalies (id, metric, dimension,     3 rows: SP-revenue,
+                    segment, start_ts, end_ts,  electronics-spike,
+                    expected_severity, desc)    voucher-dropoff
+
+  ─────────────────────────────────────────────────────────────
+  PRAGMA foreign_keys = ON      ← FK enforcement
+  PRAGMA journal_mode = WAL     ← concurrent reads
+  Read-only at runtime; rebuilt by `npm run seed` (deterministic).
 ```
 
 ---

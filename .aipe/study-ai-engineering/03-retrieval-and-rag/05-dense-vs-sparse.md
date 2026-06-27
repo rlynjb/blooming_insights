@@ -160,6 +160,14 @@ Retrieval has two axes — exact terms and meaning — and they fail on opposite
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (dense side).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach — pure structured/keyword (sparse-like) querying — and has no embedding/dense retrieval at all.
+
+The honest analog is that EQL *is* the sparse end of the spectrum, fully present and correct. The diagnostic and monitoring agents call `execute_analytics_eql` (`lib/mcp/tools.ts` L11 for monitoring, L16 for diagnostic) and `execute_analytics` to ask exact, structured questions — named events, property filters, time windows — and receive exactly the matching aggregates. That is sparse/lexical retrieval by another name: matching on exact terms, not meaning. There is deliberately no dense counterpart, because analytics questions have exact answers and a "similar" event is the wrong event. A dense retrieval path would only appear for a semantic-search-over-past-investigations feature, living alongside `lib/state/investigations.ts`. The `Project exercises` block below is the primary buildable target for that dense side.
+
+---
+
 ## Dense vs. sparse — diagram
 
 This diagram spans the Service layer (the two retrieval paths) and shows where blooming insights sits (sparse only). A reader who sees only this should grasp that the two methods have mirror-image strengths and that EQL is pure sparse.
@@ -188,14 +196,6 @@ This diagram spans the Service layer (the two retrieval paths) and shows where b
 ```
 
 The two columns are mirror images; blooming insights lives entirely in the left column because its data demands exact answers.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (dense side).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach — pure structured/keyword (sparse-like) querying — and has no embedding/dense retrieval at all.
-
-The honest analog is that EQL *is* the sparse end of the spectrum, fully present and correct. The diagnostic and monitoring agents call `execute_analytics_eql` (`lib/mcp/tools.ts` L11 for monitoring, L16 for diagnostic) and `execute_analytics` to ask exact, structured questions — named events, property filters, time windows — and receive exactly the matching aggregates. That is sparse/lexical retrieval by another name: matching on exact terms, not meaning. There is deliberately no dense counterpart, because analytics questions have exact answers and a "similar" event is the wrong event. A dense retrieval path would only appear for a semantic-search-over-past-investigations feature, living alongside `lib/state/investigations.ts`. The `Project exercises` block below is the primary buildable target for that dense side.
 
 ---
 

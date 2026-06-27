@@ -328,6 +328,127 @@ Both are legitimate "no migration tooling" stories — but for opposite reasons.
 
 Schema evolution is a question of who has to do what when the shape changes. In a relational system with live writers and durable customer data, the answer is "the DBA runs the migration, the app reads the new shape, old data gets backfilled or upcast at read time." Here, the answer splits two ways: the agent contract evolves by **add-only with optional fields** (existing data validates against the new shape automatically), and the Olist DB evolves by **deterministic-rebuild** (no existing data to preserve because the seed regenerates it). Both are "no migration tooling" — and both are right, for the constraints they hold. The day either invariant breaks (data becomes load-bearing for the agent side; the DB starts taking real writes), the soft story stops working.
 
+### Code in this codebase
+
+The repo anchors for the evolution policies Move 2 walked — the optional-field policy on the interface, the dual-spec resolution comment, the prompt as schema-as-code, and the committed snapshot under migration.
+
+#### The optional-field policy in the interface
+
+```
+lib/mcp/types.ts  (lines 36–62)
+
+  export interface Insight {
+    id: string;                       ← always present
+    timestamp: string;                ← always present
+    severity: Severity;
+    headline: string;
+    summary: string;
+    metric: string;
+    change: { ... };
+    scope: string[];
+    source: 'monitoring' | 'query';
+
+    // The 4 fields below were added LATER. All optional, so older
+    // demo snapshots (captured before they existed) still validate.
+    evidence?: { tool: string; result: unknown }[];
+    impact?: string;
+
+    // ── business-owner enrichments (Tier 1). All optional + derived from the
+    //    existing evidence, so older snapshots still validate and render. ──
+    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
+    aov?: { current: number; prior: number };
+    funnel?: { view: number; cart: number; checkout: number; purchase: number };
+    affectedCustomers?: number;
+    history?: number[];
+    downstreamReady?: { diagnosis: boolean; recommendations: number };
+    category?: CategoryId;
+  }
+       │
+       └─ the comment IS the migration policy. every new field is
+          optional. every reader of an Insight has to handle absent.
+          this is the entire migration story for the type itself.
+```
+
+#### The dual-spec resolution comment
+
+```
+lib/mcp/types.ts  (lines 113–116)
+
+  // CANONICAL Recommendation shape. NOTE: the spec contains TWO different
+  // Recommendation definitions (one in "data model", one in "recommendation agent").
+  // Use this RICHER one (the recommendation-agent version) everywhere — it has `id`,
+  // `steps`, and the 5-member `bloomreachFeature` union.
+  export interface Recommendation { ... }
+       │
+       └─ a literal migration-receipt-in-a-comment. tells any future
+          editor: the spec drifted, this is the chosen branch, don't
+          "correct" the code back to the simpler shape.
+```
+
+#### The prompt as schema-as-code
+
+```
+lib/agents/prompts/monitoring.md  (lines 70–98)
+
+  ## Output
+
+  Return ONLY a JSON array of anomaly objects, at most 10 items ...
+
+  [
+    {
+      "metric": "purchase_revenue",
+      "category": "revenue_drop",
+      "scope": ["global"],
+      "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
+      "severity": "critical",
+      "impact": "...",
+      "evidence": [
+        { "tool": "execute_analytics_eql", "result": { "current": 42000, "prior": 51500 } }
+      ]
+    }
+  ]
+
+  Field rules:
+  - `category` — REQUIRED. the checklist `id` this anomaly belongs to ...
+  - `metric` — short snake_case name (e.g. `purchase_revenue`, ...).
+  - `scope` — `["global"]` unless you located the change in a specific segment/country.
+  - `change.value` — magnitude as a positive percentage; ...
+  ...
+       │
+       └─ THIS is what the agent learns the shape from. it has to stay
+          aligned with types.ts and validate.ts. there's no codegen,
+          no schema-derived prompt — it's hand-written markdown, edited
+          alongside the type. git is the migration tool.
+```
+
+#### The committed snapshot
+
+```
+lib/state/demo-insights.json  (12 insights, ~12KB, captured 2026-05-28)
+
+  {
+    "insights": [
+      {
+        "id": "35e00e48-cdb3-4caf-aa92-b8afcea95bae",
+        "timestamp": "2026-05-28T23:14:36.313Z",
+        "severity": "critical",
+        "headline": "global purchases_exceed_sessions · +109.5%",
+        ...
+        "evidence": [{ "tool": "execute_analytics_eql", "result": { ... } }],
+        "impact": "There are 21,570 purchases but only 10,296 session_start ...",
+        "downstreamReady": { "diagnosis": true, "recommendations": 3 }
+      },
+      ...
+    ]
+  }
+       │
+       └─ NOTE what's NOT in this row: `revenueImpact`, `aov`, `funnel`,
+          `affectedCustomers`, `history`, `category`. all of those are
+          optional fields the interface was extended with after the
+          capture. the JSON still validates today because each is `?`.
+          this is the "live data under migration" story in miniature.
+```
+
 ---
 
 ## Primary diagram
@@ -369,127 +490,6 @@ Migration paths, recap.
   │   enforcement: none (the spec is markdown)                 │
   │                                                            │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### The optional-field policy in the interface
-
-```
-lib/mcp/types.ts  (lines 36–62)
-
-  export interface Insight {
-    id: string;                       ← always present
-    timestamp: string;                ← always present
-    severity: Severity;
-    headline: string;
-    summary: string;
-    metric: string;
-    change: { ... };
-    scope: string[];
-    source: 'monitoring' | 'query';
-
-    // The 4 fields below were added LATER. All optional, so older
-    // demo snapshots (captured before they existed) still validate.
-    evidence?: { tool: string; result: unknown }[];
-    impact?: string;
-
-    // ── business-owner enrichments (Tier 1). All optional + derived from the
-    //    existing evidence, so older snapshots still validate and render. ──
-    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
-    aov?: { current: number; prior: number };
-    funnel?: { view: number; cart: number; checkout: number; purchase: number };
-    affectedCustomers?: number;
-    history?: number[];
-    downstreamReady?: { diagnosis: boolean; recommendations: number };
-    category?: CategoryId;
-  }
-       │
-       └─ the comment IS the migration policy. every new field is
-          optional. every reader of an Insight has to handle absent.
-          this is the entire migration story for the type itself.
-```
-
-### The dual-spec resolution comment
-
-```
-lib/mcp/types.ts  (lines 113–116)
-
-  // CANONICAL Recommendation shape. NOTE: the spec contains TWO different
-  // Recommendation definitions (one in "data model", one in "recommendation agent").
-  // Use this RICHER one (the recommendation-agent version) everywhere — it has `id`,
-  // `steps`, and the 5-member `bloomreachFeature` union.
-  export interface Recommendation { ... }
-       │
-       └─ a literal migration-receipt-in-a-comment. tells any future
-          editor: the spec drifted, this is the chosen branch, don't
-          "correct" the code back to the simpler shape.
-```
-
-### The prompt as schema-as-code
-
-```
-lib/agents/prompts/monitoring.md  (lines 70–98)
-
-  ## Output
-
-  Return ONLY a JSON array of anomaly objects, at most 10 items ...
-
-  [
-    {
-      "metric": "purchase_revenue",
-      "category": "revenue_drop",
-      "scope": ["global"],
-      "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
-      "severity": "critical",
-      "impact": "...",
-      "evidence": [
-        { "tool": "execute_analytics_eql", "result": { "current": 42000, "prior": 51500 } }
-      ]
-    }
-  ]
-
-  Field rules:
-  - `category` — REQUIRED. the checklist `id` this anomaly belongs to ...
-  - `metric` — short snake_case name (e.g. `purchase_revenue`, ...).
-  - `scope` — `["global"]` unless you located the change in a specific segment/country.
-  - `change.value` — magnitude as a positive percentage; ...
-  ...
-       │
-       └─ THIS is what the agent learns the shape from. it has to stay
-          aligned with types.ts and validate.ts. there's no codegen,
-          no schema-derived prompt — it's hand-written markdown, edited
-          alongside the type. git is the migration tool.
-```
-
-### The committed snapshot
-
-```
-lib/state/demo-insights.json  (12 insights, ~12KB, captured 2026-05-28)
-
-  {
-    "insights": [
-      {
-        "id": "35e00e48-cdb3-4caf-aa92-b8afcea95bae",
-        "timestamp": "2026-05-28T23:14:36.313Z",
-        "severity": "critical",
-        "headline": "global purchases_exceed_sessions · +109.5%",
-        ...
-        "evidence": [{ "tool": "execute_analytics_eql", "result": { ... } }],
-        "impact": "There are 21,570 purchases but only 10,296 session_start ...",
-        "downstreamReady": { "diagnosis": true, "recommendations": 3 }
-      },
-      ...
-    ]
-  }
-       │
-       └─ NOTE what's NOT in this row: `revenueImpact`, `aov`, `funnel`,
-          `affectedCustomers`, `history`, `category`. all of those are
-          optional fields the interface was extended with after the
-          capture. the JSON still validates today because each is `?`.
-          this is the "live data under migration" story in miniature.
 ```
 
 ---

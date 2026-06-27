@@ -192,6 +192,8 @@ The practical consequence: the recommendation agent's context window stays small
 
 The condition under which it works: the message schema is expressive enough. If the recommendation agent ever needs something not in `Diagnosis`, you either widen the schema (preferred) or accept that recommendation will be missing context. The schema is the contract.
 
+**Where this lives in the repo.** `interface Diagnosis` in `lib/mcp/types.ts` L95–L104 — `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, `timeSeries`.
+
 ### Layer 3 — the in-process carrier (function argument)
 
 The technical thing: when both agents run inside the same HTTP request, the message is a *function argument*. The diagnostic agent's `investigate(...)` returns a `Diagnosis`; the recommendation agent's `propose(anomaly, diagnosis, hooks)` takes it as the second parameter. No serialization, no storage in between.
@@ -216,6 +218,8 @@ In-process function-arg handoff
 The practical consequence: the handoff is type-checked at compile time. If you ever changed `Diagnosis`'s shape, TypeScript would flag every call site that passes or receives it. The handoff has zero serialization cost.
 
 The condition under which it works: both agents run in the same process. For cross-request handoffs (the user-gated split-step UX), Layer 4's carrier applies.
+
+**Where this lives in the repo.** `app/api/agent/route.ts` `GET` stream `start()` body L237–L247 — `diagAgent.investigate(inv, hooks)` returns `Diagnosis`; passed to `recAgent.propose(inv, diagnosis!, hooks)`.
 
 ### Layer 4 — the cross-request carrier (sessionStorage + URL param)
 
@@ -261,6 +265,8 @@ The practical consequence: the *carrier* changes (function arg → session stora
 
 The condition under which it works: the message has to fit in a URL query param (a `Diagnosis` does, comfortably — usually under 4KB). For larger messages, you'd POST them or use a server-side session store.
 
+**Where this lives in the repo.** Client-side write: `lib/hooks/useInvestigation.ts` `case 'done':` of the SSE handler at ~L138 (`sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`). Server-side validate-and-resume: `app/api/agent/route.ts` `parseDiagnosis()` at L86–L97 — validates `conclusion: string`, `evidence: array`, `hypothesesConsidered: array` before resuming the pipeline.
+
 ### Layer 5 — per-agent tool subsets are part of context scoping
 
 The technical thing: each agent's tool subset is *part of its scoped context*. The recommendation agent can't even attempt to call analytics tools — they're not in its toolbox. Tools are scoped the same way messages are.
@@ -280,6 +286,43 @@ Tools as scoped context
 ```
 
 The practical consequence: scoping is enforced not just at the message layer (what data the agent sees) but at the capability layer (what tools the agent can call). The recommendation agent reasoning over the typed `Diagnosis` cannot decide to "verify" the diagnosis by re-running an EQL — it doesn't have that tool.
+
+**Where this lives in the repo.** Per-agent allow-list functions in `lib/mcp/tools.ts` — each function returns the tool names that agent can call; recommendation cannot reach analytics tools, diagnostic cannot reach feature-catalog tools. The coverage gate (the typed Diagnosis is *also* the contract for category coverage) lives in `lib/agents/categories.ts` — used to verify the diagnosis touched the expected coverage categories.
+
+```
+shape (not full impl):
+
+  // The message
+  interface Diagnosis {
+    conclusion: string;
+    evidence: string[];
+    hypothesesConsidered: { hypothesis; supported; reasoning }[];
+    affectedCustomers?: { count; segmentDescription };
+    confidence?: 'high'|'medium'|'low';
+    timeSeries?: { day; value }[];
+  }
+
+  // The in-process carrier
+  const diagnosis: Diagnosis = await diagAgent.investigate(inv, hooks);
+  const recs = await recAgent.propose(inv, diagnosis, hooks);  // typed arg
+
+  // The cross-request carrier (client)
+  sessionStorage.setItem('bi:diag:<id>', JSON.stringify({ diagnosis }));
+
+  // The cross-request carrier (server, validation at trust boundary)
+  function parseDiagnosis(param: string | null): Diagnosis | null {
+    if (!param) return null;
+    try {
+      const d = JSON.parse(param);
+      if (d && typeof d.conclusion === 'string'
+            && Array.isArray(d.evidence)
+            && Array.isArray(d.hypothesesConsidered)) {
+        return d as Diagnosis;
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+```
 
 ### Phase A vs Phase B — what would force a move toward shared state
 
@@ -372,79 +415,6 @@ Shared state vs message passing — full picture
   │   read:   parse_diagnosis(URL ?diagnosis=)│
   └──────────────────────────────────────────┘
   Schema (the contract): interface Diagnosis     (the typed inter-agent message)
-```
-
----
-
-## Implementation in codebase
-
-**Case A — blooming insights firmly uses message passing.**
-
-There is no shared blackboard, no shared mutable state object, no agent that reads another agent's scratchpad. Each agent's context is exactly what's handed to it — the anomaly object, the typed `Diagnosis` message (for the recommendation agent), and its own per-stage prompt + tool subset.
-
-**The typed inter-agent message**
-**File:** `lib/mcp/types.ts`
-**Function / class:** `interface Diagnosis`
-**Line range:** L95–L104 — `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, `timeSeries`
-
-**The in-process carrier (function argument)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body
-**Line range:** L237–L247 — `diagAgent.investigate(inv, hooks)` returns `Diagnosis`; passed to `recAgent.propose(inv, diagnosis!, hooks)`
-
-**The cross-request carrier (client side, write)**
-**File:** `lib/hooks/useInvestigation.ts`
-**Function / class:** `case 'done':` of the SSE handler
-**Line range:** ~L138 — `sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`
-
-**The cross-request carrier (server side, validate-and-resume)**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `parseDiagnosis()`
-**Line range:** L86–L97 — validates `conclusion: string`, `evidence: array`, `hypothesesConsidered: array` before resuming the pipeline
-
-**Per-stage tool subsets (scoping at the capability layer)**
-**File:** `lib/mcp/tools.ts`
-**Function / class:** per-agent allow-list functions
-**Line range:** entire file — each function returns the tool names that agent can call; recommendation cannot reach analytics tools, diagnostic cannot reach feature-catalog tools
-
-**The coverage gate (the typed Diagnosis is *also* the contract for category coverage)**
-**File:** `lib/agents/categories.ts`
-**Function / class:** category coverage check
-**Line range:** entire file — used to verify the diagnosis touched the expected coverage categories
-
-```
-shape (not full impl):
-
-  // The message
-  interface Diagnosis {
-    conclusion: string;
-    evidence: string[];
-    hypothesesConsidered: { hypothesis; supported; reasoning }[];
-    affectedCustomers?: { count; segmentDescription };
-    confidence?: 'high'|'medium'|'low';
-    timeSeries?: { day; value }[];
-  }
-
-  // The in-process carrier
-  const diagnosis: Diagnosis = await diagAgent.investigate(inv, hooks);
-  const recs = await recAgent.propose(inv, diagnosis, hooks);  // typed arg
-
-  // The cross-request carrier (client)
-  sessionStorage.setItem('bi:diag:<id>', JSON.stringify({ diagnosis }));
-
-  // The cross-request carrier (server, validation at trust boundary)
-  function parseDiagnosis(param: string | null): Diagnosis | null {
-    if (!param) return null;
-    try {
-      const d = JSON.parse(param);
-      if (d && typeof d.conclusion === 'string'
-            && Array.isArray(d.evidence)
-            && Array.isArray(d.hypothesesConsidered)) {
-        return d as Diagnosis;
-      }
-    } catch { /* ignore */ }
-    return null;
-  }
 ```
 
 ---

@@ -298,6 +298,71 @@ Drop any one of these five and the eval pillar collapses into noise:
 
 Skeleton = shared seam + anchored rubric + calibration receipts + K-run variance + tagged results. Optional hardening: a lockfile guard on the result dir (not built today; mentioned in audit's red-flag 12).
 
+### Code in this codebase
+
+**Use case A — the pre-flight + K-loop driver.** `eval/scripts/run-detection.ts` is the canonical entry point.
+
+```
+eval/scripts/run-detection.ts  (lines 92–135 — main driver)
+
+  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir
+  const tag = process.env.EVAL_RUN_TAG;
+  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
+         │
+         └─ env-var-derived result dir is the no-clobber discipline; without
+            it, two K=10 runs same day overwrite each other's receipts.
+
+  async function main(): Promise<void> {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.error('ANTHROPIC_API_KEY not set. Add it to .env.local and re-run.');
+      process.exit(1);                            ← pre-flight gate 1
+    }
+    const K = parseK();
+    const anomalies = loadSeededAnomalies();
+    if (anomalies.length === 0) {
+      console.error('No seeded anomalies in DB. Re-seed mcp-server-olist.');
+      process.exit(1);                            ← pre-flight gate 2
+    }
+    for (let i = 1; i <= K; i++) {                 ← THE OUTER K-LOOP
+      const capture = await runMonitoringAgentOnce(i, `${sessionId}-run${i}`);
+      const score = scoreRun(capture.insights, anomalies);
+      perRun.push({ k: i, capture, score });
+    }
+  }
+       │
+       └─ K=10 is the validated production number; each iteration spawns a
+          fresh subprocess so a crash in run i doesn't poison run i+1. That's
+          variance capture + hermetic-per-run, in one loop.
+```
+
+**Use case B — the pre-flight refusal in the regression eval.** `eval/scripts/run-regression.ts` has the strictest pre-flight in the suite — it refuses to score if any fixture has a null `golden_output`, which would otherwise silently produce meaningless similarity-judge calls.
+
+```
+eval/scripts/run-regression.ts  (lines 387–399 — pre-flight for score mode)
+
+  async function scoreMode(): Promise<void> {
+    const fixtures = loadFixtures();
+    // Pre-flight: every fixture must have a golden. Fail loud upfront.
+    const uncaptured = fixtures.filter((f) => f.golden_output == null);
+    if (uncaptured.length > 0) {
+      console.error(
+        `[regression:score] ${uncaptured.length}/${fixtures.length} fixtures have null golden_output:`,
+      );
+      for (const f of uncaptured) console.error(`  - ${f.id}`);
+      console.error('');
+      console.error('Run `npm run eval:regression -- --capture` first to populate goldens.');
+      process.exit(1);                            ← refuse, with remediation
+    }
+  }
+       │
+       └─ this is testing-discipline at the eval-infrastructure layer: design
+          in the safety, fail fast on a misconfiguration, tell the operator
+          the exact next command. A regression eval that silently runs against
+          missing goldens would produce numbers nobody could interpret.
+```
+
+**Use case C — the calibration receipt.** Committed at `eval/results/2026-06-15-score-baseline/` — the directory where the human-vs-judge agreement was recorded after the Phase 3 baseline run. The diagnosis judge agreed 8/8 with hand-scoring; the recommendation judge agreed 3/3 (and one of the three catches was the BRL-currency bug — the judge flagged a candidate that quoted USD when the seeded dataset is in BRL). Without those receipts, the judge scores would be uncalibrated and the "passed ≥ 7" assertion would mean nothing.
+
 ### Move 3 — the principle
 
 **Non-determinism doesn't mean unmeasurable; it means you measure differently.** `npm test` answers "did the wiring break?" — one binary per assertion. The eval suite answers "did the model regress?" — a *distribution* per anomaly, judged against an anchored rubric, calibrated against a human spot-check. Both are testing. They use different vocabularies because they answer different questions. A team that ships AI features with only `npm test` is shipping wiring without quality measurement; a team that ships only evals is shipping without a CI safety net. Both pillars.
@@ -375,71 +440,6 @@ The Phase 3 eval suite — full view
   │  if disagreement: judge prompt needs revision (rare); cycle.        │
   └─────────────────────────────────────────────────────────────────────┘
 ```
-
-## Implementation in codebase
-
-**Use case A — the pre-flight + K-loop driver.** `eval/scripts/run-detection.ts` is the canonical entry point.
-
-```
-eval/scripts/run-detection.ts  (lines 92–135 — main driver)
-
-  // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir
-  const tag = process.env.EVAL_RUN_TAG;
-  const dateDir = tag ? `${todayIso()}-${tag}` : todayIso();
-         │
-         └─ env-var-derived result dir is the no-clobber discipline; without
-            it, two K=10 runs same day overwrite each other's receipts.
-
-  async function main(): Promise<void> {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      console.error('ANTHROPIC_API_KEY not set. Add it to .env.local and re-run.');
-      process.exit(1);                            ← pre-flight gate 1
-    }
-    const K = parseK();
-    const anomalies = loadSeededAnomalies();
-    if (anomalies.length === 0) {
-      console.error('No seeded anomalies in DB. Re-seed mcp-server-olist.');
-      process.exit(1);                            ← pre-flight gate 2
-    }
-    for (let i = 1; i <= K; i++) {                 ← THE OUTER K-LOOP
-      const capture = await runMonitoringAgentOnce(i, `${sessionId}-run${i}`);
-      const score = scoreRun(capture.insights, anomalies);
-      perRun.push({ k: i, capture, score });
-    }
-  }
-       │
-       └─ K=10 is the validated production number; each iteration spawns a
-          fresh subprocess so a crash in run i doesn't poison run i+1. That's
-          variance capture + hermetic-per-run, in one loop.
-```
-
-**Use case B — the pre-flight refusal in the regression eval.** `eval/scripts/run-regression.ts` has the strictest pre-flight in the suite — it refuses to score if any fixture has a null `golden_output`, which would otherwise silently produce meaningless similarity-judge calls.
-
-```
-eval/scripts/run-regression.ts  (lines 387–399 — pre-flight for score mode)
-
-  async function scoreMode(): Promise<void> {
-    const fixtures = loadFixtures();
-    // Pre-flight: every fixture must have a golden. Fail loud upfront.
-    const uncaptured = fixtures.filter((f) => f.golden_output == null);
-    if (uncaptured.length > 0) {
-      console.error(
-        `[regression:score] ${uncaptured.length}/${fixtures.length} fixtures have null golden_output:`,
-      );
-      for (const f of uncaptured) console.error(`  - ${f.id}`);
-      console.error('');
-      console.error('Run `npm run eval:regression -- --capture` first to populate goldens.');
-      process.exit(1);                            ← refuse, with remediation
-    }
-  }
-       │
-       └─ this is testing-discipline at the eval-infrastructure layer: design
-          in the safety, fail fast on a misconfiguration, tell the operator
-          the exact next command. A regression eval that silently runs against
-          missing goldens would produce numbers nobody could interpret.
-```
-
-**Use case C — the calibration receipt.** Committed at `eval/results/2026-06-15-score-baseline/` — the directory where the human-vs-judge agreement was recorded after the Phase 3 baseline run. The diagnosis judge agreed 8/8 with hand-scoring; the recommendation judge agreed 3/3 (and one of the three catches was the BRL-currency bug — the judge flagged a candidate that quoted USD when the seeded dataset is in BRL). Without those receipts, the judge scores would be uncalibrated and the "passed ≥ 7" assertion would mean nothing.
 
 ## Elaborate
 

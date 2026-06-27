@@ -208,6 +208,26 @@ The condition under which a critic adds real value: the critic is doing somethin
 
 *Now:* the forced-synthesis turn is the producer reading its own trajectory and being told "stop calling tools and emit your final answer." It doesn't *check* the answer; it *finishes* it. There's no second-opinion architecture in the codebase.
 
+**Where this lives in the repo.** The forced-synthesis turn is `runAgentLoop()` in `lib/agents/base.ts` — `budgetSpent` check at L90, `synthesisInstruction` appended to system prompt at L98, tools stripped from request at L101. The per-agent `synthesisInstruction` strings (what gets re-passed) live in `lib/agents/diagnostic.ts` L63, `lib/agents/recommendation.ts` L58, `lib/agents/monitoring.ts` L102, and `lib/agents/query.ts` L42. The mechanics of same-family blind spots are documented in `.aipe/study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md`.
+
+```
+shape (the forced re-pass, NOT a critic):
+
+  // lib/agents/base.ts L90–L101
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;
+  const params = {
+    model: AGENT_MODEL,                   // SAME model — Sonnet, every time
+    system: forceFinal && synthesisInstruction
+      ? `${system}\n\n${synthesisInstruction}`
+      : system,
+    messages,                              // SAME trajectory — no fresh context
+  };
+  if (!forceFinal) params.tools = toolSchemas;  // strip tools on forced final
+  const res = await anthropic.messages.create(params);
+  // The producer is finalizing its own work, not being critiqued.
+```
+
 *If quality forced it:* the day the diagnostic agent ships confident wrong diagnoses at a rate the user notices, a critic earns its overhead. The critic would have to be a different model family (the LLM-as-judge bias makes same-family critiquing a rubber stamp) and would have to check against the Diagnosis schema (a structural check the producer can already partially do) AND against a quality rubric (e.g. "does the conclusion follow from the evidence? are the hypotheses considered exhaustive?").
 
 The takeaway: **the absence of a critic is a deliberate choice, not an oversight.** The codebase doesn't have the failure mode (confident wrong diagnoses at a rate users complain about) that justifies the cost of adding one — and adding a same-family critic would be paying the cost without getting the value.
@@ -279,47 +299,6 @@ Debate vs verifier-critic — full picture
   │   THIS IS NOT A CRITIC. It's a forced re-pass.               │
   │   The producer is finalizing its own work.                   │
   └──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.**
-
-There is no debate agent and no critic agent in blooming insights. The shape that gets closest is the *forced-synthesis turn* in `runAgentLoop`, which strips tools from the model's request and appends a `synthesisInstruction` when the budget is spent. That's a re-pass on the same model, same trajectory — it finalizes the producer's answer, but it does not provide a second perspective.
-
-The honest sentence: **a critic would only pay for itself if the diagnostic or recommendation agent shipped confident wrong outputs at a rate users complained about, AND the critic was a different model family from the producer.** Neither condition is true today. Adding a same-family critic would double the token cost on every investigation for the rubber-stamp regime documented in the LLM-as-judge literature.
-
-For the refactor: `../06-orchestration-system-design-templates/` includes a "verifier-critic over the diagnostic output" template; the producer (`DiagnosticAgent`) would not change, but a new `DiagnosticReviewAgent` would slot in between diagnostic and recommendation, using a different model family.
-
-**The forced-synthesis turn (the closest existing mechanic)**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L90 (`budgetSpent` check), L98 (`synthesisInstruction` appended to system prompt), L101 (tools stripped from request)
-
-**The per-agent synthesisInstructions (what gets re-passed)**
-**File:** `lib/agents/diagnostic.ts` L63 (`synthesisInstruction:` field), `lib/agents/recommendation.ts` L58, `lib/agents/monitoring.ts` L102, `lib/agents/query.ts` L42
-
-**The LLM-as-judge bias reference (why same-family is the failure mode)**
-**File:** `.aipe/study-ai-engineering/05-evals-and-observability/03-llm-as-judge-bias.md` (cross-reference for the mechanics)
-
-```
-shape (the forced re-pass, NOT a critic):
-
-  // lib/agents/base.ts L90–L101
-  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;
-  const params = {
-    model: AGENT_MODEL,                   // SAME model — Sonnet, every time
-    system: forceFinal && synthesisInstruction
-      ? `${system}\n\n${synthesisInstruction}`
-      : system,
-    messages,                              // SAME trajectory — no fresh context
-  };
-  if (!forceFinal) params.tools = toolSchemas;  // strip tools on forced final
-  const res = await anthropic.messages.create(params);
-  // The producer is finalizing its own work, not being critiqued.
 ```
 
 ---

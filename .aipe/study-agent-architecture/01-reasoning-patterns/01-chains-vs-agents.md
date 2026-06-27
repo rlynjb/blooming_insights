@@ -113,6 +113,8 @@ The technical thing: a *deterministic pipeline*. The next stage is selected by b
 
 If you're coming from frontend, this is your multi-step form's `if (step === 1) … else if (step === 2)` — except the "steps" are whole agents. The route handler reads a step query param (`diagnose` or `recommend`) and a free-form `q` param, and a plain if/else decides which agent to construct. No model is consulted about ordering.
 
+**Where this lives in the repo.** File `app/api/agent/route.ts`, inside the `GET` stream `start()` body — L199–L249. The lead-agent select is L199–L200; the query branch is L210–L218; the diagnostic→recommendation handoff is L224–L249. The diagnosis flows out of `diagAgent.investigate()` at L238 and into `recAgent.propose(inv, diagnosis!, …)` at L247 — a function return value handed straight to the next call, with no model in between.
+
 ```
 route handler — the chain is an if-ladder (not an LLM)
 
@@ -134,6 +136,22 @@ The condition under which this works: the order has to be genuinely fixed. It is
 The technical thing: an *autonomous ReAct loop*. Inside one stage, the model emits a tool call, your code runs it, feeds the result back, and the model decides the next call — or decides to stop and answer.
 
 If you're coming from frontend, this is a `.then()` chain whose *length you don't know in advance*, because each link inspects its result and picks the next call. You can't write `a().then(b).then(c)` because you don't know there will be exactly three, or that `b` comes after `a`. The model writes that chain at runtime.
+
+**Where this lives in the repo.** File `lib/agents/base.ts`, function `runAgentLoop()` — L48–L176. The loop starts at L85; the natural stop on zero `tool_use` blocks is at L121; the observation gets fed back at L171; the budget check and forced-final-turn (tools stripped from the request) sit at L90–L101. All four agents — `monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts` — call this one loop; the model writes the step sequence inside it.
+
+```
+shape (not full impl):
+  // CHAIN (route.ts): engineer-written order
+  const diagnosis = await diagAgent.investigate(anomaly, hooks);
+  const recs = await recAgent.propose(anomaly, diagnosis, hooks); // route hands it over
+
+  // AGENT (base.ts): model-written order
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const res = await anthropic.messages.create({ tools, messages });
+    if (noToolUse(res)) return finalText;        // model decided to stop
+    messages.push(runToolsAndCollect(res));      // observation → next turn
+  }
+```
 
 ```
 shared agent loop — the model writes the chain
@@ -212,38 +230,6 @@ blooming insights: a chain of agents
   └─────────────────────────────────────────────────────────────────────────────┘
 
   CHAIN owns the order of stages · AGENT owns what happens inside a stage
-```
-
----
-
-## Implementation in codebase
-
-**Chain half — the deterministic pipeline**
-**File:** `app/api/agent/route.ts`
-**Function / class:** the `GET` stream `start()` body
-**Line range:** L199–L249 (lead-agent select L199–L200; query branch L210–L218; diagnostic→recommendation L224–L249)
-
-The `if`-ladder picks the next agent. The diagnosis is passed from `diagAgent.investigate()` (L238) into `recAgent.propose(inv, diagnosis!, …)` (L247) — a return value handed to the next call. No model decides this order.
-
-**Agent half — the autonomous loop**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L48–L176 (loop L85; natural stop on zero tool_use L121; observation fed back L171; budget/forced-final L90–L101)
-
-All four agents (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`) call this one loop. The model writes the step sequence inside it.
-
-```
-shape (not full impl):
-  // CHAIN (route.ts): engineer-written order
-  const diagnosis = await diagAgent.investigate(anomaly, hooks);
-  const recs = await recAgent.propose(anomaly, diagnosis, hooks); // route hands it over
-
-  // AGENT (base.ts): model-written order
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const res = await anthropic.messages.create({ tools, messages });
-    if (noToolUse(res)) return finalText;        // model decided to stop
-    messages.push(runToolsAndCollect(res));      // observation → next turn
-  }
 ```
 
 ---

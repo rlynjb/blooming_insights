@@ -168,47 +168,7 @@ The kernel as load-bearing parts
 
 Each line in the "absorbed implementation" column is a fact that, if leaked upward, would force every caller to learn it. The wrapper is the choice to keep them all here.
 
-### Move 3 — the principle
-
-The deep module is the discipline that lets the rest of the codebase pretend hard things are easy. Bloomreach has a global per-user rate limit, two error prose formats, an observed 10s penalty window, and a transport that occasionally returns 401 mid-investigation. From the agent loop's view, none of that exists — there's just `mcp.callTool(name, args)` and you either get a result or you get a tagged error you can handle once. That's the trade: one module absorbs the reality, every other module is simpler. Drive interface size down, drive hidden behavior up. That's the whole game.
-
----
-
-## Primary diagram
-
-The full picture — the seam, the kernel, the eight mechanics absorbed.
-
-```
-McpClient — the deep-module recap
-
-   caller                                        ┌─ McpClient.callTool ────────────────┐
-   ┌────────────────────────┐  name, args, opts  │                                      │
-   │  agent / route / UI    │ ─────────────────► │  1. cache.get(key)                   │
-   └────────────────────────┘                    │     hit → return                     │
-                                                 │     miss ↓                            │
-                                                 │  2. liveCall(name, args)             │
-                                                 │       a. spacing sleep                │
-                                                 │       b. transport.callTool          │
-                                                 │       c. catch → McpToolError        │
-                                                 │  3. while isRateLimited(result):     │
-                                                 │       a. parseRetryAfterMs(result)   │
-                                                 │       b. sleep(hint ?? backoff)      │
-                                                 │       c. liveCall again              │
-                                                 │  4. if !isError: cache.set(key,…)    │
-                                                 │  5. return { result, durationMs,     │
-                                                 │              fromCache: false }      │
-   ┌────────────────────────┐                    └──────────────────────────────────────┘
-   │  { result, durationMs, │ ◄────────────────────────────
-   │    fromCache }         │
-   └────────────────────────┘
-
-   surface: 3 methods.  body: ~172 LOC of mechanics.
-   every caller in the repo gets the simple shape.
-```
-
----
-
-## Implementation in codebase
+### Move 2 — code in this codebase
 
 **Use cases.** Every tool call from every agent passes through `McpClient`. Concrete scenarios:
 
@@ -216,7 +176,7 @@ McpClient — the deep-module recap
 - A diagnostic investigation gets a 429 mid-run because another tab on the same user account also hit Bloomreach. The retry loop parses "Retry after ~12 second(s)" from the error envelope and waits 12.5s. The agent loop never sees the retry; the investigation completes one turn slower.
 - The UI shows "list_projects → invalid_token" after a revoked OAuth credential. That message exists because `liveCall` wraps the transport's raised error in `McpToolError(name, detail)` — without the wrapper, the UI would show a generic "Unauthorized."
 
-### The class shape and the kernel
+**The class shape and the kernel.** Here is what the eight-step kernel looks like in real code — note how each TRANSFORM annotation maps to one of the mechanics walked above.
 
 ```
 lib/mcp/client.ts  (lines 79–172)
@@ -297,7 +257,7 @@ lib/mcp/client.ts  (lines 79–172)
           that's the depth ratio paying for itself.
 ```
 
-### The hidden grammar — `parseRetryAfterMs`
+**The hidden grammar — `parseRetryAfterMs`.** This is the single most load-bearing hide in the repo. Grep the repo for `/retry-after/`; one file matches.
 
 ```
 lib/mcp/client.ts  (lines 24–38)
@@ -327,12 +287,11 @@ lib/mcp/client.ts  (lines 24–38)
   }
        │
        └─ this is the only place in the codebase that knows the Bloomreach
-          error grammar. grep the repo for /retry-after/ — only this file matches.
-          if Bloomreach adds a third prose format, exactly one file changes.
-          that's the strongest hide in the repo.
+          error grammar. if Bloomreach adds a third prose format, exactly one
+          file changes. that's the strongest hide in the repo.
 ```
 
-### Production tuning at construction — the earned override
+**Production tuning at construction — the earned override.** Every knob defaults; production overrides once at the boundary where construction happens.
 
 ```
 lib/mcp/connect.ts  (lines 82–96)
@@ -356,6 +315,44 @@ lib/mcp/connect.ts  (lines 82–96)
        │
        └─ overrides happen ONCE, at construction, in a single file the per-call
           code never touches. defaults work for tests; production tunes here.
+```
+
+### Move 3 — the principle
+
+The deep module is the discipline that lets the rest of the codebase pretend hard things are easy. Bloomreach has a global per-user rate limit, two error prose formats, an observed 10s penalty window, and a transport that occasionally returns 401 mid-investigation. From the agent loop's view, none of that exists — there's just `mcp.callTool(name, args)` and you either get a result or you get a tagged error you can handle once. That's the trade: one module absorbs the reality, every other module is simpler. Drive interface size down, drive hidden behavior up. That's the whole game.
+
+---
+
+## Primary diagram
+
+The full picture — the seam, the kernel, the eight mechanics absorbed.
+
+```
+McpClient — the deep-module recap
+
+   caller                                        ┌─ McpClient.callTool ────────────────┐
+   ┌────────────────────────┐  name, args, opts  │                                      │
+   │  agent / route / UI    │ ─────────────────► │  1. cache.get(key)                   │
+   └────────────────────────┘                    │     hit → return                     │
+                                                 │     miss ↓                            │
+                                                 │  2. liveCall(name, args)             │
+                                                 │       a. spacing sleep                │
+                                                 │       b. transport.callTool          │
+                                                 │       c. catch → McpToolError        │
+                                                 │  3. while isRateLimited(result):     │
+                                                 │       a. parseRetryAfterMs(result)   │
+                                                 │       b. sleep(hint ?? backoff)      │
+                                                 │       c. liveCall again              │
+                                                 │  4. if !isError: cache.set(key,…)    │
+                                                 │  5. return { result, durationMs,     │
+                                                 │              fromCache: false }      │
+   ┌────────────────────────┐                    └──────────────────────────────────────┘
+   │  { result, durationMs, │ ◄────────────────────────────
+   │    fromCache }         │
+   └────────────────────────┘
+
+   surface: 3 methods.  body: ~172 LOC of mechanics.
+   every caller in the repo gets the simple shape.
 ```
 
 ---

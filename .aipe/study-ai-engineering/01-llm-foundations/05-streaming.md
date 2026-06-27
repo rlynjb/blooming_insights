@@ -301,6 +301,24 @@ Stream when the increments have value, and pick the transport by what reconnect 
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **Event union + framing:** `AgentEvent` — `lib/mcp/events.ts` L4–L12; `encodeEvent` (JSON + `\n`) and `decodeEvent` — L15–L22.
+- **Server stream:** `ReadableStream` with `start(controller)` — `app/api/agent/route.ts` L169–L265; `send` choke-point at L172–L175; `hooksFor` wiring agent callbacks to `send` at L181–L195; schema bootstrap *inside* the stream at L201–L202; `done`/`saveInvestigation` at L251/L254; `try/catch/finally` body at L196–L263; NDJSON `Response` (`NDJSON_HEADERS`) at L107–L110 / L267. `maxDuration = 300` at L20 (was 60; 300 = Vercel Pro's max — a live diagnostic→recommendation run is ~100–115s under the ~1 req/s MCP limit). Pre-stream `connectMcp` try/catch at L155–L165.
+- **Briefing stream (same shape, local `BriefingEvent` superset):** `app/api/briefing/route.ts` — `maxDuration = 300` at L17, bootstrap inside the live `start` at L188–L189, pre-stream try/catch at L161–L171, `BriefingEvent` superset at L54–L58 (deliberately does NOT widen the shared `AgentEvent`), demo-mode paced replay (`REPLAY_DELAY_MS = 140` at L23) at L97–L143, per-category `coverage_item` emit at L209–L212.
+- **Cache-replay stream (same NDJSON shape):** precomputed events replayed with `REPLAY_DELAY_MS = 180`, filtered to the requested `step` via `filterByStep` — `app/api/agent/route.ts` L127–L141 (the `getCachedInvestigation` branch; `REPLAY_DELAY_MS` L105, `filterByStep` L66–L84).
+- **UI-stream payload truncation:** `TRUNC = 4000` / `trunc` — `app/api/agent/route.ts` L99–L103; applied to `result` at L192.
+- **Client consumer (now a hook):** `fetch` at `lib/hooks/useInvestigation.ts` L170; `getReader()` + `TextDecoder` + line-buffer loop at L184–L201; trailing flush at L202–L208; `handle` switch at L97–L151; StrictMode-safe single-run `startedRef` guard at L43, L47–L48. The investigate page (`app/investigate/[id]/page.tsx`) no longer reads the stream itself — it calls `useInvestigation(id, 'diagnose')` (L38). The feed page keeps its own briefing reader loop at `app/page.tsx` (`getReader()` L323, `handle` switch L328–L437, read loop L439–L457; `BriefingEvent` type L28–L32).
+- **Not EventSource:** confirmed — the consumer uses `fetch`/`getReader()` (hook L184), and the route returns `application/x-ndjson` (`NDJSON_HEADERS`, route L108), not `text/event-stream`.
+
+#### Why this is a codebase strength
+
+The framing is two trivial functions, the server has one `send` choke-point that both records and emits (so the full trace is cacheable *and* live), and the consumer correctly handles the two real-world hazards of chunked reads: mid-line chunk boundaries (`buf = lines.pop()`) and multi-byte UTF-8 split across chunks (`decode(..., { stream: true })`). Pulling the reader into `useInvestigation` adds a StrictMode-safe single-run guard so the dev double-mount cannot fire the expensive run twice. The cache-replay path reuses the *identical* NDJSON shape (filtered per step), so a precomputed investigation streams through the same hook as a live one.
+
+---
+
 ## Streaming — diagram
 
 This diagram spans Service (the route's stream) and UI (the browser consumer). The wire is NDJSON; the frame delimiter is `\n`. A reader who sees only this should grasp that the server enqueues one JSON line per increment and the client line-buffers and dispatches them.
@@ -339,24 +357,6 @@ This diagram spans Service (the route's stream) and UI (the browser consumer). T
 ```
 
 The server emits one JSON line per increment; the client buffers bytes, splits on `\n`, parses each complete line, and dispatches by `type`. Holding back the trailing partial line is what makes a mid-line chunk boundary safe.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **Event union + framing:** `AgentEvent` — `lib/mcp/events.ts` L4–L12; `encodeEvent` (JSON + `\n`) and `decodeEvent` — L15–L22.
-- **Server stream:** `ReadableStream` with `start(controller)` — `app/api/agent/route.ts` L169–L265; `send` choke-point at L172–L175; `hooksFor` wiring agent callbacks to `send` at L181–L195; schema bootstrap *inside* the stream at L201–L202; `done`/`saveInvestigation` at L251/L254; `try/catch/finally` body at L196–L263; NDJSON `Response` (`NDJSON_HEADERS`) at L107–L110 / L267. `maxDuration = 300` at L20 (was 60; 300 = Vercel Pro's max — a live diagnostic→recommendation run is ~100–115s under the ~1 req/s MCP limit). Pre-stream `connectMcp` try/catch at L155–L165.
-- **Briefing stream (same shape, local `BriefingEvent` superset):** `app/api/briefing/route.ts` — `maxDuration = 300` at L17, bootstrap inside the live `start` at L188–L189, pre-stream try/catch at L161–L171, `BriefingEvent` superset at L54–L58 (deliberately does NOT widen the shared `AgentEvent`), demo-mode paced replay (`REPLAY_DELAY_MS = 140` at L23) at L97–L143, per-category `coverage_item` emit at L209–L212.
-- **Cache-replay stream (same NDJSON shape):** precomputed events replayed with `REPLAY_DELAY_MS = 180`, filtered to the requested `step` via `filterByStep` — `app/api/agent/route.ts` L127–L141 (the `getCachedInvestigation` branch; `REPLAY_DELAY_MS` L105, `filterByStep` L66–L84).
-- **UI-stream payload truncation:** `TRUNC = 4000` / `trunc` — `app/api/agent/route.ts` L99–L103; applied to `result` at L192.
-- **Client consumer (now a hook):** `fetch` at `lib/hooks/useInvestigation.ts` L170; `getReader()` + `TextDecoder` + line-buffer loop at L184–L201; trailing flush at L202–L208; `handle` switch at L97–L151; StrictMode-safe single-run `startedRef` guard at L43, L47–L48. The investigate page (`app/investigate/[id]/page.tsx`) no longer reads the stream itself — it calls `useInvestigation(id, 'diagnose')` (L38). The feed page keeps its own briefing reader loop at `app/page.tsx` (`getReader()` L323, `handle` switch L328–L437, read loop L439–L457; `BriefingEvent` type L28–L32).
-- **Not EventSource:** confirmed — the consumer uses `fetch`/`getReader()` (hook L184), and the route returns `application/x-ndjson` (`NDJSON_HEADERS`, route L108), not `text/event-stream`.
-
-### Why this is a codebase strength
-
-The framing is two trivial functions, the server has one `send` choke-point that both records and emits (so the full trace is cacheable *and* live), and the consumer correctly handles the two real-world hazards of chunked reads: mid-line chunk boundaries (`buf = lines.pop()`) and multi-byte UTF-8 split across chunks (`decode(..., { stream: true })`). Pulling the reader into `useInvestigation` adds a StrictMode-safe single-run guard so the dev double-mount cannot fire the expensive run twice. The cache-replay path reuses the *identical* NDJSON shape (filtered per step), so a precomputed investigation streams through the same hook as a live one.
 
 ---
 

@@ -390,6 +390,125 @@ Doing this would not just solve the durability problem — it would retire the w
 
 Storage choice is access-pattern fit plus durability fit. The repo's `Map`s are a textbook access-pattern fit (by-id reads of bounded data) and a textbook durability mismatch (per-instance memory on ephemeral serverless). The mismatch is bridged by two compensating patterns: the wire-format-as-state (the browser holds the data, ships it back) and the committed seed (a static floor for offline/cold-start). Both patterns work, both are reasonable for a demo-and-portfolio repo, both introduce their own complexity (the leak from the lossy conversion; the seed-vs-live divergence). The right next move is to graduate to a real KV or relational store — but only when "users expect the briefing to persist" becomes a real requirement.
 
+### Code in this codebase
+
+The repo anchors for the storage layers and the four-source resolution Move 2 walked.
+
+#### The three Maps
+
+```
+lib/state/insights.ts  (lines 8–14, UPDATED)
+
+  type SessionFeed = {
+    insights:       Map<string, Insight>;
+    investigations: Map<string, Investigation>;
+    anomalies:      Map<string, Anomaly>;
+  };
+  const state = new Map<string, SessionFeed>();
+       │
+       └─ outer Map keyed by sessionId. each session gets its own
+          SessionFeed (three inner Maps). the outer Map is NEVER
+          cleared by a request; only the inner Maps for THIS session
+          are cleared on putInsights(sessionId, ...). multi-user safe
+          on a warm Vercel instance.
+```
+
+#### The dev file cache
+
+```
+lib/state/investigations.ts  (lines 1–24)
+
+  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+  import { join } from 'node:path';
+  import type { AgentEvent } from '../mcp/events';
+
+  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
+  // Writes go to in-memory always, and to the dev file in development only
+  // (serverless FS is read-only).
+  const PERSIST = process.env.NODE_ENV === 'development';
+  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
+  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+
+  const mem = new Map<string, AgentEvent[]>();
+       │
+       └─ the comment names the entire layered model: in-memory → dev
+          file → demo seed. and names the prod constraint explicitly:
+          "serverless FS is read-only." this comment IS the architecture.
+
+  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+    if (mem.has(insightId)) return mem.get(insightId)!;
+    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+    if (fromFile) return fromFile;
+    const fromDemo = readJson(DEMO_FILE)[insightId];
+    return fromDemo ?? null;
+  }
+       │
+       └─ the read fallback chain. one return per layer. note the
+          PERSIST gate skips the file read entirely in production,
+          where it would always miss anyway.
+```
+
+#### The four-source resolution at the route
+
+```
+app/api/agent/route.ts  (lines 33–62)
+
+  function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
+    // 1. WIRE-FORMAT PARAM (the durable client-side bridge)
+    if (insightParam) {
+      try {
+        const i = JSON.parse(insightParam) as Insight;
+        if (i && typeof i.metric === 'string'
+              && i.change
+              && Array.isArray(i.scope)
+              && i.severity) {
+          return insightToAnomaly(i);
+        }
+      } catch { /* malformed — fall through */ }
+    }
+
+    // 2. IN-MEMORY ANOMALIES MAP (no conversion needed)
+    const a = getAnomaly(insightId);
+    if (a) return a;
+
+    // 3. IN-MEMORY INSIGHTS MAP (lossy conversion)
+    const i = getInsight(insightId);
+    if (i) return insightToAnomaly(i);
+
+    // 4. COMMITTED DEMO SEED (last resort)
+    try {
+      if (existsSync(DEMO_FILE)) {
+        const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
+        const di = (snap.insights ?? []).find((x) => x.id === insightId);
+        if (di) return insightToAnomaly(di);
+      }
+    } catch { /* ignore */ }
+
+    return null;
+  }
+       │
+       └─ four sources, each with a specific failure mode it covers.
+          two of them (steps 3 and 4) are lossy because they go through
+          insightToAnomaly — the leak from file 02. if the route went
+          to a real DB, step 2 would be the only source, no leak.
+```
+
+#### The wire-format bridge (the browser side)
+
+```
+app/page.tsx  (the briefing component, when an insight is clicked)
+
+  // (paraphrased — the actual code lives in the click handler)
+  sessionStorage.setItem('selectedInsight', JSON.stringify(insight));
+  const url = `/investigate?id=${insight.id}&insight=${encodeURIComponent(JSON.stringify(insight))}`;
+  router.push(url);
+       │
+       └─ the Insight travels with the navigation. the route then prefers
+          this wire-format payload over its in-memory store. this is what
+          makes the route correct under Vercel's cold-start model — the
+          browser is the durability layer.
+```
+
 ---
 
 ## Primary diagram
@@ -438,125 +557,6 @@ The storage layers and the access pattern, recap.
   │   (per-instance memory isn't relied on for correctness)    │
   │                                                            │
   └────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### The three Maps
-
-```
-lib/state/insights.ts  (lines 8–14, UPDATED)
-
-  type SessionFeed = {
-    insights:       Map<string, Insight>;
-    investigations: Map<string, Investigation>;
-    anomalies:      Map<string, Anomaly>;
-  };
-  const state = new Map<string, SessionFeed>();
-       │
-       └─ outer Map keyed by sessionId. each session gets its own
-          SessionFeed (three inner Maps). the outer Map is NEVER
-          cleared by a request; only the inner Maps for THIS session
-          are cleared on putInsights(sessionId, ...). multi-user safe
-          on a warm Vercel instance.
-```
-
-### The dev file cache
-
-```
-lib/state/investigations.ts  (lines 1–24)
-
-  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-  import { join } from 'node:path';
-  import type { AgentEvent } from '../mcp/events';
-
-  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
-  // Writes go to in-memory always, and to the dev file in development only
-  // (serverless FS is read-only).
-  const PERSIST = process.env.NODE_ENV === 'development';
-  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
-  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
-
-  const mem = new Map<string, AgentEvent[]>();
-       │
-       └─ the comment names the entire layered model: in-memory → dev
-          file → demo seed. and names the prod constraint explicitly:
-          "serverless FS is read-only." this comment IS the architecture.
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];
-    return fromDemo ?? null;
-  }
-       │
-       └─ the read fallback chain. one return per layer. note the
-          PERSIST gate skips the file read entirely in production,
-          where it would always miss anyway.
-```
-
-### The four-source resolution at the route
-
-```
-app/api/agent/route.ts  (lines 33–62)
-
-  function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
-    // 1. WIRE-FORMAT PARAM (the durable client-side bridge)
-    if (insightParam) {
-      try {
-        const i = JSON.parse(insightParam) as Insight;
-        if (i && typeof i.metric === 'string'
-              && i.change
-              && Array.isArray(i.scope)
-              && i.severity) {
-          return insightToAnomaly(i);
-        }
-      } catch { /* malformed — fall through */ }
-    }
-
-    // 2. IN-MEMORY ANOMALIES MAP (no conversion needed)
-    const a = getAnomaly(insightId);
-    if (a) return a;
-
-    // 3. IN-MEMORY INSIGHTS MAP (lossy conversion)
-    const i = getInsight(insightId);
-    if (i) return insightToAnomaly(i);
-
-    // 4. COMMITTED DEMO SEED (last resort)
-    try {
-      if (existsSync(DEMO_FILE)) {
-        const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
-        const di = (snap.insights ?? []).find((x) => x.id === insightId);
-        if (di) return insightToAnomaly(di);
-      }
-    } catch { /* ignore */ }
-
-    return null;
-  }
-       │
-       └─ four sources, each with a specific failure mode it covers.
-          two of them (steps 3 and 4) are lossy because they go through
-          insightToAnomaly — the leak from file 02. if the route went
-          to a real DB, step 2 would be the only source, no leak.
-```
-
-### The wire-format bridge (the browser side)
-
-```
-app/page.tsx  (the briefing component, when an insight is clicked)
-
-  // (paraphrased — the actual code lives in the click handler)
-  sessionStorage.setItem('selectedInsight', JSON.stringify(insight));
-  const url = `/investigate?id=${insight.id}&insight=${encodeURIComponent(JSON.stringify(insight))}`;
-  router.push(url);
-       │
-       └─ the Insight travels with the navigation. the route then prefers
-          this wire-format payload over its in-memory store. this is what
-          makes the route correct under Vercel's cold-start model — the
-          browser is the durability layer.
 ```
 
 ---

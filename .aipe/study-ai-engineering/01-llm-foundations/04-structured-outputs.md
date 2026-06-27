@@ -226,6 +226,26 @@ A structured-output contract is three jobs, not one: extract the JSON from prose
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **Extract:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three strategies: fence regex, bare `JSON.parse`, first-bracket-to-last-bracket substring scan; throws if none.
+- **Validate (type guards):** `isAnomalyArray` L17–L27, `isDiagnosis` L29–L35, `isRecommendationArray` L42–L57 — all in `lib/mcp/validate.ts`. The recommendation guard validates the id-less shape and accepts *either* `estimatedImpact` shape via the `impactOk` check (L46–L48); `SEVERITIES` (L15) and `FEATURES`/`CONFIDENCE` (L37–L38) back the enum checks.
+- **The grown contracts (`lib/mcp/types.ts`):** `Insight` (L7–L32) gained optional `impact`, `revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`. `Diagnosis` (L64–L73) gained optional `confidence` ('high'|'medium'|'low', usually *derived*, not parsed) and `timeSeries`. `Recommendation` (L85–L99) gained `effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`, and `estimatedImpact` is now the `EstimatedImpact` union (L77–L79). Every addition is optional, so older snapshots still validate.
+- **Post-validation derivation:** `anomalyToInsight` (`lib/state/insights.ts` L8–L27) spreads `deriveInsightFields(a)` (L25) to compute business-owner fields (e.g. `revenueImpact`) from the anomaly's existing evidence — `lib/insights/derive.ts` L27–L39. `Diagnosis.confidence` is post-derived by `diagnosisConfidence` in `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts` L80, downgraded `high`→`medium` on tool errors at L81–L82) — `derive.ts` L54–L63. These fields are *manufactured after parse/validate*, not extracted from the model's JSON.
+- **In-loop repair nudge:** `synthesisInstruction` appended on the forced-final turn — `lib/agents/base.ts` L96–L98; the diagnostic instruction text — `lib/agents/diagnostic.ts` L62–L66.
+- **Dedicated repair call (diagnostic):** `DiagnosticAgent.synthesize(anomaly, toolCalls)` — `lib/agents/diagnostic.ts` L87–L126; tool-less `create` at L97, `max_tokens: 2048` at L99.
+- **Dedicated repair call (recommendation):** `RecommendationAgent.synthesize(anomaly, diagnosis, toolCalls)` — `lib/agents/recommendation.ts` L82–L132; `create` at L96, `max_tokens: 2048` at L98; its prompt now asks for the full enriched shape (the `EstimatedImpact` object, `effort`, `prerequisites`, `successMetric`) at L109–L119. Ids assigned post-validation via `crypto.randomUUID()` at L76, capped to 3.
+- **The contract chains:** diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` — `lib/agents/diagnostic.ts` L74–L75 (`FALLBACK` constant L16–L20); recommendation `tryParseRecommendations ?? synthesize` then `[]` — `lib/agents/recommendation.ts` L69–L73; monitoring `parseAgentJson` + `isAnomalyArray` else `[]` — `lib/agents/monitoring.ts` L95–L101.
+- **Native tool-use (the input side):** `params.tools = toolSchemas` on non-final turns — `lib/agents/base.ts` L101; schemas built by `filterToolSchemas`.
+
+#### Why this is a codebase strength
+
+Three things make the output contract robust rather than hopeful: the parser handles all three presentation modes the model uses; the guards prove shape field-by-field (not a cast); and the repair path is a *clean-context* retry rather than "ask again in the same conversation." The id-assignment-after-validation detail shows the team thought about the boundary precisely — validate what the model controls, own what the system controls.
+
+---
+
 ## Structured outputs — diagram
 
 This diagram spans the full contract. The Provider layer emits prose-with-JSON; the Service layer extracts, validates, and repairs it into a typed value. A reader who sees only this should grasp that the model returns prose and the type is manufactured by a three-stage funnel with a guaranteed floor.
@@ -267,26 +287,6 @@ This diagram spans the full contract. The Provider layer emits prose-with-JSON; 
 ```
 
 The model emits prose; the Service layer manufactures the type through extract → validate → repair, with a model-independent `FALLBACK` so the contract's return is always honest.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **Extract:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three strategies: fence regex, bare `JSON.parse`, first-bracket-to-last-bracket substring scan; throws if none.
-- **Validate (type guards):** `isAnomalyArray` L17–L27, `isDiagnosis` L29–L35, `isRecommendationArray` L42–L57 — all in `lib/mcp/validate.ts`. The recommendation guard validates the id-less shape and accepts *either* `estimatedImpact` shape via the `impactOk` check (L46–L48); `SEVERITIES` (L15) and `FEATURES`/`CONFIDENCE` (L37–L38) back the enum checks.
-- **The grown contracts (`lib/mcp/types.ts`):** `Insight` (L7–L32) gained optional `impact`, `revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`. `Diagnosis` (L64–L73) gained optional `confidence` ('high'|'medium'|'low', usually *derived*, not parsed) and `timeSeries`. `Recommendation` (L85–L99) gained `effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`, and `estimatedImpact` is now the `EstimatedImpact` union (L77–L79). Every addition is optional, so older snapshots still validate.
-- **Post-validation derivation:** `anomalyToInsight` (`lib/state/insights.ts` L8–L27) spreads `deriveInsightFields(a)` (L25) to compute business-owner fields (e.g. `revenueImpact`) from the anomaly's existing evidence — `lib/insights/derive.ts` L27–L39. `Diagnosis.confidence` is post-derived by `diagnosisConfidence` in `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts` L80, downgraded `high`→`medium` on tool errors at L81–L82) — `derive.ts` L54–L63. These fields are *manufactured after parse/validate*, not extracted from the model's JSON.
-- **In-loop repair nudge:** `synthesisInstruction` appended on the forced-final turn — `lib/agents/base.ts` L96–L98; the diagnostic instruction text — `lib/agents/diagnostic.ts` L62–L66.
-- **Dedicated repair call (diagnostic):** `DiagnosticAgent.synthesize(anomaly, toolCalls)` — `lib/agents/diagnostic.ts` L87–L126; tool-less `create` at L97, `max_tokens: 2048` at L99.
-- **Dedicated repair call (recommendation):** `RecommendationAgent.synthesize(anomaly, diagnosis, toolCalls)` — `lib/agents/recommendation.ts` L82–L132; `create` at L96, `max_tokens: 2048` at L98; its prompt now asks for the full enriched shape (the `EstimatedImpact` object, `effort`, `prerequisites`, `successMetric`) at L109–L119. Ids assigned post-validation via `crypto.randomUUID()` at L76, capped to 3.
-- **The contract chains:** diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` — `lib/agents/diagnostic.ts` L74–L75 (`FALLBACK` constant L16–L20); recommendation `tryParseRecommendations ?? synthesize` then `[]` — `lib/agents/recommendation.ts` L69–L73; monitoring `parseAgentJson` + `isAnomalyArray` else `[]` — `lib/agents/monitoring.ts` L95–L101.
-- **Native tool-use (the input side):** `params.tools = toolSchemas` on non-final turns — `lib/agents/base.ts` L101; schemas built by `filterToolSchemas`.
-
-### Why this is a codebase strength
-
-Three things make the output contract robust rather than hopeful: the parser handles all three presentation modes the model uses; the guards prove shape field-by-field (not a cast); and the repair path is a *clean-context* retry rather than "ask again in the same conversation." The id-assignment-after-validation detail shows the team thought about the boundary precisely — validate what the model controls, own what the system controls.
 
 ---
 

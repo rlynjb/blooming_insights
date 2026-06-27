@@ -130,6 +130,8 @@ raw schema (112KB, ~28k tok)  ──schema summarizer──▶  bounded summary 
    grows with workspace size                            constant regardless of workspace
 ```
 
+**Code in this codebase — prefix cap `schemaSummary`.** `lib/agents/monitoring.ts`, function `schemaSummary(schema: WorkspaceSchema): string`, L16–L57 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`); the one-liner `Data horizon: <from> → <to>` appended at L40–L49 when the live adapter is Olist (synthetic, fixed-horizon) and omitted under Bloomreach. Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents. The horizon line is the cheapest possible date anchor — one line in the prefix that earns a 5x loose-recall lift on detection eval (→ 01-anatomy.md for the structural framing, → 05-eval-driven-iteration.md for the measured before/after).
+
 ---
 
 ### The transcript — `truncate()` and `maxToolCalls` bound growth
@@ -148,6 +150,8 @@ The transcript grows two ways: each observation can be arbitrarily large, and th
 ```
 
 An MCP query that returns 80KB of rows is clipped to 16,000 chars before the loop pushes it back as the next user turn. Without this, one chatty tool call floods the window and pushes the original instructions and anomaly toward the middle — where the model attends to them least.
+
+**Code in this codebase — per-observation cap `truncate`.** `lib/agents/base.ts`, function `truncate(s)` + `MAX_TOOL_RESULT_CHARS`, L29–L34; applied at L150 (success) and L155 (error) before `messages.push` at L171. Clips every tool result to 16,000 chars so one large observation cannot flood the transcript.
 
 **Turn-count cap.** A per-agent `max_tool_calls` setting is the hard ceiling on how many Observation blocks ever get appended. Once the tool-call count reaches the cap, a `budget_spent` flag flips true, the loop sets `force_final`, and tools are dropped from the next call:
 
@@ -170,6 +174,8 @@ each Observation ≤ 16k chars   AND   at most N Observations
         └────────────── together bound transcript size ──────────────┘
 ```
 
+**Code in this codebase — turn-count cap `maxToolCalls`.** `lib/agents/base.ts` (gate) + each agent (value). `budgetSpent` / `forceFinal` in `runAgentLoop`: gate `base.ts` L90–L91, L101; values monitoring `monitoring.ts` L101 (6), diagnostic `diagnostic.ts` L61 (6), recommendation `recommendation.ts` L57 (4), query `query.ts` L41 (6). Bounds how many Observation blocks ever enter the transcript; recommendation uses 4 because it reasons from the diagnosis rather than exploring.
+
 ---
 
 ### The output reservation — `max_tokens` per call
@@ -190,6 +196,8 @@ The classifier's `16` is the sharpest example of budgeting as design. The intent
 "reply with ONLY one word"  +  max_tokens: 16   →  format enforced by the budget,
                                                     not just requested in prose
 ```
+
+**Code in this codebase — output cap `max_tokens`.** `lib/agents/base.ts` + `intent.ts` + synthesize calls. `maxTokens` default; classifier and synthesis call sites: default 4096 `base.ts` L74; classifier 16 `intent.ts` L20; synthesize 2048 `diagnostic.ts` L94, `recommendation.ts` L98; query rides the 4096 default (no `maxTokens` passed, `query.ts` L30–L45). Reserves output space sized to the job; the classifier's 16 enforces the one-word format through the budget itself.
 
 ---
 
@@ -214,6 +222,10 @@ current prompt layout (anti-pattern for prefix caching)
 ```
 
 If caching were turned on against this layout, the cache would break at the first volatile token. To actually benefit, the schema (stable) belongs *in front of* the per-call placeholders (volatile), with `cache_control` on the boundary. The current order makes the static prefix shorter than it could be — a real cost the moment call volume rises.
+
+**Code in this codebase — the gap: no prefix caching, `{schema}` placed last.** The four prompt files + `base.ts`; prompt layout; absence of `cache_control`. `{schema}` last at `monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40; no `cache_control` in `base.ts` L92–L102. The largest stable input sits behind volatile placeholders, and no call marks a cacheable prefix — the prefix is re-billed in full on every turn.
+
+**Why this is a codebase strength (with one honest weakness).** Three of the four sources are capped at the seam where they enter the window, not patched after a blow-up: the prefix is bounded before injection, observations before they re-enter the transcript, output before generation. The weakness is real and specific: the schema is the biggest stable input and it is placed last, and no call sets `cache_control`, so the prefix is paid in full on every one of the (up to) 7 turns per investigation.
 
 ---
 
@@ -259,51 +271,6 @@ This diagram spans the full budget. The Service layer assembles a bounded prefix
 ```
 
 The window is finite; four caps keep the sum under the practical fraction, and the one optimization left on the table is the cacheable prefix.
-
----
-
-## Implementation in codebase
-
-**Case A — implemented (with a named gap).**
-
-### Prefix cap — `schemaSummary`
-
-- **File:** `lib/agents/monitoring.ts`
-- **Function / class:** `schemaSummary(schema: WorkspaceSchema): string`
-- **Line range:** L16–L57 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`); the one-liner `Data horizon: <from> → <to>` appended at L40–L49 when the live adapter is Olist (synthetic, fixed-horizon) and omitted under Bloomreach.
-- **Role:** Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents. The horizon line is the cheapest possible date anchor — one line in the prefix that earns a 5x loose-recall lift on detection eval (→ 01-anatomy.md for the structural framing, → 05-eval-driven-iteration.md for the measured before/after).
-
-### Per-observation cap — `truncate`
-
-- **File:** `lib/agents/base.ts`
-- **Function / class:** `truncate(s)` + `MAX_TOOL_RESULT_CHARS`
-- **Line range:** L29–L34; applied at L150 (success) and L155 (error) before `messages.push` at L171
-- **Role:** Clips every tool result to 16,000 chars so one large observation cannot flood the transcript.
-
-### Turn-count cap — `maxToolCalls`
-
-- **File:** `lib/agents/base.ts` (gate) + each agent (value)
-- **Function / class:** `budgetSpent` / `forceFinal` in `runAgentLoop`
-- **Line range:** gate `base.ts` L90–L91, L101; values monitoring `monitoring.ts` L101 (6), diagnostic `diagnostic.ts` L61 (6), recommendation `recommendation.ts` L57 (4), query `query.ts` L41 (6)
-- **Role:** Bounds how many Observation blocks ever enter the transcript; recommendation uses 4 because it reasons from the diagnosis rather than exploring.
-
-### Output cap — `max_tokens`
-
-- **File:** `lib/agents/base.ts` + `intent.ts` + synthesize calls
-- **Function / class:** `maxTokens` default; classifier and synthesis call sites
-- **Line range:** default 4096 `base.ts` L74; classifier 16 `intent.ts` L20; synthesize 2048 `diagnostic.ts` L94, `recommendation.ts` L98; query rides the 4096 default (no `maxTokens` passed, `query.ts` L30–L45)
-- **Role:** Reserves output space sized to the job; the classifier's 16 enforces the one-word format through the budget itself.
-
-### The gap — no prefix caching, `{schema}` placed last
-
-- **File:** the four prompt files + `base.ts`
-- **Function / class:** prompt layout; absence of `cache_control`
-- **Line range:** `{schema}` last at `monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40; no `cache_control` in `base.ts` L92–L102
-- **Role:** The largest stable input sits behind volatile placeholders, and no call marks a cacheable prefix — the prefix is re-billed in full on every turn.
-
-### Why this is a codebase strength (with one honest weakness)
-
-Three of the four sources are capped at the seam where they enter the window, not patched after a blow-up: the prefix is bounded before injection, observations before they re-enter the transcript, output before generation. The weakness is real and specific: the schema is the biggest stable input and it is placed last, and no call sets `cache_control`, so the prefix is paid in full on every one of the (up to) 7 turns per investigation.
 
 ---
 

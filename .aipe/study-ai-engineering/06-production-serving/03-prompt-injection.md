@@ -214,6 +214,16 @@ You cannot make a model perfectly distinguish instruction from data, so you defe
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (input guard).** blooming insights passes `?q=` to the model with only `.trim()` (`app/api/agent/route.ts` L115) — there is no sanitization, no injection detection, and no instruction-data separation before the query becomes `userPrompt: query` (`lib/agents/query.ts` L35).
+
+The structural mitigations, by contrast, are present by design: the MCP tool set (`lib/mcp/tools.ts`) is read-only, and the agent artifacts are validated (`isDiagnosis`, `isRecommendationArray` in `lib/mcp/validate.ts`) before use — so the gap is a contained exfiltration risk, not a destructive one.
+
+Where the input guard would live: a guard function called in the route immediately after the `.trim()` at `app/api/agent/route.ts` L115, before `classifyIntent` (L211). It would reject or sanitize obvious injection patterns and could wrap the query in an explicit data delimiter before it reaches `QueryAgent.answer`. The read-only + structured-output containment would be documented as an intentional security property rather than an accident of the current tool set.
+
+---
+
 ## Prompt injection — diagram
 
 This diagram spans the Route, Agent, Provider, and Output layers, marking the open gap (dashed) and the structural mitigations (solid) that bound it.
@@ -255,16 +265,6 @@ This diagram spans the Route, Agent, Provider, and Output layers, marking the op
 ```
 
 A reader who sees only this diagram should grasp: the input is unguarded, but read-only tools and validated output bound the damage to over-disclosure.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (input guard).** blooming insights passes `?q=` to the model with only `.trim()` (`app/api/agent/route.ts` L115) — there is no sanitization, no injection detection, and no instruction-data separation before the query becomes `userPrompt: query` (`lib/agents/query.ts` L35).
-
-The structural mitigations, by contrast, are present by design: the MCP tool set (`lib/mcp/tools.ts`) is read-only, and the agent artifacts are validated (`isDiagnosis`, `isRecommendationArray` in `lib/mcp/validate.ts`) before use — so the gap is a contained exfiltration risk, not a destructive one.
-
-Where the input guard would live: a guard function called in the route immediately after the `.trim()` at `app/api/agent/route.ts` L115, before `classifyIntent` (L211). It would reject or sanitize obvious injection patterns and could wrap the query in an explicit data delimiter before it reaches `QueryAgent.answer`. The read-only + structured-output containment would be documented as an intentional security property rather than an accident of the current tool set.
 
 ---
 

@@ -181,6 +181,24 @@ Inject your dependencies behind a narrow interface and you get testability for f
 
 ---
 
+### Code in this codebase
+
+**Partially addressed — a test seam, not provider portability.** The MCP caller and the Anthropic client are injected by parameter so tests pass fakes and run with no network; but the `anthropic` parameter is the concrete SDK type, there is no vendor-neutral provider interface, and no factory — a single Anthropic provider with no swap path.
+
+#### Files, functions, and line ranges
+
+- **MCP transport interface:** `McpTransport` — `lib/mcp/transport.ts` L7–L10; production `SdkTransport` wrapping the SDK `Client` — L41–L74. Error-detail plumbing behind the interface: `HttpErrorHolder` (L15–L17), `makeCapturingFetch` (L24–L36), and the captured-body attach on failure (L52–L58, L66–L72).
+- **Tool-error type:** `McpToolError` — `lib/mcp/client.ts` L68–L77, thrown by `McpClient.liveCall` (L161) to tag a failed call with its tool name + the underlying server detail; `errorDetail` (L55–L62) unwraps the nested cause. This is the application-layer counterpart to the transport's captured body — both make a failure legible without widening the `McpCaller` interface.
+- **MCP caller interface (agent-facing):** `McpCaller` — `lib/agents/base.ts` L16–L22; intent comment ("inject a fake without depending on the concrete McpClient class or any network") — L11–L14. `McpClient` satisfies it structurally.
+- **Injected Anthropic client:** `anthropic: Anthropic` in `runAgentLoop` opts — `lib/agents/base.ts` L48–L49; the single call site — L102. Real client constructed in the route — `app/api/agent/route.ts` L207 (inside the stream's `start`); propagated through each agent's constructor.
+- **Hard-coded model identity (no runtime selection):** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9; `CLASSIFIER_MODEL` — `lib/agents/intent.ts` L14.
+
+#### Where multi-provider would live
+
+A vendor-neutral `LLMProvider` interface (e.g. `complete(messages, tools, maxTokens) → { text, toolCalls, usage }`) would sit in `lib/agents/` alongside `base.ts`; an `AnthropicProvider` would wrap the current `anthropic.messages.create` call and an `OpenAIProvider` would translate to/from Chat Completions. `runAgentLoop` would take `provider: LLMProvider` instead of `anthropic: Anthropic`, and a factory `createProvider(name)` (driven by config) would choose the implementation. The injection *point* already exists — only the *neutral interface* and the *factory* are missing.
+
+---
+
 ## Provider abstraction — diagram
 
 This diagram spans the route (constructs real clients), the agent layer (depends on interfaces), and the two implementation worlds (production vs. test). A reader who sees only this should grasp that the consumer takes its dependencies as parameters, and that the seam swaps real for fake — not Anthropic for another vendor.
@@ -212,24 +230,6 @@ This diagram spans the route (constructs real clients), the agent layer (depends
 ```
 
 The agent layer depends on interfaces and receives implementations from above. The seam swaps real clients for fakes (testability) — it does not swap Anthropic for another vendor (portability), which would need a vendor-neutral interface and a factory that do not exist.
-
----
-
-## Implementation in codebase
-
-**Partially addressed — a test seam, not provider portability.** The MCP caller and the Anthropic client are injected by parameter so tests pass fakes and run with no network; but the `anthropic` parameter is the concrete SDK type, there is no vendor-neutral provider interface, and no factory — a single Anthropic provider with no swap path.
-
-### Files, functions, and line ranges
-
-- **MCP transport interface:** `McpTransport` — `lib/mcp/transport.ts` L7–L10; production `SdkTransport` wrapping the SDK `Client` — L41–L74. Error-detail plumbing behind the interface: `HttpErrorHolder` (L15–L17), `makeCapturingFetch` (L24–L36), and the captured-body attach on failure (L52–L58, L66–L72).
-- **Tool-error type:** `McpToolError` — `lib/mcp/client.ts` L68–L77, thrown by `McpClient.liveCall` (L161) to tag a failed call with its tool name + the underlying server detail; `errorDetail` (L55–L62) unwraps the nested cause. This is the application-layer counterpart to the transport's captured body — both make a failure legible without widening the `McpCaller` interface.
-- **MCP caller interface (agent-facing):** `McpCaller` — `lib/agents/base.ts` L16–L22; intent comment ("inject a fake without depending on the concrete McpClient class or any network") — L11–L14. `McpClient` satisfies it structurally.
-- **Injected Anthropic client:** `anthropic: Anthropic` in `runAgentLoop` opts — `lib/agents/base.ts` L48–L49; the single call site — L102. Real client constructed in the route — `app/api/agent/route.ts` L207 (inside the stream's `start`); propagated through each agent's constructor.
-- **Hard-coded model identity (no runtime selection):** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9; `CLASSIFIER_MODEL` — `lib/agents/intent.ts` L14.
-
-### Where multi-provider would live
-
-A vendor-neutral `LLMProvider` interface (e.g. `complete(messages, tools, maxTokens) → { text, toolCalls, usage }`) would sit in `lib/agents/` alongside `base.ts`; an `AnthropicProvider` would wrap the current `anthropic.messages.create` call and an `OpenAIProvider` would translate to/from Chat Completions. `runAgentLoop` would take `provider: LLMProvider` instead of `anthropic: Anthropic`, and a factory `createProvider(name)` (driven by config) would choose the implementation. The injection *point* already exists — only the *neutral interface* and the *factory* are missing.
 
 ---
 

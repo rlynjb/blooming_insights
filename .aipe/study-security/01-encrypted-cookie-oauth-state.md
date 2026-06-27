@@ -252,72 +252,9 @@ The MCP SDK expects an `OAuthClientProvider` with methods like `tokens()`, `save
 
 The `redirectToAuthorization` deviation from the SDK's default (open a browser) is critical: we capture the URL so the route handler can return it to the client for a full-page redirect — there's no `window.open` available on the server.
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**State that has to survive across requests on a stateless host has to live somewhere the host doesn't own.** The browser cookie is that somewhere. Encryption + authentication is what makes the cookie safe to be in untrusted hands. The pattern works because the entire flow can be reconstructed from the cookie alone — no server-side index, no Redis lookup, no database row to join. Stateless servers + stateful clients = encrypted cookies.
-
----
-
-## Primary diagram
-
-The full encrypted-cookie pattern in one frame, from operator-set `AUTH_SECRET` to per-request runtime.
-
-```
-  Encrypted cookie OAuth state — full topology
-
-  ┌─ Operator (deploy time) ───────────────────────────────────────┐
-  │  Vercel project env var                                         │
-  │    AUTH_SECRET = "openssl rand -base64 32"  (256 bits entropy)  │
-  └──────────────────────────────┬─────────────────────────────────┘
-                                 │ process.env.AUTH_SECRET
-                                 ▼
-  ┌─ Crypto layer  (lib/mcp/auth.ts L51–L79) ──────────────────────┐
-  │                                                                  │
-  │  aesKey()        SHA-256(secret) → 32 bytes                     │
-  │  encryptStore(s) iv=rand(12) | tag=GCM-mac | enc=AES-256-GCM    │
-  │  decryptStore(t) verify tag → JSON.parse(plain) OR return {}    │
-  │                                                                  │
-  └──────────────────────────────┬─────────────────────────────────┘
-                                 │ used only by ↓
-                                 ▼
-  ┌─ Runtime layer  (lib/mcp/auth.ts L86–L104) ────────────────────┐
-  │                                                                  │
-  │  withAuthCookies(fn):                                            │
-  │    request start: ctx = { store: decryptStore(cookie), dirty }   │
-  │    requestStore.run(ctx, fn)         ← ALS-scoped                │
-  │    request end:   if ctx.dirty: cookies.set(encryptStore(...))   │
-  │                                                                  │
-  │  cookie flags: httpOnly · Secure · SameSite=None · maxAge=10d   │
-  │                                                                  │
-  └──────────────────────────────┬─────────────────────────────────┘
-                                 │ inside fn, called many times
-                                 ▼
-  ┌─ Provider layer  (lib/mcp/auth.ts L160–L218) ──────────────────┐
-  │                                                                  │
-  │  BloomreachAuthProvider implements OAuthClientProvider           │
-  │    state() / saveTokens() / codeVerifier() / clientInformation() │
-  │    each → readState/patchState against the ALS store             │
-  │    redirectToAuthorization(url) → capture, don't open            │
-  │                                                                  │
-  └──────────────────────────────┬─────────────────────────────────┘
-                                 │ MCP SDK drives PKCE + DCR
-                                 ▼
-  ┌─ Bloomreach IdP ───────────────────────────────────────────────┐
-  │  validates authorize / token / refresh requests                  │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-After the response goes out, the cookie holds the full updated state — DCR client info, PKCE code_verifier, OAuth tokens — all encrypted, all on the browser. The next request reconstructs the in-memory store from scratch.
-
----
-
-## Implementation in codebase
-
-**Use case 1 — fresh browser hits `GET /api/briefing`.** No `bi_auth` cookie. `withAuthCookies` reads empty, `ctx.store = {}`. The route calls `connectMcp(sid)` which constructs `BloomreachAuthProvider(sid, redirectUri)` and asks the SDK to connect. The SDK calls `clientInformation()` → empty → triggers DCR. DCR returns client info, SDK calls `saveClientInformation(info)` → `patchState({clientInformation: info})` → `ctx.dirty = true`. The SDK then calls `state()` and `saveCodeVerifier()`. Eventually it calls `redirectToAuthorization(url)` — we capture the URL, throw `UnauthorizedError` to escape the SDK flow, and the route returns `{ needsAuth: true, authUrl }`. On the way out, `withAuthCookies` encrypts the now-populated store and sets `bi_auth`.
-
-**Use case 2 — `GET /api/mcp/callback?code=...`.** Browser has `bi_auth` from step 1. `withAuthCookies` decrypts → `ctx.store[sessionId]` has DCR + verifier + state. Route calls `completeAuth` which feeds the code back through the SDK. The SDK calls `codeVerifier()` → reads from store → exchanges the code for tokens → calls `saveTokens(tokens)`. On the way out, the cookie is re-encrypted with the new tokens. Future requests will find `tokens()` populated.
-
-**Use case 3 — `AUTH_SECRET` rotated to a new value.** Operator changes the env var in Vercel. New deploy goes live. Every browser's existing `bi_auth` cookie was encrypted with the OLD key. The next request hits `withAuthCookies` → `decryptStore(raw)` → the new key fails the auth tag → catch block returns `{}`. The user appears unauthenticated, the route returns `needsAuth: true`, the user re-authenticates. This is the no-graceful-rotation gap from audit finding C4.
+The two load-bearing functions live side-by-side in `lib/mcp/auth.ts`. The crypto primitives (lines 51–79) and the per-request orchestrator (lines 86–104). Read them with the annotation, then read the three use-cases below to see how they compose end-to-end.
 
 ```
   lib/mcp/auth.ts  (lines 51–79)
@@ -392,6 +329,69 @@ After the response goes out, the cookie holds the full updated state — DCR cli
        └─ this is the ENTIRE "session persistence" mechanism on Vercel.
           no Redis, no DB, no server-side cache. one cookie, one ALS context.
 ```
+
+**Use case 1 — fresh browser hits `GET /api/briefing`.** No `bi_auth` cookie. `withAuthCookies` reads empty, `ctx.store = {}`. The route calls `connectMcp(sid)` which constructs `BloomreachAuthProvider(sid, redirectUri)` and asks the SDK to connect. The SDK calls `clientInformation()` → empty → triggers DCR. DCR returns client info, SDK calls `saveClientInformation(info)` → `patchState({clientInformation: info})` → `ctx.dirty = true`. The SDK then calls `state()` and `saveCodeVerifier()`. Eventually it calls `redirectToAuthorization(url)` — we capture the URL, throw `UnauthorizedError` to escape the SDK flow, and the route returns `{ needsAuth: true, authUrl }`. On the way out, `withAuthCookies` encrypts the now-populated store and sets `bi_auth`.
+
+**Use case 2 — `GET /api/mcp/callback?code=...`.** Browser has `bi_auth` from step 1. `withAuthCookies` decrypts → `ctx.store[sessionId]` has DCR + verifier + state. Route calls `completeAuth` which feeds the code back through the SDK. The SDK calls `codeVerifier()` → reads from store → exchanges the code for tokens → calls `saveTokens(tokens)`. On the way out, the cookie is re-encrypted with the new tokens. Future requests will find `tokens()` populated.
+
+**Use case 3 — `AUTH_SECRET` rotated to a new value.** Operator changes the env var in Vercel. New deploy goes live. Every browser's existing `bi_auth` cookie was encrypted with the OLD key. The next request hits `withAuthCookies` → `decryptStore(raw)` → the new key fails the auth tag → catch block returns `{}`. The user appears unauthenticated, the route returns `needsAuth: true`, the user re-authenticates. This is the no-graceful-rotation gap from audit finding C4.
+
+### Move 3 — the principle
+
+**State that has to survive across requests on a stateless host has to live somewhere the host doesn't own.** The browser cookie is that somewhere. Encryption + authentication is what makes the cookie safe to be in untrusted hands. The pattern works because the entire flow can be reconstructed from the cookie alone — no server-side index, no Redis lookup, no database row to join. Stateless servers + stateful clients = encrypted cookies.
+
+---
+
+## Primary diagram
+
+The full encrypted-cookie pattern in one frame, from operator-set `AUTH_SECRET` to per-request runtime.
+
+```
+  Encrypted cookie OAuth state — full topology
+
+  ┌─ Operator (deploy time) ───────────────────────────────────────┐
+  │  Vercel project env var                                         │
+  │    AUTH_SECRET = "openssl rand -base64 32"  (256 bits entropy)  │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ process.env.AUTH_SECRET
+                                 ▼
+  ┌─ Crypto layer  (lib/mcp/auth.ts L51–L79) ──────────────────────┐
+  │                                                                  │
+  │  aesKey()        SHA-256(secret) → 32 bytes                     │
+  │  encryptStore(s) iv=rand(12) | tag=GCM-mac | enc=AES-256-GCM    │
+  │  decryptStore(t) verify tag → JSON.parse(plain) OR return {}    │
+  │                                                                  │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ used only by ↓
+                                 ▼
+  ┌─ Runtime layer  (lib/mcp/auth.ts L86–L104) ────────────────────┐
+  │                                                                  │
+  │  withAuthCookies(fn):                                            │
+  │    request start: ctx = { store: decryptStore(cookie), dirty }   │
+  │    requestStore.run(ctx, fn)         ← ALS-scoped                │
+  │    request end:   if ctx.dirty: cookies.set(encryptStore(...))   │
+  │                                                                  │
+  │  cookie flags: httpOnly · Secure · SameSite=None · maxAge=10d   │
+  │                                                                  │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ inside fn, called many times
+                                 ▼
+  ┌─ Provider layer  (lib/mcp/auth.ts L160–L218) ──────────────────┐
+  │                                                                  │
+  │  BloomreachAuthProvider implements OAuthClientProvider           │
+  │    state() / saveTokens() / codeVerifier() / clientInformation() │
+  │    each → readState/patchState against the ALS store             │
+  │    redirectToAuthorization(url) → capture, don't open            │
+  │                                                                  │
+  └──────────────────────────────┬─────────────────────────────────┘
+                                 │ MCP SDK drives PKCE + DCR
+                                 ▼
+  ┌─ Bloomreach IdP ───────────────────────────────────────────────┐
+  │  validates authorize / token / refresh requests                  │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+After the response goes out, the cookie holds the full updated state — DCR client info, PKCE code_verifier, OAuth tokens — all encrypted, all on the browser. The next request reconstructs the in-memory store from scratch.
 
 ---
 

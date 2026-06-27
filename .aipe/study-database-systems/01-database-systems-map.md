@@ -139,6 +139,12 @@ The pattern is a **lifetime hierarchy** — bytes live until the smallest enclos
 
 ### Move 2 — the moving parts, one at a time
 
+**Where this is reached for in this codebase:**
+- **Every MCP tool call** goes through the `McpClient` cache first. The `/debug` page exists in part to verify cache behavior — its "force fresh" toggle sets `skipCache: true` so you can compare cached vs live results side by side.
+- **Every briefing** writes to the insights Map via `putInsights()`. Every investigation reads from `getCachedInvestigation()` first, falls through to the agent run, then writes back via `saveInvestigation()`.
+- **Every OAuth flow** stages state in the auth backend appropriate to the env — PKCE verifier saved on `connect`, read on `callback`, tokens saved after exchange.
+- **Demo mode** (`?demo=cached` on `/api/briefing` and the investigation route) replays committed JSON fixtures so the live demo works without Bloomreach credentials. The synthetic data source provides the same tool surface for dev/test scenarios where neither live nor cached demo applies.
+
 **Move 2a — the MCP response cache (the closest thing to a DB).**
 
 This is a real key-value store. Keys are `toolName + JSON.stringify(args)`. Values are `{result, expiresAt}`. Default TTL is 60 seconds. It's the only piece of storage in the app whose explicit job is to make repeated reads cheap.
@@ -169,6 +175,43 @@ What breaks when each part is missing:
 - **drop the "don't cache errors" check** → a transient 429 from Bloomreach poisons the cache for the next 60 seconds; every retry hits the cached error, not a fresh call
 - **drop the absolute `expiresAt` and use elapsed time** → a long-running request that started before the entry expired could see it expire mid-flight; absolute time is simpler and correct here
 
+Side-by-side with the real code:
+
+```
+  lib/mcp/client.ts  (lines 80–110)
+
+  private cache = new Map<                  ← single map, no eviction policy.
+    string,                                    keys grow unbounded until the
+    { result: unknown; expiresAt: number }     instance dies (no LRU).
+  >();
+
+  async callTool(...) {
+    const cacheKey =
+      `${name}:${JSON.stringify(args)}`;    ← key is tool+args-serialized.
+                                               JSON.stringify is order-sensitive,
+                                               so two callers with the same args
+                                               in different key order would miss
+                                               cache. (callers control args, so
+                                               in practice this is fine.)
+    const ttl = options.cacheTtlMs ?? 60_000; ← per-call TTL override possible
+                                                 but unused outside tests.
+
+    if (!options.skipCache) {
+      const cached = this.cache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return { result: cached.result,     ← absolute-time expiry — survives
+                 durationMs: 0,                clock jumps fine within Node's
+                 fromCache: true };            monotonic-ish Date.now()
+      }
+    }
+    ...
+       │
+       └─ load-bearing: skipCache still WRITES through. The /debug "force fresh"
+          path uses it to refresh the cache rather than bypass it. Drop the
+          write-through and force-fresh becomes a one-shot — next call still
+          serves the stale value.
+```
+
 **Move 2b — the schema singleton (process-global cache, no expiry).**
 
 `bootstrapSchema()` calls four MCP tools (`get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview`), stitches them into a `WorkspaceSchema`, and stores the result in a module-level variable. Subsequent calls return the cached value forever.
@@ -195,6 +238,37 @@ What breaks when each part is missing:
 - **never invalidate** → if the workspace schema changes upstream (new event type registered), this process won't see it until the instance dies
 
 The "no invalidation" choice is deliberate — workspaces don't change schema mid-session, and a stale schema is a smaller cost than the rate-limit budget you'd burn re-fetching.
+
+Side-by-side with the real code:
+
+```
+  lib/mcp/schema.ts  (lines 131, 170–192)
+
+  let cached: WorkspaceSchema | null = null;  ← process-singleton. No TTL,
+                                                 no invalidation. Lifetime =
+                                                 lifetime of the Node instance.
+
+  export async function bootstrapSchema(mcp) {
+    if (cached) return cached;                ← fast path, every call after the first.
+    const { projectId, projectName } =
+      await resolveProject(mcp);              ← the orgs → projects chain.
+    const args = { project_id: projectId };
+
+    // Sequential — server allows ~1 req/s
+    const eventSchema   = await callOrThrow(mcp, 'get_event_schema', args);
+    const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
+    const catalogs      = await callOrThrow(mcp, 'list_catalogs', args);
+    const overview      = await callOrThrow(mcp, 'get_project_overview', args);
+
+    cached = parseWorkspaceSchema({ ... });
+    return cached;
+  }
+       │
+       └─ the four-call bootstrap costs ~4-5s. Without the `if (cached) return`
+          guard, every briefing would pay it again. Caching is the difference
+          between "first briefing slow, subsequent ones fast" and "every
+          briefing slow." Worth the staleness risk.
+```
 
 **Move 2c — the in-process state Maps (the feed and the investigations).**
 
@@ -223,6 +297,33 @@ What breaks when each part is missing:
 - **the assumption that "the briefing's results live here"** breaks the moment a second Vercel instance serves a request — that instance never saw `putInsights()` and returns `[]`
 
 The investigations Map is paired with `.investigation-cache.json` in dev so a hot-reload doesn't wipe an in-progress investigation. In production that file path is read-only (serverless FS), so the file branch is skipped and only the in-memory map exists — meaning the client sends the insight blob back on every navigation (the `?insight=...` query param fallback in `app/api/agent/route.ts` L37-47 exists for exactly this reason).
+
+Side-by-side with the real code:
+
+```
+  lib/state/insights.ts  (lines 30–42)
+
+  export function putInsights(
+    items: Insight[],
+    rawAnomalies?: Anomaly[],
+  ): void {
+    insights.clear();                       ← the replace-on-write contract.
+    anomalies.clear();                         every briefing IS the current
+                                               feed — no append, no history.
+    items.forEach((i, idx) => {
+      insights.set(i.id, i);
+      if (rawAnomalies?.[idx])
+        anomalies.set(i.id, rawAnomalies[idx]);
+    });
+  }
+       │
+       └─ the comment above this function explicitly names the consequence of
+          NOT clearing: a warm Vercel instance would accumulate stale insights
+          across briefings. This IS the eviction policy — write-time, full-table.
+          A real DB would call it TRUNCATE+INSERT. Doing it any other way
+          (e.g. UPSERT-by-id) would mean yesterday's anomalies survive into
+          today's feed when ids happen not to collide.
+```
 
 **Move 2d — the auth store, with three backends.**
 
@@ -327,106 +428,6 @@ This codebase picks all-shortest-lifetimes because none of its features yet need
   │  customer profiles · event streams · catalogs · EQL query engine       │
   │  exposed via MCP tools — we never see schemas, indexes, or plans       │
   └────────────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-### Use cases
-
-- **Every MCP tool call** goes through the `McpClient` cache first. The `/debug` page exists in part to verify cache behavior — its "force fresh" toggle sets `skipCache: true` so you can compare cached vs live results side by side.
-- **Every briefing** writes to the insights Map via `putInsights()`. Every investigation reads from `getCachedInvestigation()` first, falls through to the agent run, then writes back via `saveInvestigation()`.
-- **Every OAuth flow** stages state in the auth backend appropriate to the env — PKCE verifier saved on `connect`, read on `callback`, tokens saved after exchange.
-- **Demo mode** (`?demo=cached` on `/api/briefing` and the investigation route) replays committed JSON fixtures so the live demo works without Bloomreach credentials. The synthetic data source provides the same tool surface for dev/test scenarios where neither live nor cached demo applies.
-
-### Code side by side
-
-```
-  lib/mcp/client.ts  (lines 80–110)
-
-  private cache = new Map<                  ← single map, no eviction policy.
-    string,                                    keys grow unbounded until the
-    { result: unknown; expiresAt: number }     instance dies (no LRU).
-  >();
-
-  async callTool(...) {
-    const cacheKey =
-      `${name}:${JSON.stringify(args)}`;    ← key is tool+args-serialized.
-                                               JSON.stringify is order-sensitive,
-                                               so two callers with the same args
-                                               in different key order would miss
-                                               cache. (callers control args, so
-                                               in practice this is fine.)
-    const ttl = options.cacheTtlMs ?? 60_000; ← per-call TTL override possible
-                                                 but unused outside tests.
-
-    if (!options.skipCache) {
-      const cached = this.cache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        return { result: cached.result,     ← absolute-time expiry — survives
-                 durationMs: 0,                clock jumps fine within Node's
-                 fromCache: true };            monotonic-ish Date.now()
-      }
-    }
-    ...
-       │
-       └─ load-bearing: skipCache still WRITES through. The /debug "force fresh"
-          path uses it to refresh the cache rather than bypass it. Drop the
-          write-through and force-fresh becomes a one-shot — next call still
-          serves the stale value.
-```
-
-```
-  lib/state/insights.ts  (lines 30–42)
-
-  export function putInsights(
-    items: Insight[],
-    rawAnomalies?: Anomaly[],
-  ): void {
-    insights.clear();                       ← the replace-on-write contract.
-    anomalies.clear();                         every briefing IS the current
-                                               feed — no append, no history.
-    items.forEach((i, idx) => {
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx])
-        anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ the comment above this function explicitly names the consequence of
-          NOT clearing: a warm Vercel instance would accumulate stale insights
-          across briefings. This IS the eviction policy — write-time, full-table.
-          A real DB would call it TRUNCATE+INSERT. Doing it any other way
-          (e.g. UPSERT-by-id) would mean yesterday's anomalies survive into
-          today's feed when ids happen not to collide.
-```
-
-```
-  lib/mcp/schema.ts  (lines 131, 170–192)
-
-  let cached: WorkspaceSchema | null = null;  ← process-singleton. No TTL,
-                                                 no invalidation. Lifetime =
-                                                 lifetime of the Node instance.
-
-  export async function bootstrapSchema(mcp) {
-    if (cached) return cached;                ← fast path, every call after the first.
-    const { projectId, projectName } =
-      await resolveProject(mcp);              ← the orgs → projects chain.
-    const args = { project_id: projectId };
-
-    // Sequential — server allows ~1 req/s
-    const eventSchema   = await callOrThrow(mcp, 'get_event_schema', args);
-    const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
-    const catalogs      = await callOrThrow(mcp, 'list_catalogs', args);
-    const overview      = await callOrThrow(mcp, 'get_project_overview', args);
-
-    cached = parseWorkspaceSchema({ ... });
-    return cached;
-  }
-       │
-       └─ the four-call bootstrap costs ~4-5s. Without the `if (cached) return`
-          guard, every briefing would pay it again. Caching is the difference
-          between "first briefing slow, subsequent ones fast" and "every
-          briefing slow." Worth the staleness risk.
 ```
 
 ## Elaborate

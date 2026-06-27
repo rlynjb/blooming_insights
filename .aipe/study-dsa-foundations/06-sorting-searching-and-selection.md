@@ -155,6 +155,25 @@ trace for input [{s:"info"}, {s:"critical"}, {s:"warning"}, {s:"positive"}]:
   .slice(0, 10) returns all 4 (fewer than 10).
 ```
 
+**Code in this codebase — the SEV_RANK comparator inline + a second sort by event count.**
+
+```ts
+// lib/agents/monitoring.ts L51
+const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
+
+// lib/agents/monitoring.ts L119
+return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
+```
+
+The whole sort idiom in one line. `[...parsed]` is a copy (because `.sort()` mutates). The comparator subtracts integers from a rank table — `b - a` is descending, so critical sorts first. `.slice(0, 10)` is the top-N cap. The TypeScript type `Record<Severity, number>` is the compile-time guarantee that every severity has a rank; missing one is a build error, not a runtime NaN.
+
+```ts
+// lib/mcp/schema.ts L100
+.sort((a, b) => b.eventCount - a.eventCount);
+```
+
+A second sort in the codebase: events ordered by event count, descending. Same idiom (`b - a` for descending), no rank table needed because `eventCount` is already a number. Used so downstream code (agents, UI) sees most-active events first.
+
 **Other sorts worth knowing about** (none used here):
 
 ```
@@ -324,7 +343,22 @@ top_k_stream(arr, k):
 
 **The load-bearing selection in this codebase** is `.sort().slice(0, 10)` — the sort-and-slice variant — in `lib/agents/monitoring.ts` L119. This is the right choice at N=30, where O(N log N) = ~150 ops is invisible. For N=1M with K=10 (a streaming top-K problem), heap-based would beat sort-and-slice by ~6 orders of magnitude.
 
-**Quickselect and heap-based top-K are not yet exercised.** No million-element selection problem.
+**Code in this codebase — argmin reduce: the K=1 case of top-K (`components/feed/InsightCard.tsx` L155–L161).**
+
+```ts
+// components/feed/InsightCard.tsx L155–L161
+const funnel = insight.funnel;
+const funnelStages = funnel
+  ? (['view','cart','checkout','purchase'] as const).map(k => ({ k, v: funnel[k] }))
+  : [];
+const leakKey = funnelStages.length
+  ? funnelStages.reduce((a, b) => b.v < a.v ? b : a).k
+  : null;
+```
+
+A *selection* in disguise — find the `k` of the element with the smallest `v` (argmin). This is the K=1 case of top-K. The reduce traverses once (O(N) where N=4 funnel stages), keeping the running min. The `.k` extracts the *key* of the minimum, not the value. This is the most common selection pattern in the codebase.
+
+**Quickselect and heap-based top-K are not yet exercised.** No million-element selection problem. No use of `Array.prototype.findIndex` against sorted data, no manual binary-search implementation, no `bisect`-like utility either — the CATEGORIES array is fixed (10 entries; `coverageReport` does `.map` over all 10), the TTL cache is hash-keyed, and the anomalies array is sorted once then sliced. The plausible trigger for binary search: a sorted index — say, cached MCP results sorted by `expiresAt` so you could binary-search for "the first one that's still valid." Today the Map's `.get` + inline `expiresAt > Date.now()` check makes this unnecessary; the lazy-expiry pattern beats maintaining a sorted index.
 
 ### Move 2 variant — the irreducible kernel of each operation
 
@@ -412,105 +446,6 @@ The three operations, their algorithms, cost, and where each lives (or doesn't) 
   │                     │   (nothing pre-sorted)   │   streaming top-K    │
   └─────────────────────┴──────────────────────────┴──────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-Four sites — two for sort, two for search — and one honest gap (binary search).
-
-### **Sort — the SEV_RANK comparator (`lib/agents/monitoring.ts` L51 + L119)**
-
-```ts
-// lib/agents/monitoring.ts L51
-const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
-
-// lib/agents/monitoring.ts L119
-return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
-```
-
-The whole sort idiom in one line. `[...parsed]` is a copy (because `.sort()` mutates). The comparator subtracts integers from a rank table — `b - a` is descending, so critical sorts first. `.slice(0, 10)` is the top-N cap. The TypeScript type `Record<Severity, number>` is the compile-time guarantee that every severity has a rank; missing one is a build error, not a runtime NaN. Full case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-### **Sort — the schema event sort by count (`lib/mcp/schema.ts` L100)**
-
-```ts
-// lib/mcp/schema.ts L100
-.sort((a, b) => b.eventCount - a.eventCount);
-```
-
-A second sort in the codebase: events ordered by event count, descending. Same idiom (`b - a` for descending), no rank table needed because `eventCount` is already a number. Used so downstream code (agents, UI) sees most-active events first.
-
-### **Linear search — `findCurrentPrior` (`lib/insights/derive.ts` L12–L20)**
-
-```ts
-// lib/insights/derive.ts L12–L20
-export function findCurrentPrior(evidence): {current: number; prior: number} | null {
-  for (const e of evidence) {
-    const r = e.result;
-    if (typeof r?.current === 'number' && typeof r?.prior === 'number') {
-      return { current: r.current, prior: r.prior };
-    }
-  }
-  return null;
-}
-```
-
-Hand-rolled `Array.prototype.find` with a `typeof` narrow inside the body. Why not `evidence.find(...)`? Because the type narrow only flows through an explicit `if` — `.find` would still need a cast or re-narrow after returning. The kernel is linear search: scan, test, return-on-match, fall-through-to-null. N is single-digit (evidence entries on one anomaly).
-
-### **Linear search — reverse scan `replaceRunningTool` (`lib/hooks/useInvestigation.ts` L86–L95)**
-
-```ts
-// lib/hooks/useInvestigation.ts L86–L95
-const replaceRunningTool = (arr, e) => {
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const it = arr[i];
-    if (it.kind === 'tool' && it.toolName === e.toolName && it.status === 'running') {
-      arr[i] = { ...it, status: 'done', durationMs: e.durationMs, result: e.result, error: e.error };
-      break;
-    }
-  }
-  return arr;
-};
-```
-
-Linear search, *reversed*. Walking from the end ensures the most recent matching `tool_call_start` gets paired with the incoming `tool_call_end` — LIFO match. This is the right discipline because tools are dispatched sequentially in this codebase; concurrent dispatches of the same tool would need a unique ID instead of name-matching. Full case study at `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md`.
-
-### **Substring search — the JSON extraction substring scan (`lib/mcp/validate.ts` L4, L7–L9)**
-
-```ts
-// lib/mcp/validate.ts L4
-const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-
-// lib/mcp/validate.ts L7–L9
-const start = candidate.search(/[[{]/);
-const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-if (start >= 0 && end > start) {
-  return JSON.parse(candidate.slice(start, end + 1));
-}
-```
-
-Two specialized string searches: `match(regex)` finds the first regex match (the fenced block); `search(regex)` finds the first index matching a character class (the outermost `[` or `{`); `lastIndexOf(char)` finds the last index of a specific character. The combination brackets the JSON-looking substring inside arbitrary prose. The cost is roughly O(N·M) per regex/search (N = text length, M = pattern length); for the small text sizes the agents emit, this is fine. Full case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-### **Argmin reduce — the funnel-leak selection (`components/feed/InsightCard.tsx` L155–L161)**
-
-```ts
-// components/feed/InsightCard.tsx L155–L161
-const funnel = insight.funnel;
-const funnelStages = funnel
-  ? (['view','cart','checkout','purchase'] as const).map(k => ({ k, v: funnel[k] }))
-  : [];
-const leakKey = funnelStages.length
-  ? funnelStages.reduce((a, b) => b.v < a.v ? b : a).k
-  : null;
-```
-
-A *selection* in disguise — find the `k` of the element with the smallest `v` (argmin). This is the K=1 case of top-K. The reduce traverses once (O(N) where N=4 funnel stages), keeping the running min. The `.k` extracts the *key* of the minimum, not the value. This is the most common selection pattern in the codebase; see the full derivation case study at `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-### **Binary search — `not yet exercised`**
-
-No use of `Array.prototype.findIndex` against sorted data, no manual binary-search implementation, no `bisect`-like utility. The CATEGORIES array is fixed (10 entries — linear search would be fine, and `coverageReport` does `.map` over all 10 anyway). The TTL cache is hash-keyed, not array-of-sorted-keys. The anomalies array is sorted once then sliced — no subsequent searches against it.
-
-**When this changes:** if the codebase grew a sorted index — say, a list of cached MCP results sorted by `expiresAt` so you could binary-search for "the first one that's still valid" — binary search would be the right tool. Today the Map's `.get` + inline `expiresAt > Date.now()` check makes this unnecessary; the lazy-expiry pattern beats maintaining a sorted index. (See the Elaborate block in the TTL cache case study for the cost trade.)
 
 ---
 

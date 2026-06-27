@@ -293,6 +293,96 @@ Skip for now. Reach for these only after the top 7 are solid:
 
 **Rank by leverage, then drill in order.** The temptation is to study what you find most interesting or what's closest to what you already know. Both are wrong heuristics for time-bounded preparation. Rank by *frequency × gap × leverage*, then attack from the top of the list. The items at the top of the list above are not necessarily the most interesting; they're the ones that close the biggest gaps for the lowest effort.
 
+### Code in this codebase
+
+This chapter is a plan, not a piece of code. There's no single file to anchor — but the plan grounds in the codebase's audit and the user's portfolio.
+
+**The audit evidence — chapter by chapter:**
+
+```
+chapter   verdict     evidence in repo (file:line if applies)
+────────  ──────────  ────────────────────────────────────────────────────
+01        applies     lib/mcp/client.ts L80 (Map for O(1) lookup)
+                      lib/mcp/tools.ts L38–L40 (Set dedup for O(N))
+                      lib/agents/categories.ts L116–L127 (flatten-once)
+                      lib/mcp/client.ts L148–L163 (amortized throughput)
+02        applies     lib/mcp/client.ts L80 (Map cache)
+                      lib/agents/categories.ts L116–L127 (Set capabilities)
+                      lib/mcp/tools.ts L38–L40 (Set-union dedup)
+                      lib/hooks/useInvestigation.ts L184–L208 (string buf)
+03        partial     lib/hooks/useInvestigation.ts L184–L208 (implicit
+                       queue); NO file for stack/deque/heap
+04        not yet     (closest: lib/mcp/schema.ts L8–L18 nested object,
+                       but iterated with flat loops in categories.ts)
+05        not yet     (closest: lib/mcp/schema.ts L151–L192 bootstrap
+                       chain, which is a fixed pipeline not a traversal)
+06        partial     lib/agents/monitoring.ts L51 + L119 (sort + slice)
+                      lib/mcp/schema.ts L100 (second sort)
+                      lib/insights/derive.ts L12–L20 (linear search)
+                      lib/mcp/validate.ts L7–L9 (substring scan)
+                      lib/hooks/useInvestigation.ts L86–L95 (reverse scan)
+                      components/feed/InsightCard.tsx L159–L161 (argmin)
+                      NO file for binary search
+07        not yet     (only "recursive" mention is app/api/mcp/capture/
+                       route.ts mkdir({recursive: true}) — stdlib param)
+```
+
+**The portfolio evidence — what's already built outside this codebase (from `me.md`):**
+
+- `reincodes/Graph.ts` — adjacency list, BFS, DFS, valid-tree, connected components, Eulerian
+- `reincodes/Graph2.ts` — weighted edges, supports Dijkstra
+- `reincodes/BinarySearchTree.ts` — insert, search, delete, all three traversals
+- `reincodes/BinaryHeap.ts` — MinHeap, MaxHeap, heapifyUp/Down
+- `reincodes/PriorityQueue.ts` — heap-backed, with updatePriority
+- `reincodes/Tree.ts` — n-ary, pre/post traversal with generators
+- `reincodes/Sorting/` — selection, bubble, insertion, merge, quick, heap sort + visualizers
+- `reincodes/PG.ts` — state-space search for the river-crossing puzzle (this IS backtracking)
+
+What's missing from the portfolio:
+
+- **Dynamic programming** — never built any DP problem from scratch
+- **Binary search** — never built the algorithm or any of its variants
+- **Trie** — never built
+- **Topological sort** — never built (though you have DFS in Graph.ts, the topo-sort wrapper isn't there)
+- **Union-find** — never built
+- **Segment tree / Fenwick tree** — never built
+- **Suffix array / suffix tree** — never built
+
+The practice ranking comes from the cross-product of "what the codebase doesn't exercise" × "what your portfolio doesn't already build."
+
+**The 4-6 week study schedule** (assuming 8-10 hours/week of focused study time, ordered to match the ranking):
+
+```
+WEEK 1-2 — Dynamic programming (10-15 hours)
+  drill: coin change, LCS, edit distance, 0/1 knapsack, LIS
+  format: memoized recursion first, then bottom-up tabulation
+  build: a personal "DP cheatsheet" page in your `reincodes/DP/` directory
+
+WEEK 3 — Binary search (5-8 hours)
+  drill: iterative kernel, bisect variants, search in rotated array,
+         binary search on the answer (find K-th smallest in matrix)
+  build: `reincodes/BinarySearch.ts` with all variants + tests
+
+WEEK 4 — Topological sort + union-find (8-12 hours)
+  drill: course schedule (topo), number of islands (union-find or DFS),
+         Kruskal's MST
+  build: extend `reincodes/Graph.ts` with topoSort method;
+         create `reincodes/UnionFind.ts` with path compression + union by rank
+
+WEEK 5 — Complexity rehearsal + heap rehearsal (8-12 hours)
+  practice articulating amortized vs worst case for 5 design decisions
+  rebuild streaming top-K from scratch using your PriorityQueue
+  drill: median maintenance, k-merge using min-heap
+
+WEEK 6 — Arrays/strings combos + tries (8-12 hours)
+  drill: longest substring without repeating chars, two-sum II,
+         subarray sum equals K, word break, word search II
+  build: `reincodes/Trie.ts` with insert/search/startsWith;
+         then use it for word search II
+```
+
+**Total: ~38-58 hours over 4-6 weeks.** At the end, every "not yet exercised" category in chapters 01–07 has a built artifact in `reincodes/` or a rehearsed interview problem, and you can defend the existing repo's choices with the senior signal that comes from amortized-analysis fluency.
+
 ---
 
 ## Primary diagram
@@ -339,100 +429,6 @@ The practice map in one frame — input (chapter verdicts), pipeline (three lens
   │   TOTAL: ~38-58 hours, ~4-6 weeks at 8-10 hrs/week               │
   └─────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-This chapter is a plan, not a piece of code. There's no file to anchor — but here's how the plan grounds in the codebase's audit.
-
-### **The audit evidence — chapter by chapter**
-
-```
-chapter   verdict     evidence in repo (file:line if applies)
-────────  ──────────  ────────────────────────────────────────────────────
-01        applies     lib/mcp/client.ts L80 (Map for O(1) lookup)
-                      lib/mcp/tools.ts L38–L40 (Set dedup for O(N))
-                      lib/agents/categories.ts L116–L127 (flatten-once)
-                      lib/mcp/client.ts L148–L163 (amortized throughput)
-02        applies     lib/mcp/client.ts L80 (Map cache)
-                      lib/agents/categories.ts L116–L127 (Set capabilities)
-                      lib/mcp/tools.ts L38–L40 (Set-union dedup)
-                      lib/hooks/useInvestigation.ts L184–L208 (string buf)
-03        partial     lib/hooks/useInvestigation.ts L184–L208 (implicit
-                       queue); NO file for stack/deque/heap
-04        not yet     (closest: lib/mcp/schema.ts L8–L18 nested object,
-                       but iterated with flat loops in categories.ts)
-05        not yet     (closest: lib/mcp/schema.ts L151–L192 bootstrap
-                       chain, which is a fixed pipeline not a traversal)
-06        partial     lib/agents/monitoring.ts L51 + L119 (sort + slice)
-                      lib/mcp/schema.ts L100 (second sort)
-                      lib/insights/derive.ts L12–L20 (linear search)
-                      lib/mcp/validate.ts L7–L9 (substring scan)
-                      lib/hooks/useInvestigation.ts L86–L95 (reverse scan)
-                      components/feed/InsightCard.tsx L159–L161 (argmin)
-                      NO file for binary search
-07        not yet     (only "recursive" mention is app/api/mcp/capture/
-                       route.ts mkdir({recursive: true}) — stdlib param)
-```
-
-### **The portfolio evidence — what's already built outside this codebase**
-
-From `me.md`:
-- `reincodes/Graph.ts` — adjacency list, BFS, DFS, valid-tree, connected components, Eulerian
-- `reincodes/Graph2.ts` — weighted edges, supports Dijkstra
-- `reincodes/BinarySearchTree.ts` — insert, search, delete, all three traversals
-- `reincodes/BinaryHeap.ts` — MinHeap, MaxHeap, heapifyUp/Down
-- `reincodes/PriorityQueue.ts` — heap-backed, with updatePriority
-- `reincodes/Tree.ts` — n-ary, pre/post traversal with generators
-- `reincodes/Sorting/` — selection, bubble, insertion, merge, quick, heap sort + visualizers
-- `reincodes/PG.ts` — state-space search for the river-crossing puzzle (this IS backtracking)
-
-What's missing from the portfolio:
-- **Dynamic programming** — never built any DP problem from scratch
-- **Binary search** — never built the algorithm or any of its variants
-- **Trie** — never built
-- **Topological sort** — never built (though you have DFS in Graph.ts, the topo-sort wrapper isn't there)
-- **Union-find** — never built
-- **Segment tree / Fenwick tree** — never built
-- **Suffix array / suffix tree** — never built
-
-The practice ranking comes from the cross-product of "what the codebase doesn't exercise" × "what your portfolio doesn't already build."
-
-### **The 4-6 week study schedule**
-
-Assuming 8-10 hours/week of focused study time, ordered to match the ranking:
-
-```
-WEEK 1-2 — Dynamic programming (10-15 hours)
-  drill: coin change, LCS, edit distance, 0/1 knapsack, LIS
-  format: memoized recursion first, then bottom-up tabulation
-  build: a personal "DP cheatsheet" page in your `reincodes/DP/` directory
-
-WEEK 3 — Binary search (5-8 hours)
-  drill: iterative kernel, bisect variants, search in rotated array,
-         binary search on the answer (find K-th smallest in matrix)
-  build: `reincodes/BinarySearch.ts` with all variants + tests
-
-WEEK 4 — Topological sort + union-find (8-12 hours)
-  drill: course schedule (topo), number of islands (union-find or DFS),
-         Kruskal's MST
-  build: extend `reincodes/Graph.ts` with topoSort method;
-         create `reincodes/UnionFind.ts` with path compression + union by rank
-
-WEEK 5 — Complexity rehearsal + heap rehearsal (8-12 hours)
-  practice articulating amortized vs worst case for 5 design decisions
-  rebuild streaming top-K from scratch using your PriorityQueue
-  drill: median maintenance, k-merge using min-heap
-
-WEEK 6 — Arrays/strings combos + tries (8-12 hours)
-  drill: longest substring without repeating chars, two-sum II,
-         subarray sum equals K, word break, word search II
-  build: `reincodes/Trie.ts` with insert/search/startsWith;
-         then use it for word search II
-```
-
-**Total: ~38-58 hours over 4-6 weeks.** At the end, every "not yet exercised" category in chapters 01–07 has a built artifact in `reincodes/` or a rehearsed interview problem, and you can defend the existing repo's choices with the senior signal that comes from amortized-analysis fluency.
 
 ---
 

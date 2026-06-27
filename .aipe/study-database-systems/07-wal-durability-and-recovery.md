@@ -117,23 +117,13 @@ The whole reason WAL exists is **the sync write to the WAL is small and sequenti
           this is the same shape; databases just do it on hot data.
 ```
 
-### Move 3 — the principle
-
-**Durability is what `COMMIT` actually means.** Without a WAL, `COMMIT` is a lie — the engine has to flush a whole page to disk on every commit, which is unacceptably slow, or it has to defer the write, which means a crash loses committed data. The WAL is the trick that makes "fast" and "durable" compatible: the cost of commit is one sequential append, not many random writes. Get this contract right and the rest of the database can be optimized freely; get it wrong and committed data isn't actually committed.
-
-## Primary diagram
-
-Skipped — no codebase instance to recap.
-
-## Implementation in codebase
-
-### Use cases
+### Code in this codebase
 
 - **Auth cookie** is the only piece of state with a real durability claim — durable for 10 days, encrypted, owned by the browser.
 - **Dev write paths** (`writeFileSync` in `lib/state/investigations.ts` and `lib/mcp/auth.ts`) are best-effort, no fsync, no atomic rename. Tear-on-crash recoverable by re-authenticating.
 - **Committed demo fixtures** are durable via git; the "backup" is git history.
 
-### The closest cousins, ranked
+The closest cousins, ranked:
 
 ```
   lib/mcp/auth.ts — the closest thing to a WAL
@@ -189,6 +179,14 @@ Skipped — no codebase instance to recap.
           by checkout, ship-stream is `git push`. for committed read-only
           fixtures this is fine; for live data it would be absurd.
 ```
+
+### Move 3 — the principle
+
+**Durability is what `COMMIT` actually means.** Without a WAL, `COMMIT` is a lie — the engine has to flush a whole page to disk on every commit, which is unacceptably slow, or it has to defer the write, which means a crash loses committed data. The WAL is the trick that makes "fast" and "durable" compatible: the cost of commit is one sequential append, not many random writes. Get this contract right and the rest of the database can be optimized freely; get it wrong and committed data isn't actually committed.
+
+## Primary diagram
+
+Skipped — no codebase instance to recap.
 
 ## Elaborate
 

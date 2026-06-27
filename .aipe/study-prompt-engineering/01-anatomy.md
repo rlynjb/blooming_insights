@@ -246,36 +246,36 @@ The shape is authored once; the bytes the model receives are assembled per turn 
 
 ---
 
-## Implementation in codebase
+### Code in this codebase
 
 **Case A — implemented (richly).** Two paths share the same anatomy. The **active** path imports prompts from `@aptkit/prompts` (npm, via `@aptkit/core@0.3.0`); the **legacy** path keeps the prior markdown under `lib/agents/legacy-prompts/` and is loaded by the `*-legacy.ts` agents. The anatomy concept reads the same on both; only the source location moves.
 
-### The shared anatomy (legacy markdown — still in-repo for the *-legacy agents)
+#### The shared anatomy (legacy markdown — still in-repo for the *-legacy agents)
 
 - **File:** `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md`
 - **Function / class:** the prompt source itself (the constant Layer 1) for the legacy path
 - **Line range:** Role at L3–5 in all four; Hard rules at `monitoring.md` L13 (pushed down by its `## Your category checklist` section at L7) / L7 in the other three. (Olist-specific sections — `## DATA HORIZON`, the 3-dim scan plan, dual-adapter examples — were removed in commit 03fba57; the legacy prompts are Bloomreach-only.)
 - **Role:** the constant system prompt for the legacy agents, one job per file, each Role disclaiming the others. `monitoring.md` alone carries a seventh section — `## Your category checklist` (L7) with a `{categories}` injection slot (L11) — making it the one prompt that isn't a clean six-section instance.
 
-### The shared anatomy (active path — imported from @aptkit/prompts)
+#### The shared anatomy (active path — imported from @aptkit/prompts)
 
 - **File:** `node_modules/@aptkit/core/node_modules/@aptkit/prompts/dist/src/{monitoring,diagnostic,recommendation,query}.js`
 - **Function / class:** prompt strings exported by the package; consumed by `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` via the `@aptkit/core` adapters
 - **Role:** the same six-section anatomy, sourced from a versioned npm package instead of the repo's `prompts/` folder. The seam moved from `readFileSync` to package import; the anatomy did not. See file 14 for what shipping the prompts as a package actually changes.
 
-### Layer 2 — per-call injection (legacy path)
+#### Layer 2 — per-call injection (legacy path)
 
 - **File:** `lib/agents/{monitoring-legacy,diagnostic-legacy,recommendation-legacy,query-legacy}.ts`
 - **Function / class:** the `.replace` chain that builds `system` before `runAgentLoop`
 - **Role:** stamps runtime values into the closed placeholder set on the legacy path; `userPrompt` passed separately so it stays out of the `.md`. On the active path, the AptKit adapter performs the equivalent injection inside the package boundary.
 
-### Layer 3 — synthesis append
+#### Layer 3 — synthesis append
 
 - **File:** `lib/agents/base-legacy.ts` (legacy loop) / `lib/agents/base.ts` (active adapter wiring)
 - **Function / class:** the forced-final-turn system assembly — `${system}\n\n${synthesisInstruction}` with tools removed on the one turn
 - **Role:** appends the hard-stop instruction last, on the one turn the model must answer. Identical mechanic on both paths.
 
-### Why this is a codebase strength
+#### Why this is a codebase strength
 
 The anatomy is uniform enough that adding an agent is mechanical: copy the six sections, write the disclaimer, add the placeholder, wire one `.replace`. On the legacy path the placeholder set is closed and greppable (`grep -rn '{[a-z_]*}' lib/agents/legacy-prompts`); on the active path the same closed-set property is enforced inside the AptKit package. The system-vs-user boundary is enforced by code, not convention: the constant is a file or a package export, the per-call task is a function argument.
 

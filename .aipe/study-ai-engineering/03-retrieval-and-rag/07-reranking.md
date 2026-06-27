@@ -149,6 +149,14 @@ Separate recall from precision into two stages with opposite cost profiles: a ch
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via single-path sparse EQL with no candidate ranking step — there is no first-stage retriever returning a candidate set and no reranker reordering one.
+
+There is one honest placement-side analog, though no reranker. `MonitoringAgent.scan` sorts its *output* anomalies by severity and truncates — `SEV_RANK` ordering then `.slice(0, 10)` (`lib/agents/monitoring.ts` L50, L92) — which is a "rank then keep top-k" shape, but it ranks *results by a fixed field*, not *retrieved candidates by query relevance*; it is not a cross-encoder rerank. Real reranking would sit between the dense/hybrid retriever (`05`/`06`) and the prompt assembly in a `lib/mcp/retrieval.ts`, and would inform where retrieved evidence lands in the prompt (the lost-in-the-middle placement). The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Reranking — diagram
 
 This diagram spans the Service layer (two-stage pipeline) into the prompt placement. A reader who sees only this should grasp the retrieve-broad / rerank-narrow / place-carefully flow.
@@ -175,14 +183,6 @@ This diagram spans the Service layer (two-stage pipeline) into the prompt placem
 ```
 
 Stage 1 gets the right docs in; stage 2 orders them right; placement puts the winner where the model reads.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via single-path sparse EQL with no candidate ranking step — there is no first-stage retriever returning a candidate set and no reranker reordering one.
-
-There is one honest placement-side analog, though no reranker. `MonitoringAgent.scan` sorts its *output* anomalies by severity and truncates — `SEV_RANK` ordering then `.slice(0, 10)` (`lib/agents/monitoring.ts` L50, L92) — which is a "rank then keep top-k" shape, but it ranks *results by a fixed field*, not *retrieved candidates by query relevance*; it is not a cross-encoder rerank. Real reranking would sit between the dense/hybrid retriever (`05`/`06`) and the prompt assembly in a `lib/mcp/retrieval.ts`, and would inform where retrieved evidence lands in the prompt (the lost-in-the-middle placement). The `Project exercises` block below is the primary buildable target.
 
 ---
 

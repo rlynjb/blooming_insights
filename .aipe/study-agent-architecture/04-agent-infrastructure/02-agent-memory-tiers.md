@@ -130,6 +130,8 @@ The practical consequence: every turn the model gets the full reasoning trail of
 
 The condition under which it works: working memory is right when the task fits in one run and what you remembered isn't needed afterward. The 6-call investigation pattern fits this — by the time the diagnostic agent finishes, every tool result it cared about is already reflected in its final JSON conclusion. There's nothing to keep around.
 
+**Where this lives in the repo.** `runAgentLoop()` in `lib/agents/base.ts` — the `messages` array initialised at L79 and pushed at L105/L171. Every tool call's result is `truncate`d (L150) and pushed into `messages` (L171). The array dies when the function returns; there is no carry-over to the next call.
+
 ### Move 2 — Episodic memory: the cache + sessionStorage handoff
 
 The technical thing: **a keyed snapshot of past runs that *another* run can pull back by exact id.** Not vector search — exact lookup. blooming insights has two layers of this glued together: the server-side cache (`getCachedInvestigation`) and the client-side stash (`sessionStorage`), with a special handoff key for the cross-step diagnosis.
@@ -177,6 +179,8 @@ the cross-step handoff in one picture
 
 The honest caveat: the server-side state map lives in the function instance — it survives within one warm container, but a cold start or a different lambda invocation comes up with an empty map. A dev-only file cache and the committed demo seed cover that gap in development and the seed flow. For real cross-instance persistence you'd want Redis or a row store; right now the cross-instance gap is filled by the client stash, which is more durable than the server cache.
 
+**Where this lives in the repo.** Server cache: `lib/state/investigations.ts` — `saveInvestigation()` / `getCachedInvestigation()` (the `Map` at L11, read at L22, write at L30). Client stash: `lib/hooks/useInvestigation.ts` — the `stashKey` / `diagHandoffKey` helpers at L18–L19 and the `'done'` event handler at L133–L143 (write on done, including the cross-step diagnosis handoff). The cross-step diagnosis handoff is the load-bearing case: step 2's diagnosis is stashed in `sessionStorage` at key `bi:diag:<insightId>` (`useInvestigation.ts` ~L138) and read back by step 3 via the route param at `app/api/agent/route.ts` L227.
+
 ### Move 3 — Long-term memory: NOT built, and that's a real decision
 
 The technical thing: **a persistent store the agent retrieves from by *relevance*, not exact key.** The classical shape is "embed the new fact, store it in a vector DB, on a future run embed the current task and pull the most similar past facts." Lifetime: until evicted by retention policy.
@@ -206,6 +210,25 @@ long-term memory — what it would look like (NOT in this codebase)
 The practical consequence — what the agent *can't* do today: it can't remember that this user, last week, asked the same question. It can't carry preferences across investigations. It can't learn "this workspace's Q4 dip is annual and expected" from a past run's resolution. Every run is a fresh slate above the episodic layer.
 
 Why it's not built (the honest reason): the access pattern that would justify it doesn't exist yet. The current jobs — detect, diagnose, recommend, query — are all *workspace-scoped* and *task-scoped*. The relevant context is in the schema (which is fetched fresh each run) and in the current anomaly (which is point-looked-up). There's no "user history across workspaces" yet because there isn't multi-user state yet. The day the product gains "remember my preferences across investigations" or "learn what anomalies I keep dismissing," the third tier earns its build cost.
+
+```
+shape (not full impl):
+  // WORKING — base.ts L79
+  const messages: MessageParam[] = [{ role: 'user', content: userPrompt }];
+
+  // EPISODIC server — investigations.ts L11/L22/L30
+  const mem = new Map<string, AgentEvent[]>();
+  export function saveInvestigation(id, events) { mem.set(id, events); }
+  export function getCachedInvestigation(id) { return mem.get(id) ?? null; }
+
+  // EPISODIC client handoff — useInvestigation.ts L19/L138
+  const diagHandoffKey = (id) => `bi:diag:${id}`;
+  if (step === 'diagnose' && cDiag) {
+    sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }));
+  }
+
+  // LONG-TERM — not present in the repo.
+```
 
 ### Move 4 — Where each fact actually lives (the routing decision)
 
@@ -273,50 +296,6 @@ The three tiers, mapped to this codebase
   │ The access pattern that justifies it (cross-run, by relevance) │
   │ does not exist in this product yet.                            │
   └───────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Working memory (Case A — built):**
-**File:** `lib/agents/base.ts`
-**Function:** `runAgentLoop()` — the `messages` array initialised at L79 and pushed at L105/L171
-**Line range:** L79–L172
-
-Every tool call's result is `truncate`d (L150) and pushed into `messages` (L171). The array dies when the function returns; there is no carry-over to the next call.
-
-**Episodic memory (Case A — partial, exact-key only):**
-**Server cache file:** `lib/state/investigations.ts`
-**Function:** `saveInvestigation()` / `getCachedInvestigation()`
-**Line range:** L11 (the Map), L22 (read), L30 (write)
-
-**Client stash file:** `lib/hooks/useInvestigation.ts`
-**Function:** the `stashKey` / `diagHandoffKey` helpers and the `'done'` event handler
-**Line range:** L18–L19 (key helpers), L133–L143 (write on done, including the cross-step diagnosis handoff)
-
-The cross-step diagnosis handoff is the load-bearing case: step 2's diagnosis is stashed in `sessionStorage` at key `bi:diag:<insightId>` and read back by step 3 (`useInvestigation.ts` ~L138 + the route param at `app/api/agent/route.ts` L227).
-
-**Long-term memory (Case B — Not yet implemented):**
-There is no semantic / vector long-term memory in this codebase. The honest reason: every current job (detect / diagnose / recommend / query) is workspace-scoped and task-scoped, and the relevant context is either in the live schema (re-fetched each run) or in a point-looked-up anomaly id (the episodic tier handles it). A cross-run retrieval pattern would need a user model and a persistent store, neither of which exists yet.
-
-```
-shape (not full impl):
-  // WORKING — base.ts L79
-  const messages: MessageParam[] = [{ role: 'user', content: userPrompt }];
-
-  // EPISODIC server — investigations.ts L11/L22/L30
-  const mem = new Map<string, AgentEvent[]>();
-  export function saveInvestigation(id, events) { mem.set(id, events); }
-  export function getCachedInvestigation(id) { return mem.get(id) ?? null; }
-
-  // EPISODIC client handoff — useInvestigation.ts L19/L138
-  const diagHandoffKey = (id) => `bi:diag:${id}`;
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }));
-  }
-
-  // LONG-TERM — not present in the repo.
 ```
 
 ---

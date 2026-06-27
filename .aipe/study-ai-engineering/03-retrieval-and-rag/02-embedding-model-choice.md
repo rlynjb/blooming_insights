@@ -141,6 +141,14 @@ Model selection — for chat or embeddings — is choosing the *cheapest suffici
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings — so there is no embedding model selected, no dimension, and no retrieval benchmark.
+
+The honest analog is the *model-tiering decision the codebase already makes for chat models*: `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14) is the cheap small model for the easy 16-token classification, while `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9) is the capable model for the analyst agents. That is the same "smallest sufficient model for the job" logic the embedding choice requires — applied to a different family. When embeddings are added, the model would be configured in a new `lib/mcp/embeddings.ts` and the chosen dimension would propagate into the `lib/state/` vector cache. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Embedding model choice — diagram
 
 This diagram spans the decision (Service layer, where the embedder is configured) and the consequence (State layer, where dimension determines index size). A reader who sees only this should grasp that the choice is a measured tradeoff among dimension, cost, and domain fit.
@@ -169,14 +177,6 @@ This diagram spans the decision (Service layer, where the embedder is configured
 ```
 
 The dimension chosen in the Service layer is paid forever in the State layer's storage and in every comparison's compute.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not embeddings — so there is no embedding model selected, no dimension, and no retrieval benchmark.
-
-The honest analog is the *model-tiering decision the codebase already makes for chat models*: `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14) is the cheap small model for the easy 16-token classification, while `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9) is the capable model for the analyst agents. That is the same "smallest sufficient model for the job" logic the embedding choice requires — applied to a different family. When embeddings are added, the model would be configured in a new `lib/mcp/embeddings.ts` and the chosen dimension would propagate into the `lib/state/` vector cache. The `Project exercises` block below is the primary buildable target.
 
 ---
 

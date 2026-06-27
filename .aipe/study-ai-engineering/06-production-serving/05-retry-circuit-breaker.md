@@ -193,6 +193,28 @@ Retry recovers from transient failure; a circuit breaker protects against sustai
 
 ---
 
+### Code in this codebase
+
+Partially implemented — bounded rate-limit retry with exponential backoff and Retry-After honoring is built; jitter and a circuit breaker are not.
+
+#### Bounded rate-limit retry with backoff (Case A)
+
+**File:** `lib/mcp/client.ts`
+**Function / class:** `McpClient.callTool` retry loop
+**Line range:** L122–L132 (loop), with `isRateLimited` at L18–L22 and `parseRetryAfterMs` at L31–L38. Constructor defaults `maxRetries = 3` (L89), `retryDelayMs = 10_000` (L93, the backoff base), `retryCeilingMs = 20_000` (L94, the per-wait cap); `RETRY_BUFFER_MS = 500` at module scope (L16). The wait is `Math.min(hintMs != null ? hintMs + RETRY_BUFFER_MS : retryDelayMs · 2^(retries-1), retryCeilingMs)` (L125–L129). The loop re-enters `liveCall` (L148–L163), which re-applies the 1100 ms spacing.
+
+The live values are set in `connectMcp` (`lib/mcp/connect.ts` L91–L96): `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }`, with the rationale (proactive 1.1s spacing, wait out the *stated* window on retry, 60s cache absorbs repeats) in the comment at L81–L88.
+
+Honest note: the backoff is **exponential** (`retryDelayMs · 2^(retries-1)`, L125) and prefers a parsed Retry-After window (L124, L127) — but it adds **no jitter**, so concurrent callers compute the same deterministic wait and can wake together.
+
+#### Circuit breaker (Case B — Not yet implemented)
+
+**Not yet implemented.** blooming insights has a bounded, exponential-backoff rate-limit retry but no circuit breaker — there is no failure counter, no open/closed state, and no fast-fail path, so during a sustained Bloomreach outage every `callTool` runs its full retry sequence (~51s of waiting: 10s + 20s + 20s under the 20s ceiling) before failing.
+
+Where it would live: a breaker would wrap the retry loop in `McpClient.callTool` (`lib/mcp/client.ts` L113–L132), tracking consecutive failures in instance state alongside `lastCallAt` (L81). When the count crosses a threshold the breaker opens — `callTool` returns a fast failure before `liveCall` (L113) — and a timestamp-based cooldown transitions it to half-open for a single probe. Jitter would wrap the `waitMs` computation at L126–L129 with a randomization term so concurrent retries desynchronize.
+
+---
+
 ## Retry + circuit breaker — diagram
 
 This diagram spans the Agent, Service, and Provider layers. The retry loop (with backoff + Retry-After) is built (solid); jitter and the breaker are the gaps (dashed).
@@ -234,28 +256,6 @@ This diagram spans the Agent, Service, and Provider layers. The retry loop (with
 ```
 
 A reader who sees only this diagram should grasp: bounded retry on 429 is built with exponential backoff and a parsed Retry-After window; jitter and a fail-fast breaker are the missing hardening.
-
----
-
-## Implementation in codebase
-
-Partially implemented — bounded rate-limit retry with exponential backoff and Retry-After honoring is built; jitter and a circuit breaker are not.
-
-### Bounded rate-limit retry with backoff (Case A)
-
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool` retry loop
-**Line range:** L122–L132 (loop), with `isRateLimited` at L18–L22 and `parseRetryAfterMs` at L31–L38. Constructor defaults `maxRetries = 3` (L89), `retryDelayMs = 10_000` (L93, the backoff base), `retryCeilingMs = 20_000` (L94, the per-wait cap); `RETRY_BUFFER_MS = 500` at module scope (L16). The wait is `Math.min(hintMs != null ? hintMs + RETRY_BUFFER_MS : retryDelayMs · 2^(retries-1), retryCeilingMs)` (L125–L129). The loop re-enters `liveCall` (L148–L163), which re-applies the 1100 ms spacing.
-
-The live values are set in `connectMcp` (`lib/mcp/connect.ts` L91–L96): `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }`, with the rationale (proactive 1.1s spacing, wait out the *stated* window on retry, 60s cache absorbs repeats) in the comment at L81–L88.
-
-Honest note: the backoff is **exponential** (`retryDelayMs · 2^(retries-1)`, L125) and prefers a parsed Retry-After window (L124, L127) — but it adds **no jitter**, so concurrent callers compute the same deterministic wait and can wake together.
-
-### Circuit breaker (Case B — Not yet implemented)
-
-**Not yet implemented.** blooming insights has a bounded, exponential-backoff rate-limit retry but no circuit breaker — there is no failure counter, no open/closed state, and no fast-fail path, so during a sustained Bloomreach outage every `callTool` runs its full retry sequence (~51s of waiting: 10s + 20s + 20s under the 20s ceiling) before failing.
-
-Where it would live: a breaker would wrap the retry loop in `McpClient.callTool` (`lib/mcp/client.ts` L113–L132), tracking consecutive failures in instance state alongside `lastCallAt` (L81). When the count crosses a threshold the breaker opens — `callTool` returns a fast failure before `liveCall` (L113) — and a timestamp-based cooldown transitions it to half-open for a single probe. Jitter would wrap the `waitMs` computation at L126–L129 with a randomization term so concurrent retries desynchronize.
 
 ---
 

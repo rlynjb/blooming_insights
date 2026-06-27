@@ -145,6 +145,8 @@ The practical consequence: the model writes the call, your loop executes it, the
 
 The condition under which it works: the model's `tool_use.input` has to match the tool's `input_schema`. Schemas mismatched → tool call fails → loop feeds the error back as a `tool_result` with `is_error: true`, the model adapts on the next turn.
 
+**Where the loop seam lives in the repo.** `runAgentLoop()` in `lib/agents/base.ts` — the `mcp.callTool(...)` call inside the tool_use loop at L143–L150 (call), L161–L171 (tool_result back into messages).
+
 ### Move 2 — One discovery, sliced per agent
 
 The technical thing: **the tools come from the server (`listTools()`), and a per-agent filter (`filterToolSchemas`) maps the discovered list to each agent's allowed names.**
@@ -174,6 +176,8 @@ The practical consequence: the monitoring agent sees 13 monitoring-shaped tools.
 
 The condition under which it works: the allow-list per agent has to match the agent's actual job. The four lists are hand-curated against the agent prompts; the day a prompt change adds a job the tool list doesn't support, the model will reason about a tool it doesn't have and either fail gracefully or hallucinate one.
 
+**Where the per-agent slicing lives in the repo.** `filterToolSchemas()` in `lib/agents/tool-schemas.ts` L9–L21. The four allow-lists live in `lib/mcp/tools.ts` L5–L40 (`monitoringTools`, `diagnosticTools`, `recommendationTools`, `queryTools`). Each agent passes one to `filterToolSchemas` at construction (`monitoring.ts` L96, etc.).
+
 ### Move 3 — One client, one connection, one place for cross-cutting concerns
 
 The technical thing: **the MCP client wrapper is the single dispatcher** — it owns auth (via the OAuth provider), proactive spacing (~1.1s minimum interval between live calls), rate-limit retry with parsed hints + exponential backoff, a 60-second TTL response cache, and the no-cache-on-error rule.
@@ -202,6 +206,8 @@ The practical consequence: every agent and every turn benefits from the same ret
 
 The condition under which it works: the cache key has to match the *intent* of the call. Serializing the args works because the args fully determine the result for read-only tools. If a tool's output depended on time-of-call or external state, the 60s cache would serve stale results — which is why this codebase's MCP tools are all read-only-by-contract (covered in the guardrails note).
 
+**Where the cross-cutting concerns live in the repo.** The DataSource seam (the new layer above MCP, Phase 2): `lib/data-source/types.ts` defines the `DataSource` interface (`callTool` / `listTools` / `dispose`); `lib/data-source/index.ts` is the `makeDataSource(mode, sessionId)` factory; `lib/data-source/bloomreach-data-source.ts` is the relocated `BloomreachDataSource` (was `lib/mcp/client.ts`'s `McpClient`); `lib/data-source/olist-data-source.ts` spawns `mcp-server-olist` via `StdioClientTransport`; `lib/mcp/client.ts` is now a 17-line backwards-compat re-export (`McpClient` is `BloomreachDataSource`). The Bloomreach adapter's cross-cutting concerns: `BloomreachDataSource.callTool()` in `lib/data-source/bloomreach-data-source.ts` — same surface as the old `McpClient` (60s TTL cache; ~1.1s spacing; bounded exp-backoff retry; no-cache-on-error).
+
 ### Move 4 — Auth as a first-class concern (OAuth PKCE + DCR)
 
 The technical thing: **the MCP transport speaks OAuth — Dynamic Client Registration + PKCE — to acquire and refresh tokens to the Bloomreach host.**
@@ -225,6 +231,35 @@ auth wiring — the MCP auth provider
 The practical consequence: the agent never sees credentials. The route opens an authenticated MCP client, passes it down to each agent's constructor, and the agent just calls `call_tool(...)`. Refresh, code exchange, token persistence, and the one-time auto-reconnect on a revoked token (a UI-side handler guarded by a session-storage flag) all live below the agent's contract.
 
 The condition under which it works: the provider's `save_tokens` must persist across requests *for the same session*. That's done via session-cookie-keyed storage, so each user's tokens travel with their session, and a serverless instance that gets a different user's request reads that user's tokens — no cross-user leakage.
+
+**Where the transport and auth live in the repo.** `lib/mcp/transport.ts` — `SdkTransport` wraps `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`. `lib/mcp/connect.ts` — `BloomreachAuthProvider` implements OAuth (PKCE + DCR); `connectMcp()` wires the transport with `minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3` (L92–L96). The route boundary (one connect, one listTools per request, then slice) is `app/api/agent/route.ts` `GET` stream `start()` body — reads `?mode=` (default `'live-sql'`), calls `makeDataSource(mode, sid)`, calls `dsResult.bootstrap(signal)` for the schema (which knows per-adapter how to derive it: Bloomreach lists discovery tools; Olist returns the fixed `olistWorkspaceSchema()`), calls `dataSource.listTools({ signal })`, then constructs each agent with the shared `dataSource` + `allTools`.
+
+The authored MCP server (the new Olist surface, Phase 2): package `mcp-server-olist/` (sibling Node package, ~1800 LOC); tools at `mcp-server-olist/src/tools/get_metric_timeseries.ts` · `get_segments.ts` · `get_anomaly_context.ts`; data at `mcp-server-olist/data/olist.db` — SQLite, ~10k synthetic rows + a `seeded_anomalies` table holding 3 ground-truth records the agent never sees. Why three domain tools, not `execute_sql`: SQL is too sharp an edge for the agent — it would have to derive period-over-period math, segment cuts, and the anomaly-context join itself, every time, blowing the budget on plumbing. The authored tools pre-bake those queries; the agent reasons in domain terms ("revenue last 4w vs prior 12w by state"), and the eval suite (`eval/scripts/run-detection.ts`) becomes tractable because the agent's surface is small enough to score deterministically.
+
+```
+shape (not full impl):
+  // route.ts — pick mode, factory the adapter, discover, slice per agent
+  const mode = req.nextUrl.searchParams.get('mode') === 'live-bloomreach'
+             ? 'live-bloomreach' : 'live-sql';
+  const dsResult = await makeDataSource(mode, sid);
+  if (!dsResult.ok) return redirect(dsResult.authUrl);    // Bloomreach OAuth gate
+  const dataSource = dsResult.dataSource;
+  const schema     = await dsResult.bootstrap(signal);
+  const rawTools   = await dataSource.listTools({ signal });
+
+  const agents = {
+    monitoring: new MonitoringAgent(anth, dataSource, schema, rawTools.tools),
+    diagnostic: new DiagnosticAgent(anth, dataSource, schema, rawTools.tools),
+    recommendation: new RecommendationAgent(anth, dataSource, schema, rawTools.tools),
+    query: new QueryAgent(anth, dataSource, schema, rawTools.tools, sid),
+  };
+
+  // each agent's loop slices the list per its job
+  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // monitoring.ts
+
+  // base.ts — the round trip (DataSource seam, not McpClient)
+  const { result, durationMs, fromCache } = await dataSource.callTool(tu.name, tu.input);
+```
 
 ### Move 5 — The shape MCP buys vs the alternatives
 
@@ -306,72 +341,6 @@ The full substrate — what every reasoning pattern stands on
                 │   exposes ~27 tools, lists them via JSON-RPC    │
                 │   enforces per-user rate limit (~1 req/N sec)  │
                 └───────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**The loop seam (where MCP is called):**
-**File:** `lib/agents/base.ts`
-**Function:** `runAgentLoop()` — the `mcp.callTool(...)` call inside the tool_use loop
-**Line range:** L143–L150 (call), L161–L171 (tool_result back into messages)
-
-**Per-agent slicing:**
-**File:** `lib/agents/tool-schemas.ts`
-**Function:** `filterToolSchemas()`
-**Line range:** L9–L21
-
-The four allow-lists live in `lib/mcp/tools.ts` L5–L40 (`monitoringTools`, `diagnosticTools`, `recommendationTools`, `queryTools`). Each agent passes one to `filterToolSchemas` at construction (`monitoring.ts` L96, etc.).
-
-**The DataSource seam (the new layer above MCP — Phase 2):**
-**File:** `lib/data-source/types.ts` — `DataSource` interface (`callTool` / `listTools` / `dispose`)
-**File:** `lib/data-source/index.ts` — `makeDataSource(mode, sessionId)` factory; bootstrap moved here per adapter
-**File:** `lib/data-source/bloomreach-data-source.ts` — the relocated `BloomreachDataSource` (was `lib/mcp/client.ts`'s `McpClient`)
-**File:** `lib/data-source/olist-data-source.ts` — spawns `mcp-server-olist` via `StdioClientTransport`
-**File:** `lib/mcp/client.ts` — now a 17-line backwards-compat re-export (`McpClient` is `BloomreachDataSource`)
-
-**The Bloomreach adapter's cross-cutting concerns:**
-**File:** `lib/data-source/bloomreach-data-source.ts`
-**Function:** `BloomreachDataSource.callTool()` — same surface as the old `McpClient` (60s TTL cache; ~1.1s spacing; bounded exp-backoff retry; no-cache-on-error)
-
-**The transport (MCP SDK):**
-**File:** `lib/mcp/transport.ts` — `SdkTransport` wraps `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport`.
-**File:** `lib/mcp/connect.ts` — `BloomreachAuthProvider` implements OAuth (PKCE + DCR); `connectMcp()` wires the transport with `minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3` (L92–L96).
-
-**The route boundary (one connect, one listTools per request, then slice):**
-**File:** `app/api/agent/route.ts`
-**Function:** the `GET` stream `start()` body — reads `?mode=` (default `'live-sql'`), calls `makeDataSource(mode, sid)`, calls `dsResult.bootstrap(signal)` for the schema (which knows per-adapter how to derive it: Bloomreach lists discovery tools; Olist returns the fixed `olistWorkspaceSchema()`), calls `dataSource.listTools({ signal })`, then constructs each agent with the shared `dataSource` + `allTools`.
-
-**The authored MCP server (the new Olist surface — Phase 2):**
-**Package:** `mcp-server-olist/` (sibling Node package, ~1800 LOC)
-**Tools:** `mcp-server-olist/src/tools/get_metric_timeseries.ts` · `get_segments.ts` · `get_anomaly_context.ts`
-**Data:** `mcp-server-olist/data/olist.db` — SQLite, ~10k synthetic rows + a `seeded_anomalies` table holding 3 ground-truth records the agent never sees
-**Why three domain tools, not `execute_sql`:** SQL is too sharp an edge for the agent — it would have to derive period-over-period math, segment cuts, and the anomaly-context join itself, every time, blowing the budget on plumbing. The authored tools pre-bake those queries; the agent reasons in domain terms ("revenue last 4w vs prior 12w by state"), and the eval suite (`eval/scripts/run-detection.ts`) becomes tractable because the agent's surface is small enough to score deterministically.
-
-```
-shape (not full impl):
-  // route.ts — pick mode, factory the adapter, discover, slice per agent
-  const mode = req.nextUrl.searchParams.get('mode') === 'live-bloomreach'
-             ? 'live-bloomreach' : 'live-sql';
-  const dsResult = await makeDataSource(mode, sid);
-  if (!dsResult.ok) return redirect(dsResult.authUrl);    // Bloomreach OAuth gate
-  const dataSource = dsResult.dataSource;
-  const schema     = await dsResult.bootstrap(signal);
-  const rawTools   = await dataSource.listTools({ signal });
-
-  const agents = {
-    monitoring: new MonitoringAgent(anth, dataSource, schema, rawTools.tools),
-    diagnostic: new DiagnosticAgent(anth, dataSource, schema, rawTools.tools),
-    recommendation: new RecommendationAgent(anth, dataSource, schema, rawTools.tools),
-    query: new QueryAgent(anth, dataSource, schema, rawTools.tools, sid),
-  };
-
-  // each agent's loop slices the list per its job
-  toolSchemas: filterToolSchemas(this.allTools, monitoringTools), // monitoring.ts
-
-  // base.ts — the round trip (DataSource seam, not McpClient)
-  const { result, durationMs, fromCache } = await dataSource.callTool(tu.name, tu.input);
 ```
 
 ---

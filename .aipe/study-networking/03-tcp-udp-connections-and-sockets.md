@@ -89,6 +89,12 @@ The outbounds happen inside the inbound. If undici reuses a connection (warm poo
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **Inbound stream lifecycle.** Every long route (`/api/briefing`, `/api/agent`) constructs `new Response(stream, …)` and relies on `controller.close()` in a `finally` block to release the socket.
+  → **Outbound to Bloomreach.** Every `mcp.callTool(...)` from `lib/agents/*` ends in `lib/mcp/transport.ts`'s `client.callTool`, which is undici default agent under the SDK.
+  → **Outbound to Anthropic.** Every `new Anthropic({ apiKey })` at the top of an agent run; the client's internal pool dies with the function call.
+
 **The inbound connection: opened by the browser, held by the ReadableStream.** The browser's `fetch()` opens a TCP connection to `<app>.vercel.app` (or reuses one from its keep-alive pool). TLS handshake. HTTP request. The server returns a `Response` whose body is a `ReadableStream`. As long as the stream is not closed, the socket stays open. Bytes flow whenever the producer calls `controller.enqueue(...)`. The browser's reader loop wakes up per chunk.
 
 ```
@@ -112,6 +118,36 @@ Inbound lifecycle — held open by the stream
 ```
 
 The boundary that catches people: if the producer throws and the `finally` doesn't close the controller, the socket can hang until Vercel's `maxDuration` fires and kills the function. That's why every stream in this repo has a `try { … } finally { controller.close() }` pattern.
+
+The real `try / finally` that guards inbound socket release:
+
+```
+app/api/agent/route.ts  (lines 169-264)
+
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    …
+    try {
+      …agent runs, controller.enqueue per event…
+    } catch (e) {
+      send({ type: 'error', message: `/api/agent · …` });
+                          │
+                          └─ producer-side error: caught, surfaced as
+                             a final NDJSON line so the client renders
+                             "error" instead of seeing a silent close.
+    } finally {
+      controller.close();
+                          │
+                          └─ load-bearing: without this, an uncaught
+                             throw leaves the underlying socket
+                             half-open until Vercel kills the function
+                             at maxDuration=300. With it, the socket
+                             releases immediately on completion or
+                             failure.
+    }
+  },
+});
+```
 
 **Why the inbound socket has to stay open: NDJSON has no checkpoint.** Unlike SSE (which the browser auto-reconnects on disconnect, replaying from a `Last-Event-ID`), NDJSON over `fetch` has no resumption. If the inbound TCP drops mid-investigation, the client cannot ask "resume from event 42" — it has to restart the whole agent run. So the inbound socket lives or dies with the request; there is no in-between.
 
@@ -179,6 +215,57 @@ The pattern that catches people: each route invocation builds a fresh `Anthropic
 
 **No app-layer per-call timeout.** Neither outbound fetch sets `AbortController`+`signal`. The only timeout is Vercel's `maxDuration=300` which kills the entire function — not the specific stuck call. If a Bloomreach socket hangs at minute 2, the user gets no events for minutes 2–5, then a hard kill, then nothing. This is `red flag #1` in `08-networking-red-flags-audit.md`.
 
+The fetch wrapper is the obvious insertion point for the missing timeout — it already exists, just doesn't add a signal:
+
+```
+lib/mcp/transport.ts  (lines 24-36)
+
+export function makeCapturingFetch(holder: HttpErrorHolder): FetchLike {
+  return async (url, init) => {
+    const res = await fetch(url, init);
+                          │
+                          └─ no AbortController, no signal, no timeout.
+                             undici's defaults are what we get. The
+                             insertion point for a future per-call
+                             timeout is HERE — wrap init.signal with
+                             AbortSignal.timeout(N).
+    if (!res.ok) {
+      try {
+        holder.last = { status: res.status, body: (await res.clone().text()).slice(0, MAX_BODY) };
+      } catch {
+        /* body unreadable / already consumed — leave the holder as-is */
+      }
+    }
+    return res;
+  };
+}
+```
+
+Proactive spacing — the one "rate" we control at the socket layer:
+
+```
+lib/mcp/client.ts  (lines 148-163)
+
+private async liveCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+                          │
+                          └─ not a socket-level rate-limit; this is an
+                             in-process sleep BEFORE we issue the
+                             outbound fetch. The socket itself sees no
+                             special pacing. Default minIntervalMs=1100
+                             matches the observed 1-req/s upstream
+                             rule.
+  }
+  try {
+    const result = await this.transport.callTool(name, args);
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) { … }
+}
+```
+
 ### Principle
 
 Connection lifecycle decisions are usually about latency vs cost: longer-lived connections amortise handshake, but they cost memory and resource on both ends. The default platform behaviour is right for this app's scale (one user at a time, single-digit calls per request); the absence of explicit configuration is a deliberate choice, not an oversight, and the cost of revisiting it is "instrument before you tune." Pool, timeout, and reuse are *measurable*; pick the budget first, measure, then configure.
@@ -221,97 +308,6 @@ Service band ──────────────────────�
 │  • ~6 per investigation     │                │  • ~4 per investigation  │
 │  • pool reuse opportunistic │                │  • streamed bodies       │
 └─────────────────────────────┘                └──────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **Inbound stream lifecycle.** Every long route (`/api/briefing`, `/api/agent`) constructs `new Response(stream, …)` and relies on `controller.close()` in a `finally` block to release the socket.
-  → **Outbound to Bloomreach.** Every `mcp.callTool(...)` from `lib/agents/*` ends in `lib/mcp/transport.ts`'s `client.callTool`, which is undici default agent under the SDK.
-  → **Outbound to Anthropic.** Every `new Anthropic({ apiKey })` at the top of an agent run; the client's internal pool dies with the function call.
-
-### The `try / finally` that guards inbound socket release
-
-```
-app/api/agent/route.ts  (lines 169-264)
-
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    …
-    try {
-      …agent runs, controller.enqueue per event…
-    } catch (e) {
-      send({ type: 'error', message: `/api/agent · …` });
-                          │
-                          └─ producer-side error: caught, surfaced as
-                             a final NDJSON line so the client renders
-                             "error" instead of seeing a silent close.
-    } finally {
-      controller.close();
-                          │
-                          └─ load-bearing: without this, an uncaught
-                             throw leaves the underlying socket
-                             half-open until Vercel kills the function
-                             at maxDuration=300. With it, the socket
-                             releases immediately on completion or
-                             failure.
-    }
-  },
-});
-```
-
-### The fetch-wrapper insertion point (no per-call timeout today)
-
-```
-lib/mcp/transport.ts  (lines 24-36)
-
-export function makeCapturingFetch(holder: HttpErrorHolder): FetchLike {
-  return async (url, init) => {
-    const res = await fetch(url, init);
-                          │
-                          └─ no AbortController, no signal, no timeout.
-                             undici's defaults are what we get. The
-                             insertion point for a future per-call
-                             timeout is HERE — wrap init.signal with
-                             AbortSignal.timeout(N).
-    if (!res.ok) {
-      try {
-        holder.last = { status: res.status, body: (await res.clone().text()).slice(0, MAX_BODY) };
-      } catch {
-        /* body unreadable / already consumed — leave the holder as-is */
-      }
-    }
-    return res;
-  };
-}
-```
-
-### Proactive spacing — the only "rate" we control at the socket layer
-
-```
-lib/mcp/client.ts  (lines 148-163)
-
-private async liveCall(name: string, args: Record<string, unknown>): Promise<unknown> {
-  const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-                          │
-                          └─ not a socket-level rate-limit; this is an
-                             in-process sleep BEFORE we issue the
-                             outbound fetch. The socket itself sees no
-                             special pacing. Default minIntervalMs=1100
-                             matches the observed 1-req/s upstream
-                             rule.
-  }
-  try {
-    const result = await this.transport.callTool(name, args);
-    this.lastCallAt = Date.now();
-    return result;
-  } catch (err) { … }
-}
 ```
 
 ---

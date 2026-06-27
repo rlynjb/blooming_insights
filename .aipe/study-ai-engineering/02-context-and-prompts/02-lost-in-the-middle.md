@@ -182,6 +182,22 @@ When you cannot control *what* is in the context, control *where* it sits. Posit
 
 ---
 
+### Code in this codebase
+
+**Not yet mitigated by retrieval.** blooming insights has no RAG, no embeddings, and no reranker, so there is no retrieval-ordering step to push the most relevant content to the high-attention ends — it gathers evidence live via MCP tool calls and relies purely on *conversation* recency for placement. What it does, deliberately, is keep its load-bearing content at the end of the context.
+
+#### Files, functions, and line ranges
+
+- **`synthesisInstruction` appended last:** `lib/agents/base.ts` L95–L98 — the directive is concatenated to the end of the system prompt on the `forceFinal` turn. Per-agent instruction text: `lib/agents/diagnostic.ts` L63–L67, `lib/agents/recommendation.ts` L58–L62, `lib/agents/monitoring.ts` L85–L89.
+- **Tool results as the most-recent turn:** `lib/agents/base.ts` L171 — `messages.push({ role: 'user', content: toolResults })`; the array starts at L79–L81 and grows with each assistant turn (L105) and each result batch (L171).
+- **Context-collapsing escape hatch:** `lib/agents/diagnostic.ts` L87–L126 (`synthesize()`) and `lib/agents/recommendation.ts` L82–L132 — a fresh single-turn call with a short flat context and the directive at the end (e.g. `diagnostic.ts` L105–L113).
+
+#### Where retrieval reordering would live
+
+A reranking step would sit in a new `lib/mcp/` module (e.g. `rerank.ts`) called *between* gathering tool results and feeding them back at `lib/agents/base.ts` L171 — it would score each result against the anomaly/diagnosis and reorder the batch so the most relevant payloads land at the head and tail of what is fed back, rather than in whatever order the model happened to call the tools. The retrieval that would precede it is the broader Case B in → ../03-retrieval-and-rag/.
+
+---
+
 ## Lost in the middle — diagram
 
 This diagram spans the layers where positional placement is decided. The Service layer constructs the message order and the system-prompt order; the Provider boundary is where the ordered context meets the model's U-shaped attention. There is no retrieval/rerank layer — its absence is the point.
@@ -216,22 +232,6 @@ This diagram spans the layers where positional placement is decided. The Service
 ```
 
 The Service layer places the must-obey directive and the freshest evidence at the strong ends. The retrieval/rerank layer that would govern *what* sits in the middle does not exist — recency placement is the whole mitigation here.
-
----
-
-## Implementation in codebase
-
-**Not yet mitigated by retrieval.** blooming insights has no RAG, no embeddings, and no reranker, so there is no retrieval-ordering step to push the most relevant content to the high-attention ends — it gathers evidence live via MCP tool calls and relies purely on *conversation* recency for placement. What it does, deliberately, is keep its load-bearing content at the end of the context.
-
-### Files, functions, and line ranges
-
-- **`synthesisInstruction` appended last:** `lib/agents/base.ts` L95–L98 — the directive is concatenated to the end of the system prompt on the `forceFinal` turn. Per-agent instruction text: `lib/agents/diagnostic.ts` L63–L67, `lib/agents/recommendation.ts` L58–L62, `lib/agents/monitoring.ts` L85–L89.
-- **Tool results as the most-recent turn:** `lib/agents/base.ts` L171 — `messages.push({ role: 'user', content: toolResults })`; the array starts at L79–L81 and grows with each assistant turn (L105) and each result batch (L171).
-- **Context-collapsing escape hatch:** `lib/agents/diagnostic.ts` L87–L126 (`synthesize()`) and `lib/agents/recommendation.ts` L82–L132 — a fresh single-turn call with a short flat context and the directive at the end (e.g. `diagnostic.ts` L105–L113).
-
-### Where retrieval reordering would live
-
-A reranking step would sit in a new `lib/mcp/` module (e.g. `rerank.ts`) called *between* gathering tool results and feeding them back at `lib/agents/base.ts` L171 — it would score each result against the anomaly/diagnosis and reorder the batch so the most relevant payloads land at the head and tail of what is fed back, rather than in whatever order the model happened to call the tools. The retrieval that would precede it is the broader Case B in → ../03-retrieval-and-rag/.
 
 ---
 

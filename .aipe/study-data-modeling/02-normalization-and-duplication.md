@@ -322,6 +322,113 @@ The `Diagnosis` interface in `types.ts` has rich `hypothesesConsidered: { hypoth
 
 Normalization is information hiding for data. The test is the same: **search the codebase for the field list and count occurrences.** One = normalized. Two with one of them named as a deliberate denormalization = correct denormalization. Two or three with no single owner = a leak. In this repo, the `Insight` field list occurs in three files (types, state, route); two of them are not enforced by the compiler. That's the audit, and it's exactly the same finding the software-design audit names — the lens is different (data shape vs information hiding), the bug is the same.
 
+### Code in this codebase
+
+The repo anchors for what Move 2 walked — both copy functions colocated, the parallel-Maps denormalization, and the derived-field projection.
+
+#### Both copy functions, now colocated
+
+```
+lib/state/insights.ts  (lines 25–55)
+
+  export function anomalyToInsight(a: Anomaly): Insight {
+    const id = crypto.randomUUID();
+    const sign = a.change.direction === 'down' ? '-' : '+';
+    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
+    return {
+      id, timestamp: new Date().toISOString(),
+      severity: a.severity,        ← COPY
+      headline,                     ← derived
+      summary: ...,                 ← derived
+      metric: a.metric,             ← COPY
+      change: a.change,             ← COPY
+      scope: a.scope,               ← COPY
+      source: 'monitoring',         ← stamped
+      evidence: a.evidence,         ← COPY
+      impact: a.impact,             ← COPY
+      history: a.history,           ← COPY
+      category: a.category,         ← COPY
+      ...deriveInsightFields(a),    ← +5 derived (currently only revenueImpact)
+    };
+  }
+
+  /**
+   * Reverse mapper. Intentionally drops evidence/impact/history/category —
+   * the agent loop only needs metric/scope/change/severity to investigate;
+   * the rest is regenerated downstream. The dropped fields are tested in
+   * test/state/insights.test.ts (round-trip suite).
+   */
+  export function insightToAnomaly(i: Insight): Anomaly {
+    return { metric: i.metric, scope: i.scope, change: i.change,
+             severity: i.severity, evidence: [] };
+  }
+       │
+       └─ both functions, one module, one doc comment naming the drop.
+          the test/state/insights.test.ts round-trip catches drift on every
+          future change. the schema-side leak is retired.
+```
+
+#### The intentional denormalization — the parallel Maps
+
+```
+lib/state/insights.ts  (lines 4–6, 30–42)
+
+  const insights = new Map<string, Insight>();
+  const investigations = new Map<string, Investigation>();
+  const anomalies = new Map<string, Anomaly>();   ← parallel store
+       │
+       │ no comment names why the parallel exists. it's because:
+       │   - Insight is lossy (evidence stays carried but everything
+       │     else is derived/denormalized)
+       │   - the diagnostic agent wants the original Anomaly
+       │   - so we keep both, keyed by the same id
+       │
+       └ add a one-line comment: "raw Anomaly kept alongside Insight
+         so the diagnostic agent can investigate from the original
+         agent output (Insight is a UI-friendly enriched view)."
+
+  export function putInsights(items: Insight[], rawAnomalies?: Anomaly[]): void {
+    insights.clear();
+    anomalies.clear();
+    items.forEach((i, idx) => {
+      insights.set(i.id, i);
+      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
+    });
+  }
+       │
+       └─ the parallel insert. the integrity invariant: every key in
+          `insights` should have a matching key in `anomalies` IF
+          rawAnomalies is passed. file 04 picks up what enforces that.
+```
+
+#### The derived-field denormalization — revenueImpact
+
+```
+lib/insights/derive.ts  (lines 27–40)
+
+  const REVENUE_RE = /revenue|sales|gmv|total_price|spend/i;
+
+  export function deriveInsightFields(anomaly: Anomaly): Partial<Insight> {
+    const out: Partial<Insight> = {};
+    const cp = findCurrentPrior(anomaly.evidence);   ← scan evidence array
+    if (cp && REVENUE_RE.test(anomaly.metric) && anomaly.change.direction === 'down') {
+      out.revenueImpact = {
+        lostUsd: Math.round(cp.current - cp.prior),   ← computed at write time
+        expectedUsd: Math.round(cp.prior),
+        currency: 'USD',
+      };
+    }
+    return out;
+  }
+       │
+       └─ this IS the denormalization: revenueImpact is a stored projection
+          of evidence + metric + change. computed once at write, read N times
+          by the UI. correct denormalization — the input (evidence) is also
+          kept on the Insight, so the projection is reproducible if the rules
+          change. (the agent can also emit revenueImpact directly; precedence
+          is "spread last wins" — the derived value overrides the agent's.)
+```
+
 ---
 
 ## Primary diagram
@@ -377,113 +484,6 @@ The duplication audit, ranked.
      declared on Insight (types.ts L59), commented as "denormalized
      from Diagnosis", no code path actually writes it.
      fix: ship the write path or remove the field until it's wired.
-```
-
----
-
-## Implementation in codebase
-
-### Both copy functions, now colocated
-
-```
-lib/state/insights.ts  (lines 25–55)
-
-  export function anomalyToInsight(a: Anomaly): Insight {
-    const id = crypto.randomUUID();
-    const sign = a.change.direction === 'down' ? '-' : '+';
-    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
-    return {
-      id, timestamp: new Date().toISOString(),
-      severity: a.severity,        ← COPY
-      headline,                     ← derived
-      summary: ...,                 ← derived
-      metric: a.metric,             ← COPY
-      change: a.change,             ← COPY
-      scope: a.scope,               ← COPY
-      source: 'monitoring',         ← stamped
-      evidence: a.evidence,         ← COPY
-      impact: a.impact,             ← COPY
-      history: a.history,           ← COPY
-      category: a.category,         ← COPY
-      ...deriveInsightFields(a),    ← +5 derived (currently only revenueImpact)
-    };
-  }
-
-  /**
-   * Reverse mapper. Intentionally drops evidence/impact/history/category —
-   * the agent loop only needs metric/scope/change/severity to investigate;
-   * the rest is regenerated downstream. The dropped fields are tested in
-   * test/state/insights.test.ts (round-trip suite).
-   */
-  export function insightToAnomaly(i: Insight): Anomaly {
-    return { metric: i.metric, scope: i.scope, change: i.change,
-             severity: i.severity, evidence: [] };
-  }
-       │
-       └─ both functions, one module, one doc comment naming the drop.
-          the test/state/insights.test.ts round-trip catches drift on every
-          future change. the schema-side leak is retired.
-```
-
-### The intentional denormalization — the parallel Maps
-
-```
-lib/state/insights.ts  (lines 4–6, 30–42)
-
-  const insights = new Map<string, Insight>();
-  const investigations = new Map<string, Investigation>();
-  const anomalies = new Map<string, Anomaly>();   ← parallel store
-       │
-       │ no comment names why the parallel exists. it's because:
-       │   - Insight is lossy (evidence stays carried but everything
-       │     else is derived/denormalized)
-       │   - the diagnostic agent wants the original Anomaly
-       │   - so we keep both, keyed by the same id
-       │
-       └ add a one-line comment: "raw Anomaly kept alongside Insight
-         so the diagnostic agent can investigate from the original
-         agent output (Insight is a UI-friendly enriched view)."
-
-  export function putInsights(items: Insight[], rawAnomalies?: Anomaly[]): void {
-    insights.clear();
-    anomalies.clear();
-    items.forEach((i, idx) => {
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ the parallel insert. the integrity invariant: every key in
-          `insights` should have a matching key in `anomalies` IF
-          rawAnomalies is passed. file 04 picks up what enforces that.
-```
-
-### The derived-field denormalization — revenueImpact
-
-```
-lib/insights/derive.ts  (lines 27–40)
-
-  const REVENUE_RE = /revenue|sales|gmv|total_price|spend/i;
-
-  export function deriveInsightFields(anomaly: Anomaly): Partial<Insight> {
-    const out: Partial<Insight> = {};
-    const cp = findCurrentPrior(anomaly.evidence);   ← scan evidence array
-    if (cp && REVENUE_RE.test(anomaly.metric) && anomaly.change.direction === 'down') {
-      out.revenueImpact = {
-        lostUsd: Math.round(cp.current - cp.prior),   ← computed at write time
-        expectedUsd: Math.round(cp.prior),
-        currency: 'USD',
-      };
-    }
-    return out;
-  }
-       │
-       └─ this IS the denormalization: revenueImpact is a stored projection
-          of evidence + metric + change. computed once at write, read N times
-          by the UI. correct denormalization — the input (evidence) is also
-          kept on the Insight, so the projection is reproducible if the rules
-          change. (the agent can also emit revenueImpact directly; precedence
-          is "spread last wins" — the derived value overrides the agent's.)
 ```
 
 ---

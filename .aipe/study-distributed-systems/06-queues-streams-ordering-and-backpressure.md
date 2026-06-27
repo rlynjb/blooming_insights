@@ -98,6 +98,11 @@ Three load-bearing parts:
 
 ### Move 2 — the moving parts
 
+**Use cases.**
+- A diagnostic agent runs for ~30 seconds against a slow EQL. Without streaming, the user would see a spinner the whole time. With NDJSON streaming, the user sees `reasoning_step → tool_call_start → tool_call_end → reasoning_step → diagnosis → done` as each step happens. The UX is "visibly working" instead of "appears frozen."
+- The briefing emits coverage tiles (`coverage_item` events) one at a time, paced with checklist log lines. The UI renders each tile as its event arrives — the coverage grid fills in step with the status log. Single-stream ordering makes this pacing trivial; with separate parallel requests, the grid and log could desync.
+- Demo mode replays a pre-recorded `AgentEvent[]` from disk through the same `ReadableStream` mechanism. The consumer cannot tell live from replay — both are NDJSON, both have the same event types, both are paced. The replay paces deliberately (180ms gap) to look natural.
+
 #### Part 1 — the producer (server-side `ReadableStream`)
 
 The route handler returns a `Response` whose body is a `ReadableStream<Uint8Array>`. The stream's `start(controller)` runs the agent and `enqueue`s events as they happen.
@@ -125,6 +130,36 @@ The route handler returns a `Response` whose body is a `ReadableStream<Uint8Arra
 ```
 
 The `try / catch / finally` pattern is load-bearing: it ensures `controller.close()` runs even when the agent throws, so the consumer's reader doesn't hang. Without the `finally`, an uncaught exception would close the connection abruptly (the consumer sees a network error, not a clean end).
+
+```
+  app/api/agent/route.ts  (lines 168-264)
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const collected: AgentEvent[] = [];                ← also stored locally,
+      const send = (e: AgentEvent) => {                     for the saveInvestigation
+        collected.push(e);                                  call at the end
+        controller.enqueue(encoder.encode(encodeEvent(e)));
+      };
+      // ... agent loop with hooks that call send ...
+      try {
+        // ... run diagnostic + recommendation agents ...
+        send({ type: 'done' });
+        if (step == null) saveInvestigation(insightId!, collected);
+      } catch (e) {
+        send({ type: 'error', message: ... });
+      } finally {
+        controller.close();                              ← always close,
+      }                                                     even on throw
+    },
+  });
+  return new Response(stream, { headers: NDJSON_HEADERS });
+       │
+       └─ this is the producer side. The `send` closure is the seam
+          between agent code (which emits domain events) and stream
+          code (which serializes them). Same pattern in /api/briefing.
+```
 
 #### Part 2 — the consumer (browser `fetch().body.getReader()`)
 
@@ -156,6 +191,40 @@ The client opens a fetch, gets a `ReadableStreamDefaultReader` from the response
 ```
 
 The boundary condition that gets people: `value` from `reader.read()` is **not aligned to newlines**. A single chunk might be the middle of one event, or the end of one event plus the start of another. The buffer-and-split pattern handles both cases — `lines.pop()` keeps the incomplete last line for the next iteration, joining it with whatever comes next.
+
+```
+  lib/hooks/useInvestigation.ts  (lines 184-208)
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });          ← stream: true is
+                                                            critical — handles
+                                                            multi-byte chars
+                                                            that span chunks
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';                             ← LOAD-BEARING:
+                                                            keep the trailing
+                                                            incomplete line
+                                                            for the next chunk
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        handle(JSON.parse(line) as AgentEvent);          ← per-line, not
+      } catch { /* ignore malformed line */ }              per-chunk parsing
+    }
+  }
+  if (buf.trim()) {
+    try { handle(JSON.parse(buf) as AgentEvent); } catch {}  ← flush trailing
+  }                                                            complete event
+       │
+       └─ this is the consumer side. The buffer-and-split is the
+          load-bearing part — without it, chunks that don't align with
+          newlines would either lose events or fail to parse.
+```
 
 #### Part 3 — backpressure (implicit, via the transport)
 
@@ -219,6 +288,33 @@ The cached/demo replay path is a *fake* streaming producer — it re-emits a pre
 ```
 
 The consumer cannot distinguish replay from live — both look like a paced stream of events. This is what makes the demo mode work without credentials.
+
+```
+  lib/mcp/events.ts  (lines 4-22)
+
+  export type AgentEvent =
+    | { type: 'reasoning_step'; step: ReasoningStep }
+    | { type: 'tool_call_start'; toolName: string; agent: AgentName }
+    | { type: 'tool_call_end'; toolName: string; agent: AgentName;
+        durationMs: number; result?: unknown; error?: string }
+    | { type: 'insight'; insight: Insight }
+    | { type: 'diagnosis'; diagnosis: Diagnosis }
+    | { type: 'recommendation'; recommendation: Recommendation }
+    | { type: 'done' }
+    | { type: 'error'; message: string };
+
+  export function encodeEvent(e: AgentEvent): string {
+    return JSON.stringify(e) + '\n';
+  }
+  export function decodeEvent(line: string): AgentEvent {
+    return JSON.parse(line) as AgentEvent;
+  }
+       │
+       └─ the event ALGEBRA — single source of truth for what can
+          flow over the stream. Both producer and consumer import the
+          same type, so adding a new event type forces both to update.
+          Encode/decode are deliberately minimal — JSON + newline.
+```
 
 #### Part 6 — what NOT YET EXERCISED looks like
 
@@ -317,108 +413,6 @@ The right next move for the first of these is Vercel Cron Jobs + a database for 
   ordering: emitted-order, guaranteed by single-connection chunked transfer
   backpressure: implicit, via TCP / ReadableStream's underlying transport
   delivery: at-most-once per stream (no resume on disconnect)
-```
-
----
-
-## Implementation in codebase
-
-**Use cases.**
-- A diagnostic agent runs for ~30 seconds against a slow EQL. Without streaming, the user would see a spinner the whole time. With NDJSON streaming, the user sees `reasoning_step → tool_call_start → tool_call_end → reasoning_step → diagnosis → done` as each step happens. The UX is "visibly working" instead of "appears frozen."
-- The briefing emits coverage tiles (`coverage_item` events) one at a time, paced with checklist log lines. The UI renders each tile as its event arrives — the coverage grid fills in step with the status log. Single-stream ordering makes this pacing trivial; with separate parallel requests, the grid and log could desync.
-- Demo mode replays a pre-recorded `AgentEvent[]` from disk through the same `ReadableStream` mechanism. The consumer cannot tell live from replay — both are NDJSON, both have the same event types, both are paced. The replay paces deliberately (180ms gap) to look natural.
-
-**Code side by side.**
-
-```
-  app/api/agent/route.ts  (lines 168-264)
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const collected: AgentEvent[] = [];                ← also stored locally,
-      const send = (e: AgentEvent) => {                     for the saveInvestigation
-        collected.push(e);                                  call at the end
-        controller.enqueue(encoder.encode(encodeEvent(e)));
-      };
-      // ... agent loop with hooks that call send ...
-      try {
-        // ... run diagnostic + recommendation agents ...
-        send({ type: 'done' });
-        if (step == null) saveInvestigation(insightId!, collected);
-      } catch (e) {
-        send({ type: 'error', message: ... });
-      } finally {
-        controller.close();                              ← always close,
-      }                                                     even on throw
-    },
-  });
-  return new Response(stream, { headers: NDJSON_HEADERS });
-       │
-       └─ this is the producer side. The `send` closure is the seam
-          between agent code (which emits domain events) and stream
-          code (which serializes them). Same pattern in /api/briefing.
-```
-
-```
-  lib/hooks/useInvestigation.ts  (lines 184-208)
-
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });          ← stream: true is
-                                                            critical — handles
-                                                            multi-byte chars
-                                                            that span chunks
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';                             ← LOAD-BEARING:
-                                                            keep the trailing
-                                                            incomplete line
-                                                            for the next chunk
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        handle(JSON.parse(line) as AgentEvent);          ← per-line, not
-      } catch { /* ignore malformed line */ }              per-chunk parsing
-    }
-  }
-  if (buf.trim()) {
-    try { handle(JSON.parse(buf) as AgentEvent); } catch {}  ← flush trailing
-  }                                                            complete event
-       │
-       └─ this is the consumer side. The buffer-and-split is the
-          load-bearing part — without it, chunks that don't align with
-          newlines would either lose events or fail to parse.
-```
-
-```
-  lib/mcp/events.ts  (lines 4-22)
-
-  export type AgentEvent =
-    | { type: 'reasoning_step'; step: ReasoningStep }
-    | { type: 'tool_call_start'; toolName: string; agent: AgentName }
-    | { type: 'tool_call_end'; toolName: string; agent: AgentName;
-        durationMs: number; result?: unknown; error?: string }
-    | { type: 'insight'; insight: Insight }
-    | { type: 'diagnosis'; diagnosis: Diagnosis }
-    | { type: 'recommendation'; recommendation: Recommendation }
-    | { type: 'done' }
-    | { type: 'error'; message: string };
-
-  export function encodeEvent(e: AgentEvent): string {
-    return JSON.stringify(e) + '\n';
-  }
-  export function decodeEvent(line: string): AgentEvent {
-    return JSON.parse(line) as AgentEvent;
-  }
-       │
-       └─ the event ALGEBRA — single source of truth for what can
-          flow over the stream. Both producer and consumer import the
-          same type, so adding a new event type forces both to update.
-          Encode/decode are deliberately minimal — JSON + newline.
 ```
 
 ---

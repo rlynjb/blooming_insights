@@ -158,6 +158,14 @@ When two retrievers disagree because they measure different things, the robust w
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented.** blooming insights retrieves live via a single sparse path — `execute_analytics_eql` against Bloomreach — so there is no second (dense) retriever to fuse and no rank fusion anywhere.
+
+There is no honest in-codebase analog beyond the sparse leg itself: the agents already do exact-term EQL retrieval (`lib/mcp/tools.ts` L11/L16), which would be one of the two lists a hybrid retriever fuses. Hybrid retrieval has nothing to fuse it *with* until the dense path from `05-dense-vs-sparse.md` exists. When both legs exist, the fusion would live in a `lib/mcp/retrieval.ts` `hybridSearch` over the past-investigation corpus (`lib/state/investigations.ts`); the analytics path stays sparse-only because aggregates have no meaning axis. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Hybrid retrieval + RRF — diagram
 
 This diagram spans the Service layer (parallel retrievers + fusion). A reader who sees only this should grasp that two retrievers run in parallel and a position-based fusion merges them without touching raw scores.
@@ -185,14 +193,6 @@ This diagram spans the Service layer (parallel retrievers + fusion). A reader wh
 ```
 
 The fusion node is the whole point: it merges two orderings using only positions, so the cosine-vs-BM25 scale mismatch never matters.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented.** blooming insights retrieves live via a single sparse path — `execute_analytics_eql` against Bloomreach — so there is no second (dense) retriever to fuse and no rank fusion anywhere.
-
-There is no honest in-codebase analog beyond the sparse leg itself: the agents already do exact-term EQL retrieval (`lib/mcp/tools.ts` L11/L16), which would be one of the two lists a hybrid retriever fuses. Hybrid retrieval has nothing to fuse it *with* until the dense path from `05-dense-vs-sparse.md` exists. When both legs exist, the fusion would live in a `lib/mcp/retrieval.ts` `hybridSearch` over the past-investigation corpus (`lib/state/investigations.ts`); the analytics path stays sparse-only because aggregates have no meaning axis. The `Project exercises` block below is the primary buildable target.
 
 ---
 

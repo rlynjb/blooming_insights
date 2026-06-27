@@ -109,6 +109,16 @@ Skeleton mapped. Now walk the union, the encoder, and what the consumers do with
 
 ### Move 2 — walk the parts
 
+**Use cases.** Three real moments the union earns its keep:
+
+- **Adding a new agent or output kind.** When you wire `lib/agents/coordinator.ts` or extend the categories, the union tells you exactly what changes: add a variant if there's a new *kind* of output (e.g. `coordinator_plan`); reuse `reasoning_step` if it's just more agent text. Every downstream consumer is forced by the compiler to handle the new variant — there's no place to forget. The compiler is the lint rule.
+
+- **Replaying a captured investigation.** The cache stores `AgentEvent[]`. The replay path iterates the array and calls `encodeEvent(e)` on each one — same function used live. There's no replay-specific code path that could drift; the union enforces shape parity. This is what makes the seed file (`lib/state/demo-investigations.json`) a *real* fixture rather than a brittle JSON blob.
+
+- **The briefing route extends the vocabulary.** `BriefingEvent` (declared locally in `app/api/briefing/route.ts:54–58`) is `AgentEvent` plus three extra variants (`coverage_item`, `insight`, `workspace`). The extension is clean because the shared union stays closed and the extras are scoped to the route. No conflict, no shape drift; the discriminator distinguishes everything.
+
+- **AptKit traces converge onto this same surface.** `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) implements AptKit's `CapabilityTraceSink`. It receives AptKit's `CapabilityEvent`s (`step` / `tool_call_start` / `tool_call_end`) and calls Blooming's existing `onText`/`onToolCall`/`onToolResult` hooks — which emit `reasoning_step`/`tool_call_start`/`tool_call_end` variants on the same NDJSON stream. The system grew a new agent runtime but did NOT grow a new observability surface. One stream, multiple producers; the closed union is what makes that work — AptKit had to map its event types into ours rather than co-existing as a parallel format.
+
 #### The 8 variants — the closed set
 
 The reader anchor: you've used Redux actions. Same shape. The discriminator (Redux's `type`, TypeScript's `kind`/`type`) is the field the consumer switches on; the rest of each variant is its payload. The 8 variants here aren't arbitrary — each one represents a distinct *kind of thing the agent did*, and the trichotomy (annotation, span boundary, output/terminal) is what makes the union behave like a trace.
@@ -146,6 +156,39 @@ Boundary: adding a 9th variant is *not* a casual change. The discriminator is ex
                 error                failure termination        message: string
 ```
 
+**Code in this codebase — the declaration.** 8 variants, 2 helpers, one file:
+
+```
+  lib/mcp/events.ts  (lines 4-22)
+
+  export type AgentEvent =
+    | { type: 'reasoning_step'; step: ReasoningStep }                          ← annotation between spans
+    | { type: 'tool_call_start'; toolName: string; agent: AgentName }          ← span OPEN
+    | { type: 'tool_call_end'; toolName: string; agent: AgentName;             ← span CLOSE + timing
+        durationMs: number; result?: unknown; error?: string }
+    | { type: 'insight'; insight: Insight }                                    ← briefing output
+    | { type: 'diagnosis'; diagnosis: Diagnosis }                              ← diagnostic agent output
+    | { type: 'recommendation'; recommendation: Recommendation }               ← recommendation agent output
+    | { type: 'done' }                                                         ← clean termination
+    | { type: 'error'; message: string };                                      ← failure termination
+
+  /** Encode one event as a single NDJSON line (JSON + '\n'). */
+  export function encodeEvent(e: AgentEvent): string {
+    return JSON.stringify(e) + '\n';                                           ← framing: one line per event
+  }
+
+  /** Decode one NDJSON line into an AgentEvent. */
+  export function decodeEvent(line: string): AgentEvent {
+    return JSON.parse(line) as AgentEvent;                                     ← consumer trusts the type
+  }
+        │
+        └─ this 8-line union + 3-line helpers IS the protocol. Every layer
+           above and below speaks AgentEvent. Drop any variant and you drop
+           a row from the observability map — there's nowhere else it's
+           recorded. The '\n' terminator in encodeEvent is what makes the
+           stream parseable one event at a time.
+```
+
 #### encodeEvent — one line, two responsibilities
 
 The reader anchor: you've called `JSON.stringify` on an object and shipped it as a request body. Same shape — but here the function does two things in one line: serialize, and frame.
@@ -162,6 +205,42 @@ What it does:
 ```
 
 Boundary: there's no error handling here. `JSON.stringify` can throw on circular references or `BigInt` payloads — neither of which appear in `AgentEvent` because the union forbids them at compile time. The function relies on the union's closed-shape guarantee to skip the defensive coding.
+
+**Code in this codebase — the emitter.** Where the union becomes wire bytes:
+
+```
+  app/api/agent/route.ts  (lines 168-195, abbreviated)
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const collected: AgentEvent[] = [];                                      ← buffer typed as the union
+      const send = (e: AgentEvent) => {                                        ← single emission closure
+        collected.push(e);                                                     ← write to snapshot buffer
+        controller.enqueue(encoder.encode(encodeEvent(e)));                    ← write to wire (NDJSON)
+      };
+      const stepFor = (agent, kind, content) =>
+        send({ type: 'reasoning_step', step: {id, agent, kind, content} });
+      const hooksFor = (agent: AgentName) => ({
+        onText: (t) => { if (t.trim()) stepFor(agent, 'thought', t); },        ← text → reasoning_step
+        onToolCall: (tc) =>
+          send({ type: 'tool_call_start', toolName: tc.toolName, agent }),     ← span OPEN
+        onToolResult: (tc) =>
+          send({                                                                ← span CLOSE
+            type: 'tool_call_end',
+            toolName: tc.toolName,
+            agent,
+            durationMs: tc.durationMs ?? 0,                                    ← timing from McpClient
+            result: trunc(tc.result),                                          ← capped to 4000 chars
+            error: tc.error,
+          }),
+      });
+        │
+        └─ every emission is type-checked against the union. The compiler
+           rejects any object shape that doesn't match a variant. This is
+           what makes the contract enforceable across the route ↔ agent ↔
+           UI ↔ cache boundary.
+```
 
 #### The consumer side — exhaustive switch
 
@@ -195,6 +274,35 @@ Boundary: the *positional* nature of consumer behavior (UI uses position-based m
     case 'error':        setError(e.message); break
   }
   // tsc enforces: if you added a 9th variant and missed it here, compile fails
+```
+
+**Code in this codebase — the consumer.** The exhaustive switch in the UI hook:
+
+```
+  lib/hooks/useInvestigation.ts  (handle function, abbreviated)
+
+  const handle = (e: AgentEvent) => {
+    switch (e.type) {
+      case 'reasoning_step':                                                   ← annotation
+        setItems(prev => [...prev, toReasoningTraceItem(e.step)]);
+        break;
+      case 'tool_call_start':                                                  ← span OPEN
+        setItems(prev => [...prev, toRunningToolTraceItem(e)]);
+        break;
+      case 'tool_call_end':                                                    ← span CLOSE
+        setItems(prev => replaceRunningTool(prev, e));                         ← positional match
+        break;
+      case 'diagnosis':       setDiagnosis(e.diagnosis); break;
+      case 'recommendation':  setRecs(prev => [...prev, e.recommendation]); break;
+      case 'insight':         setInsights(prev => [...prev, e.insight]); break;
+      case 'done':            setComplete(true); /* stash to sessionStorage */ break;
+      case 'error':           setError(e.message); break;
+    }
+  };
+        │
+        └─ tsc enforces exhaustiveness — adding a 9th variant to the union
+           breaks compilation here until a case is added. The compiler IS
+           the lint rule that keeps every consumer in sync with every emitter.
 ```
 
 #### Move 3 — the principle
@@ -254,122 +362,6 @@ The full union laid out, with the trichotomy and the consumer points marked.
   │  snapshot: saveInvestigation in lib/state/investigations.ts:30-41     │
   │    mem.set(id, events: AgentEvent[])                                  │
   └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-Three real moments the union earns its keep:
-
-- **Adding a new agent or output kind.** When you wire `lib/agents/coordinator.ts` or extend the categories, the union tells you exactly what changes: add a variant if there's a new *kind* of output (e.g. `coordinator_plan`); reuse `reasoning_step` if it's just more agent text. Every downstream consumer is forced by the compiler to handle the new variant — there's no place to forget. The compiler is the lint rule.
-
-- **Replaying a captured investigation.** The cache stores `AgentEvent[]`. The replay path iterates the array and calls `encodeEvent(e)` on each one — same function used live. There's no replay-specific code path that could drift; the union enforces shape parity. This is what makes the seed file (`lib/state/demo-investigations.json`) a *real* fixture rather than a brittle JSON blob.
-
-- **The briefing route extends the vocabulary.** `BriefingEvent` (declared locally in `app/api/briefing/route.ts:54–58`) is `AgentEvent` plus three extra variants (`coverage_item`, `insight`, `workspace`). The extension is clean because the shared union stays closed and the extras are scoped to the route. No conflict, no shape drift; the discriminator distinguishes everything.
-
-- **AptKit traces converge onto this same surface.** `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) implements AptKit's `CapabilityTraceSink`. It receives AptKit's `CapabilityEvent`s (`step` / `tool_call_start` / `tool_call_end`) and calls Blooming's existing `onText`/`onToolCall`/`onToolResult` hooks — which emit `reasoning_step`/`tool_call_start`/`tool_call_end` variants on the same NDJSON stream. The system grew a new agent runtime but did NOT grow a new observability surface. One stream, multiple producers; the closed union is what makes that work — AptKit had to map its event types into ours rather than co-existing as a parallel format.
-
-### Code side by side, with a line-by-line read
-
-The declaration — 8 variants, 2 helpers, one file:
-
-```
-  lib/mcp/events.ts  (lines 4-22)
-
-  export type AgentEvent =
-    | { type: 'reasoning_step'; step: ReasoningStep }                          ← annotation between spans
-    | { type: 'tool_call_start'; toolName: string; agent: AgentName }          ← span OPEN
-    | { type: 'tool_call_end'; toolName: string; agent: AgentName;             ← span CLOSE + timing
-        durationMs: number; result?: unknown; error?: string }
-    | { type: 'insight'; insight: Insight }                                    ← briefing output
-    | { type: 'diagnosis'; diagnosis: Diagnosis }                              ← diagnostic agent output
-    | { type: 'recommendation'; recommendation: Recommendation }               ← recommendation agent output
-    | { type: 'done' }                                                         ← clean termination
-    | { type: 'error'; message: string };                                      ← failure termination
-
-  /** Encode one event as a single NDJSON line (JSON + '\n'). */
-  export function encodeEvent(e: AgentEvent): string {
-    return JSON.stringify(e) + '\n';                                           ← framing: one line per event
-  }
-
-  /** Decode one NDJSON line into an AgentEvent. */
-  export function decodeEvent(line: string): AgentEvent {
-    return JSON.parse(line) as AgentEvent;                                     ← consumer trusts the type
-  }
-        │
-        └─ this 8-line union + 3-line helpers IS the protocol. Every layer
-           above and below speaks AgentEvent. Drop any variant and you drop
-           a row from the observability map — there's nowhere else it's
-           recorded. The '\n' terminator in encodeEvent is what makes the
-           stream parseable one event at a time.
-```
-
-The emitter — where the union becomes wire bytes:
-
-```
-  app/api/agent/route.ts  (lines 168-195, abbreviated)
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const collected: AgentEvent[] = [];                                      ← buffer typed as the union
-      const send = (e: AgentEvent) => {                                        ← single emission closure
-        collected.push(e);                                                     ← write to snapshot buffer
-        controller.enqueue(encoder.encode(encodeEvent(e)));                    ← write to wire (NDJSON)
-      };
-      const stepFor = (agent, kind, content) =>
-        send({ type: 'reasoning_step', step: {id, agent, kind, content} });
-      const hooksFor = (agent: AgentName) => ({
-        onText: (t) => { if (t.trim()) stepFor(agent, 'thought', t); },        ← text → reasoning_step
-        onToolCall: (tc) =>
-          send({ type: 'tool_call_start', toolName: tc.toolName, agent }),     ← span OPEN
-        onToolResult: (tc) =>
-          send({                                                                ← span CLOSE
-            type: 'tool_call_end',
-            toolName: tc.toolName,
-            agent,
-            durationMs: tc.durationMs ?? 0,                                    ← timing from McpClient
-            result: trunc(tc.result),                                          ← capped to 4000 chars
-            error: tc.error,
-          }),
-      });
-        │
-        └─ every emission is type-checked against the union. The compiler
-           rejects any object shape that doesn't match a variant. This is
-           what makes the contract enforceable across the route ↔ agent ↔
-           UI ↔ cache boundary.
-```
-
-The consumer — exhaustive switch in the UI hook:
-
-```
-  lib/hooks/useInvestigation.ts  (handle function, abbreviated)
-
-  const handle = (e: AgentEvent) => {
-    switch (e.type) {
-      case 'reasoning_step':                                                   ← annotation
-        setItems(prev => [...prev, toReasoningTraceItem(e.step)]);
-        break;
-      case 'tool_call_start':                                                  ← span OPEN
-        setItems(prev => [...prev, toRunningToolTraceItem(e)]);
-        break;
-      case 'tool_call_end':                                                    ← span CLOSE
-        setItems(prev => replaceRunningTool(prev, e));                         ← positional match
-        break;
-      case 'diagnosis':       setDiagnosis(e.diagnosis); break;
-      case 'recommendation':  setRecs(prev => [...prev, e.recommendation]); break;
-      case 'insight':         setInsights(prev => [...prev, e.insight]); break;
-      case 'done':            setComplete(true); /* stash to sessionStorage */ break;
-      case 'error':           setError(e.message); break;
-    }
-  };
-        │
-        └─ tsc enforces exhaustiveness — adding a 9th variant to the union
-           breaks compilation here until a case is added. The compiler IS
-           the lint rule that keeps every consumer in sync with every emitter.
 ```
 
 ---

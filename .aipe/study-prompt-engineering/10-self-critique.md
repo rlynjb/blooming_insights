@@ -224,9 +224,7 @@ This diagram spans the decision. The Generation layer produces a first output; f
 
 A reader who sees only this should grasp: verification is conditional on stakes, self-critique is sequential and self-consistency is parallel, both cost extra tokens, and the existing `synthesize()` sits outside this entirely — it is recovery, not verification.
 
----
-
-## Implementation in codebase
+### Code in this codebase
 
 **Not yet implemented.** There is no self-critique, self-verification, or self-consistency anywhere in blooming insights; no output is re-read for correctness and nothing is sampled-and-voted.
 

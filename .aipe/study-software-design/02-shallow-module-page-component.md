@@ -176,46 +176,7 @@ Pseudocode — the after shape
   each hook is now a deep module: small return shape, fat hidden body.
 ```
 
-### Move 3 — the principle
-
-Module depth isn't about file size — it's about the *gap* between interface size and absorbed behavior. A 200-LOC component with a clean prop contract and minimal internal state is deep; a 200-LOC component that reads 14 state slots and holds eight concerns is shallow even though it's the same size. The right unit of measurement is "how much does the reader have to learn before they can edit one concern?" In a deep module that number is small. In a shallow one it's everything. The fix is never "delete lines"; it's "introduce a seam where one concern can hide from another." Three seams here. The lines stay in the codebase — they just move behind closed doors.
-
----
-
-## Primary diagram
-
-The before-and-after shape — the recap visual.
-
-```
-The shallow module → three deep hooks (the fix)
-
-  BEFORE
-  ┌─ app/page.tsx (817 LOC) ─────────────────────────────────┐
-  │  14 useState · 218-LOC useEffect · 100-LOC capture flow   │
-  │  9 event handlers · NDJSON loop · reconnect dance · JSX   │
-  │  ─ no seam, no hiding, 8 concerns at one altitude ─       │
-  └───────────────────────────────────────────────────────────┘
-
-  AFTER
-  ┌─ app/page.tsx (~120 LOC) ────────────────────────────────┐
-  │  layout + composition only                                │
-  └────┬──────────────┬──────────────┬───────────────────────┘
-       │              │              │
-       ▼              ▼              ▼
-  ┌──────────┐  ┌──────────┐  ┌──────────────┐
-  │useBriefin│  │useReconne│  │useDemoCapture │
-  │gStream   │  │ctPolicy  │  │(dev-only)     │
-  │~150 LOC  │  │~30 LOC   │  │~80 LOC        │
-  │returns 9 │  │returns 2 │  │returns 2 fields│
-  │fields    │  │fields    │  │               │
-  └──────────┘  └──────────┘  └──────────────┘
-   each hook = small return shape over fat hidden body
-   the page is now a deep module of deep modules
-```
-
----
-
-## Implementation in codebase
+### Move 2 — code in this codebase
 
 **Use cases.** Three places this hotspot bites — chosen because they're the maintenance moments the next contributor will hit.
 
@@ -225,7 +186,7 @@ The shallow module → three deep hooks (the fix)
 
 - **Adding a second capture target (e.g. capture-by-anomaly-category).** Today the contributor opens 817 lines, finds the demo-capture region (L156-L256), reads through `postCapture` + `runInvestigation` + `captureAll`, then adds a fourth function. After extraction, they open the `useDemoCapture` file, see three small functions, add a fourth. The blast radius is one file the size of one concern.
 
-### The shape today — every concern at one altitude
+**The shape today — every concern at one altitude.** This is the actual file. Every state declaration is visible to every JSX read; every event handler can mutate any setter. No seams, no hides.
 
 ```
 app/page.tsx  (817 lines)
@@ -306,7 +267,7 @@ app/page.tsx  (817 lines)
           nothing about demo capture is needed to understand stream reading.
 ```
 
-### Contrast — a calm page next door
+**Contrast — a calm page next door.** What the fix looks like is already shipping in the sibling page.
 
 ```
 app/investigate/[id]/page.tsx  (225 LOC, the calm sibling)
@@ -330,6 +291,43 @@ app/investigate/[id]/page.tsx  (225 LOC, the calm sibling)
 ```
 
 `useInvestigation` is the proof-of-concept for the proposed `useBriefingStream` — it already extracts the NDJSON parser from a page component into a hook with a small return shape. The pattern works; it just hasn't been applied to the feed page yet.
+
+### Move 3 — the principle
+
+Module depth isn't about file size — it's about the *gap* between interface size and absorbed behavior. A 200-LOC component with a clean prop contract and minimal internal state is deep; a 200-LOC component that reads 14 state slots and holds eight concerns is shallow even though it's the same size. The right unit of measurement is "how much does the reader have to learn before they can edit one concern?" In a deep module that number is small. In a shallow one it's everything. The fix is never "delete lines"; it's "introduce a seam where one concern can hide from another." Three seams here. The lines stay in the codebase — they just move behind closed doors.
+
+---
+
+## Primary diagram
+
+The before-and-after shape — the recap visual.
+
+```
+The shallow module → three deep hooks (the fix)
+
+  BEFORE
+  ┌─ app/page.tsx (817 LOC) ─────────────────────────────────┐
+  │  14 useState · 218-LOC useEffect · 100-LOC capture flow   │
+  │  9 event handlers · NDJSON loop · reconnect dance · JSX   │
+  │  ─ no seam, no hiding, 8 concerns at one altitude ─       │
+  └───────────────────────────────────────────────────────────┘
+
+  AFTER
+  ┌─ app/page.tsx (~120 LOC) ────────────────────────────────┐
+  │  layout + composition only                                │
+  └────┬──────────────┬──────────────┬───────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────────┐
+  │useBriefin│  │useReconne│  │useDemoCapture │
+  │gStream   │  │ctPolicy  │  │(dev-only)     │
+  │~150 LOC  │  │~30 LOC   │  │~80 LOC        │
+  │returns 9 │  │returns 2 │  │returns 2 fields│
+  │fields    │  │fields    │  │               │
+  └──────────┘  └──────────┘  └──────────────┘
+   each hook = small return shape over fat hidden body
+   the page is now a deep module of deep modules
+```
 
 ---
 

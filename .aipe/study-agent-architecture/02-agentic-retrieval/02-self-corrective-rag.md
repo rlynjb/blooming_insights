@@ -184,9 +184,11 @@ The condition under which the grader earns its overhead: the answer's stakes hav
 
 The technical thing: there's no relevance grader between the analytics tool call and the model's next reasoning step. The agentic-RAG loop runs the query, feeds the JSON result back, and the model reasons on it — no per-chunk scoring sits in between. But two adjacent checks exist, and naming them honestly matters.
 
-**Adjacent check 1: the monitoring agent's volume check.** The monitoring prompt instructs the agent to spend its *first* query on a volume probe — a count of purchase events over the last 90 days — before running any anomaly recipes. If the count is empty or tiny, the agent shifts the execution time to a populated range or widens the window. This is a *premise* check: it validates that retrieval will be meaningful before doing it, not that a retrieved chunk is relevant to the question. Closest analog to a self-corrective gate, but at the wrong layer — it gates the *window*, not the *result*.
+**Adjacent check 1: the monitoring agent's volume check.** The monitoring prompt instructs the agent to spend its *first* query on a volume probe — a count of purchase events over the last 90 days — before running any anomaly recipes. If the count is empty or tiny, the agent shifts the execution time to a populated range or widens the window. This is a *premise* check: it validates that retrieval will be meaningful before doing it, not that a retrieved chunk is relevant to the question. Closest analog to a self-corrective gate, but at the wrong layer — it gates the *window*, not the *result*. **In the repo:** `lib/agents/prompts/monitoring.md` ~L31 — the `## CRITICAL: verify your windows actually contain data` block. A checklist instruction to the model, not code.
 
-**Adjacent check 2: the diagnostic agent's hypothesis testing.** The diagnostic prompt frames investigation as "generate 2–3 competing hypotheses, then query to falsify each." This is *answer-side validity* — the model is forced to check whether the evidence supports or rules out its candidate explanation, which is a groundedness check applied to its own reasoning, not to retrieved chunks.
+**Adjacent check 2: the diagnostic agent's hypothesis testing.** The diagnostic prompt frames investigation as "generate 2–3 competing hypotheses, then query to falsify each." This is *answer-side validity* — the model is forced to check whether the evidence supports or rules out its candidate explanation, which is a groundedness check applied to its own reasoning, not to retrieved chunks. **In the repo:** `lib/agents/prompts/diagnostic.md` L5 (job description) and L21–L25 (hypothesis-falsification method).
+
+**Where a real grader would slot in.** `runAgentLoop()` in `lib/agents/base.ts` — between L150 (tool result received) and L171 (result fed back as next user turn). The result-handling block at L143–L171 is the natural insertion point: collect `result` at L144–L150, score it, then either push `toolResults` back unchanged (pass) or push a rewritten "result rejected" notice (fail).
 
 ```
 What this codebase has vs the self-corrective RAG pattern
@@ -292,49 +294,6 @@ The self-corrective RAG pattern (canonical, with where this codebase sits)
   THE GAP: no per-tool-result relevance grader between the query
   and the model's next turn. "We retrieved" is silently equated
   with "we have the right numbers" on the retrieval path itself.
-```
-
----
-
-## Implementation in codebase
-
-**Case B — the relevance grader is not implemented on the retrieval path.** The honest sentence: there is no model-graded relevance check between `execute_analytics_eql` results and the next agent turn — the loop in `runAgentLoop` (`lib/agents/base.ts` L161–L171) wraps the tool result and feeds it back unmodified.
-
-What exists adjacent to the pattern:
-
-**Adjacent check 1 — pre-retrieval premise check**
-**File:** `lib/agents/prompts/monitoring.md`
-**Function / class:** the `## CRITICAL: verify your windows actually contain data` prompt block
-**Line range:** ~L31 (the CRITICAL block)
-
-This validates retrieval's *premise* (the window has data) before running anomaly recipes. It's a checklist instruction to the model, not code, but it gates whether retrieval is meaningful in the first place. Closest thing in the codebase to a self-corrective gate; on the wrong side of the retrieve step to count as one.
-
-**Adjacent check 2 — answer-side groundedness via hypothesis testing**
-**File:** `lib/agents/prompts/diagnostic.md`
-**Function / class:** the "generate 2–3 competing hypotheses, then query to falsify each" instruction
-**Line range:** L5 (job description) and L21–L25 (hypothesis-falsification method)
-
-This is groundedness applied to the *answer*: the model is forced to state hypotheses, then run queries to support or rule them out. A hypothesis the data doesn't support is dropped. It's a groundedness check applied to reasoning rather than to retrieved chunks.
-
-**Where the grader would go**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()` — between L150 (tool result received) and L171 (result fed back as next user turn)
-**Line range:** L143–L171 (the result-handling block)
-
-If a grader were added, it would slot in between collecting the `result` (L144–L150) and pushing the `toolResults` back as the next message (L171). The fallback path would either re-emit a tool_use with a rewritten query or surface an "insufficient evidence" notice the agent uses to abstain.
-
-```
-shape (not full impl) — what a self-corrective gate would look like here:
-  const { result } = await mcp.callTool(tu.name, tu.input);
-  // ── NEW: grade result for relevance + groundedness vs user question ──
-  const grade = await grader.score({ question: userPrompt, result });
-  if (grade.relevant && grade.groundedFor(currentHypothesis)) {
-    toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: ... });
-  } else {
-    // fallback: re-emit a tool_use with a rewritten EQL, or surface "no evidence"
-    toolResults.push({ type: 'tool_result', tool_use_id: tu.id,
-                       content: `result rejected: ${grade.reason}; retry with widened window` });
-  }
 ```
 
 ---

@@ -148,6 +148,8 @@ each "do NOT" = a bug that happened once, now fenced off
 
 These are not generic best practices; they are this workspace's specific failures, encoded where the model will read them every call.
 
+**Code in this codebase — negative constraints (used pervasively).** `monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md` — the Hard rules / method / field-rules sections (prompt text). `monitoring.md` L17 ("do NOT re-run variations"), L37 ("Never report a change derived from an empty or zero window"); `diagnostic.md` L35 ("Do NOT use a `customers matching` clause"); `recommendation.md` L82 ("Do NOT include an `id` field"); `query.md` L11 (the same unsupported-clause ban). Each fences off a specific, previously-hit failure — wasted budget, bogus numbers, unsupported syntax, model-owned identity — read by the model on every call.
+
 ---
 
 ### The rotating-formula half — correctly absent, and why
@@ -170,6 +172,8 @@ query agent → prose output → BUT one-shot per question → nothing repeats �
 
 So both conditions for rotation fail everywhere: the repeated generations are structured (no phrasing), and the prose generation is not repeated (no convergence). Rotation correctly absent.
 
+**Code in this codebase — rotating formulas absent (and correctly so).** The repeated chains + the prose agent; structured outputs vs. one-shot prose. Structured: `monitoring.md` L69–L97, `diagnostic.md` L59–L103, `recommendation.md` L47–L91 (JSON — no phrasing to converge); one-shot prose: `query.md` L49 + `route.ts` L135–L143 (one classify→answer→done per question). Rotation is unnecessary because every repeated generation is structured and the one prose generation is not repeated for the same user — neither condition for convergence holds.
+
 ---
 
 ### Move 2.5 — when rotation WOULD be needed here
@@ -186,6 +190,10 @@ the scenario that flips it: a recurring prose digest
 ```
 
 That feature does not exist today — which is exactly why rotation is correctly absent today. The discipline is conditional: add rotation *when* you add a recurring prose generation for a fixed recipient, not before.
+
+**Code in this codebase — the condition that would require rotation (not yet built).** Would live alongside a new recurring-digest feature; a hypothetical daily prose summary emailed to the same merchant. Does not exist; the closest existing prose is `query.md` (one-shot, so exempt). The only scenario that flips the decision — prose generated repeatedly for the same user over time — and the point at which forbidden openings + rotating formulas would earn their place.
+
+**Why this split is correct.** The negative-constraint half is present because the model genuinely drifts into known bad behaviors, and a "do NOT" line is the cheapest fence. The rotating-formula half is absent because the problem it solves — phrasing convergence — requires prose repeated for one recipient over time, and the codebase has structured repeated output plus one-shot prose. Adding rotation now would be solving a problem the codebase does not have; the team correctly did not.
 
 ---
 
@@ -227,37 +235,6 @@ This diagram spans both halves. The Negative-constraint layer fences off drift i
 ```
 
 The codebase ships the negative-constraint half and omits the rotation half, because its output shape removes the convergence problem rotation solves.
-
----
-
-## Implementation in codebase
-
-**Case A for negative constraints · Case B for rotating formulas.**
-
-### Negative constraints — forbidden instructions (used pervasively)
-
-- **File:** `monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md`
-- **Function / class:** the Hard rules / method / field-rules sections (prompt text)
-- **Line range:** `monitoring.md` L17 ("do NOT re-run variations"), L37 ("Never report a change derived from an empty or zero window"); `diagnostic.md` L35 ("Do NOT use a `customers matching` clause"); `recommendation.md` L82 ("Do NOT include an `id` field"); `query.md` L11 (the same unsupported-clause ban)
-- **Role:** each fences off a specific, previously-hit failure — wasted budget, bogus numbers, unsupported syntax, model-owned identity — read by the model on every call.
-
-### Rotating formulas — absent (and correctly so)
-
-- **File:** the repeated chains + the prose agent
-- **Function / class:** structured outputs vs. one-shot prose
-- **Line range:** structured: `monitoring.md` L69–L97, `diagnostic.md` L59–L103, `recommendation.md` L47–L91 (JSON — no phrasing to converge); one-shot prose: `query.md` L49 + `route.ts` L135–L143 (one classify→answer→done per question)
-- **Role:** rotation is unnecessary because every repeated generation is structured and the one prose generation is not repeated for the same user — neither condition for convergence holds.
-
-### The condition that would require rotation (not yet built)
-
-- **File:** would live alongside a new recurring-digest feature
-- **Function / class:** a hypothetical daily prose summary emailed to the same merchant
-- **Line range:** n/a — does not exist; the closest existing prose is `query.md` (one-shot, so exempt)
-- **Role:** the only scenario that flips the decision — prose generated repeatedly for the same user over time — and the point at which forbidden openings + rotating formulas would earn their place.
-
-### Why this split is correct
-
-The negative-constraint half is present because the model genuinely drifts into known bad behaviors, and a "do NOT" line is the cheapest fence. The rotating-formula half is absent because the problem it solves — phrasing convergence — requires prose repeated for one recipient over time, and the codebase has structured repeated output plus one-shot prose. Adding rotation now would be solving a problem the codebase does not have; the team correctly did not.
 
 ---
 

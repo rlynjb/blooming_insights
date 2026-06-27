@@ -94,6 +94,58 @@ Skeleton mapped. Now walk the read chain, the write chain, and the offline seed 
 
 ### Move 2 — walk the parts
 
+**Use cases.** Three real moments the 3-rung structure earns its keep:
+
+- **Demoing without creds.** Clone the repo, `npm run dev`, open the app, click a seeded insight. The replay path hits rung 3 (the committed seed), short-circuits before any auth/key check, and the UI animates the captured run at 180ms ticks. No Anthropic key, no Bloomreach OAuth, no network. This is the *whole point* of rung 3 — no other rung survives a fresh clone.
+
+- **Iterating on a captured bug in dev.** A captured `insightId` produced a bad diagnosis. You replay it (rung 1 or rung 2 hits depending on whether you've restarted the server), scrub the trace, change one thing (prompt, tool description), re-run live (`?live=1`) which captures a new snapshot to rung 1+2. Next page load reads rung 1 (the fresh one) without going to the seed. The priority order is what makes "live run shadows seed" the natural behavior — no cache invalidation needed.
+
+- **Capturing the demo seed itself.** No script, no automation — the workflow is: run dev, trigger a combined-run investigation, let `saveInvestigation` write `.investigation-cache.json`, copy/merge into `lib/state/demo-investigations.json`, commit. The seed becomes the canonical *capture* artifact for cross-machine replay. The lack of automation is a real gap (the workflow lives in muscle memory) but the rung structure makes the artifact small and portable.
+
+**Code in this codebase — module setup.** Paths, gates, and the mem map:
+
+```
+  lib/state/investigations.ts  (lines 1-11)
+
+  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+  import { join } from 'node:path';
+  import type { AgentEvent } from '../mcp/events';
+
+  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
+  // Writes go to in-memory always, and to the dev file in development only.
+  const PERSIST = process.env.NODE_ENV === 'development';                      ← write gate for rung 2
+  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');         ← rung 2 path (dev only)
+  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json'); ← rung 3 path (committed)
+
+  const mem = new Map<string, AgentEvent[]>();                                 ← rung 1 (per-process)
+        │
+        └─ four lines of constants, one Map. The whole rung topology is
+           visible in 11 lines. The comment IS the documentation — the
+           ordering ("in order: in-memory → dev file → committed seed") is
+           the read priority, named in plain English at the top of the file.
+```
+
+**Code in this codebase — the defensive read.** `existsSync` first, malformed-JSON-tolerant:
+
+```
+  lib/state/investigations.ts  (lines 13-20)
+
+  function readJson(path: string): Record<string, AgentEvent[]> {
+    try {
+      if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));     ← guarded read
+    } catch {
+      /* ignore */                                                              ← malformed → empty
+    }
+    return {};                                                                  ← absent → empty
+  }
+        │
+        └─ a missing file or malformed JSON returns {} — the read chain
+           falls through cleanly. No process crash, no surfaced error.
+           This is what makes a fresh clone work even before the first
+           snapshot is captured: rung 3 reads empty, returns null, falls
+           through to the live path. No "first-run" special case needed.
+```
+
 #### Rung 1 — in-memory Map (per-process)
 
 The reader anchor: you've used a `Map` as an in-memory cache (`const cache = new Map(); cache.set(key, value)`). Same shape. The mem rung is a module-level `Map<string, AgentEvent[]>` — one entry per cached investigation, scoped to whatever process is currently serving the request.
@@ -180,6 +232,25 @@ Boundary: the priority order (mem → dev file → seed) means a stale dev-file 
             └─ freshness preference: a recent live run shadows an older seed
 ```
 
+**Code in this codebase — the read chain.** First non-null wins:
+
+```
+  lib/state/investigations.ts  (lines 22-28)
+
+  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1: process mem
+    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2: dev only
+    if (fromFile) return fromFile;
+    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3: always tried
+    return fromDemo ?? null;                                                    ← null → live run
+  }
+        │
+        └─ priority: mem > dev file > seed. First non-null wins. The
+           `??` operator returns null only if BOTH `fromDemo` and the
+           short-circuit chain hit nothing — the explicit `null` is
+           what the caller's `if (cached)` gate looks for.
+```
+
 #### Write chain — every rung you legally can
 
 The reader anchor: you've used a write-through cache (write to cache AND to source-of-truth). Here it's write to two rungs, gated by environment.
@@ -201,6 +272,48 @@ Boundary: the write is *not transactional*. If the route process crashes between
     except:
       ─ best effort, ignore ─        ← EROFS in prod is harmless
                                        (gate prevents it anyway)
+```
+
+**Code in this codebase — the write chain.** Every rung you legally can:
+
+```
+  lib/state/investigations.ts  (lines 30-41)
+
+  export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+    mem.set(insightId, events);                                                ← rung 1: always
+    if (PERSIST) {                                                              ← gate for rung 2
+      const all = readJson(CACHE_FILE);                                         ← read whole
+      all[insightId] = events;
+      try {
+        writeFileSync(CACHE_FILE, JSON.stringify(all));                        ← write whole
+      } catch {
+        /* best effort */                                                       ← EROFS in prod = ok
+      }
+    }
+  }
+        │
+        └─ never writes rung 3 (the seed) — that's a git-add'd artifact.
+           The PERSIST gate is the load-bearing safety net: if it weren't
+           there, prod would attempt writeFileSync and the catch would
+           swallow EROFS silently on every save. Gate first, catch second,
+           defense in depth.
+```
+
+**Code in this codebase — the test-only escape hatch.** Proves the mem rung is the test scope:
+
+```
+  lib/state/investigations.ts  (lines 43-46)
+
+  /** test-only */
+  export function _clearInvestigationCache(): void {
+    mem.clear();
+  }
+        │
+        └─ tests reset rung 1 between cases. They never touch rung 2 or
+           rung 3 — vitest runs with NODE_ENV=test so PERSIST=false and
+           the dev file is untouched; the seed is read-only fixture data.
+           The underscore prefix is the convention for "internal, not
+           public API."
 ```
 
 #### Move 3 — the principle
@@ -249,127 +362,6 @@ The full store, with the read priority and write gates marked.
   4. copy/merge .investigation-cache.json → lib/state/demo-investigations.json
   5. git add lib/state/demo-investigations.json && git commit
   6. ship → seed is now portable across deploys
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-Three real moments the 3-rung structure earns its keep:
-
-- **Demoing without creds.** Clone the repo, `npm run dev`, open the app, click a seeded insight. The replay path hits rung 3 (the committed seed), short-circuits before any auth/key check, and the UI animates the captured run at 180ms ticks. No Anthropic key, no Bloomreach OAuth, no network. This is the *whole point* of rung 3 — no other rung survives a fresh clone.
-
-- **Iterating on a captured bug in dev.** A captured `insightId` produced a bad diagnosis. You replay it (rung 1 or rung 2 hits depending on whether you've restarted the server), scrub the trace, change one thing (prompt, tool description), re-run live (`?live=1`) which captures a new snapshot to rung 1+2. Next page load reads rung 1 (the fresh one) without going to the seed. The priority order is what makes "live run shadows seed" the natural behavior — no cache invalidation needed.
-
-- **Capturing the demo seed itself.** No script, no automation — the workflow is: run dev, trigger a combined-run investigation, let `saveInvestigation` write `.investigation-cache.json`, copy/merge into `lib/state/demo-investigations.json`, commit. The seed becomes the canonical *capture* artifact for cross-machine replay. The lack of automation is a real gap (the workflow lives in muscle memory) but the rung structure makes the artifact small and portable.
-
-### Code side by side, with a line-by-line read
-
-The module setup — paths, gates, and the mem map:
-
-```
-  lib/state/investigations.ts  (lines 1-11)
-
-  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-  import { join } from 'node:path';
-  import type { AgentEvent } from '../mcp/events';
-
-  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
-  // Writes go to in-memory always, and to the dev file in development only.
-  const PERSIST = process.env.NODE_ENV === 'development';                      ← write gate for rung 2
-  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');         ← rung 2 path (dev only)
-  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json'); ← rung 3 path (committed)
-
-  const mem = new Map<string, AgentEvent[]>();                                 ← rung 1 (per-process)
-        │
-        └─ four lines of constants, one Map. The whole rung topology is
-           visible in 11 lines. The comment IS the documentation — the
-           ordering ("in order: in-memory → dev file → committed seed") is
-           the read priority, named in plain English at the top of the file.
-```
-
-The defensive read — `existsSync` first, malformed-JSON-tolerant:
-
-```
-  lib/state/investigations.ts  (lines 13-20)
-
-  function readJson(path: string): Record<string, AgentEvent[]> {
-    try {
-      if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));     ← guarded read
-    } catch {
-      /* ignore */                                                              ← malformed → empty
-    }
-    return {};                                                                  ← absent → empty
-  }
-        │
-        └─ a missing file or malformed JSON returns {} — the read chain
-           falls through cleanly. No process crash, no surfaced error.
-           This is what makes a fresh clone work even before the first
-           snapshot is captured: rung 3 reads empty, returns null, falls
-           through to the live path. No "first-run" special case needed.
-```
-
-The read chain — first non-null wins:
-
-```
-  lib/state/investigations.ts  (lines 22-28)
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1: process mem
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2: dev only
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3: always tried
-    return fromDemo ?? null;                                                    ← null → live run
-  }
-        │
-        └─ priority: mem > dev file > seed. First non-null wins. The
-           `??` operator returns null only if BOTH `fromDemo` and the
-           short-circuit chain hit nothing — the explicit `null` is
-           what the caller's `if (cached)` gate looks for.
-```
-
-The write chain — every rung you legally can:
-
-```
-  lib/state/investigations.ts  (lines 30-41)
-
-  export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
-    mem.set(insightId, events);                                                ← rung 1: always
-    if (PERSIST) {                                                              ← gate for rung 2
-      const all = readJson(CACHE_FILE);                                         ← read whole
-      all[insightId] = events;
-      try {
-        writeFileSync(CACHE_FILE, JSON.stringify(all));                        ← write whole
-      } catch {
-        /* best effort */                                                       ← EROFS in prod = ok
-      }
-    }
-  }
-        │
-        └─ never writes rung 3 (the seed) — that's a git-add'd artifact.
-           The PERSIST gate is the load-bearing safety net: if it weren't
-           there, prod would attempt writeFileSync and the catch would
-           swallow EROFS silently on every save. Gate first, catch second,
-           defense in depth.
-```
-
-The test-only escape hatch — proves the mem rung is the test scope:
-
-```
-  lib/state/investigations.ts  (lines 43-46)
-
-  /** test-only */
-  export function _clearInvestigationCache(): void {
-    mem.clear();
-  }
-        │
-        └─ tests reset rung 1 between cases. They never touch rung 2 or
-           rung 3 — vitest runs with NODE_ENV=test so PERSIST=false and
-           the dev file is untouched; the seed is read-only fixture data.
-           The underscore prefix is the convention for "internal, not
-           public API."
 ```
 
 ---

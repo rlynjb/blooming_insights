@@ -89,6 +89,10 @@ The seams are the boundaries where the answer flips. Each one is where you'd nee
 
 ## How it works
 
+**Where this is reached for in this codebase:**
+- The rate-limit counter (`lastCallAt`) is the only "concurrency primitive" present, and it's instance-local.
+- `putInsights()` is the closest thing to a transaction that needs atomicity, and it relies on Node's single-thread within one tick to fake it.
+
 ### Move 1 — the mental model
 
 A database lets many transactions run at once. Without something to coordinate them, they'd corrupt each other's data. The two strategies:
@@ -143,20 +147,35 @@ A database lets many transactions run at once. Without something to coordinate t
 The MCP client enforces `minIntervalMs=1100` to space calls and stay under Bloomreach's 1-req-per-second cap. That counter is per-instance:
 
 ```
-  lib/mcp/client.ts L82, L149-156
+  lib/mcp/client.ts  (lines 148–163)
 
-  private lastCallAt = 0;
-  private minIntervalMs: number;
-  ...
   private async liveCall(name, args) {
     const elapsed = Date.now() - this.lastCallAt;
     if (elapsed < this.minIntervalMs) {
-      await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+      await new Promise((r) =>             ← single-instance pacing.
+        setTimeout(r, this.minIntervalMs - elapsed));
+                                              works because Node runs the
+                                              setTimeout on this process's
+                                              event loop.
     }
-    ...
-    this.lastCallAt = Date.now();
-    ...
+    try {
+      const result =
+        await this.transport.callTool(name, args);
+      this.lastCallAt = Date.now();
+      return result;
+    } catch (err) {
+      this.lastCallAt = Date.now();        ← important: still update on error,
+                                              otherwise a thrown error means
+                                              the next call doesn't wait.
+      throw new McpToolError(name, ...);
+    }
   }
+       │
+       └─ no global coordination. on Vercel with N warm instances, total
+          req/s can be Nx the per-instance budget. the McpClient.retry path
+          (parseRetryAfterMs, 10s back-off) is the SAFETY NET that absorbs
+          this — not a fix. the real fix is a shared rate-limit token bucket
+          in something like Upstash Redis, with atomic INCR + EXPIRE.
 ```
 
 Two warm instances each carry their own `lastCallAt`. Two concurrent briefings on two instances can each fire one MCP call per 1.1s — but Bloomreach sees two calls per 1.1s globally. The rate limit then trips, and the retry path (10s back-off) eats the per-investigation budget.
@@ -194,6 +213,27 @@ Today `putInsights()` does `clear()` then `set()` in a loop. The non-atomic writ
 
 We don't have this. The acceptable workaround for blooming insights today is: only one briefing runs at a time per user (the UI enforces this), and accept the demo-grade staleness across instances.
 
+Side-by-side with the real code:
+
+```
+  lib/state/insights.ts  (lines 30–42 — repeated from 05 for the concurrency angle)
+
+  export function putInsights(items, rawAnomalies?) {
+    insights.clear();              ← within ONE Node tick, this whole
+    anomalies.clear();                function body is atomic (no await).
+    items.forEach((i, idx) => {       across instances, it's not — instance
+      insights.set(i.id, i);          A's clear can run while B is mid-set;
+      ...                             both write their own truth.
+    });
+  }
+       │
+       └─ the only thing protecting us today is that the UI doesn't kick off
+          concurrent briefings. add a "background refresh" feature, or have
+          two users in two browser tabs, and the race becomes observable.
+          the MVCC fix lives in whatever DB we'd pick — UPSERT with version
+          column, or wrap the whole thing in BEGIN/COMMIT.
+```
+
 ### Move 3 — the principle
 
 **Concurrency control is the price of multi-writer correctness.** You can't avoid it by being careful — careful code under load develops races. You either coordinate (locks, versions, MVCC) or you accept that writers can step on each other. The choice between pessimistic and optimistic is just a bet on how often you expect conflicts. For low-contention workloads, optimistic wins; for hot rows, pessimistic does. For this codebase, "no coordination" is the current bet, and the trigger that flips it is "real traffic with concurrent writers."
@@ -222,66 +262,6 @@ We don't have this. The acceptable workaround for blooming insights today is: on
   │  sees 3 calls in <1s → 429 → all three instances retry on 10s         │
   │  back-off; investigation budget burns                                 │
   └───────────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-### Use cases
-
-- The rate-limit counter (`lastCallAt`) is the only "concurrency primitive" present, and it's instance-local.
-- `putInsights()` is the closest thing to a transaction that needs atomicity, and it relies on Node's single-thread within one tick to fake it.
-
-### Code side by side
-
-```
-  lib/mcp/client.ts  (lines 148–163)
-
-  private async liveCall(name, args) {
-    const elapsed = Date.now() - this.lastCallAt;
-    if (elapsed < this.minIntervalMs) {
-      await new Promise((r) =>             ← single-instance pacing.
-        setTimeout(r, this.minIntervalMs - elapsed));
-                                              works because Node runs the
-                                              setTimeout on this process's
-                                              event loop.
-    }
-    try {
-      const result =
-        await this.transport.callTool(name, args);
-      this.lastCallAt = Date.now();
-      return result;
-    } catch (err) {
-      this.lastCallAt = Date.now();        ← important: still update on error,
-                                              otherwise a thrown error means
-                                              the next call doesn't wait.
-      throw new McpToolError(name, ...);
-    }
-  }
-       │
-       └─ no global coordination. on Vercel with N warm instances, total
-          req/s can be Nx the per-instance budget. the McpClient.retry path
-          (parseRetryAfterMs, 10s back-off) is the SAFETY NET that absorbs
-          this — not a fix. the real fix is a shared rate-limit token bucket
-          in something like Upstash Redis, with atomic INCR + EXPIRE.
-```
-
-```
-  lib/state/insights.ts  (lines 30–42 — repeated from 05 for the concurrency angle)
-
-  export function putInsights(items, rawAnomalies?) {
-    insights.clear();              ← within ONE Node tick, this whole
-    anomalies.clear();                function body is atomic (no await).
-    items.forEach((i, idx) => {       across instances, it's not — instance
-      insights.set(i.id, i);          A's clear can run while B is mid-set;
-      ...                             both write their own truth.
-    });
-  }
-       │
-       └─ the only thing protecting us today is that the UI doesn't kick off
-          concurrent briefings. add a "background refresh" feature, or have
-          two users in two browser tabs, and the race becomes observable.
-          the MVCC fix lives in whatever DB we'd pick — UPSERT with version
-          column, or wrap the whole thing in BEGIN/COMMIT.
 ```
 
 ## Elaborate

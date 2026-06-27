@@ -293,6 +293,94 @@ Every layer-crossing in this pipeline is an `await` on I/O that can fail indepen
 
 The primary diagram below makes all layers and boundaries explicit.
 
+### Code in this codebase
+
+Each hop in Move 2 above maps to a real file + function in the repo. Open these in order to read the live wiring.
+
+**Hop 1 — Page fetch · `app/page.tsx`**
+**Function / class:** `HomePage` (default export); the `[mode, ready]` briefing fetch effect
+**Line range:** L87–455 (`HomePage`); L248–455 (briefing fetch effect)
+**Role:** 2-column layout with a runtime demo/live toggle and dev-only capture button. Resolves `localStorage` `bi:mode` (L119–129), fires the briefing fetch when mode is ready, handles 401+`needsAuth` redirect (L272–277), error display, empty state, the NDJSON live stream, and card render (L682).
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/page.tsx#L87-L455
+
+**Hops 2 + 5.5 + 6 + 7 — The route handler · `app/api/briefing/route.ts`**
+**Function / class:** `GET` (named export); `describeToolCall`; `trunc`; `coverageChecklistSteps`; `maxDuration = 300`; `REPLAY_DELAY_MS = 140`
+**Line range:** L75–265
+**Role:** The full pipeline: demo short-circuit that now *replays* the snapshot as a paced NDJSON stream (L76–151, `existsSync(DEMO_FILE)` L84, replay loop L97–149 at `REPLAY_DELAY_MS = 140`), API-key guard (L153–155), session + connect wrapped in try/catch (L161–171), 401 gate (L172–174), then a live NDJSON `ReadableStream` (L178–264): bootstrap (L189) + `workspace` event (L190–197), coverage gate `schemaCapabilities`/`coverageReport`/`runnableCategories` + per-category `step`/`coverage_item` (L199–212), `agent.scan(hooks, runnable)` (L223–240), mapping + `insight`/`done` events (L242–246), `error` event on throw (L247–252).
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/api/briefing/route.ts#L75-L265
+
+**Briefing route happy path (pseudocode):**
+```
+GET /api/briefing
+  if ?demo=cached && file exists →            // paced NDJSON replay, not a JSON blob
+    snapshot = JSON.parse(readFileSync(DEMO_FILE))
+    return ReadableStream(NDJSON, REPLAY_DELAY_MS=140 per event):
+      send {workspace}
+      send {step "matching…checklist"}; for each coverage row: send {step}+{coverage_item}
+      for each recorded trace item: send {tool_call_start}/{tool_call_end} | {step}
+      for each insight: send {insight}; send {done}
+  if !ANTHROPIC_API_KEY → 500 { error }
+
+  try:                                         // setup throw → real error, not bare 500
+    sid  = await getOrCreateSessionId()        // cookie bi_session
+    conn = await connectMcp(sid)               // wraps connectMcpInner in withAuthCookies
+  catch e → 500 { error: '/api/briefing setup · ' + e.message }
+  if !conn.ok → 401 { needsAuth, authUrl }
+
+  return ReadableStream(NDJSON):
+    schema    = await bootstrapSchema(mcp)     // module-cached after first call
+    send { workspace }
+    // coverage gate: match the live schema to the 10-category checklist
+    capabilities = schemaCapabilities(schema)
+    coverage     = coverageReport(capabilities)     // full | limited | unavailable
+    runnable     = runnableCategories(capabilities) // full + limited only
+    step('matching…checklist…')
+    for each item of coverage: step(line); send { coverage_item: item }
+    allTools  = await mcp.listTools()
+    agent     = new MonitoringAgent(anthropic, mcp, schema, allTools)
+    anomalies = await agent.scan({ onToolCall, onToolResult, onText }, runnable)  // gated; each → BriefingEvent
+    insights  = anomalies.map(anomalyToInsight)
+    putInsights(insights, anomalies)
+    for insight of listInsights(): send { insight }
+    send { done }                              // catch → send { error }
+```
+
+**Hop 3 — Session resolution · `lib/mcp/session.ts`**
+**Function / class:** `getOrCreateSessionId`; `readSessionId`; `sessionCookieOpts`
+**Line range:** L10–29 (`sessionCookieOpts` L10–14, `getOrCreateSessionId` L16–24, `readSessionId` L26–29)
+**Role:** Reads or creates the `bi_session` cookie that keys all per-session OAuth and MCP state; `sessionCookieOpts` picks `SameSite=None; Secure` in prod (survives the cross-site OAuth round trip), `Lax` in dev.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/session.ts#L10-L29
+
+**Hop 4 — MCP connection / OAuth gate · `lib/mcp/connect.ts`**
+**Function / class:** `connectMcp` (async, wraps `connectMcpInner` in `withAuthCookies`); `redirectUri` (async, host-based); `completeAuth`; `ConnectResult` type
+**Line range:** L31–122 (`redirectUri` L31–52, `connectMcp` L59–64, `connectMcpInner` L66–107, `completeAuth` L114–122)
+**Role:** Derives a host-based `redirectUri()` (from `x-forwarded-host` in prod), builds the `StreamableHTTPClientTransport` + `BloomreachAuthProvider`, and returns either a ready `McpClient` or an `authUrl` for redirect — all inside `withAuthCookies` so the prod encrypted-cookie store is seeded/flushed once per request.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L31-L122
+
+**Hop 5 — Schema bootstrap · `lib/mcp/schema.ts`**
+**Function / class:** `bootstrapSchema`; `resolveProject`; `parseWorkspaceSchema`
+**Line range:** L170–192 (`bootstrapSchema`); `cached` at L131
+**Role:** Module-level cached `WorkspaceSchema` built from four sequential MCP tool calls.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/schema.ts#L170-L192
+
+**Hop 5.5 — Coverage gate · `lib/agents/categories.ts`**
+**Function / class:** `schemaCapabilities`; `coverageReport`; `runnableCategories`; `CATEGORIES`
+**Line range:** L116–160 (`schemaCapabilities` L116–127, `coverageReport` L144–155, `runnableCategories` L158–160; `CATEGORIES` registry L19–112)
+**Role:** The coverage gate (hop 5.5). `schemaCapabilities` flattens the schema into a capability `Set`; `coverageReport` classifies each of the 10 `CATEGORIES` as `full`/`limited`/`unavailable`; `runnableCategories` returns the `full` + `limited` ones that the route hands to `MonitoringAgent.scan`.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/categories.ts#L116-L160
+
+**Hop 6 — Agent run · `lib/agents/monitoring.ts`**
+**Function / class:** `MonitoringAgent`; `MonitoringAgent.scan`
+**Line range:** L61–121 (`scan` L69–120, `maxToolCalls` L101)
+**Role:** Runs the agentic Claude loop against MCP tools. `scan(hooks?, categories: AnomalyCategory[] = [])` (L69) builds a per-category checklist from the passed `categories` (the runnable set from the route's coverage gate) and injects it into the prompt (L73–86), then returns sorted `Anomaly[]`.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L61-L121
+
+**Hop 7 — Mapping and response · `lib/state/insights.ts`**
+**Function / class:** `anomalyToInsight`; `putInsights`; `listInsights`
+**Line range:** L8–53 (`anomalyToInsight` L8–27, `putInsights` L29–41, `listInsights` L51–53)
+**Role:** In-process `Map`-backed store; `anomalyToInsight` maps `Anomaly` → `Insight` with a headline and UUID, and also sets `impact`, `history`, and spreads `...deriveInsightFields(a)`.
+**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/state/insights.ts#L8-L53
+
 ---
 
 ## Request flow — diagram
@@ -371,108 +459,6 @@ MCP / Provider layer
                                 │
                     (responses flow back up through the layers above)
 ```
-
----
-
-## Implementation in codebase
-
-**File:** `app/page.tsx`
-**Function / class:** `HomePage` (default export); the `[mode, ready]` briefing fetch effect
-**Line range:** L87–455 (`HomePage`); L248–455 (briefing fetch effect)
-**Role:** 2-column layout with a runtime demo/live toggle and dev-only capture button. Resolves `localStorage` `bi:mode` (L119–129), fires the briefing fetch when mode is ready, handles 401+`needsAuth` redirect (L272–277), error display, empty state, the NDJSON live stream, and card render (L682).
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/page.tsx#L87-L455
-
----
-
-**File:** `app/api/briefing/route.ts`
-**Function / class:** `GET` (named export); `describeToolCall`; `trunc`; `coverageChecklistSteps`; `maxDuration = 300`; `REPLAY_DELAY_MS = 140`
-**Line range:** L75–265
-**Role:** The full pipeline: demo short-circuit that now *replays* the snapshot as a paced NDJSON stream (L76–151, `existsSync(DEMO_FILE)` L84, replay loop L97–149 at `REPLAY_DELAY_MS = 140`), API-key guard (L153–155), session + connect wrapped in try/catch (L161–171), 401 gate (L172–174), then a live NDJSON `ReadableStream` (L178–264): bootstrap (L189) + `workspace` event (L190–197), coverage gate `schemaCapabilities`/`coverageReport`/`runnableCategories` + per-category `step`/`coverage_item` (L199–212), `agent.scan(hooks, runnable)` (L223–240), mapping + `insight`/`done` events (L242–246), `error` event on throw (L247–252).
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/app/api/briefing/route.ts#L75-L265
-
-**Briefing route happy path (pseudocode):**
-```
-GET /api/briefing
-  if ?demo=cached && file exists →            // paced NDJSON replay, not a JSON blob
-    snapshot = JSON.parse(readFileSync(DEMO_FILE))
-    return ReadableStream(NDJSON, REPLAY_DELAY_MS=140 per event):
-      send {workspace}
-      send {step "matching…checklist"}; for each coverage row: send {step}+{coverage_item}
-      for each recorded trace item: send {tool_call_start}/{tool_call_end} | {step}
-      for each insight: send {insight}; send {done}
-  if !ANTHROPIC_API_KEY → 500 { error }
-
-  try:                                         // setup throw → real error, not bare 500
-    sid  = await getOrCreateSessionId()        // cookie bi_session
-    conn = await connectMcp(sid)               // wraps connectMcpInner in withAuthCookies
-  catch e → 500 { error: '/api/briefing setup · ' + e.message }
-  if !conn.ok → 401 { needsAuth, authUrl }
-
-  return ReadableStream(NDJSON):
-    schema    = await bootstrapSchema(mcp)     // module-cached after first call
-    send { workspace }
-    // coverage gate: match the live schema to the 10-category checklist
-    capabilities = schemaCapabilities(schema)
-    coverage     = coverageReport(capabilities)     // full | limited | unavailable
-    runnable     = runnableCategories(capabilities) // full + limited only
-    step('matching…checklist…')
-    for each item of coverage: step(line); send { coverage_item: item }
-    allTools  = await mcp.listTools()
-    agent     = new MonitoringAgent(anthropic, mcp, schema, allTools)
-    anomalies = await agent.scan({ onToolCall, onToolResult, onText }, runnable)  // gated; each → BriefingEvent
-    insights  = anomalies.map(anomalyToInsight)
-    putInsights(insights, anomalies)
-    for insight of listInsights(): send { insight }
-    send { done }                              // catch → send { error }
-```
-
----
-
-**File:** `lib/mcp/session.ts`
-**Function / class:** `getOrCreateSessionId`; `readSessionId`; `sessionCookieOpts`
-**Line range:** L10–29 (`sessionCookieOpts` L10–14, `getOrCreateSessionId` L16–24, `readSessionId` L26–29)
-**Role:** Reads or creates the `bi_session` cookie that keys all per-session OAuth and MCP state; `sessionCookieOpts` picks `SameSite=None; Secure` in prod (survives the cross-site OAuth round trip), `Lax` in dev.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/session.ts#L10-L29
-
----
-
-**File:** `lib/mcp/connect.ts`
-**Function / class:** `connectMcp` (async, wraps `connectMcpInner` in `withAuthCookies`); `redirectUri` (async, host-based); `completeAuth`; `ConnectResult` type
-**Line range:** L31–122 (`redirectUri` L31–52, `connectMcp` L59–64, `connectMcpInner` L66–107, `completeAuth` L114–122)
-**Role:** Derives a host-based `redirectUri()` (from `x-forwarded-host` in prod), builds the `StreamableHTTPClientTransport` + `BloomreachAuthProvider`, and returns either a ready `McpClient` or an `authUrl` for redirect — all inside `withAuthCookies` so the prod encrypted-cookie store is seeded/flushed once per request.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/connect.ts#L31-L122
-
----
-
-**File:** `lib/mcp/schema.ts`
-**Function / class:** `bootstrapSchema`; `resolveProject`; `parseWorkspaceSchema`
-**Line range:** L170–192 (`bootstrapSchema`); `cached` at L131
-**Role:** Module-level cached `WorkspaceSchema` built from four sequential MCP tool calls.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/mcp/schema.ts#L170-L192
-
----
-
-**File:** `lib/agents/monitoring.ts`
-**Function / class:** `MonitoringAgent`; `MonitoringAgent.scan`
-**Line range:** L61–121 (`scan` L69–120, `maxToolCalls` L101)
-**Role:** Runs the agentic Claude loop against MCP tools. `scan(hooks?, categories: AnomalyCategory[] = [])` (L69) builds a per-category checklist from the passed `categories` (the runnable set from the route's coverage gate) and injects it into the prompt (L73–86), then returns sorted `Anomaly[]`.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/monitoring.ts#L61-L121
-
----
-
-**File:** `lib/agents/categories.ts`
-**Function / class:** `schemaCapabilities`; `coverageReport`; `runnableCategories`; `CATEGORIES`
-**Line range:** L116–160 (`schemaCapabilities` L116–127, `coverageReport` L144–155, `runnableCategories` L158–160; `CATEGORIES` registry L19–112)
-**Role:** The coverage gate (hop 5.5). `schemaCapabilities` flattens the schema into a capability `Set`; `coverageReport` classifies each of the 10 `CATEGORIES` as `full`/`limited`/`unavailable`; `runnableCategories` returns the `full` + `limited` ones that the route hands to `MonitoringAgent.scan`.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/agents/categories.ts#L116-L160
-
----
-
-**File:** `lib/state/insights.ts`
-**Function / class:** `anomalyToInsight`; `putInsights`; `listInsights`
-**Line range:** L8–53 (`anomalyToInsight` L8–27, `putInsights` L29–41, `listInsights` L51–53)
-**Role:** In-process `Map`-backed store; `anomalyToInsight` maps `Anomaly` → `Insight` with a headline and UUID, and also sets `impact`, `history`, and spreads `...deriveInsightFields(a)`.
-**GitHub:** https://github.com/rlynjb/blooming_insights/blob/main/lib/state/insights.ts#L8-L53
 
 ---
 

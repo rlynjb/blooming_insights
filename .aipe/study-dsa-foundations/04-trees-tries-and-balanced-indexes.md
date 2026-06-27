@@ -156,6 +156,36 @@ BFS by level:    root, A, B, C, D, E, F, G, H
 
 **In this codebase: not yet exercised as an algorithm.** The schema is a 2-level tree (`events → properties`) but the access pattern is `for each event: for each property` — two flat loops, no recursion, no DFS/BFS abstraction. The schema is *shaped* like a tree but *used* like a 2D array.
 
+**Code in this codebase — schema-as-nested-object is NOT a tree algorithm (`lib/mcp/schema.ts` L8–L18, `lib/agents/categories.ts` L116–L127).**
+
+```ts
+// lib/mcp/schema.ts L8–L18
+export interface WorkspaceSchema {
+  projectId: string;
+  projectName: string;
+  events: { name: string; properties: string[]; eventCount: number }[];
+  customerProperties: string[];
+  catalogs: { id: string; name: string }[];
+  totalCustomers: number;
+  totalEvents: number;
+  oldestTimestamp: number | null;
+}
+```
+
+The shape is a 2-level "tree": `WorkspaceSchema → events[] → properties[]`. But look at how it's actually used:
+
+```ts
+// lib/agents/categories.ts L116–L127 (schemaCapabilities)
+for (const e of schema.events ?? []) {
+  set.add(e.name);
+  for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
+}
+```
+
+Two flat `for` loops. No recursion. No DFS. No tree navigation. The data *happens to be* a 2-level nested array; the algorithm treats it as a 2D structure and flattens it. If the schema grew to three or four levels (events → property groups → properties → property attributes), the natural rewrite would be a recursive walker — and *that* would be a tree algorithm. Today it isn't. This is the difference between *data shaped like a tree* and *a tree algorithm*.
+
+**The React component tree is also not ours.** The render output in `app/page.tsx` and `components/feed/InsightCard.tsx` produces a JSX tree, which React turns into a Fiber tree internally. React reconciles it — diffs old tree against new, computes minimal DOM mutations. We don't *write* tree-walking code; React does it for us. From the codebase's perspective, the tree is invisible. Beginners sometimes count "I use React" as "I use a tree algorithm." You don't — React uses the tree algorithm; you use React.
+
 ### Move 2 — search trees and balanced indexes
 
 A binary search tree (BST) is a tree where every node's value is greater than all values in its left subtree and less than all values in its right subtree. This invariant lets you find a value in O(log N) time when the tree is balanced.
@@ -219,6 +249,8 @@ in-order      O(N)                O(N)             O(N)
 
 **In this codebase: not yet exercised.** No use of a `TreeMap` equivalent. The closest thing is `.sort()` over an array of 30 anomalies, which is one-shot — no need for an ordered-by-default structure. The JavaScript standard library doesn't ship a balanced BST; if the codebase needed one it would reach for the `sorted-btree` npm package (or roll an array of `{key, value}` pairs kept sorted with binary insertion, which is the same idea at small N).
 
+**Code in this codebase — `not yet exercised`.** No `class.*Tree`, no `insert`/`delete` BST operations anywhere in `lib/` or `app/`. The user's own portfolio outside this repo (`reincodes/BinarySearchTree.ts`, `reincodes/Tree.ts`) has these — but they haven't been reached for in `blooming_insights`. The plausible trigger: if the TTL cache needed to answer "give me everything cached in the last 30 seconds" (range query by `expiresAt`), a balanced BST would beat the current `Map` (which can't answer range queries without iterating all entries).
+
 ### Move 3 — tries (prefix trees)
 
 A trie is a tree where *each edge is labeled by a character*, and paths from the root spell out the stored strings. Lookup is O(M) where M is the length of the key.
@@ -253,6 +285,8 @@ A trie is a tree where *each edge is labeled by a character*, and paths from the
 - **Dictionary / lexicon** — efficient storage of many words sharing prefixes (common letters share edges).
 
 **In this codebase: not yet exercised.** No autocomplete. No prefix lookup. The closest thing is `text.match(/^(?:json)?/)` regex prefix matching — different mechanism. If the agent intent classifier (`lib/agents/intent.ts`) needed to match user input against a dictionary of known intents efficiently, a trie would fit, but the current implementation is a few regex tests.
+
+**Code in this codebase — `not yet exercised`.** No file path. The plausible trigger: if the UI added a search box that suggested tools or event names as the user types, a trie would beat a linear regex test once the dataset grows beyond ~100 strings.
 
 ### Move 2 variant — the BST kernel (the load-bearing tree-family example)
 
@@ -347,64 +381,6 @@ The tree family — three subfamilies, their invariant, their cost, and their pr
   │  with flat loops)  │                        │                        │
   └────────────────────┴────────────────────────┴────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-The closest-thing-to-a-tree, named honestly, and the gaps.
-
-### **Schema as a nested object — NOT a tree algorithm (`lib/mcp/schema.ts` L8–L18, L92–L100)**
-
-```ts
-// lib/mcp/schema.ts L8–L18
-export interface WorkspaceSchema {
-  projectId: string;
-  projectName: string;
-  events: { name: string; properties: string[]; eventCount: number }[];
-  customerProperties: string[];
-  catalogs: { id: string; name: string }[];
-  totalCustomers: number;
-  totalEvents: number;
-  oldestTimestamp: number | null;
-}
-```
-
-The shape is a 2-level "tree": `WorkspaceSchema → events[] → properties[]`. But look at how it's actually used:
-
-```ts
-// lib/agents/categories.ts L116–L127 (schemaCapabilities)
-for (const e of schema.events ?? []) {
-  set.add(e.name);
-  for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
-}
-```
-
-Two flat `for` loops. No recursion. No DFS. No tree navigation. The data *happens to be* a 2-level nested array; the algorithm treats it as a 2D structure and flattens it. If the schema grew to three or four levels (events → property groups → properties → property attributes), the natural rewrite would be a recursive walker — and *that* would be a tree algorithm. Today it isn't.
-
-This is the difference between *data shaped like a tree* and *a tree algorithm*. The codebase has the first; it doesn't have the second.
-
-### **React component tree — managed by React, not by us**
-
-The render output in `app/page.tsx` and `components/feed/InsightCard.tsx` (etc.) produces a JSX tree, which React turns into a Fiber tree internally. React reconciles it — diffs old tree against new, computes minimal DOM mutations. We don't *write* tree-walking code; React does it for us. From the codebase's perspective, the tree is invisible.
-
-This is worth naming because beginners sometimes count "I use React" as "I use a tree algorithm." You don't. React uses the tree algorithm; you use React.
-
-### **No BST, no AVL, no B-tree, no trie**
-
-Confirmed by grep: no `class.*Tree`, no `class.*Trie`, no `class.*Node` for hierarchical data, no `insert`/`delete` BST operations anywhere in `lib/` or `app/`. The user's own portfolio outside this repo (`reincodes/BinarySearchTree.ts`, `reincodes/Tree.ts`) has these — but they haven't been reached for in `blooming_insights`.
-
-### **What would trigger reaching for a tree here?**
-
-Three concrete triggers, ranked by likelihood:
-
-1. **Hierarchical schemas grow.** If Bloomreach's schema added nested property groups (which is likely as the platform evolves), the flat-loop pattern in `schemaCapabilities` would become unmanageable. A recursive walker — a real tree algorithm — would be the right rewrite.
-
-2. **Autocomplete over tools or events.** If the UI added a search box that suggested tools or event names as the user types, a trie would beat a linear regex test once the dataset grows beyond ~100 strings.
-
-3. **Sorted, range-queried local cache.** If the TTL cache needed to answer "give me everything cached in the last 30 seconds" (range query by `expiresAt`), a balanced BST would beat the current `Map` (which can't answer range queries without iterating all entries).
-
-None of these triggers has fired. The chapter is here because they're the structures you reach for when one does.
 
 ---
 

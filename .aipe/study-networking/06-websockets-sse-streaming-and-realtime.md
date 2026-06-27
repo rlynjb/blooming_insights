@@ -95,6 +95,13 @@ The browser's reader doesn't care about line boundaries; it gets `Uint8Array` ch
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **Live briefing scan.** `/api/briefing` emits `workspace`, `coverage_item` × N, `reasoning_step` × many, `tool_call_start/end` × ~10, `insight` × ~3, `done`. ~60 s.
+  → **Live investigation.** `/api/agent?insightId=…&step=diagnose` emits `reasoning_step` (agent thoughts), `tool_call_start/end` (EQL queries), `diagnosis`, `done`. ~30–60 s for diagnose, ~20–40 s for recommend.
+  → **Demo replay.** Same wire format; route reads a snapshot from disk and paces events with `REPLAY_DELAY_MS = 140` (briefing) or `180` (agent). The consumer doesn't know it's a replay.
+  → **Free-form query.** `/api/agent?q=…` runs a one-shot query agent, emits one `reasoning_step` per chunk, then a final conclusion + `done`.
+
 **Why not SSE? Auto-reconnect would re-bill a 115 s LLM run.** SSE's `EventSource` API is *built* to auto-reconnect on disconnect, replaying from a `Last-Event-ID`. That's beautiful for a chat feed (re-pull missed messages). It's a disaster for an agent: a transient network blip mid-investigation triggers `EventSource` to open a new connection, our server has no idea the previous one was a "continuation," it runs the *whole* diagnostic agent again — re-billing Anthropic, re-burning Bloomreach rate-limit budget, doubling the cost. We get the same streaming shape from chunked HTTP without that footgun.
 
 ```
@@ -155,118 +162,7 @@ Pseudocode — producer side
     })
 ```
 
-**The consumer side — `getReader()` + line-buffered loop.** The client `fetch`es the URL, checks the status (handle 401/500 first), grabs `res.body.getReader()`, and loops: `await reader.read()` returns `{done, value}`; `value` is a `Uint8Array` chunk; `TextDecoder({stream:true}).decode(value)` turns it into a partial string; `buf.split('\n')` slices into complete lines; `buf = lines.pop()` saves the trailing partial; each complete line is `JSON.parse`'d and handed to the event switch.
-
-```
-Pseudocode — consumer side
-
-  reader = res.body.getReader()
-  decoder = new TextDecoder()
-  buf = ''
-  loop:
-    {done, value} = await reader.read()
-    if done: break
-    buf += decoder.decode(value, {stream:true})
-                                  │
-                                  └─ stream:true keeps partial UTF-8 bytes
-                                     buffered across reads (a multi-byte char
-                                     split across two chunks doesn't corrupt)
-    lines = buf.split('\n')
-    buf = lines.pop()           // ← either '' (clean break) or partial line
-    for line in lines:
-      if line is empty: continue
-      try:
-        event = JSON.parse(line)
-        handle(event)            // switch (event.type) → setState
-      catch:
-        skip                    // malformed line, log-and-skip
-```
-
-The boundary that catches people: `lines.pop()` is load-bearing. Drop it (or use `lines.slice(0,-1)` without re-stashing the trailing partial in `buf`) and the partial line becomes the start of the next read's parse — which corrupts two events instead of one.
-
-**What about the cache-replay path?** The same NDJSON shape is used by the demo replay (`?demo=cached`) — the route reads a JSON snapshot from disk and re-emits the same events into a `ReadableStream` with `REPLAY_DELAY_MS` between them. The consumer code is unchanged: same reader, same handler. The wire format being identical between live and replay is what makes "demo mode" useful — the UI sees no difference.
-
-### Move 2.5 — current vs future state (when applicable)
-
-NDJSON over chunked HTTP is fully shipped; SSE / WebSocket / gRPC-streaming are `not yet exercised` and there is no migration in motion. If we ever needed *server-initiated push outside a request context* (e.g. "tell the user when a new anomaly fires, without them asking"), the right next step is SSE — not WebSocket — because the data flow is still server-push only, and SSE's auto-reconnect is now an asset (no expensive backend recomputation, just re-fetch the latest events).
-
-```
-Hypothetical evolution — when SSE/WS would be the right call
-
-  trigger                          right next step
-  ───────                           ───────────────
-  push without request context     SSE (server-initiated, browser-pulled)
-  bidirectional collab (multi-user)WebSocket (full-duplex)
-  binary payloads at high freq     WebSocket binary frames or WebTransport
-  large structured snapshots       chunked HTTP + NDJSON ★ (we are here)
-```
-
-### Principle
-
-Pick the smallest transport that carries your event shape. Streaming JSON over a regular HTTP request gives you 90% of what SSE/WebSocket give you, with 10% of the complexity (no server runtime, no auto-reconnect logic, no separate auth dance). Reach for SSE only when auto-reconnect is what you actually want; reach for WebSocket only when you have a real back-channel.
-
----
-
-## Primary diagram
-
-The recap — the realtime transport, end to end.
-
-```
-Realtime over NDJSON — full recap
-
-UI band ──────────────────────────────────────────────────────────
-┌────────────────────────────────────────────────────────────────┐
-│  fetch(url)                                                     │
-│  res.status check (200/401/500)                                 │
-│  res.headers['content-type'] check (ndjson vs json)             │
-│  res.body.getReader()                                           │
-│  loop:                                                          │
-│    {done, value} = read()                                       │
-│    buf += decode(value, {stream:true})                          │
-│    lines = buf.split('\n')                                      │
-│    buf = lines.pop()                                            │
-│    for line: handle(JSON.parse(line))                           │
-│  done → cleanup, final state                                    │
-└─────────────────────────┬──────────────────────────────────────┘
-                          │ HTTP chunked / HTTP/2 DATA frames
-                          │ Content-Type: application/x-ndjson; …
-                          │ Cache-Control: no-cache, no-transform
-                          ▼
-Service band ──────────────────────────────────────────────────────
-┌────────────────────────────────────────────────────────────────┐
-│  ReadableStream({                                               │
-│    start(controller) {                                          │
-│      send(e) = controller.enqueue(encode(json(e)+'\n'))         │
-│      try {                                                      │
-│        for each agent event: send(event)                        │
-│      } catch (e) {                                              │
-│        send({type:'error', message:e})                          │
-│      } finally {                                                │
-│        controller.close()                                       │
-│      }                                                          │
-│    }                                                            │
-│  })                                                             │
-│  maxDuration=300                                                │
-└────────────────────────────────────────────────────────────────┘
-
-ALTERNATIVES NOT USED:
-  SSE       — auto-reconnect would re-bill a 115s LLM run
-  WebSocket — no back-channel, no native serverless support
-  gRPC      — wrong tool for browser-first; binary opaque in DevTools
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **Live briefing scan.** `/api/briefing` emits `workspace`, `coverage_item` × N, `reasoning_step` × many, `tool_call_start/end` × ~10, `insight` × ~3, `done`. ~60 s.
-  → **Live investigation.** `/api/agent?insightId=…&step=diagnose` emits `reasoning_step` (agent thoughts), `tool_call_start/end` (EQL queries), `diagnosis`, `done`. ~30–60 s for diagnose, ~20–40 s for recommend.
-  → **Demo replay.** Same wire format; route reads a snapshot from disk and paces events with `REPLAY_DELAY_MS = 140` (briefing) or `180` (agent). The consumer doesn't know it's a replay.
-  → **Free-form query.** `/api/agent?q=…` runs a one-shot query agent, emits one `reasoning_step` per chunk, then a final conclusion + `done`.
-
-### Producer — `app/api/agent/route.ts`
+The real producer in the repo — every annotation traces a load-bearing line:
 
 ```
 app/api/agent/route.ts  (lines 168-264)
@@ -322,7 +218,36 @@ const stream = new ReadableStream<Uint8Array>({
 return new Response(stream, { headers: NDJSON_HEADERS });
 ```
 
-### Consumer — `lib/hooks/useInvestigation.ts`
+**The consumer side — `getReader()` + line-buffered loop.** The client `fetch`es the URL, checks the status (handle 401/500 first), grabs `res.body.getReader()`, and loops: `await reader.read()` returns `{done, value}`; `value` is a `Uint8Array` chunk; `TextDecoder({stream:true}).decode(value)` turns it into a partial string; `buf.split('\n')` slices into complete lines; `buf = lines.pop()` saves the trailing partial; each complete line is `JSON.parse`'d and handed to the event switch.
+
+```
+Pseudocode — consumer side
+
+  reader = res.body.getReader()
+  decoder = new TextDecoder()
+  buf = ''
+  loop:
+    {done, value} = await reader.read()
+    if done: break
+    buf += decoder.decode(value, {stream:true})
+                                  │
+                                  └─ stream:true keeps partial UTF-8 bytes
+                                     buffered across reads (a multi-byte char
+                                     split across two chunks doesn't corrupt)
+    lines = buf.split('\n')
+    buf = lines.pop()           // ← either '' (clean break) or partial line
+    for line in lines:
+      if line is empty: continue
+      try:
+        event = JSON.parse(line)
+        handle(event)            // switch (event.type) → setState
+      catch:
+        skip                    // malformed line, log-and-skip
+```
+
+The boundary that catches people: `lines.pop()` is load-bearing. Drop it (or use `lines.slice(0,-1)` without re-stashing the trailing partial in `buf`) and the partial line becomes the start of the next read's parse — which corrupts two events instead of one.
+
+The real consumer in the repo — the same shape, with the 401 short-circuit and tail handling spelled out:
 
 ```
 lib/hooks/useInvestigation.ts  (lines 153-208)
@@ -393,11 +318,78 @@ if (buf.trim()) {
 }
 ```
 
-### What's absent (and the verdict)
+**What about the cache-replay path?** The same NDJSON shape is used by the demo replay (`?demo=cached`) — the route reads a JSON snapshot from disk and re-emits the same events into a `ReadableStream` with `REPLAY_DELAY_MS` between them. The consumer code is unchanged: same reader, same handler. The wire format being identical between live and replay is what makes "demo mode" useful — the UI sees no difference.
 
-  → **No `EventSource`** anywhere in the codebase. A grep for `EventSource`, `text/event-stream`, `data:` returns no hits. Verdict: `not yet exercised`; SSE is the right move *if and only if* we ever need server-push outside a request context.
-  → **No WebSocket.** A grep for `WebSocket`, `ws://`, `wss://` returns no hits. Verdict: `not yet exercised`; would only be right with a full-duplex requirement.
-  → **No gRPC, no WebTransport.** Same.
+**What's absent (and the verdict).** A grep for `EventSource`, `text/event-stream`, `data:` returns no hits — verdict: `not yet exercised`; SSE is the right move *if and only if* we ever need server-push outside a request context. A grep for `WebSocket`, `ws://`, `wss://` returns no hits — `not yet exercised`; would only be right with a full-duplex requirement. Same for gRPC and WebTransport.
+
+### Move 2.5 — current vs future state (when applicable)
+
+NDJSON over chunked HTTP is fully shipped; SSE / WebSocket / gRPC-streaming are `not yet exercised` and there is no migration in motion. If we ever needed *server-initiated push outside a request context* (e.g. "tell the user when a new anomaly fires, without them asking"), the right next step is SSE — not WebSocket — because the data flow is still server-push only, and SSE's auto-reconnect is now an asset (no expensive backend recomputation, just re-fetch the latest events).
+
+```
+Hypothetical evolution — when SSE/WS would be the right call
+
+  trigger                          right next step
+  ───────                           ───────────────
+  push without request context     SSE (server-initiated, browser-pulled)
+  bidirectional collab (multi-user)WebSocket (full-duplex)
+  binary payloads at high freq     WebSocket binary frames or WebTransport
+  large structured snapshots       chunked HTTP + NDJSON ★ (we are here)
+```
+
+### Principle
+
+Pick the smallest transport that carries your event shape. Streaming JSON over a regular HTTP request gives you 90% of what SSE/WebSocket give you, with 10% of the complexity (no server runtime, no auto-reconnect logic, no separate auth dance). Reach for SSE only when auto-reconnect is what you actually want; reach for WebSocket only when you have a real back-channel.
+
+---
+
+## Primary diagram
+
+The recap — the realtime transport, end to end.
+
+```
+Realtime over NDJSON — full recap
+
+UI band ──────────────────────────────────────────────────────────
+┌────────────────────────────────────────────────────────────────┐
+│  fetch(url)                                                     │
+│  res.status check (200/401/500)                                 │
+│  res.headers['content-type'] check (ndjson vs json)             │
+│  res.body.getReader()                                           │
+│  loop:                                                          │
+│    {done, value} = read()                                       │
+│    buf += decode(value, {stream:true})                          │
+│    lines = buf.split('\n')                                      │
+│    buf = lines.pop()                                            │
+│    for line: handle(JSON.parse(line))                           │
+│  done → cleanup, final state                                    │
+└─────────────────────────┬──────────────────────────────────────┘
+                          │ HTTP chunked / HTTP/2 DATA frames
+                          │ Content-Type: application/x-ndjson; …
+                          │ Cache-Control: no-cache, no-transform
+                          ▼
+Service band ──────────────────────────────────────────────────────
+┌────────────────────────────────────────────────────────────────┐
+│  ReadableStream({                                               │
+│    start(controller) {                                          │
+│      send(e) = controller.enqueue(encode(json(e)+'\n'))         │
+│      try {                                                      │
+│        for each agent event: send(event)                        │
+│      } catch (e) {                                              │
+│        send({type:'error', message:e})                          │
+│      } finally {                                                │
+│        controller.close()                                       │
+│      }                                                          │
+│    }                                                            │
+│  })                                                             │
+│  maxDuration=300                                                │
+└────────────────────────────────────────────────────────────────┘
+
+ALTERNATIVES NOT USED:
+  SSE       — auto-reconnect would re-bill a 115s LLM run
+  WebSocket — no back-channel, no native serverless support
+  gRPC      — wrong tool for browser-first; binary opaque in DevTools
+```
 
 ---
 

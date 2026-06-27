@@ -252,95 +252,16 @@ The boundary: **the gate's sleep DOES serialize the calls correctly** (because i
 
 ---
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Same code shape, different semantic, different failure mode.** The lesson isn't "spacing gates are bad" or "always add backpressure" — it's "name what your code actually does." The spacing gate at `lib/mcp/client.ts:148-152` is the *correct* compliance solution for a single-flight rate-limited consumer. It would be the *wrong* backpressure solution for a fan-out consumer because it has no queue and no signal. Naming it accurately ("rate-limit compliance, not backpressure") makes the limitation visible: the day someone ships parallel agents, *they need to add the queue + semaphore + signal* — the gate alone won't catch them. The general principle: **same code shape ≠ same pattern**. Always name the failure mode the code prevents, not just the code's surface behavior.
-
----
-
-## Primary diagram
-
-The full picture — the gate kernel, what it has, what it deliberately lacks, what would change with fan-out.
-
-```
-  blooming insights — the spacing gate in context
-
-  ┌─ TODAY: sequential, single-flight ─────────────────────────────────┐
-  │                                                                     │
-  │  agent loop                                                         │
-  │     │  awaits tool 1                                                │
-  │     ▼                                                                │
-  │  McpClient.callTool                                                 │
-  │     │  (cache check, MISS path)                                     │
-  │     ▼                                                                │
-  │  McpClient.liveCall (THE GATE — lib/mcp/client.ts:148-152)         │
-  │     elapsed = now - lastCallAt                                      │
-  │     if elapsed < 1100:                                              │
-  │       sleep(1100 - elapsed)        ← THE FLOOR (deterministic)      │
-  │     transport.callTool(...)        ← actual HTTPS                   │
-  │     lastCallAt = now               ← update state                   │
-  │     │                                                                │
-  │     ▼                                                                │
-  │  return to agent loop                                               │
-  │     │  awaits tool 2 (gate fires again)                             │
-  │     ▼  serialized by await chain                                    │
-  │                                                                     │
-  │  state: { lastCallAt: number }    ← that's it. one number.          │
-  │                                                                     │
-  │  ★ everything works. 6 calls × ~1.1s = ~6.6s spacing per agent ★    │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ WHAT THE GATE IS NOT ─────────────────────────────────────────────┐
-  │                                                                     │
-  │  NOT a queue       (single-flight, no buffer of pending calls)     │
-  │  NOT a semaphore   (concurrency is already 1 via await)             │
-  │  NOT an upward     (no producer to signal — agent IS producer)     │
-  │     signal                                                          │
-  │  NOT load-         (fires every call, regardless of load)           │
-  │     conditional                                                     │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ TOMORROW: parallel fan-out (the failure mode) ───────────────────┐
-  │                                                                     │
-  │  supervisor                                                         │
-  │     │  Promise.all([ sub-agent 1, sub-agent 2, ..., sub-agent N ]) │
-  │     ▼                                                                │
-  │  sub-agents (all in flight at once, sharing one McpClient)         │
-  │     │                                                                │
-  │     │  ALL call McpClient.callTool concurrently                     │
-  │     │  all serialize at the gate (await sleep)                      │
-  │     │                                                                │
-  │     ▼                                                                │
-  │  gate processes one at a time, lastCallAt updates serially         │
-  │  ★ calls still correctly spaced ★                                   │
-  │                                                                     │
-  │  BUT:                                                               │
-  │  ★ memory grows: N stacks holding N agent states                    │
-  │  ★ no signal back to supervisor: "queue's full, stop spawning"     │
-  │  ★ latency = N × 1.1s for the last sub-agent's first call          │
-  │                                                                     │
-  │  what BACKPRESSURE would add:                                       │
-  │  - semaphore: K concurrent permits (K=1 or 2)                       │
-  │  - bounded queue: max M waiting (M=10 for the scan)                 │
-  │  - upward signal: if queue full, supervisor refuses to spawn        │
-  │                                                                     │
-  │  cross-ref: study-agent-architecture/05-production-serving/        │
-  │             02-fan-out-backpressure.md                              │
-  └────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases — where the spacing gate appears (and doesn't)
+##### Use cases — where the spacing gate appears (and doesn't)
 
 - **Every MCP call.** Every `McpClient.callTool` invocation that misses the cache routes through `liveCall`, which runs the gate. Bootstrap chain (4-6 calls), agent loops (4-6 calls per agent × 2 agents per investigation), debug routes — all of them.
 - **NOT for cache hits.** A cache hit at `lib/mcp/client.ts:102-110` short-circuits before `liveCall` is reached. The gate's sleep is skipped entirely.
 - **NOT for Anthropic calls.** The gate is McpClient-specific. Anthropic calls (`anthropic.messages.create`) have no spacing — Anthropic's per-key rate limit is much higher and isn't observed at this scale.
 - **Not yet exercised: a fan-out producer.** No code in the codebase spawns parallel agents; if it did, the gate alone wouldn't be enough.
 
-### Code side by side
+##### Code side by side
 
 **The gate itself — five lines.**
 
@@ -434,6 +355,85 @@ The full picture — the gate kernel, what it has, what it deliberately lacks, w
   // but possible) would each have their own gate — both would think
   // "elapsed is large" and both would try to call. The retry loop
   // (lib/mcp/client.ts:121-132) catches the 429 from Bloomreach.
+```
+
+---
+
+### Move 3 — the principle
+
+**Same code shape, different semantic, different failure mode.** The lesson isn't "spacing gates are bad" or "always add backpressure" — it's "name what your code actually does." The spacing gate at `lib/mcp/client.ts:148-152` is the *correct* compliance solution for a single-flight rate-limited consumer. It would be the *wrong* backpressure solution for a fan-out consumer because it has no queue and no signal. Naming it accurately ("rate-limit compliance, not backpressure") makes the limitation visible: the day someone ships parallel agents, *they need to add the queue + semaphore + signal* — the gate alone won't catch them. The general principle: **same code shape ≠ same pattern**. Always name the failure mode the code prevents, not just the code's surface behavior.
+
+---
+
+## Primary diagram
+
+The full picture — the gate kernel, what it has, what it deliberately lacks, what would change with fan-out.
+
+```
+  blooming insights — the spacing gate in context
+
+  ┌─ TODAY: sequential, single-flight ─────────────────────────────────┐
+  │                                                                     │
+  │  agent loop                                                         │
+  │     │  awaits tool 1                                                │
+  │     ▼                                                                │
+  │  McpClient.callTool                                                 │
+  │     │  (cache check, MISS path)                                     │
+  │     ▼                                                                │
+  │  McpClient.liveCall (THE GATE — lib/mcp/client.ts:148-152)         │
+  │     elapsed = now - lastCallAt                                      │
+  │     if elapsed < 1100:                                              │
+  │       sleep(1100 - elapsed)        ← THE FLOOR (deterministic)      │
+  │     transport.callTool(...)        ← actual HTTPS                   │
+  │     lastCallAt = now               ← update state                   │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  return to agent loop                                               │
+  │     │  awaits tool 2 (gate fires again)                             │
+  │     ▼  serialized by await chain                                    │
+  │                                                                     │
+  │  state: { lastCallAt: number }    ← that's it. one number.          │
+  │                                                                     │
+  │  ★ everything works. 6 calls × ~1.1s = ~6.6s spacing per agent ★    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌─ WHAT THE GATE IS NOT ─────────────────────────────────────────────┐
+  │                                                                     │
+  │  NOT a queue       (single-flight, no buffer of pending calls)     │
+  │  NOT a semaphore   (concurrency is already 1 via await)             │
+  │  NOT an upward     (no producer to signal — agent IS producer)     │
+  │     signal                                                          │
+  │  NOT load-         (fires every call, regardless of load)           │
+  │     conditional                                                     │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌─ TOMORROW: parallel fan-out (the failure mode) ───────────────────┐
+  │                                                                     │
+  │  supervisor                                                         │
+  │     │  Promise.all([ sub-agent 1, sub-agent 2, ..., sub-agent N ]) │
+  │     ▼                                                                │
+  │  sub-agents (all in flight at once, sharing one McpClient)         │
+  │     │                                                                │
+  │     │  ALL call McpClient.callTool concurrently                     │
+  │     │  all serialize at the gate (await sleep)                      │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  gate processes one at a time, lastCallAt updates serially         │
+  │  ★ calls still correctly spaced ★                                   │
+  │                                                                     │
+  │  BUT:                                                               │
+  │  ★ memory grows: N stacks holding N agent states                    │
+  │  ★ no signal back to supervisor: "queue's full, stop spawning"     │
+  │  ★ latency = N × 1.1s for the last sub-agent's first call          │
+  │                                                                     │
+  │  what BACKPRESSURE would add:                                       │
+  │  - semaphore: K concurrent permits (K=1 or 2)                       │
+  │  - bounded queue: max M waiting (M=10 for the scan)                 │
+  │  - upward signal: if queue full, supervisor refuses to spawn        │
+  │                                                                     │
+  │  cross-ref: study-agent-architecture/05-production-serving/        │
+  │             02-fan-out-backpressure.md                              │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

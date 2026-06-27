@@ -179,43 +179,9 @@ The three gate verdicts map to three honest tile states. The grid renders all 10
 
 A coverage note ("checked N of 10 … skipped search failure, fraud detection — the required events aren't emitted here") closes the loop in words. The user sees the whole checklist and *why* parts are dark — the opposite of silently dropping unsupported features.
 
----
+### Code in this codebase
 
-## Schema-gated coverage — diagram
-
-Primary recap, labelled by layer.
-
-```
-┌─ UI layer (app/page.tsx · components/feed/CoverageGrid.tsx) ───────────────────┐
-│   CoverageGrid: 10 tiles from the fixed registry                               │
-│     reported → clear / amber / firing / ghost     not-yet → "checking…" pulse  │
-│     accumulates coverage_item events: setCoverage(prev => […prev, item])       │
-└───────────────────────────────▲────────────────────────────────────────────────┘
-                                 │  NDJSON: coverage_item per category (+ checklist log)
-─────────────────────────────────│──── Network boundary (chunked NDJSON stream) ──
-┌─ Route / Service layer (app/api/briefing/route.ts) ────────────────────────────┐
-│   bootstrapSchema → schema                                                      │
-│        │                                                                        │
-│   ┌─ coverage gate (lib/agents/categories.ts) ───────────────────────────┐     │
-│   │  schemaCapabilities(schema) → Set<string>                            │     │
-│   │  coverageReport(set)      → CoverageItem[10]  ──► stream to UI        │     │
-│   │  runnableCategories(set)  → AnomalyCategory[] ──┐                     │     │
-│   └─────────────────────────────────────────────────│─────────────────────┘     │
-│        │                                             ▼                           │
-│   MonitoringAgent.scan(hooks, runnable)  ── spends ~1 req/s budget on the       │
-│        │                                     runnable categories only            │
-│        ▼                                                                         │
-│   anomalies → insights → stream → done                                          │
-└──────────────────────────────────────│──────────────────────────────────────────┘
-                                        ▼  Provider layer
-                          Bloomreach MCP (events/properties/catalogs = the schema)
-```
-
-The gate is a free, in-memory checkpoint that does two jobs at once: it bounds the expensive downstream stage, and it produces the UI's coverage state. Both fall out of the same classification.
-
----
-
-## Implementation in codebase
+The gate stage lives in the briefing route; the pure classification functions live in `categories.ts`; the tiles render in `CoverageGrid.tsx`; the client accumulator is in `app/page.tsx`.
 
 **File:** `app/api/briefing/route.ts` (gate + stream), `lib/agents/categories.ts` (the gate functions), `components/feed/CoverageGrid.tsx` (the UI), `app/page.tsx` (the client accumulator)
 **Function / class:** the `GET` handler's coverage stage; `schemaCapabilities` / `coverageReport` / `runnableCategories`; `CoverageGrid`; the briefing `handle()` switch
@@ -254,6 +220,40 @@ case 'coverage_item':
 The grid renders pending tiles for not-yet-reported categories while loading (`CoverageGrid.tsx` L117–L124, gated by `loading`).
 
 GitHub: https://github.com/rlynjb/blooming_insights/blob/main/app/api/briefing/route.ts#L202-L223
+
+---
+
+## Schema-gated coverage — diagram
+
+Primary recap, labelled by layer.
+
+```
+┌─ UI layer (app/page.tsx · components/feed/CoverageGrid.tsx) ───────────────────┐
+│   CoverageGrid: 10 tiles from the fixed registry                               │
+│     reported → clear / amber / firing / ghost     not-yet → "checking…" pulse  │
+│     accumulates coverage_item events: setCoverage(prev => […prev, item])       │
+└───────────────────────────────▲────────────────────────────────────────────────┘
+                                 │  NDJSON: coverage_item per category (+ checklist log)
+─────────────────────────────────│──── Network boundary (chunked NDJSON stream) ──
+┌─ Route / Service layer (app/api/briefing/route.ts) ────────────────────────────┐
+│   bootstrapSchema → schema                                                      │
+│        │                                                                        │
+│   ┌─ coverage gate (lib/agents/categories.ts) ───────────────────────────┐     │
+│   │  schemaCapabilities(schema) → Set<string>                            │     │
+│   │  coverageReport(set)      → CoverageItem[10]  ──► stream to UI        │     │
+│   │  runnableCategories(set)  → AnomalyCategory[] ──┐                     │     │
+│   └─────────────────────────────────────────────────│─────────────────────┘     │
+│        │                                             ▼                           │
+│   MonitoringAgent.scan(hooks, runnable)  ── spends ~1 req/s budget on the       │
+│        │                                     runnable categories only            │
+│        ▼                                                                         │
+│   anomalies → insights → stream → done                                          │
+└──────────────────────────────────────│──────────────────────────────────────────┘
+                                        ▼  Provider layer
+                          Bloomreach MCP (events/properties/catalogs = the schema)
+```
+
+The gate is a free, in-memory checkpoint that does two jobs at once: it bounds the expensive downstream stage, and it produces the UI's coverage state. Both fall out of the same classification.
 
 ---
 

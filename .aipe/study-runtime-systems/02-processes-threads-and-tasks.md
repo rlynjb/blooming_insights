@@ -255,46 +255,7 @@ Important nuance: the repo builds a *new* `McpClient` per `connectMcp` call (`li
 
 What breaks without the ALS scoping on auth: request B reads the cookie, sees request A's mid-flight decrypted store, the OAuth round-trip corrupts. This is exactly the failure the comment at `lib/mcp/auth.ts:41-47` describes — and is why `04` exists.
 
-### Move 3 — the principle
-
-**Single-threaded run-to-completion gives you cheap safety on read-modify-write, but it's a contract that breaks the moment you block the loop.** A `Map.set` followed by a `Map.get` is safe across requests because no other JS can interleave. The same `Map.set` followed by a 200ms synchronous loop is a 200ms freeze for every other request on the instance. The repo gets this right in the parent today because all its work is I/O-bound — and gets it right in the Olist child by making the child *single-flight*, which is the load-bearing reason the synchronous `better-sqlite3` calls don't poison its event loop. The same `better-sqlite3` running in the parent's hot path would be a textbook anti-pattern; in a single-flight subprocess it's the right call.
-
----
-
-## Primary diagram
-
-The full concurrency picture for one warm Node instance handling N concurrent requests:
-
-```
-  One warm Vercel instance · N concurrent requests · ONE event loop
-
-  ┌─ Vercel function (Node 20) ───────────────────────────────────────────┐
-  │                                                                       │
-  │   ┌─ Main thread ──────────────────────────────────────────────────┐  │
-  │   │                                                                 │ │
-  │   │   ┌─ event loop ────────────────────────────────────────────┐   │ │
-  │   │   │                                                          │   │ │
-  │   │   │   request A: GET → ReadableStream.start → runAgentLoop  │   │ │
-  │   │   │   request B: GET → ReadableStream.start → runAgentLoop  │   │ │
-  │   │   │   request C: ... (queued)                                │   │ │
-  │   │   │                                                          │   │ │
-  │   │   │   they interleave at every `await`:                      │   │ │
-  │   │   │     A awaits fetch → B runs until ITS next await → ...    │   │ │
-  │   │   │                                                          │   │ │
-  │   │   └──────────────────────────────────────────────────────────┘   │ │
-  │   │                                                                 │ │
-  │   │   ALS contexts (one per request) keep auth-store separate;     │ │
-  │   │   everything else (the Maps) is shared without locks.          │ │
-  │   └────────────────────────────────────────────────────────────────┘ │
-  │                                                                       │
-  │   libuv thread pool: exists, NOT exercised by this repo               │
-  │   worker_threads / cluster / child_process: NOT used anywhere         │
-  └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 5) Code in this codebase
 
 **Use cases.** Every async function in `lib/agents/*` and `lib/mcp/*` is a task scheduled onto the one event loop. The places where the pattern matters most:
 
@@ -362,6 +323,43 @@ The full concurrency picture for one warm Node instance handling N concurrent re
                           other request on the warm instance until it
                           finished. Documented honestly — the cost is
                           tiny today but the contract is fragile.
+```
+
+### Move 3 — the principle
+
+**Single-threaded run-to-completion gives you cheap safety on read-modify-write, but it's a contract that breaks the moment you block the loop.** A `Map.set` followed by a `Map.get` is safe across requests because no other JS can interleave. The same `Map.set` followed by a 200ms synchronous loop is a 200ms freeze for every other request on the instance. The repo gets this right in the parent today because all its work is I/O-bound — and gets it right in the Olist child by making the child *single-flight*, which is the load-bearing reason the synchronous `better-sqlite3` calls don't poison its event loop. The same `better-sqlite3` running in the parent's hot path would be a textbook anti-pattern; in a single-flight subprocess it's the right call.
+
+---
+
+## Primary diagram
+
+The full concurrency picture for one warm Node instance handling N concurrent requests:
+
+```
+  One warm Vercel instance · N concurrent requests · ONE event loop
+
+  ┌─ Vercel function (Node 20) ───────────────────────────────────────────┐
+  │                                                                       │
+  │   ┌─ Main thread ──────────────────────────────────────────────────┐  │
+  │   │                                                                 │ │
+  │   │   ┌─ event loop ────────────────────────────────────────────┐   │ │
+  │   │   │                                                          │   │ │
+  │   │   │   request A: GET → ReadableStream.start → runAgentLoop  │   │ │
+  │   │   │   request B: GET → ReadableStream.start → runAgentLoop  │   │ │
+  │   │   │   request C: ... (queued)                                │   │ │
+  │   │   │                                                          │   │ │
+  │   │   │   they interleave at every `await`:                      │   │ │
+  │   │   │     A awaits fetch → B runs until ITS next await → ...    │   │ │
+  │   │   │                                                          │   │ │
+  │   │   └──────────────────────────────────────────────────────────┘   │ │
+  │   │                                                                 │ │
+  │   │   ALS contexts (one per request) keep auth-store separate;     │ │
+  │   │   everything else (the Maps) is shared without locks.          │ │
+  │   └────────────────────────────────────────────────────────────────┘ │
+  │                                                                       │
+  │   libuv thread pool: exists, NOT exercised by this repo               │
+  │   worker_threads / cluster / child_process: NOT used anywhere         │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

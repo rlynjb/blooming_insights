@@ -107,6 +107,14 @@ Skeleton mapped. Now walk the four phases against the real diff.
 
 ### Move 2 — walk the four phases
 
+**Use cases.** Three real moments the post-mortem template gets exercised:
+
+- **A flaky test reappears.** First move: run the suite repeatedly. If it's the "isolated pass, parallel flake" pattern, look for shared mutable state. The `e83a8e0` template is now a reusable recipe — `vi.stubEnv`/`vi.unstubAllEnvs` for env vars, `vi.spyOn` + `mockRestore` for module-level functions, fixture rollback for DB state. The diagnostic shortcut is fingerprint-first.
+
+- **A user reports a bad investigation result.** Different shape — this is a *runtime* incident, not a *test* incident. The diagnostic loop uses the trace and snapshot machinery (load the `insightId`, the cache replays, scrub the trace looking for the failing event). The phases (detect → diagnose → fix → prevent) are the same; the tooling at each phase is different. This file's lesson — *write the four-phase post-mortem* — applies to both incident kinds.
+
+- **The route catches an exception in prod.** Today, the only detect signal is the `console.error` line in Vercel's stdout plus the `{type:'error',message}` event in the trace. There's no incident tooling past that — no Sentry to dedupe, no PagerDuty to page, no Slack to notify. The repo is in "manual log review" mode for prod incidents. When the first prod incident lands that needs a post-mortem, this file is the template for writing it.
+
 #### Detect — the test runner went red
 
 The reader anchor: you've had a CI build fail and wondered what changed. Same shape. The first signal here was vitest's exit code: `npm run test` flaked. Critically, the test *passed in isolation* — running `test/mcp/auth.test.ts` alone always passed. The flake only appeared in a full `vitest run` where parallel workers exercised other test files concurrently.
@@ -131,6 +139,26 @@ Boundary: in this repo, the detection layer is the test runner. There's no Sentr
                        ▲
                        └─ fingerprint: "isolated pass, parallel flake"
                           → diagnostic shortcut: find the shared global
+```
+
+**Code in this codebase — what's available in production today for incident *detection*:**
+
+```
+  app/api/agent/route.ts  (lines 255-260)
+
+  } catch (e) {
+    console.error('[agent] error:', e); // full stack/cause in Vercel logs   ← only prod detection signal
+    send({
+      type: 'error',
+      message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`, ← surfaces to UI
+    });
+  }
+        │
+        └─ this is the whole detection layer for prod incidents on /api/agent.
+           Vercel's log explorer is the dashboard. No aggregation, no
+           paging, no rotation. Incident response = "developer notices the
+           user's error message and digs in." When a real prod incident
+           lands, the post-mortem template from THIS file is what to write.
 ```
 
 #### Diagnose — name the shared global
@@ -160,6 +188,26 @@ Boundary: the diagnosis here used the *test* trace, i.e. vitest's reporter outpu
                                                           ▲
                                                           └─ shared mutable state,
                                                              racing, no isolation
+```
+
+**Code in this codebase — the reproduction primitive for *runtime* incident diagnosis:**
+
+```
+  lib/state/investigations.ts  (lines 22-28)
+
+  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1
+    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2 (dev)
+    if (fromFile) return fromFile;
+    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3 (committed)
+    return fromDemo ?? null;
+  }
+        │
+        └─ for a captured runtime incident, this is the time-machine. Load
+           the insightId, replay the run, scrub the trace. The snapshot
+           machinery IS the incident-diagnosis tool for runtime bugs (when
+           the bug was on the captured path). Different tooling from the
+           flake-fix story; same four-phase shape.
 ```
 
 #### Fix — switch to a tracked mutation API
@@ -204,6 +252,32 @@ Boundary: the fix is *test-only*. The production code is unchanged. The original
                                                    └─ vi.unstubAllEnvs() in
                                                         afterEach restores
 ```
+
+**Code in this codebase — the fix in place.** The comment IS the post-mortem:
+
+```
+  test/mcp/auth.test.ts  (lines 112-122, after the fix)
+
+  describe('auth cookie crypto (production backend)', () => {
+    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
+    // test and restore the prior environment after. Mutating process.env directly
+    // (as before) leaked the var across files running in parallel workers, which
+    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
+    beforeEach(() => {
+      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');                  ← tracked write
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();                                                       ← tracked restore
+    });
+
+    it('round-trips an encrypted store under AUTH_SECRET', () => {
+      // (the original process.env.AUTH_SECRET = '…' line removed here)        ← was: untracked write
+      const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
+      const token = _authCookieCrypto.encrypt(store);
+      ...
+```
+
+The comment names the root cause ("leaked across files running in parallel workers"), the fix ("stubEnv/unstubAllEnvs"), and the prevention ("keeps it self-contained"). Future readers find the lesson next to the code — no separate post-mortem doc to look up.
 
 #### Prevent — the afterEach IS the regression guard
 
@@ -285,88 +359,6 @@ The full incident lifecycle for `e83a8e0`, with each phase's evidence.
   │  proof: the same pattern (run the suite N times) that      │
   │  detected the flake now passes N for N runs                │
   └─────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-Three real moments the post-mortem template gets exercised:
-
-- **A flaky test reappears.** First move: run the suite repeatedly. If it's the "isolated pass, parallel flake" pattern, look for shared mutable state. The `e83a8e0` template is now a reusable recipe — `vi.stubEnv`/`vi.unstubAllEnvs` for env vars, `vi.spyOn` + `mockRestore` for module-level functions, fixture rollback for DB state. The diagnostic shortcut is fingerprint-first.
-
-- **A user reports a bad investigation result.** Different shape — this is a *runtime* incident, not a *test* incident. The diagnostic loop uses the trace and snapshot machinery (load the `insightId`, the cache replays, scrub the trace looking for the failing event). The phases (detect → diagnose → fix → prevent) are the same; the tooling at each phase is different. This file's lesson — *write the four-phase post-mortem* — applies to both incident kinds.
-
-- **The route catches an exception in prod.** Today, the only detect signal is the `console.error` line in Vercel's stdout plus the `{type:'error',message}` event in the trace. There's no incident tooling past that — no Sentry to dedupe, no PagerDuty to page, no Slack to notify. The repo is in "manual log review" mode for prod incidents. When the first prod incident lands that needs a post-mortem, this file is the template for writing it.
-
-### Code side by side, with a line-by-line read
-
-The fix in place — the comment IS the post-mortem:
-
-```
-  test/mcp/auth.test.ts  (lines 112-122, after the fix)
-
-  describe('auth cookie crypto (production backend)', () => {
-    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
-    // test and restore the prior environment after. Mutating process.env directly
-    // (as before) leaked the var across files running in parallel workers, which
-    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
-    beforeEach(() => {
-      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');                  ← tracked write
-    });
-    afterEach(() => {
-      vi.unstubAllEnvs();                                                       ← tracked restore
-    });
-
-    it('round-trips an encrypted store under AUTH_SECRET', () => {
-      // (the original process.env.AUTH_SECRET = '…' line removed here)        ← was: untracked write
-      const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
-      const token = _authCookieCrypto.encrypt(store);
-      ...
-```
-
-The comment names the root cause ("leaked across files running in parallel workers"), the fix ("stubEnv/unstubAllEnvs"), and the prevention ("keeps it self-contained"). Future readers find the lesson next to the code — no separate post-mortem doc to look up.
-
-The catch sites — what's available in production today for incident *detection*:
-
-```
-  app/api/agent/route.ts  (lines 255-260)
-
-  } catch (e) {
-    console.error('[agent] error:', e); // full stack/cause in Vercel logs   ← only prod detection signal
-    send({
-      type: 'error',
-      message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`, ← surfaces to UI
-    });
-  }
-        │
-        └─ this is the whole detection layer for prod incidents on /api/agent.
-           Vercel's log explorer is the dashboard. No aggregation, no
-           paging, no rotation. Incident response = "developer notices the
-           user's error message and digs in." When a real prod incident
-           lands, the post-mortem template from THIS file is what to write.
-```
-
-The reproduction primitive — what's available for incident *diagnosis* of runtime bugs:
-
-```
-  lib/state/investigations.ts  (lines 22-28)
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2 (dev)
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3 (committed)
-    return fromDemo ?? null;
-  }
-        │
-        └─ for a captured runtime incident, this is the time-machine. Load
-           the insightId, replay the run, scrub the trace. The snapshot
-           machinery IS the incident-diagnosis tool for runtime bugs (when
-           the bug was on the captured path). Different tooling from the
-           flake-fix story; same four-phase shape.
 ```
 
 ---

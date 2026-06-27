@@ -82,6 +82,12 @@ The shape — name → socket, two delegations + one read
 
 ### Move 2 walkthrough
 
+**Use cases this walkthrough covers.**
+
+  → **Every cold function start.** First Bloomreach hop pays a fresh DNS lookup (no in-process cache pre-warmed by a build step). Warm starts hit undici's pool and skip the lookup until the keep-alive ages out.
+  → **Preview deployment OAuth.** A new Vercel preview gets a unique hostname; the function reads `x-forwarded-host` and registers a fresh DCR client with that exact redirect URI. No env var to edit per preview.
+  → **Local dev.** `x-forwarded-host` isn't set (Next.js dev server), so `redirectUri()` falls through to `APP_ORIGIN ?? 'http://localhost:3000'`.
+
 **The URL string is constructed once per call.** For Bloomreach, `mcpUrl()` reads `BLOOMREACH_MCP_URL` from env, defaults to `https://loomi-mcp-alpha.bloomreach.com/mcp/`, strips trailing slashes, and returns a `URL` object. The trailing-slash strip is a real bug-fix — leaving it on caused a 307 redirect from the alpha server, which the SDK doesn't carry the auth header through cleanly. For Anthropic, the URL is baked into `@anthropic-ai/sdk` — we never write `api.anthropic.com` anywhere; the SDK does. For same-origin browser fetches, the URL is a path string (`/api/briefing?demo=cached`), no host at all.
 
 ```
@@ -102,6 +108,28 @@ URL construction — three call sites, three patterns
 
   // Same-origin — no host, path only
   fetch('/api/briefing?demo=cached')                // ← browser fills in host
+```
+
+The actual `mcpUrl()` in the repo — every line of it is load-bearing:
+
+```
+lib/mcp/connect.ts  (lines 25-29)
+
+function mcpUrl(): URL {
+  const raw =
+    process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
+                          │
+                          └─ env-overridable so tests and prod-staging
+                             can point at different hosts; default is
+                             the alpha endpoint Bloomreach published.
+  return new URL(raw.replace(/\/+$/, ''));
+                       │
+                       └─ load-bearing: leaving the trailing slash on
+                          caused a 307 redirect from the alpha server,
+                          and the SDK doesn't carry the Authorization
+                          header through redirects cleanly. Stripping
+                          it sidesteps the whole class of bugs.
+}
 ```
 
 **The DNS lookup happens inside undici.** When the route handler in Node calls `fetch(mcpUrl())`, control passes to undici (Node's default fetch engine). Undici uses the system resolver via libuv — that's `getaddrinfo` on most platforms — which in turn consults `/etc/resolv.conf`, `/etc/hosts`, and any platform DNS cache. We do not configure any of this. We do not provide a custom `lookup`, do not set a `Dispatcher` with a DNS-aware connector, do not pre-resolve. This is `not yet exercised` from our side.
@@ -160,6 +188,44 @@ Pseudocode — redirect URI per request
     return `${env.APP_ORIGIN or 'http://localhost:3000'}/api/mcp/callback`
 ```
 
+The real `redirectUri()` — the one place hostname leaks into application logic:
+
+```
+lib/mcp/connect.ts  (lines 31-52)
+
+async function redirectUri(): Promise<string> {
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      const { headers } = await import('next/headers');
+      const h = await headers();
+      const host = h.get('x-forwarded-host') ?? h.get('host');
+                          │
+                          └─ x-forwarded-host is set by the edge with
+                             the public hostname the user typed. host
+                             is the fallback for runtimes that don't
+                             set x-forwarded-host (rare on Vercel).
+      if (host) {
+        const proto = h.get('x-forwarded-proto') ?? 'https';
+        return `${proto}://${host}/api/mcp/callback`;
+                          │
+                          └─ this URI must match what DCR registered
+                             for THIS host. If it doesn't, the IdP
+                             rejects the authorize request.
+      }
+    } catch {
+      /* not in a request scope — fall through to APP_ORIGIN */
+                          │
+                          └─ headers() throws when called outside a
+                             request (e.g. during a build); the
+                             fallback is the static env var.
+    }
+  }
+  return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
+}
+```
+
+**No custom resolver, no DNS cache — the absence is the finding.** There is nothing to point at. Grep for `dns`, `lookup`, `Agent({`, `Dispatcher` across `lib/` and `app/` returns no app-layer hits. The repo delegates DNS to undici and the OS without any override. If we later need it (e.g. to pre-warm Bloomreach's hostname on cold start, or to fail fast on resolver hangs), the insertion point would be `lib/mcp/transport.ts`'s `makeCapturingFetch` — but it doesn't do this today.
+
 ### Principle
 
 Delegate addressing as far down the stack as you can; the *one* exception is the case where the *name itself* leaks into a contract you depend on. In this app, that case is exactly one: the OAuth redirect URI has to match the user's actual host, so we read `x-forwarded-host` instead of trusting `APP_ORIGIN`. Everything else — DNS, region selection, IP pinning, resolver caching — is the platform's problem until measurement says otherwise.
@@ -205,78 +271,6 @@ Outbound resolves ▼                              Outbound resolves ▼
 │                              │         │   the hostname)           │
 └─────────────────────────────┘         └──────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-### Use cases
-
-  → **Every cold function start.** First Bloomreach hop pays a fresh DNS lookup (no in-process cache pre-warmed by a build step). Warm starts hit undici's pool and skip the lookup until the keep-alive ages out.
-  → **Preview deployment OAuth.** A new Vercel preview gets a unique hostname; the function reads `x-forwarded-host` and registers a fresh DCR client with that exact redirect URI. No env var to edit per preview.
-  → **Local dev.** `x-forwarded-host` isn't set (Next.js dev server), so `redirectUri()` falls through to `APP_ORIGIN ?? 'http://localhost:3000'`.
-
-### `mcpUrl()` and the trailing-slash strip
-
-```
-lib/mcp/connect.ts  (lines 25-29)
-
-function mcpUrl(): URL {
-  const raw =
-    process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
-                          │
-                          └─ env-overridable so tests and prod-staging
-                             can point at different hosts; default is
-                             the alpha endpoint Bloomreach published.
-  return new URL(raw.replace(/\/+$/, ''));
-                       │
-                       └─ load-bearing: leaving the trailing slash on
-                          caused a 307 redirect from the alpha server,
-                          and the SDK doesn't carry the Authorization
-                          header through redirects cleanly. Stripping
-                          it sidesteps the whole class of bugs.
-}
-```
-
-### `redirectUri()` — the one place hostname leaks into application logic
-
-```
-lib/mcp/connect.ts  (lines 31-52)
-
-async function redirectUri(): Promise<string> {
-  if (process.env.NODE_ENV === 'production') {
-    try {
-      const { headers } = await import('next/headers');
-      const h = await headers();
-      const host = h.get('x-forwarded-host') ?? h.get('host');
-                          │
-                          └─ x-forwarded-host is set by the edge with
-                             the public hostname the user typed. host
-                             is the fallback for runtimes that don't
-                             set x-forwarded-host (rare on Vercel).
-      if (host) {
-        const proto = h.get('x-forwarded-proto') ?? 'https';
-        return `${proto}://${host}/api/mcp/callback`;
-                          │
-                          └─ this URI must match what DCR registered
-                             for THIS host. If it doesn't, the IdP
-                             rejects the authorize request.
-      }
-    } catch {
-      /* not in a request scope — fall through to APP_ORIGIN */
-                          │
-                          └─ headers() throws when called outside a
-                             request (e.g. during a build); the
-                             fallback is the static env var.
-    }
-  }
-  return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
-}
-```
-
-### No custom resolver, no DNS cache
-
-There is nothing to point at — that's the finding. Grep for `dns`, `lookup`, `Agent({`, `Dispatcher` across `lib/` and `app/` returns no app-layer hits. The repo delegates DNS to undici and the OS without any override. If we later need it (e.g. to pre-warm Bloomreach's hostname on cold start, or to fail fast on resolver hangs), the insertion point would be `lib/mcp/transport.ts`'s `makeCapturingFetch` — but it doesn't do this today.
 
 ---
 

@@ -314,6 +314,76 @@ The final aggregate. 4 fields: `insightId` (FK), `reasoning[]`, `diagnosis`, `re
 
 The model is what every other module relies on. When it's a single source of truth (`types.ts`), every boundary is clean. When two files implicitly co-own a piece of it (the field-copy list), every change has to land in N files at once and TypeScript can't help. The test: **for any field, can you point at one file where adding it lands?** If yes, the model is clean. If the answer is "you add it to the interface, but you also have to remember to update X and Y," the model has fractured.
 
+### Code in this codebase
+
+The repo anchors for what Move 2 walked — the interface declarations, the upstream projection, and where the field-copy leak lives in code.
+
+#### The 8 interfaces, with the canonical comment
+
+```
+lib/mcp/types.ts  (lines 36–141)
+
+  export interface Insight {
+    id: string;                              ← PK, stamped by crypto.randomUUID
+    timestamp: string;
+    severity: Severity;
+    headline: string;
+    summary: string;
+    metric: string;
+    change: { value: number; direction: 'up' | 'down'; baseline: string };
+    scope: string[];
+    source: 'monitoring' | 'query';
+    evidence?: { tool: string; result: unknown }[];   ← optional, agent-emitted
+    impact?: string;                                   ← optional, agent-emitted
+    // ── business-owner enrichments (Tier 1). All optional + derived from the
+    //    existing evidence, so older snapshots still validate and render. ──
+    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
+    aov?: { current: number; prior: number };
+    funnel?: { view: number; cart: number; checkout: number; purchase: number };
+    affectedCustomers?: number;
+    history?: number[];
+    downstreamReady?: { diagnosis: boolean; recommendations: number };
+    category?: CategoryId;
+  }
+       │
+       │  the "All optional + derived from the existing evidence, so older
+       │  snapshots still validate and render" comment IS the migration policy
+       │  for this interface. when a new field is added, it goes here as
+       │  optional. old data still validates. file 05 walks this.
+       └──
+```
+
+#### The capacity-set projection (the upstream → owned bridge)
+
+```
+lib/agents/categories.ts  (lines 116–127)
+
+  export function schemaCapabilities(schema: {
+    events: { name: string; properties: string[] }[];
+    catalogs?: { name: string }[];
+  }): Set<string> {
+    const set = new Set<string>();
+    for (const e of schema.events ?? []) {
+      set.add(e.name);                          ← event names as bare strings
+      for (const p of e.properties ?? [])
+        set.add(`${e.name}.${p}`);              ← properties as "event.prop"
+    }
+    for (const c of schema.catalogs ?? [])
+      set.add(`catalog:${c.name}`);             ← catalogs as "catalog:name"
+    return set;
+  }
+       │
+       │ this is the model-level translation: the upstream nested
+       │ WorkspaceSchema becomes a flat Set<string> the coverage gate
+       │ can test membership against. the namespaced keys ("event.prop",
+       │ "catalog:name") are the shape; they're THE schema for the gate.
+       └──
+```
+
+#### Where the leak sits in code (UPDATED — partly retired)
+
+Both conversion functions now live in `lib/state/insights.ts` — `anomalyToInsight` at L25–L45, `insightToAnomaly` at L53–L55. The doc comment on `insightToAnomaly` names the deliberate drop explicitly: "Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream." A round-trip test lives in `test/state/insights.test.ts`. The point for *this* file: the `Insight` interface is still the schema; the two functions are now colocated implementations of the field-copy. File 02 walks the updated status (the schema-side leak is retired; a wire-format leak is still live).
+
 ---
 
 ## Primary diagram
@@ -359,76 +429,6 @@ The full picture — the 8 interfaces, with the upstream model on top, the owned
   │   (the only schema check TypeScript can't do on its own)  │
   └──────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Implementation in codebase
-
-### The 8 interfaces, with the canonical comment
-
-```
-lib/mcp/types.ts  (lines 36–141)
-
-  export interface Insight {
-    id: string;                              ← PK, stamped by crypto.randomUUID
-    timestamp: string;
-    severity: Severity;
-    headline: string;
-    summary: string;
-    metric: string;
-    change: { value: number; direction: 'up' | 'down'; baseline: string };
-    scope: string[];
-    source: 'monitoring' | 'query';
-    evidence?: { tool: string; result: unknown }[];   ← optional, agent-emitted
-    impact?: string;                                   ← optional, agent-emitted
-    // ── business-owner enrichments (Tier 1). All optional + derived from the
-    //    existing evidence, so older snapshots still validate and render. ──
-    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
-    aov?: { current: number; prior: number };
-    funnel?: { view: number; cart: number; checkout: number; purchase: number };
-    affectedCustomers?: number;
-    history?: number[];
-    downstreamReady?: { diagnosis: boolean; recommendations: number };
-    category?: CategoryId;
-  }
-       │
-       │  the "All optional + derived from the existing evidence, so older
-       │  snapshots still validate and render" comment IS the migration policy
-       │  for this interface. when a new field is added, it goes here as
-       │  optional. old data still validates. file 05 walks this.
-       └──
-```
-
-### The capacity-set projection (the upstream → owned bridge)
-
-```
-lib/agents/categories.ts  (lines 116–127)
-
-  export function schemaCapabilities(schema: {
-    events: { name: string; properties: string[] }[];
-    catalogs?: { name: string }[];
-  }): Set<string> {
-    const set = new Set<string>();
-    for (const e of schema.events ?? []) {
-      set.add(e.name);                          ← event names as bare strings
-      for (const p of e.properties ?? [])
-        set.add(`${e.name}.${p}`);              ← properties as "event.prop"
-    }
-    for (const c of schema.catalogs ?? [])
-      set.add(`catalog:${c.name}`);             ← catalogs as "catalog:name"
-    return set;
-  }
-       │
-       │ this is the model-level translation: the upstream nested
-       │ WorkspaceSchema becomes a flat Set<string> the coverage gate
-       │ can test membership against. the namespaced keys ("event.prop",
-       │ "catalog:name") are the shape; they're THE schema for the gate.
-       └──
-```
-
-### Where the leak sits in code (UPDATED — partly retired)
-
-Both conversion functions now live in `lib/state/insights.ts` — `anomalyToInsight` at L25–L45, `insightToAnomaly` at L53–L55. The doc comment on `insightToAnomaly` names the deliberate drop explicitly: "Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream." A round-trip test lives in `test/state/insights.test.ts`. The point for *this* file: the `Insight` interface is still the schema; the two functions are now colocated implementations of the field-copy. File 02 walks the updated status (the schema-side leak is retired; a wire-format leak is still live).
 
 ---
 

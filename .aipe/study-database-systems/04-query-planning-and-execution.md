@@ -73,6 +73,10 @@ A planner takes a declarative query (`SELECT ... WHERE ... ORDER BY ...`) and ch
 
 ### Move 2 — the moving parts
 
+**Where this is reached for in this codebase:**
+- **Every monitoring run** emits a sequence of EQL queries through `execute_analytics_eql`. The schema-gate decides which queries run; the order is sequential because of the rate limit. Bloomreach's planner runs each one; we see only the result.
+- **Every investigation** runs a smaller set of follow-up queries scoped to the anomaly's category.
+
 **Move 2a — the cost-based optimizer.** Modern planners estimate cost per plan using table statistics (row count, value distribution, index selectivity). The plan with the lowest estimated cost wins. The estimate can be wrong — stale statistics cause the planner to pick a bad plan with confidence.
 
 **Move 2b — join algorithms.** Three to know:
@@ -108,24 +112,7 @@ The codebase HAS an N+1, just at the agent layer not the DB layer:
        so it stays N+1 by acceptance, not by oversight.
 ```
 
-**Move 2d — EXPLAIN, the planner's window.** Every real database lets you print the chosen plan: `EXPLAIN SELECT ...`. Reading EXPLAIN output is the single most valuable skill in database performance work. Without it you're guessing at why a query is slow; with it you can see "ah, it's doing a seq scan because the index is on `(b,a)` not `(a,b)`."
-
-### Move 3 — the principle
-
-**Planning is where declarative meets physical.** SQL says what; the planner picks how. The whole reason SQL won as an interface is that the planner can change its mind as the data shape changes — same query, faster execution next quarter when you add an index. You give up imperative control to buy the freedom to re-tune later. The day you're hand-writing the plan (like we sort-of do in `lib/agents/monitoring.ts`), you've given up that lever.
-
-## Primary diagram
-
-Skipped — no codebase instance to recap.
-
-## Implementation in codebase
-
-### Use cases
-
-- **Every monitoring run** emits a sequence of EQL queries through `execute_analytics_eql`. The schema-gate decides which queries run; the order is sequential because of the rate limit. Bloomreach's planner runs each one; we see only the result.
-- **Every investigation** runs a smaller set of follow-up queries scoped to the anomaly's category.
-
-### The agent loop is the closest cousin
+Side-by-side with the real code:
 
 ```
   lib/agents/monitoring.ts  (the scan loop, paraphrased — the real impl is
@@ -145,6 +132,16 @@ Skipped — no codebase instance to recap.
 ```
 
 The relevant tunables aren't planner-side, they're rate-limit-side: see `lib/mcp/client.ts` L82-95 (`minIntervalMs`, `retryDelayMs`, `retryCeilingMs`).
+
+**Move 2d — EXPLAIN, the planner's window.** Every real database lets you print the chosen plan: `EXPLAIN SELECT ...`. Reading EXPLAIN output is the single most valuable skill in database performance work. Without it you're guessing at why a query is slow; with it you can see "ah, it's doing a seq scan because the index is on `(b,a)` not `(a,b)`."
+
+### Move 3 — the principle
+
+**Planning is where declarative meets physical.** SQL says what; the planner picks how. The whole reason SQL won as an interface is that the planner can change its mind as the data shape changes — same query, faster execution next quarter when you add an index. You give up imperative control to buy the freedom to re-tune later. The day you're hand-writing the plan (like we sort-of do in `lib/agents/monitoring.ts`), you've given up that lever.
+
+## Primary diagram
+
+Skipped — no codebase instance to recap.
 
 ## Elaborate
 

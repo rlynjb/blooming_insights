@@ -209,6 +209,30 @@ A test with the network mocked out and an exact `.toBe()` assertion guards behav
 
 ---
 
+### Code in this codebase
+
+**Case B — no eval sets in the repo.** PR #8 (commit 62c24d7) removed the entire `eval/` directory along with the Olist MCP server it ran against. The 221 Vitest tests under `test/` still inject fakes and assert plumbing — that hasn't changed and it shouldn't. There is no parallel quality-measurement layer right now.
+
+#### The golden set — not present
+
+- **What would go here:** a small (20–50 case) set of representative anomaly inputs paired with rubric-checked reference diagnoses / recommendations, run against the real `claude-sonnet-4-6` agents.
+- **What's gone:** the `seeded_anomalies` table in `mcp-server-olist/data/olist.db` was the previous golden set; `eval/fixtures/reference-diagnoses.json` and `eval/fixtures/reference-recommendations.json` were the per-agent references. Both gone.
+
+#### The regression set — not present
+
+- **What would go here:** a growing directory of inputs that previously failed in production, each frozen with the corrected reference answer.
+- **What's gone:** `eval/fixtures/regression-golden/` (10 fixtures captured 2026-06-15) and `eval/scripts/run-regression.ts` (the capture-then-score harness). See `05-regression-evals.md` for the pattern as a historical record.
+
+#### The adversarial set — not present (and never was)
+
+- **Status:** Case B. The `?q=` path (`app/api/agent/route.ts`) is only `.trim()`'d — no adversarial fixtures exist for it.
+
+#### What's deliberately NOT here
+
+The 221 Vitest tests under `test/agents/*.test.ts` and `test/agents-legacy/*.test.ts` build fake MCP callers and assert structure (not correctness); `lib/mcp/validate.ts` still validates *shape* (`metric` is a string, `evidence` is an array), not whether a conclusion is true. Without an eval suite alongside them, quality is uninstrumented end-to-end — there is no score on a model swap or a prompt edit. The exercises below name what would have to be rebuilt to reach Case A here again.
+
+---
+
 ## Eval set types — diagram
 
 This diagram spans the State layer (where eval datasets live as fixtures), the Service layer (the agents under evaluation), and the Provider boundary (the real model the eval calls). A reader who sees only this should grasp that evals are a separate dataset + runner that calls the *real* model, sitting alongside — not inside — the unit-test suite.
@@ -241,30 +265,6 @@ This diagram spans the State layer (where eval datasets live as fixtures), the S
 ```
 
 The eval set is a dataset that exercises the real Provider boundary; the unit suite is a dataset that mocks it. Same agents in the middle; opposite halves of the quality question.
-
----
-
-## Implementation in codebase
-
-**Case B — no eval sets in the repo.** PR #8 (commit 62c24d7) removed the entire `eval/` directory along with the Olist MCP server it ran against. The 221 Vitest tests under `test/` still inject fakes and assert plumbing — that hasn't changed and it shouldn't. There is no parallel quality-measurement layer right now.
-
-### The golden set — not present
-
-- **What would go here:** a small (20–50 case) set of representative anomaly inputs paired with rubric-checked reference diagnoses / recommendations, run against the real `claude-sonnet-4-6` agents.
-- **What's gone:** the `seeded_anomalies` table in `mcp-server-olist/data/olist.db` was the previous golden set; `eval/fixtures/reference-diagnoses.json` and `eval/fixtures/reference-recommendations.json` were the per-agent references. Both gone.
-
-### The regression set — not present
-
-- **What would go here:** a growing directory of inputs that previously failed in production, each frozen with the corrected reference answer.
-- **What's gone:** `eval/fixtures/regression-golden/` (10 fixtures captured 2026-06-15) and `eval/scripts/run-regression.ts` (the capture-then-score harness). See `05-regression-evals.md` for the pattern as a historical record.
-
-### The adversarial set — not present (and never was)
-
-- **Status:** Case B. The `?q=` path (`app/api/agent/route.ts`) is only `.trim()`'d — no adversarial fixtures exist for it.
-
-### What's deliberately NOT here
-
-The 221 Vitest tests under `test/agents/*.test.ts` and `test/agents-legacy/*.test.ts` build fake MCP callers and assert structure (not correctness); `lib/mcp/validate.ts` still validates *shape* (`metric` is a string, `evidence` is an array), not whether a conclusion is true. Without an eval suite alongside them, quality is uninstrumented end-to-end — there is no score on a model swap or a prompt edit. The exercises below name what would have to be rebuilt to reach Case A here again.
 
 ---
 

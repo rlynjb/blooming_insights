@@ -226,6 +226,73 @@ What is the minimum that makes the pattern correct?
 
 Skeleton = tracked entry + tracked exit + exception-safe. Drop any one and the flake is one parallel-worker race away.
 
+### Code in this codebase
+
+**Use case A — the AUTH_SECRET fix in full context.** The comment block above the `beforeEach` is itself part of the fix. It names *why* the pattern exists, so the next refactor doesn't silently revert to raw mutation.
+
+```
+test/mcp/auth.test.ts  (lines 112–122 — the fixed block, full)
+
+  describe('auth cookie crypto (production backend)', () => {
+    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
+    // test and restore the prior environment after. Mutating process.env directly
+    // (as before) leaked the var across files running in parallel workers, which
+    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
+    beforeEach(() => {
+      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');   ← every test starts
+    });                                                          with this exact value
+    afterEach(() => {
+      vi.unstubAllEnvs();                                       ← every test exits
+    });                                                          with the prior env
+       │
+       └─ the comment is the post-mortem itself. Without it, a year from now
+          someone reviews this code, sees "wait, why is this stubEnv pattern
+          here when other tests use plain assignment?" and refactors it back
+          to a flake. The comment is documentation as a guard rail.
+
+  test/mcp/auth.test.ts  (lines 126–133 — the test that depends on the isolation)
+
+    it('round-trips an encrypted store under AUTH_SECRET', () => {
+      const store = { … };
+      const token = _authCookieCrypto.encrypt(store);     ← reads AUTH_SECRET
+      expect(_authCookieCrypto.decrypt(token)).toEqual(store);
+    });
+    it('returns an empty store for a tampered/garbage cookie', () => {
+      expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
+    });
+       │
+       └─ both tests need AUTH_SECRET set to a known value. The encrypt/decrypt
+          path derives an AES-256-GCM key from the env var; if the var is the
+          wrong value mid-test, decrypt fails on input it produced itself.
+          That's the exact failure mode the flake produced before the fix.
+```
+
+**Use case B — same family for `fetch`, in the transport test.** `vi.stubGlobal('fetch', …)` is the same pattern applied to a different global; `vi.unstubAllGlobals()` in `afterEach` is the same exception-safe restore.
+
+```
+test/mcp/transport.test.ts  (lines 1–18, 33–39)
+
+  import { describe, it, expect, vi, afterEach } from 'vitest';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();         ← restore real fetch after every test
+  });
+
+  describe('makeCapturingFetch', () => {
+    it('records the body of a non-OK response and leaves the original readable', async () => {
+      const holder = { last: null };
+      const f = makeCapturingFetch(holder);
+      vi.stubGlobal(                ← tracked global stub
+        'fetch',
+        async () => new Response('{"error":"invalid_token", …}', { status: 401 }),
+      );
+       │
+       └─ scripted Response stands in for a real HTTP call. The capturing
+          fetch can then be tested without spinning a real HTTP server. The
+          stub leak is bounded by the file-scoped afterEach above; no other
+          test in the suite sees a stubbed fetch.
+```
+
 ### Move 3 — the principle
 
 **Flakes are state leaks in disguise.** A test that fails sometimes is rarely "actually nondeterministic" — it's deterministic given the world state, and the world state changed underneath it. The fix is never "retry the test"; the fix is "find the leak and seal it." Route every mutation of shared state through a framework-tracked mutator. The discipline travels: env vars, timers, globals, module-scoped state — same shape, different name.
@@ -300,73 +367,6 @@ The AUTH_SECRET flake fix — before vs after
   │  THE COMMENT BLOCK is part of the fix — it explains WHY this    │
   │  pattern exists so the next person doesn't "simplify" it back.  │
   └──────────────────────────────────────────────────────────────────┘
-```
-
-## Implementation in codebase
-
-**Use case A — the AUTH_SECRET fix in full context.** The comment block above the `beforeEach` is itself part of the fix. It names *why* the pattern exists, so the next refactor doesn't silently revert to raw mutation.
-
-```
-test/mcp/auth.test.ts  (lines 112–122 — the fixed block, full)
-
-  describe('auth cookie crypto (production backend)', () => {
-    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
-    // test and restore the prior environment after. Mutating process.env directly
-    // (as before) leaked the var across files running in parallel workers, which
-    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
-    beforeEach(() => {
-      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');   ← every test starts
-    });                                                          with this exact value
-    afterEach(() => {
-      vi.unstubAllEnvs();                                       ← every test exits
-    });                                                          with the prior env
-       │
-       └─ the comment is the post-mortem itself. Without it, a year from now
-          someone reviews this code, sees "wait, why is this stubEnv pattern
-          here when other tests use plain assignment?" and refactors it back
-          to a flake. The comment is documentation as a guard rail.
-
-  test/mcp/auth.test.ts  (lines 126–133 — the test that depends on the isolation)
-
-    it('round-trips an encrypted store under AUTH_SECRET', () => {
-      const store = { … };
-      const token = _authCookieCrypto.encrypt(store);     ← reads AUTH_SECRET
-      expect(_authCookieCrypto.decrypt(token)).toEqual(store);
-    });
-    it('returns an empty store for a tampered/garbage cookie', () => {
-      expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
-    });
-       │
-       └─ both tests need AUTH_SECRET set to a known value. The encrypt/decrypt
-          path derives an AES-256-GCM key from the env var; if the var is the
-          wrong value mid-test, decrypt fails on input it produced itself.
-          That's the exact failure mode the flake produced before the fix.
-```
-
-**Use case B — same family for `fetch`, in the transport test.** `vi.stubGlobal('fetch', …)` is the same pattern applied to a different global; `vi.unstubAllGlobals()` in `afterEach` is the same exception-safe restore.
-
-```
-test/mcp/transport.test.ts  (lines 1–18, 33–39)
-
-  import { describe, it, expect, vi, afterEach } from 'vitest';
-
-  afterEach(() => {
-    vi.unstubAllGlobals();         ← restore real fetch after every test
-  });
-
-  describe('makeCapturingFetch', () => {
-    it('records the body of a non-OK response and leaves the original readable', async () => {
-      const holder = { last: null };
-      const f = makeCapturingFetch(holder);
-      vi.stubGlobal(                ← tracked global stub
-        'fetch',
-        async () => new Response('{"error":"invalid_token", …}', { status: 401 }),
-      );
-       │
-       └─ scripted Response stands in for a real HTTP call. The capturing
-          fetch can then be tested without spinning a real HTTP server. The
-          stub leak is bounded by the file-scoped afterEach above; no other
-          test in the suite sees a stubbed fetch.
 ```
 
 ## Elaborate

@@ -151,6 +151,14 @@ An embedding index is a cache of derived values, so it inherits every caching di
 
 ---
 
+### Code in this codebase
+
+**Not yet implemented (embedding staleness).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to go stale — and notably, *live retrieval has no staleness problem at all*, which is a core reason for the no-RAG decision (`11-rag.md`): a fresh tool call always returns current data, where an embedding index would lag.
+
+The honest analog is exact and present: the 60-second TTL cache in `McpClient` *is* the freshness/staleness mechanism, fully implemented. Every cached tool result carries `expiresAt = Date.now() + 60_000` (`lib/mcp/client.ts` L65); the read path serves it only while `cached.expiresAt > Date.now()` (L40); and error results are never cached (L58–L60) so a failure cannot poison the cache. `embedding_stale_at` would be the direct analog of `expiresAt`, and the no-stale-on-error policy the direct analog of no-cache-on-error. An embedding index's freshness policy would live in `lib/state/` and reuse this exact thinking. The `Project exercises` block below is the primary buildable target.
+
+---
+
 ## Stale embeddings — diagram
 
 This diagram spans the State layer (the index as a cache) and shows the direct parallel to `McpClient`'s TTL cache. A reader who sees only this should grasp that an embedding is a cached snapshot and needs the same expiry/no-poison policy.
@@ -174,14 +182,6 @@ This diagram spans the State layer (the index as a cache) and shows the direct p
 ```
 
 `embedding_stale_at` is `expiresAt` for vectors; the no-poison-on-error rule is `no-cache-on-error` for the index. The codebase already wrote both — for tool results.
-
----
-
-## Implementation in codebase
-
-**Not yet implemented (embedding staleness).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to go stale — and notably, *live retrieval has no staleness problem at all*, which is a core reason for the no-RAG decision (`11-rag.md`): a fresh tool call always returns current data, where an embedding index would lag.
-
-The honest analog is exact and present: the 60-second TTL cache in `McpClient` *is* the freshness/staleness mechanism, fully implemented. Every cached tool result carries `expiresAt = Date.now() + 60_000` (`lib/mcp/client.ts` L65); the read path serves it only while `cached.expiresAt > Date.now()` (L40); and error results are never cached (L58–L60) so a failure cannot poison the cache. `embedding_stale_at` would be the direct analog of `expiresAt`, and the no-stale-on-error policy the direct analog of no-cache-on-error. An embedding index's freshness policy would live in `lib/state/` and reuse this exact thinking. The `Project exercises` block below is the primary buildable target.
 
 ---
 

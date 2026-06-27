@@ -289,6 +289,74 @@ The recommendation judge in `eval/judges/recommendation-judge.md` scores three c
 
 A column name is part of the schema. It's read by humans, by LLMs, by future contributors browsing tables — and what it implies has to match what the column stores. **"Store in canonical units; name with the unit"** is the discipline that prevents this entire class of bug: a column named `price_brl_cents` cannot lie about its unit; a column named `price` with no unit forces the consumer to look it up (still better than lying). The Olist schema's `_brl` columns are the canonical example of the anti-pattern — and the Phase 3 evals make the cost measurable in dollars (well, judge points). The lesson generalises: any time a unit is encoded in a name, the storage has to match, OR the wire format has to convert, OR you're shipping a bug that some consumer will hit.
 
+### Code in this codebase
+
+The repo anchors for the bug's full path Move 2 walked — the dishonest schema, the tool that preserves the lie, the prompt disclaimer trying to recover, and where the cost is committed.
+
+#### The dishonest schema
+
+```
+mcp-server-olist/scripts/seed-olist.ts  (in SCHEMA_SQL, lines 205–217)
+
+  CREATE TABLE order_items (
+    order_id    TEXT NOT NULL REFERENCES orders(id),
+    product_id  TEXT NOT NULL REFERENCES products(id),
+    price_brl   INTEGER NOT NULL,        ← ★ lie: name says BRL, stores cents
+    freight_brl INTEGER NOT NULL          ← ★ lie: name says BRL, stores cents
+  );
+
+  CREATE TABLE payments (
+    order_id     TEXT NOT NULL REFERENCES orders(id),
+    type         TEXT NOT NULL,
+    installments INTEGER NOT NULL,
+    value_brl    INTEGER NOT NULL         ← ★ lie: name says BRL, stores cents
+  );
+       │
+       └─ three columns across two tables. all integer cents.
+          all named _brl (which the model reads as "BRL the currency").
+```
+
+#### The tool output that preserves the lie
+
+```
+mcp-server-olist/src/tools/get_metric_timeseries.ts (line 98)
+
+  metricExpr = 'SUM(oi.price_brl)';
+       │
+       └─ sums cents. the SUM is correct integer arithmetic — but the
+          field name in the output JSON ("value") loses even the _brl
+          hint. the caller has nothing to remind it that this number
+          is in cents.
+```
+
+#### The prompt disclaimer that tries to recover
+
+```
+lib/agents/prompts/monitoring.md  (line ~22)
+
+  - All BRL monetary values are returned as **integer cents**
+    (e.g. `12450000` is R$ 124 500,00). Divide by 100 when narrating
+    in `impact`.
+       │
+       └─ load-bearing disclaimer. when the model follows it,
+          the impact text uses correct Reais. when the model drops it
+          (long context, synthesis turn, downstream agent), the impact
+          uses raw cents read as Reais. the fix would be: remove this
+          line entirely + make the tool output Reais (option C) OR
+          rename the column (option A).
+```
+
+#### Where the cost is committed
+
+```
+eval/results/2026-06-15/diagnosis-summary.md
+eval/results/2026-06-15-after-fix/summary.md
+
+  the second file shows the partial fix's impact (+32 loose precision,
+  +27 loose recall). the strict bar remains at 0% — the units-in-name
+  bug is the dominant contributor to the gap between loose and strict.
+```
+
 ---
 
 ## Primary diagram
@@ -326,74 +394,6 @@ The bug's full path, with the eval evidence.
     every tool divides by 100 before emitting JSON.
     the wire shape becomes "_brl means Reais" — honest at the
     boundary even if the storage stays in cents.
-```
-
----
-
-## Implementation in codebase
-
-### The dishonest schema
-
-```
-mcp-server-olist/scripts/seed-olist.ts  (in SCHEMA_SQL, lines 205–217)
-
-  CREATE TABLE order_items (
-    order_id    TEXT NOT NULL REFERENCES orders(id),
-    product_id  TEXT NOT NULL REFERENCES products(id),
-    price_brl   INTEGER NOT NULL,        ← ★ lie: name says BRL, stores cents
-    freight_brl INTEGER NOT NULL          ← ★ lie: name says BRL, stores cents
-  );
-
-  CREATE TABLE payments (
-    order_id     TEXT NOT NULL REFERENCES orders(id),
-    type         TEXT NOT NULL,
-    installments INTEGER NOT NULL,
-    value_brl    INTEGER NOT NULL         ← ★ lie: name says BRL, stores cents
-  );
-       │
-       └─ three columns across two tables. all integer cents.
-          all named _brl (which the model reads as "BRL the currency").
-```
-
-### The tool output that preserves the lie
-
-```
-mcp-server-olist/src/tools/get_metric_timeseries.ts (line 98)
-
-  metricExpr = 'SUM(oi.price_brl)';
-       │
-       └─ sums cents. the SUM is correct integer arithmetic — but the
-          field name in the output JSON ("value") loses even the _brl
-          hint. the caller has nothing to remind it that this number
-          is in cents.
-```
-
-### The prompt disclaimer that tries to recover
-
-```
-lib/agents/prompts/monitoring.md  (line ~22)
-
-  - All BRL monetary values are returned as **integer cents**
-    (e.g. `12450000` is R$ 124 500,00). Divide by 100 when narrating
-    in `impact`.
-       │
-       └─ load-bearing disclaimer. when the model follows it,
-          the impact text uses correct Reais. when the model drops it
-          (long context, synthesis turn, downstream agent), the impact
-          uses raw cents read as Reais. the fix would be: remove this
-          line entirely + make the tool output Reais (option C) OR
-          rename the column (option A).
-```
-
-### Where the cost is committed
-
-```
-eval/results/2026-06-15/diagnosis-summary.md
-eval/results/2026-06-15-after-fix/summary.md
-
-  the second file shows the partial fix's impact (+32 loose precision,
-  +27 loose recall). the strict bar remains at 0% — the units-in-name
-  bug is the dominant contributor to the gap between loose and strict.
 ```
 
 ---

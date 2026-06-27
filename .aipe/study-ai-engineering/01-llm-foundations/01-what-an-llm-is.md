@@ -205,6 +205,23 @@ An LLM call is an I/O boundary with an untyped, adversarial-by-default return va
 
 ---
 
+### Code in this codebase
+
+#### Files, functions, and line ranges
+
+- **The model call:** `anthropic.messages.create(params)` — `lib/agents/base.ts`, `runAgentLoop`, L102. The single point where Claude is invoked for all four agents.
+- **Text extraction:** `res.content.filter(b => b.type === 'text').map(b => b.text).join('')` — `lib/agents/base.ts` L108–L113 (surfacing to `onText`) and L122 (the returned `finalText`).
+- **Parse step:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three escalating strategies: markdown fence, bare `JSON.parse`, then a first-bracket-to-last-bracket substring scan; throws if all fail.
+- **Validate step (type guards):** `isAnomalyArray` (`lib/mcp/validate.ts` L17–L27), `isDiagnosis` (L29–L35), `isRecommendationArray` (L42–L53). Each is a `v is T` predicate that proves the shape field by field.
+- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L16–L20; the three-tier chain — `lib/agents/diagnostic.ts` L74–L75. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L113–L118.
+- **Model identity:** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9. The one constant naming the function being called.
+
+#### Why three tiers, not one
+
+The single most important design choice is that there are three independent answers to "what if the model output is bad," not one. `tryParseDiagnosis` handles malformed output that the loop's final turn produced. `synthesize()` handles the case where the loop produced prose but the gathered evidence is salvageable (a fresh, clean-context retry — see → 04-structured-outputs.md). `FALLBACK` handles total failure. Each tier covers a failure mode the previous tier cannot, and the bottom tier is model-independent so it can never itself fail.
+
+---
+
 ## What an LLM is — diagram
 
 This diagram spans the full path from prompt to typed value. The Provider layer is probabilistic; the Service layer is where the string is forced into a type or replaced by a safe default. A reader who sees only this should grasp that the model returns a string and the type is manufactured downstream.
@@ -239,23 +256,6 @@ This diagram spans the full path from prompt to typed value. The Provider layer 
 ```
 
 The model never hands the system a `Diagnosis`. It hands the system a string, and the Service layer either proves that string is a `Diagnosis` or substitutes a hand-written one.
-
----
-
-## Implementation in codebase
-
-### Files, functions, and line ranges
-
-- **The model call:** `anthropic.messages.create(params)` — `lib/agents/base.ts`, `runAgentLoop`, L102. The single point where Claude is invoked for all four agents.
-- **Text extraction:** `res.content.filter(b => b.type === 'text').map(b => b.text).join('')` — `lib/agents/base.ts` L108–L113 (surfacing to `onText`) and L122 (the returned `finalText`).
-- **Parse step:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three escalating strategies: markdown fence, bare `JSON.parse`, then a first-bracket-to-last-bracket substring scan; throws if all fail.
-- **Validate step (type guards):** `isAnomalyArray` (`lib/mcp/validate.ts` L17–L27), `isDiagnosis` (L29–L35), `isRecommendationArray` (L42–L53). Each is a `v is T` predicate that proves the shape field by field.
-- **Fall back:** `FALLBACK` constant — `lib/agents/diagnostic.ts` L16–L20; the three-tier chain — `lib/agents/diagnostic.ts` L74–L75. Monitoring's `[]` degradation — `lib/agents/monitoring.ts` L113–L118.
-- **Model identity:** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9. The one constant naming the function being called.
-
-### Why three tiers, not one
-
-The single most important design choice is that there are three independent answers to "what if the model output is bad," not one. `tryParseDiagnosis` handles malformed output that the loop's final turn produced. `synthesize()` handles the case where the loop produced prose but the gathered evidence is salvageable (a fresh, clean-context retry — see → 04-structured-outputs.md). `FALLBACK` handles total failure. Each tier covers a failure mode the previous tier cannot, and the bottom tier is model-independent so it can never itself fail.
 
 ---
 

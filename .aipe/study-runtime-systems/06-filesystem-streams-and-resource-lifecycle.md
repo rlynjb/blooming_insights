@@ -320,62 +320,7 @@ What breaks without the `finally { await dispose() }`: the child outlives the ca
          but WE never see a socket object. no close() to call. no leak path.
 ```
 
-### Move 3 — the principle
-
-**The discipline isn't "always close everything" — it's "know which resources need a `finally`, and make sure they have one."** In modern JS most resources are GC'd implicitly. The exceptions are stream controllers (you have to call `close()`) and persistent handles like DB pools (you have to call `release()`). The repo is small enough that the only exception that matters is the stream controller, and both long routes handle it correctly.
-
----
-
-## Primary diagram
-
-The full resource-lifecycle picture for one investigation request:
-
-```
-  One investigation request — every resource opened, every cleanup
-
-  ┌─ Browser ───────────────────────────────────────────────────────────┐
-  │  useInvestigation effect:                                            │
-  │     fetch(url)                            ← opens response           │
-  │       └─ res.body.getReader()             ← opens reader              │
-  │            └─ while(true) await read()    ← drains until done=true   │
-  │                                                                      │
-  │  cleanup: NONE (deliberate; see 01 and useInvestigation:32-36)       │
-  │  reader/socket released when the body completes (server close())     │
-  └─────────────────────────────────│───────────────────────────────────┘
-                                    │  HTTPS chunked
-  ┌─ Server (Vercel function) ──────▼───────────────────────────────────┐
-  │                                                                     │
-  │   GET(req):                                                          │
-  │     return new Response(                                             │
-  │       new ReadableStream({                                           │
-  │         async start(controller) {              ← acquire             │
-  │           try {                                                      │
-  │             …controller.enqueue(...)…           ← drives the stream  │
-  │             await runAgentLoop({ ... })                              │
-  │             send({ type: 'done' })                                   │
-  │             if (step == null) saveInvestigation(insightId, collected)│
-  │           } catch (e) {                                              │
-  │             send({ type:'error', message: … })  ← user-visible error │
-  │           } finally {                                                │
-  │             controller.close();                 ← release (always!)  │
-  │           }                                                          │
-  │         },                                                           │
-  │       }),                                                            │
-  │       { headers: NDJSON_HEADERS }                                    │
-  │     );                                                               │
-  │                                                                      │
-  │   inside runAgentLoop:                                               │
-  │     await anthropic.messages.create(...)  ← fetch; auto-release       │
-  │     await mcp.callTool(...)               ← fetch; auto-release       │
-  │       └─ inside liveCall:                                            │
-  │            await new Promise(r => setTimeout(r, gap))  ← one-shot    │
-  │            await transport.callTool(...)               ← fetch        │
-  └─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
+#### 8) Code in this codebase
 
 **Use cases.**
 
@@ -459,6 +404,59 @@ The full resource-lifecycle picture for one investigation request:
        └─ The pattern: persistence is opportunistic. If the disk write fails
           (EROFS in a misconfigured prod env, ENOSPC in dev), the function
           still succeeds because the in-memory write is the source of truth.
+```
+
+### Move 3 — the principle
+
+**The discipline isn't "always close everything" — it's "know which resources need a `finally`, and make sure they have one."** In modern JS most resources are GC'd implicitly. The exceptions are stream controllers (you have to call `close()`) and persistent handles like DB pools (you have to call `release()`). The repo is small enough that the only exception that matters is the stream controller, and both long routes handle it correctly.
+
+---
+
+## Primary diagram
+
+The full resource-lifecycle picture for one investigation request:
+
+```
+  One investigation request — every resource opened, every cleanup
+
+  ┌─ Browser ───────────────────────────────────────────────────────────┐
+  │  useInvestigation effect:                                            │
+  │     fetch(url)                            ← opens response           │
+  │       └─ res.body.getReader()             ← opens reader              │
+  │            └─ while(true) await read()    ← drains until done=true   │
+  │                                                                      │
+  │  cleanup: NONE (deliberate; see 01 and useInvestigation:32-36)       │
+  │  reader/socket released when the body completes (server close())     │
+  └─────────────────────────────────│───────────────────────────────────┘
+                                    │  HTTPS chunked
+  ┌─ Server (Vercel function) ──────▼───────────────────────────────────┐
+  │                                                                     │
+  │   GET(req):                                                          │
+  │     return new Response(                                             │
+  │       new ReadableStream({                                           │
+  │         async start(controller) {              ← acquire             │
+  │           try {                                                      │
+  │             …controller.enqueue(...)…           ← drives the stream  │
+  │             await runAgentLoop({ ... })                              │
+  │             send({ type: 'done' })                                   │
+  │             if (step == null) saveInvestigation(insightId, collected)│
+  │           } catch (e) {                                              │
+  │             send({ type:'error', message: … })  ← user-visible error │
+  │           } finally {                                                │
+  │             controller.close();                 ← release (always!)  │
+  │           }                                                          │
+  │         },                                                           │
+  │       }),                                                            │
+  │       { headers: NDJSON_HEADERS }                                    │
+  │     );                                                               │
+  │                                                                      │
+  │   inside runAgentLoop:                                               │
+  │     await anthropic.messages.create(...)  ← fetch; auto-release       │
+  │     await mcp.callTool(...)               ← fetch; auto-release       │
+  │       └─ inside liveCall:                                            │
+  │            await new Promise(r => setTimeout(r, gap))  ← one-shot    │
+  │            await transport.callTool(...)               ← fetch        │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

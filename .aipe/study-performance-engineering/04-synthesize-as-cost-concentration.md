@@ -306,91 +306,9 @@ What this unblocks:
 
 ---
 
-### Move 3 — the principle
+#### Code in this codebase
 
-**Cost concentration without measurement is the worst combination.** Having a dominant line item is fine (every system has one); having an *unmeasured* dominant line item is dangerous (any change can move the bill silently). The synthesize call is the structural cost concentration in blooming insights, but the load-bearing fact isn't the call — it's the missing meter. The right discipline is: **before optimizing any LLM cost, log `res.usage` on every call**. The data is free. The fix is trivial. The unblock is enormous. blooming insights ships without the meter today; until the meter lands, every cost claim in this file is an inference, not a measurement. The general principle: **measurement before optimization, even (especially) when the optimization is obvious.**
-
----
-
-## Primary diagram
-
-The full picture — the synthesize call's role, the four unread `res.usage` sites, the five-line fix, and what it unblocks.
-
-```
-  blooming insights — synthesize as cost concentration
-
-  ┌─ Agent loop (every investigation) ────────────────────────────────┐
-  │                                                                    │
-  │  lib/agents/base.ts:102                                            │
-  │    const res = await this.anthropic.messages.create(params);       │
-  │    ★ res.usage RETURNED but UNREAD ★                               │
-  │                                                                    │
-  │  fires up to maxTurns times per agent (default 8)                  │
-  │  cost shape: INPUT-heavy (messages[] grows per turn)               │
-  │  per-call cost (estimated): ~$0.030                                │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │  if loop's final JSON fails to parse:
-                                   ▼
-  ┌─ Synthesize fallback (recovery, output-heavy) ─────────────────────┐
-  │                                                                    │
-  │  lib/agents/diagnostic.ts:87-126                                   │
-  │    private async synthesize(...): Promise<Diagnosis> {             │
-  │      const res = await this.anthropic.messages.create({            │
-  │        system: PROMPT + "\nOutput ONLY a JSON object..."           │
-  │        messages,                                                    │
-  │        // no tools                                                  │
-  │      });                                                            │
-  │      ★ res.usage RETURNED but UNREAD ★                             │
-  │      return parseDiagnosis(res);                                    │
-  │    }                                                                │
-  │                                                                    │
-  │  lib/agents/recommendation.ts:82-132   (same shape, returns        │
-  │                                          Recommendation[])         │
-  │                                                                    │
-  │  cost shape: OUTPUT-heavy (~3-6K output tokens)                    │
-  │  per-call cost (estimated): ~$0.057  (~2× a loop turn)             │
-  │  fires: ONLY when loop's final turn fails to parse                 │
-  │  fire rate: UNKNOWN (no counter, no metric)                        │
-  └────────────────────────────────┬───────────────────────────────────┘
-                                   │
-  ┌─ Anthropic API (returns res.usage on EVERY call) ──────────────────┐
-  │                                                                    │
-  │  res.usage = {                                                     │
-  │    input_tokens:  number,                                          │
-  │    output_tokens: number,                                          │
-  │    cache_creation_input_tokens: number,                            │
-  │    cache_read_input_tokens:     number                             │
-  │  }                                                                  │
-  │                                                                    │
-  │  ★ FREE DATA — delivered on the wire — never read ★                │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ THE FIVE-LINE FIX (R2 in the audit) ──────────────────────────────┐
-  │                                                                    │
-  │  add `console.log('[perf]', { agent, kind, ...res.usage })`        │
-  │  at each of the four call sites:                                   │
-  │   - lib/agents/base.ts:102               (loop_turn)               │
-  │   - lib/agents/diagnostic.ts:97          (synthesize / Diagnosis)  │
-  │   - lib/agents/recommendation.ts:96      (synthesize / Recommends) │
-  │   - lib/agents/intent.ts:18              (haiku classifier)        │
-  │                                                                    │
-  │  ships to Vercel function logs (already queryable)                 │
-  │                                                                    │
-  │  unblocks:                                                         │
-  │   - per-investigation cost (now SUMMABLE)                          │
-  │   - synthesize fire rate (now COUNTABLE)                           │
-  │   - R1 cost concentration (now CONFIRMED or REFUTED)               │
-  │   - R3 budget headroom correlation                                 │
-  │   - R4 prompt-prefix caching ROI                                   │
-  │   - every soft budget in file 01                                   │
-  └────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-### Use cases — where synthesize fires (and where it doesn't)
+##### Use cases — where synthesize fires (and where it doesn't)
 
 - **Diagnostic agent: synthesize for Diagnosis.** Fires when the loop's final turn returns a text response that can't be parsed as a `Diagnosis` (missing fields, malformed JSON, prose instead of JSON). `lib/agents/diagnostic.ts:78-86` is the trigger; `lib/agents/diagnostic.ts:87-126` is the synthesize call.
 - **Recommendation agent: synthesize for Recommendation[].** Same shape — parse fails on the loop's final turn, synthesize fires. `lib/agents/recommendation.ts:74-80` triggers `lib/agents/recommendation.ts:82-132`.
@@ -398,7 +316,7 @@ The full picture — the synthesize call's role, the four unread `res.usage` sit
 - **Query agent: NO synthesize.** Same as monitoring — the query agent returns either a text answer or an EQL result; no fallback for structured-JSON parsing.
 - **Intent classifier (`lib/agents/intent.ts`): cheap, NOT a concentration.** Single haiku call per `?q=` query. Output is a short classification, not a structured payload. Cost is ~$0.005/call — noise.
 
-### Code side by side
+##### Code side by side
 
 **The diagnostic synthesize call — the recovery path that's suspected to be the cost concentration.**
 
@@ -556,6 +474,88 @@ The full picture — the synthesize call's role, the four unread `res.usage` sit
            is why synthesize is suspected to be costly — every fired
            synthesize is an ADDITIONAL call on top of the loop's already
            input-heavy run.
+```
+
+---
+
+### Move 3 — the principle
+
+**Cost concentration without measurement is the worst combination.** Having a dominant line item is fine (every system has one); having an *unmeasured* dominant line item is dangerous (any change can move the bill silently). The synthesize call is the structural cost concentration in blooming insights, but the load-bearing fact isn't the call — it's the missing meter. The right discipline is: **before optimizing any LLM cost, log `res.usage` on every call**. The data is free. The fix is trivial. The unblock is enormous. blooming insights ships without the meter today; until the meter lands, every cost claim in this file is an inference, not a measurement. The general principle: **measurement before optimization, even (especially) when the optimization is obvious.**
+
+---
+
+## Primary diagram
+
+The full picture — the synthesize call's role, the four unread `res.usage` sites, the five-line fix, and what it unblocks.
+
+```
+  blooming insights — synthesize as cost concentration
+
+  ┌─ Agent loop (every investigation) ────────────────────────────────┐
+  │                                                                    │
+  │  lib/agents/base.ts:102                                            │
+  │    const res = await this.anthropic.messages.create(params);       │
+  │    ★ res.usage RETURNED but UNREAD ★                               │
+  │                                                                    │
+  │  fires up to maxTurns times per agent (default 8)                  │
+  │  cost shape: INPUT-heavy (messages[] grows per turn)               │
+  │  per-call cost (estimated): ~$0.030                                │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │  if loop's final JSON fails to parse:
+                                   ▼
+  ┌─ Synthesize fallback (recovery, output-heavy) ─────────────────────┐
+  │                                                                    │
+  │  lib/agents/diagnostic.ts:87-126                                   │
+  │    private async synthesize(...): Promise<Diagnosis> {             │
+  │      const res = await this.anthropic.messages.create({            │
+  │        system: PROMPT + "\nOutput ONLY a JSON object..."           │
+  │        messages,                                                    │
+  │        // no tools                                                  │
+  │      });                                                            │
+  │      ★ res.usage RETURNED but UNREAD ★                             │
+  │      return parseDiagnosis(res);                                    │
+  │    }                                                                │
+  │                                                                    │
+  │  lib/agents/recommendation.ts:82-132   (same shape, returns        │
+  │                                          Recommendation[])         │
+  │                                                                    │
+  │  cost shape: OUTPUT-heavy (~3-6K output tokens)                    │
+  │  per-call cost (estimated): ~$0.057  (~2× a loop turn)             │
+  │  fires: ONLY when loop's final turn fails to parse                 │
+  │  fire rate: UNKNOWN (no counter, no metric)                        │
+  └────────────────────────────────┬───────────────────────────────────┘
+                                   │
+  ┌─ Anthropic API (returns res.usage on EVERY call) ──────────────────┐
+  │                                                                    │
+  │  res.usage = {                                                     │
+  │    input_tokens:  number,                                          │
+  │    output_tokens: number,                                          │
+  │    cache_creation_input_tokens: number,                            │
+  │    cache_read_input_tokens:     number                             │
+  │  }                                                                  │
+  │                                                                    │
+  │  ★ FREE DATA — delivered on the wire — never read ★                │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌─ THE FIVE-LINE FIX (R2 in the audit) ──────────────────────────────┐
+  │                                                                    │
+  │  add `console.log('[perf]', { agent, kind, ...res.usage })`        │
+  │  at each of the four call sites:                                   │
+  │   - lib/agents/base.ts:102               (loop_turn)               │
+  │   - lib/agents/diagnostic.ts:97          (synthesize / Diagnosis)  │
+  │   - lib/agents/recommendation.ts:96      (synthesize / Recommends) │
+  │   - lib/agents/intent.ts:18              (haiku classifier)        │
+  │                                                                    │
+  │  ships to Vercel function logs (already queryable)                 │
+  │                                                                    │
+  │  unblocks:                                                         │
+  │   - per-investigation cost (now SUMMABLE)                          │
+  │   - synthesize fire rate (now COUNTABLE)                           │
+  │   - R1 cost concentration (now CONFIRMED or REFUTED)               │
+  │   - R3 budget headroom correlation                                 │
+  │   - R4 prompt-prefix caching ROI                                   │
+  │   - every soft budget in file 01                                   │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

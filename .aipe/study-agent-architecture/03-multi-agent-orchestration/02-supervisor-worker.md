@@ -230,6 +230,25 @@ Right now in blooming insights, the supervisor role exists — it's played by co
 
 *Now:* the supervisor is the route handler's `GET` body. It decomposes the request via query-string fields (an insightId, a free-form q, a step), picks the worker by if-ladder, hands the typed diagnosis from one worker to the next via a function call, and "synthesizes" by streaming workers' outputs to the client in order. The decomposition is hard-coded because the user *journey* is the decomposition: there are exactly three product flows.
 
+**Where this lives in the repo.** The "hard-coded supervisor" entry point is `app/api/agent/route.ts` `GET` stream `start()` body at L199–L249 — lead-agent select (L199–L200), query branch (L210–L218), diagnostic→recommendation handoff (L224–L249). The workers are one shared loop and four agent classes: `runAgentLoop()` in `lib/agents/base.ts` L48–L176, called by every worker (`DiagnosticAgent`, `RecommendationAgent`, `QueryAgent`, `MonitoringAgent`); per-worker `maxToolCalls` (6/6/6/4) cap the loop budget. For the LLM-supervisor refactor: see `../06-orchestration-system-design-templates/` for the concrete "how to make this codebase a multi-agent research assistant" template — the workers in this codebase already fit the worker shape; the supervisor is what would be added.
+
+```
+shape (the supervisor role, played by code):
+
+  // app/api/agent/route.ts — the "supervisor" is this if-ladder
+  const leadAgent: AgentName =
+    q && !insightId      ? 'coordinator'    // → QueryAgent
+    : step === 'recommend' ? 'recommendation' // → RecommendationAgent
+                           : 'diagnostic';   // → DiagnosticAgent + RecommendationAgent
+
+  // Decompose: the request shape IS the decomposition
+  // Delegate: pick the worker by query param
+  // Synthesize: function call, not LLM merge
+  const diagnosis = await diagAgent.investigate(inv, hooks); // worker A
+  const recs     = await recAgent.propose(inv, diagnosis, hooks); // worker B
+  // (the route streams these to the client in order)
+```
+
 *If quality forced it:* the day the user journey isn't expressible as 3 product flows — e.g. when "anomaly type" branches into 20 specialist worker agents and the route file becomes a switchboard — a supervisor agent earns its overhead. The workers (diagnostic, recommendation, etc.) don't change at all; only the *outer* implementation of decompose-delegate-merge moves from code to a model.
 
 The takeaway: **a "hard-coded supervisor" is still a supervisor.** It plays the supervisor role; it just doesn't reason. Naming this out loud is what keeps the architecture honest — the codebase is supervisor-worker shaped, with the supervisor implemented as `if`s.
@@ -285,45 +304,6 @@ Supervisor-worker — the two flavors
   │   trajectory: ONE per worker; the route streams them         │
   │                                                              │
   └──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implementation in codebase
-
-**Not yet implemented as an LLM supervisor — and deliberately so.**
-
-The supervisor *role* is filled by `app/api/agent/route.ts` (lines L199–L249), which decomposes the user journey, picks the worker agent, hands one worker's output to the next, and streams the merge. It plays every part of the supervisor role except *reasoning about which step to take* — that's hard-coded.
-
-The honest sentence: blooming insights doesn't need an autonomous supervisor because the user journey has exactly three product flows (free-form query, anomaly investigation, split-step recommend), and those flows are knowable up front — so the route file's `if`-ladder expresses the decomposition without any model help.
-
-**The "hard-coded supervisor" entry point**
-**File:** `app/api/agent/route.ts`
-**Function / class:** `GET` stream `start()` body
-**Line range:** L199–L249 — lead-agent select (L199–L200), query branch (L210–L218), diagnostic→recommendation handoff (L224–L249)
-
-**The workers (one shared loop, four agent classes)**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L48–L176 — called by every worker (`DiagnosticAgent`, `RecommendationAgent`, `QueryAgent`, `MonitoringAgent`); per-worker `maxToolCalls` (6/6/6/4) cap the loop budget
-
-**For the LLM-supervisor refactor:** see `../06-orchestration-system-design-templates/` for the concrete "how to make this codebase a multi-agent research assistant" template — the workers in this codebase already fit the worker shape; the supervisor is what would be added.
-
-```
-shape (the supervisor role, played by code):
-
-  // app/api/agent/route.ts — the "supervisor" is this if-ladder
-  const leadAgent: AgentName =
-    q && !insightId      ? 'coordinator'    // → QueryAgent
-    : step === 'recommend' ? 'recommendation' // → RecommendationAgent
-                           : 'diagnostic';   // → DiagnosticAgent + RecommendationAgent
-
-  // Decompose: the request shape IS the decomposition
-  // Delegate: pick the worker by query param
-  // Synthesize: function call, not LLM merge
-  const diagnosis = await diagAgent.investigate(inv, hooks); // worker A
-  const recs     = await recAgent.propose(inv, diagnosis, hooks); // worker B
-  // (the route streams these to the client in order)
 ```
 
 ---

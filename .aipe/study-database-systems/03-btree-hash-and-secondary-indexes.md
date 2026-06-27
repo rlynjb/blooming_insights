@@ -110,21 +110,9 @@ Bridge: think of `Map.get(key)` (O(1) hash) vs `[...map.entries()].sort()` (O(N 
 
 **Move 2c — covering indexes.** An index that contains every column the query needs (in Postgres: `CREATE INDEX ... INCLUDE (...)`). The query never visits the heap; the index alone answers it. This is the difference between "use the index" and "use ONLY the index" — at scale, the latter can be 10× faster.
 
-### Move 3 — the principle
+### Code in this codebase
 
-**An index is a bet on which queries are hot.** Every index pays a write tax for a read discount. You don't index by default — you index by query pattern. The hardest indexing mistake is the one you can't see: an index that's there but never used (still costing writes) or a query that should use one but doesn't (slow but quiet).
-
-## Primary diagram
-
-Skipped — no codebase instance to recap.
-
-## Implementation in codebase
-
-### Use cases
-
-The only "indexes" today are V8's internal hash tables backing every `Map`. The codebase doesn't write SQL, so there's nothing to teach about index selection in our code yet.
-
-### Code side by side
+The only "indexes" today are V8's internal hash tables backing every `Map`. The codebase doesn't write SQL, so there's nothing to teach about index selection in our code yet — but the lookup pattern is the same shape, just at a different scale.
 
 ```
   lib/state/insights.ts  (lines 44–54)
@@ -159,6 +147,14 @@ The only "indexes" today are V8's internal hash tables backing every `Map`. The 
                                                 In practice callers control
                                                 args shape, so this never bites.
 ```
+
+### Move 3 — the principle
+
+**An index is a bet on which queries are hot.** Every index pays a write tax for a read discount. You don't index by default — you index by query pattern. The hardest indexing mistake is the one you can't see: an index that's there but never used (still costing writes) or a query that should use one but doesn't (slow but quiet).
+
+## Primary diagram
+
+Skipped — no codebase instance to recap.
 
 ## Elaborate
 

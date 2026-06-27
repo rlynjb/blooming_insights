@@ -135,6 +135,8 @@ for turn in maxTurns:                                ─┐
 
 Four load-bearing pieces: (1) the **bounded turn loop**, (2) the **`tool_use` → execute → `tool_result` back** observation cycle, (3) the **per-loop tool-call budget**, and (4) the **forced-final escape hatch** (strip `tools` so the model must write text). The wire-level mechanics — what a turn looks like in the Messages API, the difference between `text` and `tool_use` blocks, how the message history accumulates — are covered in the ai-engineering ReAct pattern note. This file's kernel is about *placement*: what makes this an agent loop and not its predecessor or its replacement.
 
+**Where the kernel lives in the repo.** All four kernel pieces sit in one function: `runAgentLoop()` in `lib/agents/base.ts`, L86 onward. `AGENT_MODEL` is declared at L10; the `McpCaller` alias (= `Pick<DataSource, 'callTool'>`) at L24. Inside the for-loop body: the `forceFinal` gate is computed where `budgetSpent` is calculated (L122–L123); the tools are omitted from `params.tools` on the forced-final turn (L133); the natural-stop check fires when zero `tool_use` blocks come back; `dataSource.callTool` is the dispatch site; the tool_results are pushed as the next user turn. One function, the four load-bearing pieces named above, in that order.
+
 ---
 
 ### Name each part by what breaks when removed
@@ -208,6 +210,30 @@ synthesis instruction appended on the            │   surface (→ ai-eng strea
 ```
 
 All four agents in this codebase share the kernel — that's why one shared loop function powers them. The variations are at the hardening layer: which tool subset, which synthesis instruction, which validator. The agents themselves are the same loop. And the next escalation on the ladder — plan-and-execute, reflexion, etc. — is *another layer of hardening* on the same kernel, not a different kernel.
+
+**Where the four callers live in the repo.** Each one parameterizes the same loop with its own knobs:
+
+- `MonitoringAgent.scan` — `lib/agents/monitoring.ts` — `maxToolCalls: 6`, produces an `Anomaly[]`
+- `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` — `maxToolCalls: 6`, produces a `Diagnosis`
+- `RecommendationAgent.propose` — `lib/agents/recommendation.ts` — `maxToolCalls: 4`, produces `Recommendation[]`
+- `QueryAgent.answer` — `lib/agents/query.ts` — `maxToolCalls: 6`, produces prose
+
+Each caller supplies its own system prompt (`lib/agents/prompts/*.md`), tool subset (`lib/mcp/tools.ts`), and `synthesisInstruction`. The loop body is identical for all four. Each is constructed with a `DataSource` (not an `McpClient`) — Phase 2's seam means the loop is agnostic to whether the tools come from Bloomreach (~27 MCP tools over OAuth) or the authored `mcp-server-olist` subprocess (3 domain tools: `get_metric_timeseries`, `get_segments`, `get_anomaly_context`). The model never sees `execute_sql` under Olist — the domain tools pre-bake the period-over-period math, which is the authoring-MCP-server angle this file's escalation ladder doesn't have to address.
+
+```
+shape (not full impl):
+  // per-caller knobs become a single runAgentLoop call
+  await runAgentLoop({
+    anthropic, dataSource,                                  // DataSource seam
+    agent: 'diagnostic',                                    // for trace events
+    system,                                                 // per-agent prompt
+    userPrompt: 'Investigate the anomaly and return JSON.', // role-specific
+    toolSchemas: filterToolSchemas(allTools, diagnosticTools), // tool subset
+    maxTurns: 8,
+    maxToolCalls: 6,                                        // per-job budget
+    synthesisInstruction: '…Stop investigating now…',       // forced-final
+  });
+```
 
 ---
 
@@ -283,39 +309,6 @@ the shared agent loop — the baseline reused four times
 
        4 callers, 1 loop. The per-caller knobs are just
        (system prompt, tool subset, tool-call budget, synthesis instruction).
-```
-
----
-
-## Implementation in codebase
-
-**The loop itself**
-**File:** `lib/agents/base.ts`
-**Function / class:** `runAgentLoop()`
-**Line range:** L86 onward — `AGENT_MODEL` L10; `McpCaller` alias L24 (= `Pick<DataSource, 'callTool'>`); for-loop body; `forceFinal` gate at the `budgetSpent` calc (L122–L123); tools omitted from `params.tools` on forced-final (L133); natural stop on zero tool_use; `dataSource.callTool` is the dispatch site; tool_results pushed as the next user turn.
-
-**The four callers — each one parameterizes the same loop**
-
-- `MonitoringAgent.scan` — `lib/agents/monitoring.ts` — `maxToolCalls: 6`, produces an Anomaly[]
-- `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` — `maxToolCalls: 6`, produces a Diagnosis
-- `RecommendationAgent.propose` — `lib/agents/recommendation.ts` — `maxToolCalls: 4`, produces Recommendation[]
-- `QueryAgent.answer` — `lib/agents/query.ts` — `maxToolCalls: 6`, produces prose
-
-Each caller supplies its own system prompt (`lib/agents/prompts/*.md`), tool subset (`lib/mcp/tools.ts`), and `synthesisInstruction`. The loop body is identical for all four. Each is constructed with a `DataSource` (not an `McpClient`) — Phase 2's seam means the loop is agnostic to whether the tools come from Bloomreach (~27 MCP tools over OAuth) or the authored `mcp-server-olist` subprocess (3 domain tools: `get_metric_timeseries`, `get_segments`, `get_anomaly_context`). The model never sees `execute_sql` under Olist — the domain tools pre-bake the period-over-period math, which is the authoring-MCP-server angle this file's escalation ladder doesn't have to address.
-
-```
-shape (not full impl):
-  // per-caller knobs become a single runAgentLoop call
-  await runAgentLoop({
-    anthropic, dataSource,                                  // DataSource seam
-    agent: 'diagnostic',                                    // for trace events
-    system,                                                 // per-agent prompt
-    userPrompt: 'Investigate the anomaly and return JSON.', // role-specific
-    toolSchemas: filterToolSchemas(allTools, diagnosticTools), // tool subset
-    maxTurns: 8,
-    maxToolCalls: 6,                                        // per-job budget
-    synthesisInstruction: '…Stop investigating now…',       // forced-final
-  });
 ```
 
 ---
