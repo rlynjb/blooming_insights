@@ -9,7 +9,7 @@
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** This sits inside the bigger encrypted-cookie pattern as the *synchronization primitive*. The cookie is the durable state; ALS is what makes the cookie usable in a server runtime where multiple requests may run concurrently on one V8 isolate (Vercel Edge / Node runtime both have this) and where the OAuth provider's many calls all need to see the same view of the state.
+**Zoom out — the bigger picture.** AsyncLocalStorage is *thread-local storage for async code* — like a backpack the request carries through every `await`, every callback, every `setTimeout`, where any function inside that request's call tree can reach in and pull out the same context. Without it you'd either pass a context object explicitly through every function (forking any SDK that doesn't know about it) or fall back to a module global (which two concurrent requests on the same instance would clobber). This sits inside the bigger encrypted-cookie pattern as the *synchronization primitive*. The cookie is the durable state; ALS is what makes the cookie usable in a server runtime where multiple requests may run concurrently on one V8 isolate (Vercel Edge / Node runtime both have this) and where the OAuth provider's many calls all need to see the same view of the state.
 
 ```
   Zoom out — where ALS sits in the auth layer
